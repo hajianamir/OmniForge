@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Testing & linting
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local secrets & workspace runtime artifacts
+.env
+.omniforge_workspace/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+*.jsonl
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
+
+# OS & Editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

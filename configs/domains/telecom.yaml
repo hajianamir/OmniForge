@@ -1,0 +1,8 @@
+domain:
+  name: telecom
+  display_name: "Telecommunications"
+  version: "1.0.0"
+  compliance_frameworks: [GDPR, ePrivacy, FCC-CPNI]
+  primary_tasks: [classification, survival, anomaly, forecasting, graphs]
+  key_metrics: [auc_roc, lift_top_decile, c_index, f1_score, smape]
+  default_cv_strategy: stratified_kfold

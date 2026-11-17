@@ -1,0 +1,197 @@
+"""OmegaConf/Hydra-style layered YAML configuration composer for OmniForge."""
+
+from __future__ import annotations
+
+import copy
+import os
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from omniforge.config.settings import OmniForgeSettings
+from omniforge.core.exceptions import ConfigurationError
+from omniforge.core.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge two configuration dictionaries without mutating inputs.
+
+    Args:
+        base: Lower-precedence dictionary.
+        override: Higher-precedence dictionary.
+
+    Returns:
+        Newly merged dictionary.
+    """
+    result = copy.deepcopy(base)
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def parse_dotlist_overrides(overrides: list[str]) -> dict[str, Any]:
+    """Parse Hydra-style ``section.key=value`` CLI overrides into a nested dictionary.
+
+    Args:
+        overrides: List of strings like ``["automl.max_trials=50", "debug=true"]``.
+
+    Returns:
+        Nested dictionary representation.
+    """
+    parsed: dict[str, Any] = {}
+    for item in overrides:
+        if "=" not in item:
+            raise ConfigurationError(
+                f"Invalid configuration override '{item}'. Expected 'key=value' syntax.",
+                suggestions=["Use dot-notation overrides such as 'automl.max_trials=50'."],
+            )
+        raw_key, raw_val = item.split("=", 1)
+        keys = [part.strip() for part in raw_key.split(".") if part.strip()]
+        if not keys:
+            raise ConfigurationError(f"Empty key in configuration override '{item}'.")
+        value = yaml.safe_load(raw_val)
+        cursor = parsed
+        for part in keys[:-1]:
+            if part not in cursor or not isinstance(cursor[part], dict):
+                cursor[part] = {}
+            cursor = cursor[part]
+        cursor[keys[-1]] = value
+    return parsed
+
+
+def _resolve_env_interpolation(obj: Any) -> Any:
+    """Resolve ``${ENV_VAR:default}`` placeholders inside YAML configs."""
+    if isinstance(obj, dict):
+        return {k: _resolve_env_interpolation(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_resolve_env_interpolation(v) for v in obj]
+    if isinstance(obj, str) and obj.startswith("${") and obj.endswith("}"):
+        expr = obj[2:-1]
+        if ":" in expr:
+            env_name, default_val = expr.split(":", 1)
+            return os.getenv(env_name.strip(), default_val.strip())
+        return os.getenv(expr.strip(), obj)
+    return obj
+
+
+class ConfigLoader:
+    """Composes OmniForge configuration from base YAML, domain YAML, custom overlays, and dotlist overrides."""
+
+    def __init__(self, config_dir: str | Path | None = None) -> None:
+        if config_dir is not None:
+            self.config_dir = Path(config_dir)
+        else:
+            # Locate configs/ directory relative to package root or cwd
+            pkg_root = Path(__file__).resolve().parents[3]
+            candidate = pkg_root / "configs"
+            self.config_dir = candidate if candidate.exists() else Path.cwd() / "configs"
+
+    def load_yaml(self, path: str | Path) -> dict[str, Any]:
+        """Load and interpolate a single YAML configuration file."""
+        file_path = Path(path)
+        if not file_path.exists():
+            raise ConfigurationError(
+                f"Configuration file not found: {file_path}",
+                suggestions=["Verify config_dir or pass an explicit YAML file path."],
+            )
+        try:
+            content = yaml.safe_load(file_path.read_text(encoding="utf-8")) or {}
+            if not isinstance(content, dict):
+                raise ConfigurationError(
+                    f"YAML root in {file_path} must be a mapping, got {type(content).__name__}."
+                )
+            return dict(_resolve_env_interpolation(content))
+        except ConfigurationError:
+            raise
+        except Exception as exc:
+            raise ConfigurationError(
+                f"Failed to parse YAML configuration file {file_path}.",
+                cause=exc,
+            ) from exc
+
+    def compose(
+        self,
+        *,
+        base_file: str | Path | None = None,
+        domain: str | None = None,
+        extra_files: list[str | Path] | None = None,
+        overrides: list[str] | None = None,
+    ) -> OmniForgeSettings:
+        """Compose layered configuration into a validated :class:`OmniForgeSettings` object.
+
+        Args:
+            base_file: Optional path to base YAML (defaults to ``configs/default.yaml``).
+            domain: Optional domain name (loads ``configs/domains/{domain}.yaml``).
+            extra_files: Optional list of additional overlay YAML paths.
+            overrides: Optional Hydra-style ``key.subkey=value`` overrides.
+
+        Returns:
+            Validated :class:`OmniForgeSettings`.
+        """
+        merged: dict[str, Any] = {}
+        default_yaml = Path(base_file) if base_file else (self.config_dir / "default.yaml")
+        if default_yaml.exists():
+            merged = deep_merge(merged, self.load_yaml(default_yaml))
+
+        domain_cfg: dict[str, Any] = {}
+        if domain:
+            domain_path = self.config_dir / "domains" / f"{domain.lower()}.yaml"
+            if domain_path.exists():
+                domain_cfg = self.load_yaml(domain_path)
+            else:
+                raise ConfigurationError(
+                    f"Domain configuration file not found for domain '{domain}': {domain_path}",
+                    suggestions=["Run 'uap domains list' to view available domains."],
+                )
+
+        if extra_files:
+            for extra in extra_files:
+                merged = deep_merge(merged, self.load_yaml(extra))
+
+        if overrides:
+            merged = deep_merge(merged, parse_dotlist_overrides(overrides))
+
+        # Map top-level platform section keys onto root OmniForgeSettings fields
+        platform_section = merged.pop("platform", {})
+        if isinstance(platform_section, dict):
+            for field_name in ("environment", "debug", "random_seed", "default_tenant_id"):
+                if field_name in platform_section:
+                    merged.setdefault(field_name, platform_section[field_name])
+
+        if domain_cfg:
+            merged["domain_overrides"] = domain_cfg
+
+        try:
+            settings = OmniForgeSettings(**merged)
+            logger.info(
+                "configuration_composed",
+                environment=settings.environment,
+                domain=domain or "generic",
+            )
+            return settings
+        except Exception as exc:
+            raise ConfigurationError(
+                "Composed configuration failed schema validation.",
+                cause=exc,
+                suggestions=["Review YAML types and dotlist override syntax."],
+            ) from exc
+
+
+def load_config(
+    *,
+    domain: str | None = None,
+    config_file: str | Path | None = None,
+    overrides: list[str] | None = None,
+) -> OmniForgeSettings:
+    """Convenience function to compose and return :class:`OmniForgeSettings`."""
+    loader = ConfigLoader()
+    return loader.compose(base_file=config_file, domain=domain, overrides=overrides)
+
+
+load_settings = load_config

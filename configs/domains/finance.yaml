@@ -1,0 +1,13 @@
+domain:
+  name: finance
+  display_name: "Finance & Insurance"
+  version: "1.0.0"
+  compliance_frameworks: [SOX, Basel-III, SR-11-7, GDPR, MiFID-II, Fair-Lending]
+  primary_tasks: [classification, regression, forecasting, anomaly, optimization, survival]
+  key_metrics: [auc_roc, ks_statistic, gini_coefficient, sharpe_ratio, max_drawdown, var_95, cvar_95, brier_score]
+  protected_attributes: [age_group, gender, marital_status, postal_code]
+  default_cv_strategy: purged_kfold
+  drift_sensitivity: high
+  fairness_thresholds:
+    disparate_impact_min: 0.80
+    demographic_parity_diff_max: 0.10

@@ -1,0 +1,8 @@
+domain:
+  name: real_estate
+  display_name: "Real Estate & PropTech"
+  version: "1.0.0"
+  compliance_frameworks: [Fair-Housing-Act, RESPA, USPAP]
+  primary_tasks: [regression, forecasting, computer_vision, optimization, anomaly]
+  key_metrics: [mape, median_ape, cod_dispersion, r2, rmse]
+  default_cv_strategy: group_kfold

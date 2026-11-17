@@ -1,0 +1,8 @@
+domain:
+  name: media
+  display_name: "Media, Entertainment & Publishing"
+  version: "1.0.0"
+  compliance_frameworks: [GDPR, CCPA, DSA, Copyright-Compliance]
+  primary_tasks: [recommendation, nlp, forecasting, classification, causal]
+  key_metrics: [ndcg_at_10, map_at_10, auc_roc, ctr_lift, smape]
+  default_cv_strategy: time_series_split

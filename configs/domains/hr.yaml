@@ -1,0 +1,12 @@
+domain:
+  name: hr
+  display_name: "HR & People Analytics"
+  version: "1.0.0"
+  compliance_frameworks: [EEOC, GDPR-Employment, EU-AI-Act-High-Risk, NYC-LL144]
+  primary_tasks: [classification, survival, causal, regression, nlp]
+  key_metrics: [auc_roc, disparate_impact_ratio, demographic_parity_diff, c_index]
+  protected_attributes: [gender, age_group, ethnicity, disability_status]
+  fairness_thresholds:
+    disparate_impact_min: 0.80
+    demographic_parity_diff_max: 0.05
+  default_cv_strategy: stratified_kfold

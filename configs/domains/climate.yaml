@@ -1,0 +1,8 @@
+domain:
+  name: climate
+  display_name: "Climate, Environment & Sustainability"
+  version: "1.0.0"
+  compliance_frameworks: [GHG-Protocol, TCFD, CSRD, ISO-14064, SBTi]
+  primary_tasks: [forecasting, simulation, regression, anomaly, optimization]
+  key_metrics: [rmse, crps, pinball_loss, skill_score, carbon_intensity_error]
+  default_cv_strategy: time_series_split

@@ -1,0 +1,111 @@
+platform:
+  name: OmniForge
+  short_name: OmniForge
+  version: "2.0.0"
+  edition: Enterprise Analytics & AI Workbench
+  environment: development
+  debug: false
+  random_seed: 42
+  default_tenant_id: default-tenant
+
+paths:
+  workspace_dir: ./.omniforge_workspace
+  artifact_store_dir: ./.omniforge_workspace/artifacts
+  cache_dir: ./.omniforge_workspace/cache
+  feature_store_dir: ./.omniforge_workspace/feature_store
+  tracking_db_path: ./.omniforge_workspace/mlops_tracking.db
+  registry_db_path: ./.omniforge_workspace/model_registry.db
+  audit_log_path: ./.omniforge_workspace/audit.jsonl
+
+logging:
+  level: INFO
+  format: json
+  redact_secrets: true
+  include_trace_id: true
+  log_file: ./.omniforge_workspace/omniforge.log
+
+compute:
+  n_jobs: -1
+  prefer_gpu: true
+  backend: local
+  chunk_size: 100000
+  memory_limit_mb: 8192
+
+carbon:
+  enabled: true
+  country_iso: DEU
+  region_intensity_g_per_kwh: 380.0
+  pue: 1.25
+  cpu_tdp_watts: 65.0
+  gpu_tdp_watts: 250.0
+
+data:
+  default_encoding: utf-8
+  optimize_dtypes: true
+  compute_checksums: true
+  missing_threshold_drop_col: 0.95
+  outlier_method: iqr
+  outlier_threshold: 1.5
+  quality_thresholds:
+    completeness: 0.90
+    uniqueness: 0.95
+    validity: 0.95
+    consistency: 0.95
+    accuracy: 0.90
+    timeliness: 0.85
+
+modeling:
+  always_compare_baselines: true
+  default_cv_folds: 5
+  test_size: 0.2
+  enable_conformal_uncertainty: true
+  enable_fairness_audit: true
+  enable_interpretability: true
+  default_classification_metric: f1_weighted
+  default_regression_metric: rmse
+  default_forecasting_metric: smape
+
+automl:
+  time_budget_seconds: 120
+  max_trials: 30
+  search_strategy: bayesian
+  enable_ensembling: true
+  early_stopping_rounds: 10
+
+mlops:
+  auto_track_experiments: true
+  drift_psi_warning: 0.1
+  drift_psi_critical: 0.25
+  drift_ks_alpha: 0.05
+  retrain_on_critical_drift: true
+
+security:
+  enable_rbac: true
+  jwt_algorithm: HS256
+  jwt_expiration_minutes: 60
+  encrypt_artifacts_at_rest: false
+  pii_detection_enabled: true
+  compliance_profiles:
+    - GDPR
+    - SOX
+
+copilot:
+  provider: local
+  model: gpt-4o-mini
+  temperature: 0.1
+  max_tokens: 2048
+  max_tool_steps: 8
+  memory_window: 20
+
+api:
+  host: 0.0.0.0
+  port: 8000
+  cors_origins:
+    - "*"
+  rate_limit_per_minute: 300
+
+ui:
+  host: 0.0.0.0
+  port: 8501
+  default_theme: dark
+  locale: en

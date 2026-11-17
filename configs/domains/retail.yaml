@@ -1,0 +1,9 @@
+domain:
+  name: retail
+  display_name: "Retail & E-Commerce"
+  version: "1.0.0"
+  compliance_frameworks: [GDPR, CCPA, PCI-DSS]
+  primary_tasks: [forecasting, recommendation, classification, causal, optimization, regression]
+  key_metrics: [smape, wmape, ndcg_at_10, recall_at_10, uplift_qini, clv_rmse, auc_roc]
+  default_cv_strategy: time_series_split
+  drift_sensitivity: medium

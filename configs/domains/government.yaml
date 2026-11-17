@@ -1,0 +1,8 @@
+domain:
+  name: government
+  display_name: "Government, Public Policy & Smart Cities"
+  version: "1.0.0"
+  compliance_frameworks: [EU-AI-Act, NIST-AI-RMF, FOIA, GDPR, FedRAMP]
+  primary_tasks: [causal, forecasting, optimization, simulation, graphs, anomaly]
+  key_metrics: [ate_error, disparate_impact_ratio, smape, service_equity_index]
+  default_cv_strategy: group_kfold

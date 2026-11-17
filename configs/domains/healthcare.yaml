@@ -1,0 +1,14 @@
+domain:
+  name: healthcare
+  display_name: "Healthcare & Pharma"
+  version: "1.0.0"
+  compliance_frameworks: [HIPAA, FDA-21-CFR-Part-11, GDPR-Health, EU-MDR, ISO-13485]
+  primary_tasks: [classification, survival, causal, anomaly, nlp, computer_vision]
+  key_metrics: [auc_roc, auc_pr, sensitivity, specificity, npv, ppv, c_index, brier_score, calibration_error]
+  protected_attributes: [sex, race, age_group, ethnicity]
+  pii_columns_patterns: [patient_id, ssn, mrn, dob, name, email, phone]
+  default_cv_strategy: stratified_group_kfold
+  drift_sensitivity: critical
+  fairness_thresholds:
+    equalized_odds_diff_max: 0.05
+    demographic_parity_diff_max: 0.08

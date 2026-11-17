@@ -1,0 +1,8 @@
+domain:
+  name: agriculture
+  display_name: "Agriculture & Precision Farming"
+  version: "1.0.0"
+  compliance_frameworks: [GAP, EU-CAP, USDA-Organic]
+  primary_tasks: [regression, forecasting, computer_vision, optimization, simulation]
+  key_metrics: [rmse, r2, smape, water_efficiency_gain, yield_mape]
+  default_cv_strategy: group_kfold

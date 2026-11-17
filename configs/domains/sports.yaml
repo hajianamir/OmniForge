@@ -1,0 +1,8 @@
+domain:
+  name: sports
+  display_name: "Sports Analytics & Performance"
+  version: "1.0.0"
+  compliance_frameworks: [GDPR-Biometrics, Anti-Doping-Data-Privacy]
+  primary_tasks: [classification, regression, simulation, survival, computer_vision]
+  key_metrics: [brier_score, log_loss, auc_roc, rps, mae]
+  default_cv_strategy: time_series_split

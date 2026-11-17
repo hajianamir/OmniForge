@@ -1,0 +1,10 @@
+domain:
+  name: energy
+  display_name: "Energy & Utilities"
+  version: "1.0.0"
+  compliance_frameworks: [NERC-CIP, ISO-50001, EU-Grid-Code, ESG-CSRD]
+  primary_tasks: [forecasting, anomaly, optimization, simulation, regression]
+  key_metrics: [smape, mape, pinball_loss, winkler_score, ramp_score, peak_error]
+  default_cv_strategy: time_series_split
+  forecast_horizons: [24, 48, 168]
+  drift_sensitivity: high

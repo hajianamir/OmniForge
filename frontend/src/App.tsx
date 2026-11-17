@@ -1,0 +1,518 @@
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  Activity,
+  AlertTriangle,
+  BarChart3,
+  BookOpen,
+  Cpu,
+  Database,
+  FileText,
+  FolderOpen,
+  Gauge,
+  GitBranch,
+  HelpCircle,
+  Lock,
+  MessageSquare,
+  Moon,
+  Save,
+  ScatterChart,
+  Server,
+  Shield,
+  Sliders,
+  Sparkles,
+  Sun,
+  Target,
+  TrendingUp,
+  Unlock,
+  X,
+} from 'lucide-react';
+import { apiDelete, apiDownload, apiGet, apiPost, apiUpload } from './api';
+import { HelpGuideModal, StudioHelpButton, type HandbookSectionId } from './components/HelpGuideModal';
+import { Studio01Data, Studio02Clustering, Studio03Diagnostics, Studio04EDA, Studio05Features } from './studios/StudiosPart1';
+import { Studio06Modeling, Studio07Responsible, Studio08Decision } from './studios/StudiosPart2';
+import { Studio09Specialized, Studio10DAG, Studio11MLOps, Studio12Reporting, Studio13Copilot } from './studios/StudiosPart3';
+import { Studio14Supervisory } from './studios/Studio14Supervisory';
+import { STUDIOS, type StudioId, type WorkspaceState } from './types';
+
+const ICONS: Record<StudioId, React.ReactNode> = {
+  '01': <Database size={15} />,
+  '02': <ScatterChart size={15} />,
+  '03': <Activity size={15} />,
+  '04': <BarChart3 size={15} />,
+  '05': <Sliders size={15} />,
+  '06': <Cpu size={15} />,
+  '07': <Shield size={15} />,
+  '08': <TrendingUp size={15} />,
+  '09': <Sparkles size={15} />,
+  '10': <GitBranch size={15} />,
+  '11': <Server size={15} />,
+  '12': <FileText size={15} />,
+  '13': <MessageSquare size={15} />,
+  '14': <Gauge size={15} />,
+};
+
+const EMPTY_WS: WorkspaceState = {
+  session_id: 'default',
+  platform: { name: 'OmniForge', version: '2.0.0', edition: 'Enterprise' },
+  has_dataset: false,
+  dataset_name: null,
+  dataset_source: null,
+  n_rows: 0,
+  n_cols: 0,
+  raw_rows: 0,
+  raw_cols: 0,
+  columns: [],
+  numeric_columns: [],
+  categorical_columns: [],
+  targets: [],
+  primary_target: null,
+  excluded_columns: [],
+  analysis_cols_count: 0,
+  can_undo: false,
+  processing_status: {},
+  split_lock: null,
+  total_deleted_rows: 0,
+  format_audit_issues: 0,
+  intake_audit: null,
+  s02_cluster_committed: false,
+  s02_anomaly_committed: false,
+  active_model_name: null,
+  active_model_metrics: null,
+  active_feature_cols: [],
+  available_models_count: 0,
+  supervisory_status: 'IDLE',
+  studio_completed: {},
+  workflow_checklist: [],
+  lineage: [],
+  theme: 'dark',
+  project_name: 'omniforge_project',
+};
+
+export const App: React.FC = () => {
+  const [ws, setWs] = useState<WorkspaceState>(EMPTY_WS);
+  const [studio, setStudio] = useState<StudioId>('01');
+  const [visitedStudios, setVisitedStudios] = useState<StudioId[]>(['01']);
+  const [gridVersion, setGridVersion] = useState(0);
+  const [modal, setModal] = useState<'none' | 'targets' | 'exclusions' | 'split' | 'project'>('none');
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [helpSection, setHelpSection] = useState<HandbookSectionId>('workflow');
+  const [toast, setToast] = useState<string | null>(null);
+  const [studioCache, setStudioCache] = useState<Record<string, any>>({});
+
+  const openHelp = useCallback((section: HandbookSectionId = 'workflow') => {
+    setHelpSection(section);
+    setHelpOpen(true);
+  }, []);
+
+  const mainPaneRef = useRef<HTMLElement | null>(null);
+
+  const navigateStudio = useCallback((id: StudioId) => {
+    setStudio(id);
+    setVisitedStudios((prev) => (prev.includes(id) ? prev : [...prev, id]));
+    requestAnimationFrame(() => {
+      mainPaneRef.current?.scrollTo({ top: 0, behavior: 'auto' });
+    });
+  }, []);
+
+  // Split Lock form state
+  const [splitStrat, setSplitStrat] = useState('auto');
+  const [splitTestSize, setSplitTestSize] = useState(0.2);
+  const [splitCvFolds, setSplitCvFolds] = useState(5);
+
+  // .omniforge Project save/load
+  const [projName, setProjName] = useState('omniforge_project');
+  const [projNotes, setProjNotes] = useState('');
+
+  const fetchServerCache = useCallback(() => {
+    apiGet<{ results?: Record<string, any> }>('/api/workbench/results')
+      .then((res) => {
+        if (res && typeof res.results === 'object') {
+          setStudioCache((prev) => ({ ...prev, ...(res.results || {}) }));
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  const setStudioResult = useCallback((key: string, val: any) => {
+    setStudioCache((prev) => {
+      if (val === undefined || val === null) {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      }
+      return { ...prev, [key]: val };
+    });
+  }, []);
+
+  const syncState = useCallback((next?: WorkspaceState) => {
+    if (next) {
+      setWs(next);
+      document.documentElement.setAttribute('data-theme', next.theme === 'light' ? 'light' : 'dark');
+      if (!next.has_dataset) {
+        setStudioCache({});
+        return;
+      }
+      // Prune local keys only when the server explicitly removed them on dataset reset/upstream mutation,
+      // and hydrate any server keys missing locally (e.g. after .omniforge restore).
+      if (Array.isArray(next.cached_result_keys)) {
+        const allowed = new Set(next.cached_result_keys);
+        let missingOnClient = false;
+        setStudioCache((prev) => {
+          const filtered: Record<string, any> = {};
+          for (const [k, v] of Object.entries(prev)) {
+            if (allowed.has(k)) filtered[k] = v;
+          }
+          for (const k of allowed) {
+            if (!(k in filtered)) {
+              missingOnClient = true;
+              break;
+            }
+          }
+          return filtered;
+        });
+        if (missingOnClient) {
+          fetchServerCache();
+        }
+      }
+      return;
+    }
+    apiGet<WorkspaceState>('/api/workbench/state')
+      .then((s) => {
+        setWs(s);
+        document.documentElement.setAttribute('data-theme', s.theme === 'light' ? 'light' : 'dark');
+        fetchServerCache();
+      })
+      .catch(() => {});
+  }, [fetchServerCache]);
+
+  useEffect(() => { syncState(); }, [syncState]);
+
+  const bumpGrid = useCallback(() => setGridVersion((v) => v + 1), []);
+  const flash = (text: string) => {
+    setToast(text);
+    setTimeout(() => setToast((cur) => (cur === text ? null : cur)), 4500);
+  };
+
+  const toggleTheme = async () => {
+    const nextTheme = ws.theme === 'light' ? 'dark' : 'light';
+    document.documentElement.setAttribute('data-theme', nextTheme);
+    setWs((prev) => ({ ...prev, theme: nextTheme }));
+    try { await apiPost('/api/workbench/theme', { theme: nextTheme }); } catch {}
+  };
+
+  const toggleTarget = async (col: string) => {
+    const next = ws.targets.includes(col) ? ws.targets.filter((c) => c !== col) : [...ws.targets, col];
+    if (!next.length) return;
+    const r = await apiPost('/api/workbench/targets', { targets: next });
+    syncState(r.state); bumpGrid();
+  };
+
+  const toggleExclude = async (col: string) => {
+    const next = ws.excluded_columns.includes(col)
+      ? ws.excluded_columns.filter((c) => c !== col)
+      : [...ws.excluded_columns, col];
+    const r = await apiPost('/api/workbench/exclusions', { excluded_columns: next });
+    syncState(r.state); bumpGrid();
+  };
+
+  const handleSaveProject = async () => {
+    const fd = new FormData();
+    fd.append('project_name', projName || ws.project_name);
+    fd.append('notes', projNotes);
+    await apiDownload('/api/workbench/workspace/save', `${projName || 'omniforge_project'}.omniforge`, 'POST', fd);
+    flash('Saved portable .omniforge workspace project.');
+    setModal('none');
+  };
+
+  const handleLoadProject = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const fd = new FormData();
+    fd.append('file', file);
+    const res = await apiUpload('/api/workbench/workspace/load', fd);
+    syncState(res.state);
+    fetchServerCache();
+    bumpGrid();
+    flash(`Restored OmniForge project '${file.name}'.`);
+    setModal('none');
+    e.target.value = '';
+  };
+
+  const commonProps = {
+    ws,
+    onSync: syncState,
+    gridVersion,
+    bumpGrid,
+    studioCache,
+    setStudioResult,
+    refreshCache: fetchServerCache,
+    openHelp,
+  };
+
+  return (
+    <div className="app-shell">
+      {/* Persistent Top Header */}
+      <header className="topbar">
+        <div className="brand">
+          <div className="brand-mark">Ω</div>
+          <div>
+            <span>{ws.platform?.name || 'OmniForge'}</span>
+            <span className="badge badge-accent" style={{ marginLeft: 8 }}>v{ws.platform?.version || '2.0.0'} · Enterprise</span>
+          </div>
+        </div>
+
+        <div className="topbar-meta">
+          {ws.supervisory_status && ws.supervisory_status !== 'IDLE' && (
+            <button
+              className={`btn btn-sm ${ws.supervisory_status === 'CRITICAL_ALARM' ? 'btn-danger' : ws.supervisory_status === 'WARNING' ? '' : 'btn-success'}`}
+              onClick={() => navigateStudio('14')}
+              title="Open Studio 14 Supervisory Monitor"
+            >
+              <AlertTriangle size={13} /> Monitor: {ws.supervisory_status}
+            </button>
+          )}
+          {ws.has_dataset ? (
+            <>
+              <span className="badge badge-green">
+                {ws.dataset_name} · {ws.n_rows.toLocaleString()} × {ws.n_cols}
+              </span>
+              <span
+                className={`badge ${ws.processing_status?.is_processed ? 'badge-accent' : 'badge-amber'}`}
+                title={`${ws.processing_status?.summary || ''} | Active: ${ws.n_rows}×${ws.n_cols} (Raw: ${ws.raw_rows}×${ws.raw_cols}) — All downstream studios operate on this active dataset.`}
+              >
+                {ws.processing_status?.detailed_label || (ws.processing_status?.is_processed ? 'PROCESSED' : 'RAW')}
+              </span>
+              {ws.intake_audit && ws.intake_audit.defect_counts?.total > 0 && (
+                <button className="btn btn-sm" onClick={() => navigateStudio('01')} title="Inspect Automatic Intake Defects">
+                  Defects: {ws.intake_audit.defect_counts.total} ({ws.intake_audit.quality_grade})
+                </button>
+              )}
+              <button className="btn btn-sm" onClick={() => setModal('targets')}>
+                <Target size={13} /> Targets ({ws.targets.length})
+              </button>
+              <button className="btn btn-sm" onClick={() => setModal('exclusions')}>
+                Exclusions ({ws.excluded_columns.length})
+              </button>
+              <button className={`btn btn-sm ${ws.split_lock?.active ? 'btn-success' : ''}`} onClick={() => setModal('split')}>
+                {ws.split_lock?.active ? <Lock size={13} /> : <Unlock size={13} />}
+                {ws.split_lock?.active ? `Split Locked (${ws.split_lock.strategy})` : 'Split Lock'}
+              </button>
+            </>
+          ) : (
+            <span className="badge">No Dataset Loaded</span>
+          )}
+        </div>
+
+        <div className="topbar-fixed-actions">
+          <button className="btn btn-sm" onClick={() => { setProjName(ws.project_name); setModal('project'); }} title="Save or Restore Portable .omniforge Project">
+            <Save size={13} /> Project
+          </button>
+          <button
+            className="btn btn-sm topbar-help-btn"
+            data-global-help="true"
+            onClick={() => openHelp('workflow')}
+            title="Open Complete OmniForge Comprehensive Reference Handbook (Formulas, Thresholds, Tests & All 14 Studios)"
+          >
+            <HelpCircle size={15} /> Help
+          </button>
+          <button className="btn btn-sm" onClick={toggleTheme} title="Toggle Dark/Light Mode">
+            {ws.theme === 'light' ? <Moon size={14} /> : <Sun size={14} />}
+          </button>
+        </div>
+      </header>
+
+      {/* CRISP-DM Lifecycle Left Sidebar + Persistent Green Completion LEDs */}
+      <aside className="sidebar">
+        <div className="sidebar-section">CRISP-DM 14-Studio Lifecycle</div>
+        {STUDIOS.map((s) => {
+          const isDone = Boolean(ws.studio_completed?.[s.id]);
+          return (
+            <button
+              key={s.id}
+              data-studio={s.id}
+              data-completed={isDone ? 'true' : 'false'}
+              className={`nav-item ${studio === s.id ? 'active' : ''}`}
+              onClick={() => navigateStudio(s.id)}
+              title={`${s.id} · ${s.title}${isDone ? ' (Completed)' : ''}`}
+            >
+              <span className="nav-code">{s.id}</span>
+              {ICONS[s.id]}
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.short}</span>
+              <span className={`studio-led ${isDone ? 'done' : ''}`} aria-label={isDone ? 'Completed' : 'Pending'} />
+            </button>
+          );
+        })}
+
+        <div style={{ padding: '10px 8px 4px' }}>
+          <button className="btn btn-sm" style={{ width: '100%', justifyContent: 'center' }} onClick={() => openHelp('workflow')}>
+            <BookOpen size={13} /> Complete Handbook
+          </button>
+        </div>
+
+        {ws.workflow_checklist?.length > 0 && (
+          <>
+            <div className="sidebar-section" style={{ marginTop: 10 }}>Workflow Readiness</div>
+            <div style={{ padding: '0 8px', display: 'flex', flexDirection: 'column', gap: 5 }}>
+              {ws.workflow_checklist.map((item) => (
+                <div key={item.label} style={{ fontSize: 11.5, color: item.done ? 'var(--green)' : 'var(--text-dim)' }}>
+                  {item.done ? '✓' : '○'} {item.label}
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+      </aside>
+
+      {/* Main Studio Workspace — Keep visited studios mounted so returning NEVER resets tabs, forms, or results */}
+      <main ref={mainPaneRef} className="main-pane">
+        {toast && <div className="alert alert-success">{toast}</div>}
+        {visitedStudios.includes('01') && <div style={{ display: studio === '01' ? 'block' : 'none' }}><Studio01Data {...commonProps} /></div>}
+        {visitedStudios.includes('02') && <div style={{ display: studio === '02' ? 'block' : 'none' }}><Studio02Clustering {...commonProps} /></div>}
+        {visitedStudios.includes('03') && <div style={{ display: studio === '03' ? 'block' : 'none' }}><Studio03Diagnostics {...commonProps} /></div>}
+        {visitedStudios.includes('04') && <div style={{ display: studio === '04' ? 'block' : 'none' }}><Studio04EDA {...commonProps} /></div>}
+        {visitedStudios.includes('05') && <div style={{ display: studio === '05' ? 'block' : 'none' }}><Studio05Features {...commonProps} /></div>}
+        {visitedStudios.includes('06') && <div style={{ display: studio === '06' ? 'block' : 'none' }}><Studio06Modeling {...commonProps} /></div>}
+        {visitedStudios.includes('07') && <div style={{ display: studio === '07' ? 'block' : 'none' }}><Studio07Responsible {...commonProps} /></div>}
+        {visitedStudios.includes('08') && <div style={{ display: studio === '08' ? 'block' : 'none' }}><Studio08Decision {...commonProps} /></div>}
+        {visitedStudios.includes('09') && <div style={{ display: studio === '09' ? 'block' : 'none' }}><Studio09Specialized {...commonProps} /></div>}
+        {visitedStudios.includes('10') && <div style={{ display: studio === '10' ? 'block' : 'none' }}><Studio10DAG {...commonProps} /></div>}
+        {visitedStudios.includes('11') && <div style={{ display: studio === '11' ? 'block' : 'none' }}><Studio11MLOps {...commonProps} /></div>}
+        {visitedStudios.includes('12') && <div style={{ display: studio === '12' ? 'block' : 'none' }}><Studio12Reporting {...commonProps} /></div>}
+        {visitedStudios.includes('13') && <div style={{ display: studio === '13' ? 'block' : 'none' }}><Studio13Copilot {...commonProps} /></div>}
+        {visitedStudios.includes('14') && <div style={{ display: studio === '14' ? 'block' : 'none' }}><Studio14Supervisory {...commonProps} /></div>}
+      </main>
+
+      <HelpGuideModal open={helpOpen} initialSection={helpSection} onClose={() => setHelpOpen(false)} onJumpStudio={navigateStudio} />
+
+      {/* Always-Visible Floating Contextual '?' Quick-Help Launcher for the Current Studio */}
+      {!helpOpen && (
+        <button
+          type="button"
+          className="floating-help-fab"
+          data-floating-help={`studio-${studio}`}
+          onClick={() => openHelp(`studio-${studio}` as HandbookSectionId)}
+          title={`Open Comprehensive Reference Chapter for Studio ${studio} (Formulas, Thresholds, Worked Examples & Troubleshooting)`}
+          aria-label={`Open Help Chapter for Studio ${studio}`}
+        >
+          <HelpCircle size={17} />
+          <span>? Studio {studio} Guide</span>
+        </button>
+      )}
+
+      {/* Modals: Multi-Target, Column Exclusions, Split Lock, .omniforge Project */}
+      {modal !== 'none' && (
+        <div className="modal-backdrop" onClick={() => setModal('none')}>
+          <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
+            <div className="card-title">
+              <span>
+                {modal === 'targets' && 'Global Multi-Target Selector'}
+                {modal === 'exclusions' && 'Reversible Column Exclusions (All 14 Studios)'}
+                {modal === 'split' && 'Anti-Leakage Train/Test Split Lock'}
+                {modal === 'project' && 'Portable .omniforge Workspace Save & Restore'}
+              </span>
+              <div className="row" style={{ gap: 6 }}>
+                <StudioHelpButton
+                  section={modal === 'project' ? 'studio-12' : 'studio-01'}
+                  onOpenHelp={(sec) => { setModal('none'); openHelp(sec); }}
+                  title={
+                    modal === 'split'
+                      ? 'Read Split Lock vs Data Cleaning Anti-Leakage Guide'
+                      : modal === 'project'
+                        ? 'Read Portable .omniforge Workspace & Reporting Guide'
+                        : 'Read Target Selection, Column Exclusions & Data Provenance Guide'
+                  }
+                  compact
+                />
+                <button className="btn btn-sm" onClick={() => setModal('none')}><X size={14} /></button>
+              </div>
+            </div>
+
+            {modal === 'targets' && (
+              <div>
+                <p style={{ color: 'var(--text-muted)', marginTop: 0 }}>Click columns to toggle target selection across Diagnostics, Feature Selection, AutoML, Supervisory Monitor &amp; Reporting.</p>
+                <div className="chip-grid">
+                  {ws.columns.map((c) => (
+                    <button key={c} className={`chip ${ws.targets.includes(c) ? 'selected' : ''}`} onClick={() => toggleTarget(c)}>{c}</button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {modal === 'exclusions' && (
+              <div>
+                <p style={{ color: 'var(--text-muted)', marginTop: 0 }}>Excluded columns are masked reversibly across all 14 studios without mutating raw data.</p>
+                <div className="chip-grid" style={{ marginBottom: 14 }}>
+                  {ws.columns.map((c) => (
+                    <button key={c} className={`chip ${ws.excluded_columns.includes(c) ? 'excluded' : ''}`} onClick={() => toggleExclude(c)}>{c}</button>
+                  ))}
+                </div>
+                {ws.excluded_columns.length > 0 && (
+                  <button className="btn btn-sm" onClick={async () => { const r = await apiPost('/api/workbench/exclusions', { excluded_columns: [] }); syncState(r.state); bumpGrid(); }}>
+                    Restore All Excluded Columns
+                  </button>
+                )}
+              </div>
+            )}
+
+            {modal === 'split' && (
+              <div>
+                <p style={{ color: 'var(--text-muted)', marginTop: 0 }}>Lock a deterministic Train/Test partition BEFORE cleaning, clustering, feature engineering, or modeling to guarantee zero data leakage.</p>
+                <div className="grid-3" style={{ marginBottom: 14 }}>
+                  <label className="field">Strategy
+                    <select value={splitStrat} onChange={(e) => setSplitStrat(e.target.value)}>
+                      <option value="auto">Auto (Stratified / Random)</option>
+                      <option value="stratified">Stratified</option>
+                      <option value="random">Random</option>
+                      <option value="time_series">Chronological Time-Series</option>
+                    </select>
+                  </label>
+                  <label className="field">Test Ratio
+                    <input type="number" step={0.05} min={0.1} max={0.4} value={splitTestSize} onChange={(e) => setSplitTestSize(Number(e.target.value))} />
+                  </label>
+                  <label className="field">CV Folds
+                    <input type="number" min={2} max={10} value={splitCvFolds} onChange={(e) => setSplitCvFolds(Number(e.target.value))} />
+                  </label>
+                </div>
+                <div className="row">
+                  <button className="btn btn-primary" onClick={async () => {
+                    const r = await apiPost('/api/workbench/split-lock', { strategy: splitStrat, test_size: splitTestSize, cv_folds: splitCvFolds });
+                    syncState(r.state); flash('Anti-Leakage Split Lock enabled.'); setModal('none');
+                  }}>Lock Train/Test Split</button>
+                  {ws.split_lock?.active && (
+                    <button className="btn btn-danger" onClick={async () => {
+                      const r = await apiDelete('/api/workbench/split-lock');
+                      syncState(r.state); flash('Split Lock unlocked.'); setModal('none');
+                    }}>Unlock Split</button>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {modal === 'project' && (
+              <div className="grid-2">
+                <div>
+                  <h4 style={{ marginTop: 0 }}>Save Active Workspace (.omniforge)</h4>
+                  <label className="field" style={{ marginBottom: 8 }}>Project Name
+                    <input type="text" value={projName} onChange={(e) => setProjName(e.target.value)} />
+                  </label>
+                  <label className="field" style={{ marginBottom: 10 }}>Notes
+                    <textarea rows={2} value={projNotes} onChange={(e) => setProjNotes(e.target.value)} />
+                  </label>
+                  <button className="btn btn-primary" disabled={!ws.has_dataset} onClick={handleSaveProject}><Save size={14} /> Download .omniforge File</button>
+                </div>
+                <div>
+                  <h4 style={{ marginTop: 0 }}>Restore Portable .omniforge Project</h4>
+                  <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>Upload any saved OmniForge <code>.omniforge</code> (or legacy <code>.uap</code>) snapshot to restore datasets, exclusions, models &amp; lineage.</p>
+                  <label className="btn" style={{ cursor: 'pointer' }}>
+                    <FolderOpen size={14} /> Choose .omniforge File
+                    <input type="file" accept=".omniforge,.uap" onChange={handleLoadProject} style={{ display: 'none' }} />
+                  </label>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};

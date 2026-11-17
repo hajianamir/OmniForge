@@ -1,0 +1,8 @@
+domain:
+  name: materials
+  display_name: "Materials Science & Chemistry"
+  version: "1.0.0"
+  compliance_frameworks: [REACH, ISO-17025, FAIR-Materials]
+  primary_tasks: [regression, graphs, optimization, simulation, deep]
+  key_metrics: [mae, rmse, r2, spearman_r, conformal_coverage]
+  default_cv_strategy: group_kfold

@@ -1,0 +1,8 @@
+domain:
+  name: bioinformatics
+  display_name: "Bioinformatics & Genomics"
+  version: "1.0.0"
+  compliance_frameworks: [HIPAA, GINA, GDPR-Genetic, FAIR-Data]
+  primary_tasks: [classification, survival, graphs, deep, clustering]
+  key_metrics: [auc_roc, auc_pr, matthews_corrcoef, c_index, adjusted_rand_index]
+  default_cv_strategy: stratified_kfold

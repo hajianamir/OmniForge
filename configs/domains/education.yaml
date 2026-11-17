@@ -1,0 +1,9 @@
+domain:
+  name: education
+  display_name: "Education & EdTech"
+  version: "1.0.0"
+  compliance_frameworks: [FERPA, COPPA, GDPR-Minors, EU-AI-Act]
+  primary_tasks: [classification, regression, recommendation, causal, nlp]
+  key_metrics: [auc_roc, rmse, recall, fairness_gap, ndcg_at_10]
+  protected_attributes: [gender, socioeconomic_tier, first_language]
+  default_cv_strategy: stratified_group_kfold

@@ -1,0 +1,226 @@
+[build-system]
+requires = ["setuptools>=84.2.1", "wheel>=0.48.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omniforge"
+version = "2.0.0"
+description = "OmniForge — Enterprise-grade, domain-agnostic Analytics & AI Workbench for Data Science, Machine Learning, Deep Learning, Forecasting, Causal Inference, Optimization, Simulation, MLOps, Responsible AI, and Decision Intelligence."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+authors = [
+    { name = "OmniForge Engineering", email = "engineering@omniforge.io" }
+]
+keywords = [
+    "machine-learning",
+    "deep-learning",
+    "forecasting",
+    "causal-inference",
+    "optimization",
+    "simulation",
+    "automl",
+    "mlops",
+    "responsible-ai",
+    "data-science",
+    "decision-intelligence",
+    "copilot",
+    "fastapi",
+    "react",
+    "graph-ml",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Intended Audience :: Healthcare Industry",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Typing :: Typed",
+]
+dependencies = [
+    "numpy>=2.5.5",
+    "pandas>=3.1.1",
+    "scipy>=1.18.1",
+    "scikit-learn>=1.9.1",
+    "pydantic>=2.14.3",
+    "pydantic-settings>=2.16.3",
+    "PyYAML>=6.0.3",
+    "plotly>=7.1.0",
+    "networkx>=3.7",
+    "joblib>=1.6.0",
+    "typer>=0.29.1",
+    "rich>=15.0.0",
+    "Jinja2>=3.1.6",
+    "httpx>=0.28.1",
+    "psutil>=7.2.2",
+    "structlog>=26.1.0",
+    "python-dateutil>=4.0.0",
+    "openpyxl>=3.1.5",
+    "nbformat>=5.11.1",
+]
+
+[project.optional-dependencies]
+api = [
+    "fastapi>=0.163.1",
+    "uvicorn[standard]>=0.54.0",
+    "python-multipart>=0.0.33",
+    "pyjwt>=2.15.1",
+    "cryptography>=50.0.2",
+    "prometheus-client>=0.26.0",
+]
+ui = [
+    "fastapi>=0.163.1",
+    "uvicorn[standard]>=0.54.0",
+    "python-multipart>=0.0.33",
+    "matplotlib>=3.11.2",
+    "seaborn>=0.13.2",
+    "bokeh>=3.10.2",
+    "pillow>=13.0.0",
+]
+reporting = [
+    "python-docx>=1.2.0",
+    "python-pptx>=1.0.2",
+    "reportlab>=5.1.0",
+]
+data = [
+    "pyarrow>=26.0.1",
+    "duckdb>=2.0.0",
+    "sqlalchemy>=2.1.8",
+    "fsspec>=2026.9.0",
+    "lxml>=6.1.3",
+    "polars>=2.1.0",
+    "dask[dataframe]>=2026.8.0",
+]
+forecasting = [
+    "statsmodels>=0.15.0",
+]
+deep = [
+    "torch>=2.15.0",
+    "lightning>=2.6.6",
+]
+boosting = [
+    "xgboost>=3.4.1",
+    "lightgbm>=4.7.0",
+    "catboost>=1.2.10; python_version < '3.15'",
+]
+automl = [
+    "optuna>=5.0.0",
+    "flaml>=2.8.0",
+    "autogluon.tabular>=1.6.0; python_version < '3.14'",
+    "TPOT>=1.1.0; python_version < '3.14'",
+    "h2o>=3.46.0",
+]
+foundation = [
+    "timm>=1.0.31",
+    "open-clip-torch>=4.2.0",
+    "transformers>=5.20.0",
+    "sentence-transformers>=6.3.0",
+    "ultralytics>=8.4.0",
+]
+responsible = [
+    "shap>=0.54.1",
+    "codecarbon>=3.3.2",
+]
+nlp = [
+    "nltk>=3.10.4",
+    "spacy>=3.8.18",
+    "gensim>=4.4.0; python_version < '3.14'",
+]
+vision = [
+    "opencv-python>=5.0.0.93",
+    "scikit-image>=0.26.0; python_version < '3.15'",
+    "pillow>=13.0.0",
+]
+audio = [
+    "librosa>=1.0.1",
+    "soundfile>=0.14.0",
+]
+build = [
+    "pyinstaller>=6.22.3",
+    "pyinstaller-hooks-contrib>=2026.10",
+    "pillow>=13.0.0",
+    "setuptools>=84.2.1",
+    "wheel>=0.48.0",
+    "build>=1.6.1",
+]
+dev = [
+    "pytest>=9.2.0",
+    "pytest-cov>=7.1.0",
+    "mypy>=2.4.1",
+    "ruff>=0.17.5",
+    "types-PyYAML>=6.0.12.20261113",
+]
+all = [
+    "omniforge[api,ui,reporting,data,forecasting,nlp,vision,audio,build,dev]",
+]
+
+[project.scripts]
+omniforge = "omniforge.cli:app"
+omniforge-desktop = "omniforge.launcher:main"
+[project.entry-points."omniforge.domains"]
+finance = "omniforge.domains.finance:FinanceDomainPlugin"
+energy = "omniforge.domains.energy:EnergyDomainPlugin"
+healthcare = "omniforge.domains.healthcare:HealthcareDomainPlugin"
+manufacturing = "omniforge.domains.manufacturing:ManufacturingDomainPlugin"
+retail = "omniforge.domains.retail:RetailDomainPlugin"
+transportation = "omniforge.domains.transportation:TransportationDomainPlugin"
+agriculture = "omniforge.domains.agriculture:AgricultureDomainPlugin"
+climate = "omniforge.domains.climate:ClimateDomainPlugin"
+telecom = "omniforge.domains.telecom:TelecomDomainPlugin"
+hr = "omniforge.domains.hr:HRDomainPlugin"
+education = "omniforge.domains.education:EducationDomainPlugin"
+real_estate = "omniforge.domains.real_estate:RealEstateDomainPlugin"
+sports = "omniforge.domains.sports:SportsDomainPlugin"
+cybersecurity = "omniforge.domains.cybersecurity:CybersecurityDomainPlugin"
+government = "omniforge.domains.government:GovernmentDomainPlugin"
+bioinformatics = "omniforge.domains.bioinformatics:BioinformaticsDomainPlugin"
+materials = "omniforge.domains.materials:MaterialsDomainPlugin"
+media = "omniforge.domains.media:MediaDomainPlugin"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.package-data]
+omniforge = ["ui/static_app/*", "ui/static_app/assets/*"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["omniforge*"]
+
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "unit: fast unit tests",
+    "integration: cross-module integration tests",
+    "e2e: full end-to-end platform workflow tests",
+    "slow: computationally intensive tests",
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = false
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+check_untyped_defs = true
+no_implicit_optional = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B", "UP"]
+ignore = ["E501", "B008"]

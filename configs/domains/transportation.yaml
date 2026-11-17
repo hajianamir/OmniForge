@@ -1,0 +1,9 @@
+domain:
+  name: transportation
+  display_name: "Transportation, Logistics & Supply Chain"
+  version: "1.0.0"
+  compliance_frameworks: [ISO-28000, DOT-Compliance, EU-ETS-Transport]
+  primary_tasks: [optimization, forecasting, simulation, graphs, anomaly, regression]
+  key_metrics: [mae, smape, on_time_rate, route_cost_reduction, fill_rate, inventory_turns]
+  default_cv_strategy: time_series_split
+  drift_sensitivity: medium
