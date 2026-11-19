@@ -1,4 +1,4 @@
-"""Enterprise Typer CLI for OmniForge (compatible with both `omniforge` and `uap` commands)."""
+"""Enterprise Typer CLI for OmniForge (`omniforge` console entry point)."""
 
 from __future__ import annotations
 
@@ -87,14 +87,16 @@ def cmd_clean(
     ing = DataIngestionEngine().ingest(source)
     cleaned, rep = DataCleaner().fit_transform(ing.data)
     cleaned.to_csv(out, index=False)
-    console.print(f"[green]Cleaned dataset saved to {out}[/green] | Rows: {rep.rows_before} -> {rep.rows_after}")
+    console.print(
+        f"[green]Cleaned dataset saved to {out}[/green] | Rows: {rep.input_shape[0]} -> {rep.output_shape[0]}"
+    )
 
 
 @cli.command("eda")
 def cmd_eda(
     source: str = typer.Argument(..., help="Input dataset path."),
     target: str | None = typer.Option(None, "--target", "-t", help="Optional target column."),
-    html_out: Path = typer.Option(Path("uap_eda_report.html"), "--html", help="Standalone HTML report output path."),
+    html_out: Path = typer.Option(Path("omniforge_eda_report.html"), "--html", help="Standalone HTML report output path."),
 ) -> None:
     """Run Automated EDA and export an interactive standalone HTML report."""
     from omniforge.data.ingestion import DataIngestionEngine

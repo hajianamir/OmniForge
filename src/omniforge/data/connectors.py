@@ -1,41 +1,444 @@
-"""Enterprise External Data Connectors for Excel Workbooks (.xlsx/.xls), SQL Databases (SQLite/PostgreSQL/MySQL/MSSQL), and Microsoft Access (.accdb/.mdb)."""
+"""Enterprise External Data Connectors for Excel Workbooks (.xlsx/.xls), SQL Databases (SQLite/PostgreSQL/MySQL/MSSQL), and Microsoft Access (.accdb/.mdb).
+
+Security Hardening (CWE-89 / CWE-22 / CWE-918):
+- SQL queries must be single read-only ``SELECT`` / ``WITH`` statements (comments stripped, stacked
+  statements and DDL/DML/PRAGMA/ATTACH rejected).
+- SQLite connections enforce three independent read-only layers:
+  1. Path confinement to allowed OmniForge workspace / ``OMNIFORGE_ALLOWED_DB_DIRS`` directories,
+     existing-file verification, suffix check, and SQLite header magic verification.
+  2. OS-level read-only URI open (``file:...?mode=ro``) plus ``PRAGMA query_only = ON``.
+  3. C-level ``sqlite3.Connection.set_authorizer(...)`` blocking all writes, DDL, ``ATTACH``,
+     ``DETACH``, ``load_extension``, and write/arbitrary ``PRAGMA`` statements.
+- Remote SQL database URLs enforce an explicit dialect allowlist, block cloud metadata / SSRF
+  targets (``169.254.0.0/16``, link-local, unspecified, metadata hostnames, and private/loopback
+  hosts unless explicitly allowed), and block dangerous query options such as ``local_infile``.
+- Microsoft Access files enforce allowed-directory confinement, ``.accdb``/``.mdb`` suffix checks,
+  read-only ODBC flags, and table-name verification against inspected tables.
+"""
 
 from __future__ import annotations
 
 import io
+import ipaddress
+import os
 import re
 import shutil
+import socket
 import sqlite3
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
 
-from omniforge.core.exceptions import DataIngestionError
+from omniforge.config.settings import get_settings
+from omniforge.core.exceptions import DataIngestionError, SecurityError
 from omniforge.core.logging import get_logger
 from omniforge.core.utils import to_json_safe
 
 logger = get_logger(__name__)
 
+_ALLOWED_SQL_BACKENDS: frozenset[str] = frozenset(
+    {"sqlite", "postgresql", "mysql", "mariadb", "mssql", "duckdb"}
+)
+
+_ALLOWED_SQLITE_SUFFIXES: frozenset[str] = frozenset({".db", ".sqlite", ".sqlite3", ".s3db"})
+_ALLOWED_ACCESS_SUFFIXES: frozenset[str] = frozenset({".accdb", ".mdb"})
+_SQLITE_MAGIC_HEADER: bytes = b"SQLite format 3\x00"
+
+_BLOCKED_METADATA_HOSTS: frozenset[str] = frozenset(
+    {
+        "metadata.google.internal",
+        "metadata.goog",
+        "metadata.azure.com",
+        "instance-data",
+        "169.254.169.254",
+        "fd00:ec2::254",
+    }
+)
+
+_BLOCKED_SQL_QUERY_OPTIONS: frozenset[str] = frozenset(
+    {
+        "local_infile",
+        "allow_local_infile",
+        "load_data_local_infile",
+        "allowloadlocalinfile",
+        "allowurlinlocalinfile",
+    }
+)
+
+_BLOCKED_SQLITE_FUNCTIONS: frozenset[str] = frozenset(
+    {
+        "load_extension",
+        "fts3_tokenizer",
+        "edit",
+        "readfile",
+        "writefile",
+        "sqlar_compress",
+        "sqlar_uncompress",
+    }
+)
+
+_READONLY_INTROSPECTION_PRAGMAS: frozenset[str] = frozenset(
+    {
+        "table_info",
+        "table_xinfo",
+        "index_list",
+        "index_info",
+        "foreign_key_list",
+        "table_list",
+    }
+)
+
 _FORBIDDEN_SQL_RE = re.compile(
-    r"\b(DROP|DELETE|UPDATE|INSERT|ALTER|TRUNCATE|CREATE|REPLACE|ATTACH|DETACH|EXEC|EXECUTE|MERGE|GRANT|REVOKE)\b",
+    r"\b("
+    r"DROP|DELETE|UPDATE|INSERT|ALTER|TRUNCATE|CREATE|REPLACE|ATTACH|DETACH|PRAGMA|"
+    r"VACUUM|REINDEX|EXPLAIN|EXEC|EXECUTE|MERGE|GRANT|REVOKE|CALL|DO|COPY|"
+    r"BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE|LOAD_EXTENSION|LOAD_FILE|OUTFILE|DUMPFILE"
+    r")\b",
     re.IGNORECASE,
 )
 
 
+def _strip_sql_comments_and_scan(query: str) -> tuple[str, str]:
+    """Strip SQL comments and return ``(cleaned_sql, code_without_string_literals)``.
+
+    Raises ``SecurityError`` on unterminated comments/quotes or stacked multi-statement semicolons.
+    """
+    n = len(query)
+    i = 0
+    cleaned_parts: list[str] = []
+    code_parts: list[str] = []
+    semicolon_positions: list[int] = []
+
+    while i < n:
+        ch = query[i]
+        nxt = query[i + 1] if i + 1 < n else ""
+
+        # Line comment: -- ... \n
+        if ch == "-" and nxt == "-":
+            i += 2
+            while i < n and query[i] != "\n":
+                i += 1
+            cleaned_parts.append(" ")
+            code_parts.append(" ")
+            continue
+
+        # Block comment: /* ... */
+        if ch == "/" and nxt == "*":
+            end_idx = query.find("*/", i + 2)
+            if end_idx == -1:
+                raise SecurityError("Unterminated SQL block comment is not permitted.")
+            i = end_idx + 2
+            cleaned_parts.append(" ")
+            code_parts.append(" ")
+            continue
+
+        # Single-quoted string literal ('...''...')
+        if ch == "'":
+            start = i
+            i += 1
+            closed = False
+            while i < n:
+                if query[i] == "'":
+                    if i + 1 < n and query[i + 1] == "'":
+                        i += 2
+                        continue
+                    i += 1
+                    closed = True
+                    break
+                i += 1
+            if not closed:
+                raise SecurityError("Unterminated SQL string literal is not permitted.")
+            cleaned_parts.append(query[start:i])
+            code_parts.append(" '' ")
+            continue
+
+        # Double-quoted identifier ("...""...")
+        if ch == '"':
+            start = i
+            i += 1
+            closed = False
+            while i < n:
+                if query[i] == '"':
+                    if i + 1 < n and query[i + 1] == '"':
+                        i += 2
+                        continue
+                    i += 1
+                    closed = True
+                    break
+                i += 1
+            if not closed:
+                raise SecurityError("Unterminated SQL quoted identifier is not permitted.")
+            ident = query[start:i]
+            cleaned_parts.append(ident)
+            code_parts.append(ident)
+            continue
+
+        if ch == ";":
+            semicolon_positions.append(len(cleaned_parts))
+            cleaned_parts.append(";")
+            code_parts.append(";")
+            i += 1
+            continue
+
+        cleaned_parts.append(ch)
+        code_parts.append(ch)
+        i += 1
+
+    cleaned = "".join(cleaned_parts).strip()
+    code_only = "".join(code_parts).strip()
+
+    # Allow at most a single trailing semicolon; reject any embedded statement separator.
+    if cleaned.endswith(";"):
+        cleaned = cleaned[:-1].strip()
+    if code_only.endswith(";"):
+        code_only = code_only[:-1].strip()
+
+    if ";" in code_only:
+        raise SecurityError("Stacked multi-statement SQL queries are blocked for security.")
+
+    return cleaned, code_only
+
+
 def _validate_readonly_sql(query: str) -> str:
-    """Ensure user-supplied SQL queries are strictly read-only SELECT/WITH statements."""
-    cleaned = query.strip().rstrip(";").strip()
-    if not cleaned:
+    """Ensure user-supplied SQL queries are strictly single read-only ``SELECT`` / ``WITH`` statements."""
+    if not isinstance(query, str) or not query.strip():
         raise DataIngestionError("SQL query cannot be empty.")
-    first_tok = cleaned.split()[0].upper()
-    if first_tok not in {"SELECT", "WITH", "PRAGMA"}:
-        raise DataIngestionError("Only read-only SELECT / WITH SQL queries are permitted.")
-    if _FORBIDDEN_SQL_RE.search(cleaned):
-        raise DataIngestionError("Write or DDL SQL statements are blocked for safety. Provide a read-only SELECT query.")
+    if "\x00" in query:
+        raise SecurityError("NUL bytes are forbidden in SQL queries.")
+
+    cleaned, code_only = _strip_sql_comments_and_scan(query)
+    if not cleaned or not code_only:
+        raise DataIngestionError("SQL query cannot be empty.")
+
+    tokens = code_only.split()
+    first_tok = tokens[0].upper() if tokens else ""
+    if first_tok not in {"SELECT", "WITH"}:
+        raise SecurityError("Only single read-only SELECT / WITH SQL queries are permitted.")
+    if _FORBIDDEN_SQL_RE.search(code_only):
+        raise SecurityError(
+            "Write, DDL, PRAGMA, ATTACH, or file-access SQL statements are blocked for security. "
+            "Provide a read-only SELECT query."
+        )
     return cleaned
+
+
+def _allowed_local_db_roots() -> list[Path]:
+    """Return canonical directories from which local SQLite / Access files may be opened."""
+    settings = get_settings()
+    roots: list[Path] = [
+        settings.paths.workspace_dir.expanduser().resolve(),
+        (Path.cwd() / ".omniforge_workspace").resolve(),
+    ]
+    extra = os.getenv("OMNIFORGE_ALLOWED_DB_DIRS", "").strip()
+    if extra:
+        for raw_dir in extra.split(os.pathsep):
+            item = raw_dir.strip()
+            if item:
+                roots.append(Path(item).expanduser().resolve())
+
+    deduped: list[Path] = []
+    for r in roots:
+        if r not in deduped:
+            deduped.append(r)
+    return deduped
+
+
+def _resolve_allowed_local_db_path(
+    raw_path: str | Path,
+    *,
+    allowed_suffixes: frozenset[str],
+    verify_sqlite_magic: bool = False,
+) -> Path:
+    """Resolve and validate a local database path against workspace directory confinement."""
+    raw_str = str(raw_path).strip()
+    if not raw_str or "\x00" in raw_str:
+        raise SecurityError("Invalid local database file path.")
+    if "?" in raw_str or "#" in raw_str:
+        raise SecurityError("Query/fragment parameters are forbidden in local database paths.")
+
+    resolved = Path(raw_str).expanduser().resolve()
+    allowed_roots = _allowed_local_db_roots()
+    if not any(resolved.is_relative_to(root) for root in allowed_roots):
+        raise SecurityError(
+            "Local database path is outside the allowed OmniForge workspace directories. "
+            "Place database files inside '.omniforge_workspace/' or explicitly configure "
+            "OMNIFORGE_ALLOWED_DB_DIRS."
+        )
+    if resolved.suffix.lower() not in allowed_suffixes:
+        raise SecurityError(
+            f"Unsupported local database file extension '{resolved.suffix or '<none>'}'. "
+            f"Allowed: {sorted(allowed_suffixes)}."
+        )
+    if not resolved.is_file():
+        raise DataIngestionError(f"Database file not found: {resolved.name}")
+
+    if verify_sqlite_magic:
+        with resolved.open("rb") as fh:
+            header = fh.read(16)
+        if header != _SQLITE_MAGIC_HEADER:
+            raise SecurityError(
+                f"File '{resolved.name}' does not have a valid SQLite 3 database header."
+            )
+    return resolved
+
+
+def _make_sqlite_authorizer(
+    *,
+    allow_introspection_pragmas: bool = False,
+    allow_read_uncommitted: bool = True,
+) -> Any:
+    """Build a C-level SQLite authorizer callback enforcing strict read-only execution."""
+    allowed_actions = {
+        sqlite3.SQLITE_SELECT,
+        sqlite3.SQLITE_READ,
+    }
+    recursive_action = getattr(sqlite3, "SQLITE_RECURSIVE", None)
+    if recursive_action is not None:
+        allowed_actions.add(recursive_action)
+
+    def _authorizer(
+        action: int,
+        arg1: str | None,
+        arg2: str | None,
+        dbname: str | None,
+        source: str | None,
+    ) -> int:
+        if action in allowed_actions:
+            return sqlite3.SQLITE_OK
+        if action == sqlite3.SQLITE_FUNCTION:
+            fn_name = (arg2 or arg1 or "").strip().lower()
+            if fn_name in _BLOCKED_SQLITE_FUNCTIONS:
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+        if action == sqlite3.SQLITE_PRAGMA:
+            pragma_name = (arg1 or "").strip().lower()
+            if allow_read_uncommitted and pragma_name == "read_uncommitted" and arg2 is None:
+                return sqlite3.SQLITE_OK
+            if allow_introspection_pragmas and pragma_name in _READONLY_INTROSPECTION_PRAGMAS:
+                return sqlite3.SQLITE_OK
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_DENY
+
+    return _authorizer
+
+
+def _validate_remote_db_host(host: str | None, port: int | None) -> None:
+    """Block SSRF against cloud metadata services and unauthorized private/loopback endpoints."""
+    if not host or not host.strip():
+        raise SecurityError("Remote SQL connection URL must specify a valid hostname.")
+
+    norm_host = host.strip().lower().rstrip(".")
+    if norm_host in _BLOCKED_METADATA_HOSTS:
+        raise SecurityError(f"Blocked SSRF database host '{norm_host}'.")
+
+    allowed_hosts = {
+        h.strip().lower()
+        for h in os.getenv("OMNIFORGE_ALLOWED_DB_HOSTS", "").split(",")
+        if h.strip()
+    }
+    allow_private = os.getenv("OMNIFORGE_ALLOW_PRIVATE_DB_HOSTS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+    resolved_ips: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    try:
+        resolved_ips.append(ipaddress.ip_address(norm_host))
+    except ValueError:
+        try:
+            addr_info = socket.getaddrinfo(norm_host, port or 5432, type=socket.SOCK_STREAM)
+            for info in addr_info:
+                ip_str = str(info[4][0]).split("%", 1)[0]
+                resolved_ips.append(ipaddress.ip_address(ip_str))
+        except OSError as exc:
+            raise DataIngestionError(f"Unable to resolve SQL database host '{norm_host}': {exc}") from exc
+
+    for ip in resolved_ips:
+        if ip.is_link_local or ip.is_multicast or ip.is_unspecified or str(ip) in _BLOCKED_METADATA_HOSTS:
+            raise SecurityError(f"Blocked link-local/metadata database target '{ip}'.")
+        if (ip.is_private or ip.is_loopback or ip.is_reserved) and (
+            norm_host not in allowed_hosts and not allow_private
+        ):
+            raise SecurityError(
+                f"Blocked private/loopback database host '{norm_host}' ({ip}) to prevent SSRF. "
+                "Add the host to OMNIFORGE_ALLOWED_DB_HOSTS or set OMNIFORGE_ALLOW_PRIVATE_DB_HOSTS=true."
+            )
+
+
+def _normalize_sql_url(connection_url: str) -> str:
+    """Normalize a raw SQLite path or SQLAlchemy URL into a validated SQLAlchemy URL."""
+    url = connection_url.strip()
+    if not url:
+        raise DataIngestionError("Database connection string cannot be empty.")
+    if "\x00" in url:
+        raise SecurityError("NUL bytes are forbidden in database connection strings.")
+    if "://" not in url:
+        p = Path(url).expanduser()
+        return f"sqlite:///{p.as_posix()}"
+    return url
+
+
+def _create_readonly_sql_engine(
+    connection_url: str,
+    *,
+    allow_introspection_pragmas: bool = False,
+) -> tuple[Any, str]:
+    """Create a hardened read-only SQLAlchemy engine for SQLite or remote SQL databases."""
+    url = _normalize_sql_url(connection_url)
+    try:
+        from sqlalchemy import create_engine
+        from sqlalchemy.engine.url import make_url
+    except ImportError as exc:
+        raise DataIngestionError(
+            "SQLAlchemy is required for SQL database connections. Install via: pip install SQLAlchemy"
+        ) from exc
+
+    try:
+        parsed = make_url(url)
+    except Exception as exc:
+        raise DataIngestionError(f"Invalid SQL connection URL: {exc}") from exc
+
+    backend = parsed.get_backend_name().lower()
+    if backend not in _ALLOWED_SQL_BACKENDS:
+        raise SecurityError(
+            f"Unsupported SQL dialect '{backend}'. Permitted dialects: {sorted(_ALLOWED_SQL_BACKENDS)}."
+        )
+
+    for qkey in parsed.query:
+        if str(qkey).strip().lower() in _BLOCKED_SQL_QUERY_OPTIONS:
+            raise SecurityError(f"Forbidden SQL connection query option '{qkey}'.")
+
+    if backend == "sqlite":
+        db_target = (parsed.database or "").strip()
+        if not db_target or db_target == ":memory:":
+            raise SecurityError("In-memory or empty SQLite URLs are not permitted on connector endpoints.")
+        if db_target.lower().startswith("file:"):
+            raise SecurityError("Raw SQLite URI parameters are forbidden; supply a workspace file path.")
+        resolved_path = _resolve_allowed_local_db_path(
+            db_target,
+            allowed_suffixes=_ALLOWED_SQLITE_SUFFIXES,
+            verify_sqlite_magic=True,
+        )
+        readonly_uri = f"file:{quote(str(resolved_path))}?mode=ro"
+        authorizer = _make_sqlite_authorizer(allow_introspection_pragmas=allow_introspection_pragmas)
+
+        def _sqlite_creator() -> sqlite3.Connection:
+            conn = sqlite3.connect(readonly_uri, uri=True, check_same_thread=False)
+            conn.execute("PRAGMA query_only = ON")
+            conn.set_authorizer(authorizer)
+            return conn
+
+        engine = create_engine("sqlite://", creator=_sqlite_creator)
+        return engine, "sqlite"
+
+    _validate_remote_db_host(parsed.host, parsed.port)
+    engine = create_engine(parsed, pool_pre_ping=True)
+    return engine, backend
 
 
 def list_excel_sheets(raw_bytes: bytes) -> list[str]:
@@ -70,7 +473,6 @@ def ensure_demo_sqlite_database(workspace_dir: Path | None = None) -> Path:
     pressure = rng.normal(115.0, 9.0, n)
     vibration = rng.gamma(2.5, 1.2, n)
     load_pct = rng.uniform(45.0, 96.0, n)
-    # Physical equation + small sensor noise + 18 realistic anomaly/fault events in the latest 60 hours
     efficiency = (
         94.0
         - 0.18 * (temp - 70.0)
@@ -96,10 +498,8 @@ def ensure_demo_sqlite_database(workspace_dir: Path | None = None) -> Path:
         }
     )
 
-    # Second table: batch incoming operational measurements (latest 80 readings)
     incoming_ops = telemetry.tail(80).reset_index(drop=True)
 
-    # Third table: credit/finance risk transactions
     m = 250
     income = rng.lognormal(10.8, 0.45, m)
     debt_ratio = rng.uniform(0.05, 0.72, m)
@@ -119,38 +519,28 @@ def ensure_demo_sqlite_database(workspace_dir: Path | None = None) -> Path:
         }
     )
 
-    with sqlite3.connect(db_path) as conn:
-        telemetry.to_sql("industrial_turbine_telemetry", conn, if_exists="replace", index=False)
-        incoming_ops.to_sql("live_turbine_monitoring_batch", conn, if_exists="replace", index=False)
-        credit_df.to_sql("finance_credit_applications", conn, if_exists="replace", index=False)
+    conn = sqlite3.connect(db_path)
+    try:
+        with conn:
+            telemetry.to_sql("industrial_turbine_telemetry", conn, if_exists="replace", index=False)
+            incoming_ops.to_sql("live_turbine_monitoring_batch", conn, if_exists="replace", index=False)
+            credit_df.to_sql("finance_credit_applications", conn, if_exists="replace", index=False)
+    finally:
+        conn.close()
 
     logger.info("demo_sqlite_db_created", path=str(db_path))
     return db_path
 
 
-def _normalize_sql_url(connection_url: str) -> str:
-    """Normalize a raw SQLite path or SQLAlchemy URL into a valid SQLAlchemy URL."""
-    url = connection_url.strip()
-    if not url:
-        raise DataIngestionError("Database connection string cannot be empty.")
-    if "://" not in url:
-        p = Path(url).expanduser()
-        return f"sqlite:///{p.as_posix()}"
-    return url
-
-
 def sql_inspect_database(connection_url: str) -> dict[str, Any]:
-    """Connect to any SQLAlchemy-supported SQL database and list tables/views with row counts."""
-    url = _normalize_sql_url(connection_url)
-    try:
-        from sqlalchemy import create_engine, inspect, text
-    except ImportError as exc:
-        raise DataIngestionError(
-            "SQLAlchemy is required for SQL database connections. Install via: pip install SQLAlchemy"
-        ) from exc
+    """Connect read-only to a validated SQL database and list tables/views with row counts."""
+    from sqlalchemy import inspect, text
 
+    engine, dialect_name = _create_readonly_sql_engine(
+        connection_url,
+        allow_introspection_pragmas=True,
+    )
     try:
-        engine = create_engine(url, pool_pre_ping=True)
         with engine.connect() as conn:
             insp = inspect(conn)
             tables = list(insp.get_table_names())
@@ -173,17 +563,23 @@ def sql_inspect_database(connection_url: str) -> dict[str, Any]:
                         "row_count": row_cnt,
                     }
                 )
-        engine.dispose()
-        return to_json_safe(
-            {
-                "connected": True,
-                "dialect": engine.dialect.name,
-                "tables": details,
-                "table_names": [d["name"] for d in details],
-            }
+        return cast(
+            dict[str, Any],
+            to_json_safe(
+                {
+                    "connected": True,
+                    "dialect": dialect_name,
+                    "tables": details,
+                    "table_names": [d["name"] for d in details],
+                }
+            ),
         )
+    except (SecurityError, DataIngestionError):
+        raise
     except Exception as exc:
         raise DataIngestionError(f"SQL connection failed ({type(exc).__name__}): {exc}") from exc
+    finally:
+        engine.dispose()
 
 
 def sql_load_dataframe(
@@ -193,45 +589,84 @@ def sql_load_dataframe(
     query: str | None = None,
     limit: int = 100_000,
 ) -> pd.DataFrame:
-    """Load a table or read-only SQL query from any SQLAlchemy-supported database."""
-    url = _normalize_sql_url(connection_url)
-    try:
-        from sqlalchemy import create_engine, text
-    except ImportError as exc:
-        raise DataIngestionError("SQLAlchemy is required for SQL database connections.") from exc
+    """Load a verified table or read-only SQL query from a validated database."""
+    from sqlalchemy import inspect, text
 
     if query and query.strip():
         sql = _validate_readonly_sql(query)
-    elif table_name and table_name.strip():
-        safe_tbl = table_name.strip().replace('"', '""')
-        sql = f'SELECT * FROM "{safe_tbl}" LIMIT {int(max(1, min(limit, 500_000)))}'
-    else:
+        engine, dialect_name = _create_readonly_sql_engine(
+            connection_url,
+            allow_introspection_pragmas=False,
+        )
+        try:
+            with engine.connect() as conn:
+                if dialect_name == "sqlite":
+                    raw_dbapi = getattr(getattr(conn, "connection", None), "dbapi_connection", None)
+                    if raw_dbapi is not None and hasattr(raw_dbapi, "set_authorizer"):
+                        raw_dbapi.set_authorizer(
+                            _make_sqlite_authorizer(
+                                allow_introspection_pragmas=False,
+                                allow_read_uncommitted=False,
+                            )
+                        )
+                elif dialect_name == "postgresql":
+                    conn = conn.execution_options(postgresql_readonly=True)
+                df = pd.read_sql_query(text(sql), conn)
+            logger.info("sql_data_loaded", dialect=dialect_name, rows=len(df), cols=df.shape[1])
+            return df
+        except (SecurityError, DataIngestionError):
+            raise
+        except Exception as exc:
+            raise DataIngestionError(f"SQL query execution failed: {exc}") from exc
+        finally:
+            engine.dispose()
+
+    if not table_name or not table_name.strip():
         raise DataIngestionError("Provide either a table name or a read-only SQL SELECT query.")
 
+    requested_table = table_name.strip()
+    engine, dialect_name = _create_readonly_sql_engine(
+        connection_url,
+        allow_introspection_pragmas=True,
+    )
     try:
-        engine = create_engine(url, pool_pre_ping=True)
         with engine.connect() as conn:
+            insp = inspect(conn)
+            valid_objects = set(insp.get_table_names()) | set(insp.get_view_names())
+            if requested_table not in valid_objects:
+                raise DataIngestionError(
+                    f"Table or view '{requested_table}' was not found in the target database."
+                )
+            safe_tbl = requested_table.replace('"', '""')
+            row_limit = int(max(1, min(limit, 500_000)))
+            sql = f'SELECT * FROM "{safe_tbl}" LIMIT {row_limit}'
+            if dialect_name == "postgresql":
+                conn = conn.execution_options(postgresql_readonly=True)
             df = pd.read_sql_query(text(sql), conn)
-        engine.dispose()
-        logger.info("sql_data_loaded", dialect=engine.dialect.name, rows=len(df), cols=df.shape[1])
+        logger.info("sql_data_loaded", dialect=dialect_name, rows=len(df), cols=df.shape[1])
         return df
+    except (SecurityError, DataIngestionError):
+        raise
     except Exception as exc:
         raise DataIngestionError(f"SQL query execution failed: {exc}") from exc
+    finally:
+        engine.dispose()
 
 
 def access_inspect_database(file_path: str | Path) -> dict[str, Any]:
-    """Inspect tables inside a Microsoft Access (.accdb / .mdb) database via pyodbc or mdbtools."""
-    p = Path(file_path).expanduser().resolve()
-    if not p.exists():
-        raise DataIngestionError(f"Microsoft Access file not found: {p}")
+    """Inspect tables inside an allowed Microsoft Access (``.accdb`` / ``.mdb``) database."""
+    p = _resolve_allowed_local_db_path(
+        file_path,
+        allowed_suffixes=_ALLOWED_ACCESS_SUFFIXES,
+        verify_sqlite_magic=False,
+    )
 
-    # 1. Try Windows / ODBC pyodbc Access driver first
     try:
-        import pyodbc  # type: ignore[import-not-found]
+        import pyodbc
 
         drivers = [d for d in pyodbc.drivers() if "access" in d.lower()]
         if drivers:
-            conn_str = f"DRIVER={{{drivers[0]}}};DBQ={p};"
+            conn_str = f"DRIVER={{{drivers[0]}}};DBQ={p};ReadOnly=1;"
             with pyodbc.connect(conn_str) as conn:
                 cur = conn.cursor()
                 tables = [
@@ -239,19 +674,30 @@ def access_inspect_database(file_path: str | Path) -> dict[str, Any]:
                     for row in cur.tables(tableType="TABLE")
                     if not str(row.table_name).startswith("MSys")
                 ]
-            return to_json_safe({"connected": True, "driver": f"pyodbc:{drivers[0]}", "table_names": tables})
+            return cast(
+                dict[str, Any],
+                to_json_safe({"connected": True, "driver": f"pyodbc:{drivers[0]}", "table_names": tables}),
+            )
     except ImportError:
         pass
     except Exception as exc:
         logger.warning("access_pyodbc_inspect_failed", error=str(exc))
 
-    # 2. Cross-platform mdbtools fallback (Linux / macOS)
     mdb_tables_bin = shutil.which("mdb-tables")
     if mdb_tables_bin:
         try:
-            proc = subprocess.run([mdb_tables_bin, "-1", str(p)], capture_output=True, text=True, check=True, timeout=20)
+            proc = subprocess.run(
+                [mdb_tables_bin, "-1", str(p)],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=20,
+            )
             tables = [line.strip() for line in proc.stdout.splitlines() if line.strip() and not line.startswith("MSys")]
-            return to_json_safe({"connected": True, "driver": "mdbtools", "table_names": tables})
+            return cast(
+                dict[str, Any],
+                to_json_safe({"connected": True, "driver": "mdbtools", "table_names": tables}),
+            )
         except Exception as exc:
             raise DataIngestionError(f"mdb-tables failed on Access file '{p.name}': {exc}") from exc
 
@@ -267,40 +713,52 @@ def access_load_table(
     *,
     limit: int = 100_000,
 ) -> pd.DataFrame:
-    """Load a table from a Microsoft Access (.accdb / .mdb) database via pyodbc or mdb-export."""
-    p = Path(file_path).expanduser().resolve()
-    if not p.exists():
-        raise DataIngestionError(f"Microsoft Access file not found: {p}")
-    if not table_name.strip():
-        raise DataIngestionError("Provide an Access table name to load.")
+    """Load a verified table from an allowed Microsoft Access (``.accdb`` / ``.mdb``) database."""
+    p = _resolve_allowed_local_db_path(
+        file_path,
+        allowed_suffixes=_ALLOWED_ACCESS_SUFFIXES,
+        verify_sqlite_magic=False,
+    )
+    requested_table = table_name.strip()
+    if not requested_table or requested_table.startswith("-") or "\x00" in requested_table:
+        raise SecurityError("Invalid Microsoft Access table name.")
 
-    # 1. pyodbc path
+    inspected = access_inspect_database(p)
+    valid_tables = set(inspected.get("table_names", []))
+    if requested_table not in valid_tables:
+        raise DataIngestionError(f"Table '{requested_table}' not found in Access database '{p.name}'.")
+
     try:
-        import pyodbc  # type: ignore[import-not-found]
+        import pyodbc
 
         drivers = [d for d in pyodbc.drivers() if "access" in d.lower()]
         if drivers:
-            conn_str = f"DRIVER={{{drivers[0]}}};DBQ={p};"
-            safe_tbl = table_name.strip().replace("]", "]]")
+            conn_str = f"DRIVER={{{drivers[0]}}};DBQ={p};ReadOnly=1;"
+            safe_tbl = requested_table.replace("]", "]]")
             with pyodbc.connect(conn_str) as conn:
-                df = pd.read_sql(f"SELECT TOP {int(max(1, limit))} * FROM [{safe_tbl}]", conn)
-            logger.info("access_table_loaded", driver=drivers[0], table=table_name, rows=len(df))
+                df = pd.read_sql(f"SELECT TOP {int(max(1, min(limit, 500_000)))} * FROM [{safe_tbl}]", conn)
+            logger.info("access_table_loaded", driver=drivers[0], table=requested_table, rows=len(df))
             return df
     except ImportError:
         pass
     except Exception as exc:
         logger.warning("access_pyodbc_load_failed", error=str(exc))
 
-    # 2. mdb-export fallback
     mdb_export_bin = shutil.which("mdb-export")
     if mdb_export_bin:
         try:
-            proc = subprocess.run([mdb_export_bin, str(p), table_name.strip()], capture_output=True, text=True, check=True, timeout=60)
-            df = pd.read_csv(io.StringIO(proc.stdout), nrows=int(max(1, limit)))
-            logger.info("access_table_loaded", driver="mdbtools", table=table_name, rows=len(df))
+            proc = subprocess.run(
+                [mdb_export_bin, str(p), requested_table],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=60,
+            )
+            df = pd.read_csv(io.StringIO(proc.stdout), nrows=int(max(1, min(limit, 500_000))))
+            logger.info("access_table_loaded", driver="mdbtools", table=requested_table, rows=len(df))
             return df
         except Exception as exc:
-            raise DataIngestionError(f"mdb-export failed for table '{table_name}': {exc}") from exc
+            raise DataIngestionError(f"mdb-export failed for table '{requested_table}': {exc}") from exc
 
     raise DataIngestionError(
         "Microsoft Access driver not detected. Install 'Microsoft Access Database Engine (64-bit)' + 'pyodbc' on Windows, "

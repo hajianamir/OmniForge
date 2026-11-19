@@ -183,7 +183,7 @@ if not defined INSTALL_PROFILE (
     echo.
     echo [Step 2/7] Choose OmniForge Enterprise installation profile:
     echo   [1] Standard Enterprise ^(Recommended^)
-    echo       Core + FastAPI + FastAPI + React UI + 18 Industry Domains + Forecasting +
+    echo       Core + FastAPI + React UI + 18 Industry Domains + Forecasting +
     echo       DuckDB/PyArrow + DOCX/PPTX/PDF/XLSX Reporting + PyInstaller Build Tools
     echo   [2] Full Complete Suite ^(Large Download^)
     echo       Everything in Standard + PyTorch Deep Learning + XGBoost/LightGBM/CatBoost +
@@ -244,7 +244,7 @@ if "%RECREATE_VENV%"=="1" (
         if exist "%VENV_DIR%" (
             echo.
             echo [ERROR] Could not remove old "%VENV_DIR%" because a file is in use.
-            echo         Please close any running OmniForge / OmniForge / Python windows, delete ".venv",
+            echo         Please close any running OmniForge / Python windows, delete ".venv",
             echo         and run install.bat again.
             echo [%DATE% %TIME%] ERROR: Failed to remove locked .venv directory >> "%LOG_FILE%"
             goto :fail_exit
@@ -274,8 +274,10 @@ if !errorlevel! neq 0 (
     goto :fail_exit
 )
 
-echo   [INFO] Upgrading pip, setuptools, and wheel...
-"%VENV_PY%" -m pip install --upgrade pip setuptools wheel >> "%LOG_FILE%" 2>&1
+set "PIP_NO_CACHE_DIR=1"
+set "PIP_DISABLE_PIP_VERSION_CHECK=1"
+echo   [INFO] Upgrading pip, setuptools, and wheel ^(no-cache mode to avoid Windows Defender / pip cache locks^)...
+"%VENV_PY%" -m pip install --no-cache-dir --retries 5 --timeout 120 --upgrade pip setuptools wheel >> "%LOG_FILE%" 2>&1
 if !errorlevel! neq 0 (
     echo [ERROR] Failed to upgrade pip/setuptools/wheel. Check internet connection and "%LOG_FILE%".
     goto :fail_exit
@@ -287,20 +289,23 @@ if !errorlevel! neq 0 (
 echo.
 echo [Step 4/7] Installing OmniForge dependencies (%INSTALL_PROFILE%)...
 set "PYYAML_FORCE_LIBYAML=0"
+set "PIP_NO_CACHE_DIR=1"
+set "PIP_FLAGS=--no-cache-dir --retries 5 --timeout 120"
+"%VENV_PY%" -m pip uninstall -y omniforge >> "%LOG_FILE%" 2>&1
 echo            This may take several minutes on first installation.
 
 if /i "%INSTALL_PROFILE%"=="core" (
-    "%VENV_PY%" -m pip install --no-build-isolation --upgrade -e . >> "%LOG_FILE%" 2>&1
+    "%VENV_PY%" -m pip install %PIP_FLAGS% --no-build-isolation --upgrade -e . >> "%LOG_FILE%" 2>&1
     if !errorlevel! neq 0 goto :pip_failed
 ) else if /i "%INSTALL_PROFILE%"=="full" (
-    "%VENV_PY%" -m pip install --upgrade -r "%ROOT_DIR%\requirements.txt" >> "%LOG_FILE%" 2>&1
+    "%VENV_PY%" -m pip install %PIP_FLAGS% --upgrade -r "%ROOT_DIR%\requirements.txt" >> "%LOG_FILE%" 2>&1
     if !errorlevel! neq 0 goto :pip_failed
-    "%VENV_PY%" -m pip install --no-build-isolation --upgrade -e ".[api,ui,reporting,data,forecasting,deep,boosting,automl,responsible,nlp,vision,audio,build,dev]" >> "%LOG_FILE%" 2>&1
+    "%VENV_PY%" -m pip install %PIP_FLAGS% --no-build-isolation --upgrade -e ".[api,ui,reporting,data,forecasting,deep,boosting,automl,responsible,nlp,vision,audio,build,dev]" >> "%LOG_FILE%" 2>&1
     if !errorlevel! neq 0 goto :pip_failed
 ) else (
-    "%VENV_PY%" -m pip install --upgrade -r "%ROOT_DIR%\requirements.txt" >> "%LOG_FILE%" 2>&1
+    "%VENV_PY%" -m pip install %PIP_FLAGS% --upgrade -r "%ROOT_DIR%\requirements.txt" >> "%LOG_FILE%" 2>&1
     if !errorlevel! neq 0 goto :pip_failed
-    "%VENV_PY%" -m pip install --no-build-isolation --no-deps -e . >> "%LOG_FILE%" 2>&1
+    "%VENV_PY%" -m pip install %PIP_FLAGS% --no-build-isolation --no-deps -e . >> "%LOG_FILE%" 2>&1
     if !errorlevel! neq 0 goto :pip_failed
 )
 
@@ -311,7 +316,7 @@ if !errorlevel! neq 0 (
 )
 
 echo   [INFO] Installing latest Windows .exe build prerequisites (PyInstaller, Pillow)...
-"%VENV_PY%" -m pip install --upgrade -r "%ROOT_DIR%\requirements-build.txt" >> "%LOG_FILE%" 2>&1
+"%VENV_PY%" -m pip install %PIP_FLAGS% --upgrade -r "%ROOT_DIR%\requirements-build.txt" >> "%LOG_FILE%" 2>&1
 if !errorlevel! neq 0 goto :pip_failed
 
 echo   [OK] All Python packages and OmniForge package installed cleanly.
@@ -450,6 +455,12 @@ echo ---------------------------------------------------------------------------
 powershell -NoProfile -Command "if (Test-Path '%LOG_FILE%') { Get-Content -Path '%LOG_FILE%' -Tail 20 }" 2>nul
 echo ----------------------------------------------------------------------------
 echo         Full install log: "%LOG_FILE%"
+echo.
+echo   [TIP] If you saw "[Errno 13] Permission denied" on a wheel or .venv file:
+echo         1. Close any running Python / OmniForge windows and clear stale pip cache:
+echo              .venv\Scripts\python.exe -m pip cache purge
+echo         2. Temporarily allow your antivirus / Windows Defender exclusion for this folder.
+echo         3. Re-run install.bat ^(now uses --no-cache-dir automatically^).
 goto :fail_exit
 
 :fail_exit

@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 
 from omniforge.core.exceptions import ForecastingError
 from omniforge.core.types import TaskType
@@ -20,7 +21,7 @@ def _causal_series_to_array(y: pd.Series | np.ndarray) -> np.ndarray:
     if not s.notna().any():
         raise ForecastingError("Input time series contains no valid numeric observations.")
     first_valid = float(s.dropna().iloc[0])
-    return s.ffill().fillna(first_valid).to_numpy(dtype=float).ravel()
+    return np.asarray(s.ffill().fillna(first_valid).to_numpy(dtype=float).ravel(), dtype=float)
 
 
 class DeepForecaster:
@@ -50,6 +51,7 @@ class DeepForecaster:
         self._mean: float = 0.0
         self._std: float = 1.0
         self._residual_q: float = 1.0
+        self._tft_cqr_q: float = 0.0
         self._eff_context: int = self.context_length
         self._eff_horizon: int = self.horizon_train
 
@@ -87,8 +89,22 @@ class DeepForecaster:
         if len(arr) <= L + H + 4:
             return False
         self._eff_horizon = H
-        self._mean = float(np.mean(arr))
-        self._std = max(float(np.std(arr)), 1e-6)
+        alpha = float(np.clip(1.0 - self.confidence_level, 1e-4, 0.5))
+
+        # Determine chronological train / calibration split BEFORE scaling to prevent calibration leakage
+        n_windows = len(arr) - L - H + 1
+        cal_n = max(2, int(n_windows * 0.2))
+        has_holdout = n_windows > cal_n + H + 3
+        if has_holdout:
+            # Last training window starts at (n_windows - cal_n - H) so its H-step target never overlaps calibration targets
+            train_end_win = max(2, n_windows - cal_n - (H - 1))
+            scaler_end_idx = min(len(arr), L + train_end_win + H - 1)
+        else:
+            train_end_win = n_windows
+            scaler_end_idx = len(arr)
+
+        self._mean = float(np.mean(arr[:scaler_end_idx]))
+        self._std = max(float(np.std(arr[:scaler_end_idx])), 1e-6)
         norm_arr = (arr - self._mean) / self._std
 
         X_win = np.array([norm_arr[i - L : i] for i in range(L, len(norm_arr) - H + 1)], dtype=np.float32)
@@ -121,7 +137,8 @@ class DeepForecaster:
                 resid = x - b1
                 hs = self.seas_fc(resid)
                 f2 = self.seas_fore(hs) @ self.S_f
-                return f1 + f2
+                out_t: torch.Tensor = f1 + f2
+                return out_t
 
         class _PatchTSTNet(nn.Module):
             """Nie et al. (ICLR 2023): Patch Tokenization + Multi-Head Self-Attention Time-Series Transformer."""
@@ -141,7 +158,8 @@ class DeepForecaster:
                 patches = x.unfold(dimension=1, size=self.patch_len, step=self.stride)[:, : self.n_patches, :]
                 tok = self.proj(patches) + self.pos[:, : patches.size(1), :]
                 z = self.enc(tok).reshape(x.size(0), -1)
-                return self.head(z)
+                out_p: torch.Tensor = self.head(z)
+                return out_p
 
         class _TFTNet(nn.Module):
             """Lim et al. (2021) Temporal Fusion Transformer: Gated Residual Network + Self-Attention + Quantile Head (P10/P50/P90)."""
@@ -154,7 +172,7 @@ class DeepForecaster:
                 self.attn = nn.MultiheadAttention(32, 4, batch_first=True)
                 self.gate = nn.Sequential(nn.Linear(32, 32), nn.Sigmoid())
                 self.norm = nn.LayerNorm(32)
-                self.q_head = nn.Linear(32, H * 3)  # P10, P50, P90
+                self.q_head = nn.Linear(32, H * 3)  # [q_lo, q_50, q_hi]
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
                 w = self.vsn(x)
@@ -163,19 +181,22 @@ class DeepForecaster:
                 seq, _ = self.lstm(h)
                 att, _ = self.attn(seq, seq, seq)
                 fused = self.norm(seq + self.gate(att) * att)
-                return self.q_head(fused[:, -1, :]).view(x.size(0), H, 3)
+                out_q: torch.Tensor = self.q_head(fused[:, -1, :]).view(x.size(0), H, 3)
+                return out_q
 
         net: nn.Module = _NBEATSNet() if arch == "nbeats" else (_PatchTSTNet() if arch == "patchtst" else _TFTNet())
         opt = torch.optim.AdamW(net.parameters(), lr=5e-3, weight_decay=1e-4)
         Xt = torch.tensor(X_win)
         Yt = torch.tensor(Y_win)
 
-        # Hold out last 20% for split conformal residual calibration
-        cal_n = max(2, int(len(Xt) * 0.2))
-        X_tr, Y_tr = (Xt[:-cal_n], Yt[:-cal_n]) if len(Xt) > cal_n + 4 else (Xt, Yt)
-        X_ca, Y_ca = (Xt[-cal_n:], Yt[-cal_n:]) if len(Xt) > cal_n + 4 else (Xt, Yt)
+        # Chronological split conformal / CQR calibration (non-overlapping targets when series is long enough)
+        X_tr, Y_tr = (Xt[:train_end_win], Yt[:train_end_win]) if has_holdout else (Xt, Yt)
+        X_ca, Y_ca = (Xt[-cal_n:], Yt[-cal_n:]) if has_holdout else (Xt, Yt)
 
-        quantiles = torch.tensor([0.1, 0.5, 0.9], dtype=torch.float32)
+        # Match TFT quantile levels to requested confidence_level: [alpha/2, 0.5, 1 - alpha/2]
+        q_lo_level = float(np.clip(alpha / 2.0, 0.005, 0.45))
+        q_hi_level = float(np.clip(1.0 - alpha / 2.0, 0.55, 0.995))
+        quantiles = torch.tensor([q_lo_level, 0.5, q_hi_level], dtype=torch.float32)
         net.train()
         for _ in range(self.epochs):
             opt.zero_grad()
@@ -192,10 +213,24 @@ class DeepForecaster:
         net.eval()
         with torch.no_grad():
             pred_ca = net(X_ca)
-            p50 = pred_ca[:, :, 1] if arch == "tft" else pred_ca
-            res = torch.abs(Y_ca[:, 0] - p50[:, 0]).cpu().numpy() * self._std
-            q_level = min(self.confidence_level * (1.0 + 1.0 / max(len(res), 1)), 0.995)
-            self._residual_q = max(float(np.quantile(res, q_level)), 1e-6)
+            if arch == "tft":
+                # Conformalized Quantile Regression (Romano, Patterson & Candès 2019):
+                # E_i = max(q_lo(X_i) - Y_i, Y_i - q_hi(X_i))
+                ca_raw = pred_ca[:, 0, :].cpu().numpy() * self._std + self._mean
+                y_true_ca = Y_ca[:, 0].cpu().numpy() * self._std + self._mean
+                lo_ca = np.minimum(ca_raw[:, 0], ca_raw[:, 2])
+                hi_ca = np.maximum(ca_raw[:, 0], ca_raw[:, 2])
+                cqr_scores = np.maximum(lo_ca - y_true_ca, y_true_ca - hi_ca)
+                n_ca = len(cqr_scores)
+                k_ca = min(max(int(np.ceil((n_ca + 1) * (1.0 - alpha))), 1), n_ca)
+                self._tft_cqr_q = float(np.partition(cqr_scores, k_ca - 1)[k_ca - 1])
+                res = np.abs(y_true_ca - ca_raw[:, 1])
+                self._residual_q = max(float(np.partition(res, k_ca - 1)[k_ca - 1]), 1e-6)
+            else:
+                res = torch.abs(Y_ca[:, 0] - pred_ca[:, 0]).cpu().numpy() * self._std
+                n_ca = len(res)
+                k_ca = min(max(int(np.ceil((n_ca + 1) * (1.0 - alpha))), 1), n_ca)
+                self._residual_q = max(float(np.partition(res, k_ca - 1)[k_ca - 1]), 1e-6)
         self._torch_net = net
         return True
 
@@ -217,16 +252,19 @@ class DeepForecaster:
         last_level = X_win[:, -1]
         y_delta = arr[self._eff_context :] - last_level
 
+        alpha = float(np.clip(1.0 - self.confidence_level, 1e-4, 0.5))
         cal_n = max(4, int(len(X_win) * 0.2))
         if len(X_win) > cal_n + 8:
             cal_model = self._build_backbone()
             cal_model.fit(X_win[:-cal_n], y_delta[:-cal_n])
             cal_pred = last_level[-cal_n:] + cal_model.predict(X_win[-cal_n:])
             residuals = np.abs(arr[self._eff_context :][-cal_n:] - cal_pred)
-            q_level = min(self.confidence_level * (1.0 + 1.0 / max(len(residuals), 1)), 0.995)
-            self._residual_q = float(np.quantile(residuals, q_level))
+            n_ca = len(residuals)
+            k_ca = min(max(int(np.ceil((n_ca + 1) * (1.0 - alpha))), 1), n_ca)
+            self._residual_q = float(np.partition(residuals, k_ca - 1)[k_ca - 1])
         else:
-            self._residual_q = float(np.std(y_delta)) * 1.96
+            z_crit = float(stats.norm.ppf(1.0 - alpha / 2.0))
+            self._residual_q = float(np.std(y_delta, ddof=1)) * z_crit if len(y_delta) > 1 else 1.0
 
         self._model = self._build_backbone()
         self._model.fit(X_win, y_delta)
@@ -248,13 +286,18 @@ class DeepForecaster:
                     win = torch.tensor(np.asarray(buf[-self._eff_context :], dtype=np.float32).reshape(1, -1))
                     out = self._torch_net(win).cpu().numpy()[0]
                     if self.architecture == "tft":
-                        p10 = out[:, 0] * self._std + self._mean
+                        p_lo = out[:, 0] * self._std + self._mean
                         p50 = out[:, 1] * self._std + self._mean
-                        p90 = out[:, 2] * self._std + self._mean
-                        for a, m, b in zip(p10, p50, p90, strict=False):
+                        p_hi = out[:, 2] * self._std + self._mean
+                        for a, m, b in zip(p_lo, p50, p_hi, strict=False):
                             if len(preds) >= h:
                                 break
-                            lo_v, mid_v, hi_v = sorted([float(a), float(m), float(b)])
+                            lo_raw, mid_v, hi_raw = sorted([float(a), float(m), float(b)])
+                            # Apply CQR finite-sample conformal margin (scaled mildly with horizon)
+                            h_scale = float(np.sqrt(len(preds) + 1))
+                            cqr_adj = self._tft_cqr_q * h_scale if self._tft_cqr_q >= 0.0 else self._tft_cqr_q
+                            lo_v = min(mid_v, lo_raw - cqr_adj)
+                            hi_v = max(mid_v, hi_raw + cqr_adj)
                             preds.append(mid_v)
                             q10_list.append(lo_v)
                             q90_list.append(hi_v)

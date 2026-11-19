@@ -33,7 +33,7 @@ export interface EquationEntry {
   explanation_notes?: string[];
   intercept?: number | null;
   coefficients?: Record<string, number>;
-  coefficients_table?: Record<string, any>[];
+  coefficients_table?: Record<string, unknown>[];
   structured_terms?: StructuredTerm[];
   feature_importance?: Record<string, number>;
   metrics?: Record<string, number>;

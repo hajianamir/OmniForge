@@ -227,8 +227,8 @@ class SupervisoryPredictionMonitor:
         num = pd.to_numeric(pd.Series(raw), errors="coerce").to_numpy(dtype=float)
         if np.isnan(num).all():
             codes, _ = pd.factorize(pd.Series(raw).astype(str))
-            return codes.astype(float)
-        return np.nan_to_num(num, nan=0.0)
+            return np.asarray(codes, dtype=float)
+        return np.asarray(np.nan_to_num(num, nan=0.0), dtype=float)
 
     @classmethod
     def extract_model_equation(
@@ -254,7 +254,8 @@ class SupervisoryPredictionMonitor:
             eq_dict = rep.model_dump() if hasattr(rep, "model_dump") else dict(rep)
             eq_dict["model_name"] = str(entry.get("label") or eq_dict.get("model_name") or "Model")
             eq_dict["model_family"] = str(entry.get("family") or eq_dict.get("model_family") or "Model")
-            return to_json_safe(eq_dict)
+            safe_eq: dict[str, Any] = dict(to_json_safe(eq_dict))
+            return safe_eq
         except Exception as exc:
             logger.debug("supervisory_equation_extract_skipped", error=str(exc))
             return None
@@ -302,12 +303,15 @@ class SupervisoryPredictionMonitor:
                     if len(ser) >= 3:
                         med = float(ser.median())
                         mu = float(ser.mean())
-                        sd = max(float(ser.std()), 1e-6)
+                        raw_sd = float(ser.std())
+                        sd = max(raw_sd, 1e-6) if math.isfinite(raw_sd) else 1e-6
                         q05 = float(ser.quantile(0.05))
                         q95 = float(ser.quantile(0.95))
                     else:
                         live_s = pd.to_numeric(X_primary[c], errors="coerce").fillna(0.0)
-                        med, mu, sd = float(live_s.median()), float(live_s.mean()), max(float(live_s.std()), 1e-6)
+                        med, mu = float(live_s.median()), float(live_s.mean())
+                        raw_sd = float(live_s.std()) if len(live_s) > 1 else 0.0
+                        sd = max(raw_sd, 1e-6) if math.isfinite(raw_sd) else 1e-6
                         q05, q95 = float(live_s.quantile(0.05)), float(live_s.quantile(0.95))
                     ref_row[c] = med
                     ref_stats[c] = {"median": med, "mean": mu, "std": sd, "p05": q05, "p95": q95}
@@ -317,7 +321,9 @@ class SupervisoryPredictionMonitor:
             else:
                 if c in num_cols:
                     live_s = pd.to_numeric(X_primary[c], errors="coerce").fillna(0.0)
-                    med, mu, sd = float(live_s.median()), float(live_s.mean()), max(float(live_s.std()), 1e-6)
+                    med, mu = float(live_s.median()), float(live_s.mean())
+                    raw_sd = float(live_s.std()) if len(live_s) > 1 else 0.0
+                    sd = max(raw_sd, 1e-6) if math.isfinite(raw_sd) else 1e-6
                     q05, q95 = float(live_s.quantile(0.05)), float(live_s.quantile(0.95))
                     ref_row[c] = med
                     ref_stats[c] = {"median": med, "mean": mu, "std": sd, "p05": q05, "p95": q95}
@@ -645,6 +651,7 @@ class SupervisoryPredictionMonitor:
         else:
             # Fallback statistical mean/mode baseline computed from reference dataset
             baseline_label = "Reference Mean/Mode Floor"
+            b_val: Any
             if ref_df is not None and target_name in ref_df.columns:
                 if pd.api.types.is_numeric_dtype(ref_df[target_name]):
                     b_val = float(pd.to_numeric(ref_df[target_name], errors="coerce").median())
@@ -729,7 +736,7 @@ class SupervisoryPredictionMonitor:
 
             # Estimate baseline residual sigma (from training holdout or robust MAD of current batch)
             valid_res = residuals[np.isfinite(residuals)]
-            res_std = float(np.std(valid_res)) if len(valid_res) > 2 else 1.0
+            res_std = float(np.std(valid_res, ddof=1)) if len(valid_res) > 2 else 1.0
             mad_sigma = float(1.4826 * np.median(np.abs(valid_res - np.median(valid_res)))) if len(valid_res) > 2 else res_std
             sigma_ref = max(mad_sigma if mad_sigma > 1e-6 else res_std, 1e-6)
             res_z = residuals / sigma_ref
@@ -1114,6 +1121,7 @@ class SupervisoryPredictionMonitor:
 
         # Compute Signed Root-Cause Attribution (What Caused Increase (+) or Decrease (-) vs Baseline)
         preds_scalar = self._predict_scalar_response(primary_entry["_estimator"], X_primary, is_clf)
+        base_scalar: np.ndarray | None
         if baseline_entry is not None:
             X_base_rc = self._align_features(work_df, baseline_entry["feature_cols"] or primary_entry["feature_cols"], ref_df=ref_df)
             base_scalar = self._predict_scalar_response(baseline_entry["_estimator"], X_base_rc, is_clf)
@@ -1209,4 +1217,4 @@ class SupervisoryPredictionMonitor:
             status=system_status,
             breaches=n_breach,
         )
-        return result
+        return dict(result)

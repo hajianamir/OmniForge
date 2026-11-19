@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 from pydantic import BaseModel, Field
 from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import Matern
+from sklearn.gaussian_process.kernels import ConstantKernel, Matern
 
 from omniforge.core.exceptions import AutoMLError
 from omniforge.core.logging import get_logger
@@ -146,10 +146,19 @@ class HyperparameterOptimizer:
             if tid < n_init or len(X_obs) < 3:
                 cfg = self._sample_random_config(search_space, rng)
             else:
-                gp = GaussianProcessRegressor(
-                    kernel=Matern(nu=2.5), alpha=1e-4, normalize_y=True, random_state=self.random_seed
+                kernel = ConstantKernel(1.0, (1e-3, 1e3)) * Matern(
+                    length_scale=0.5, length_scale_bounds=(1e-2, 1e3), nu=2.5
                 )
-                gp.fit(np.vstack(X_obs), np.asarray(y_obs) * sign)
+                # Avoid marginal-likelihood degeneracy when too few observations exist to identify length-scale
+                opt_mode: str | None = "fmin_l_bfgs_b" if len(X_obs) >= 6 else None
+                gp = GaussianProcessRegressor(
+                    kernel=kernel,
+                    alpha=1e-4,
+                    optimizer=opt_mode,
+                    normalize_y=True,
+                    random_state=self.random_seed,
+                )
+                gp.fit(np.vstack(X_obs), np.asarray(y_obs, dtype=float) * sign)
                 cands = [self._sample_random_config(search_space, rng) for _ in range(40)]
                 X_cands = np.vstack([self._encode_config(c, search_space) for c in cands])
                 mu, std = gp.predict(X_cands, return_std=True)
@@ -158,9 +167,10 @@ class HyperparameterOptimizer:
 
             ts = time.perf_counter()
             score = float(objective_fn(cfg))
-            X_obs.append(self._encode_config(cfg, search_space))
-            y_obs.append(score)
-            trials.append(OptimizationTrial(trial_id=tid, params=cfg, score=round(score, 6), duration_seconds=round(time.perf_counter() - ts, 4)))
+            if np.isfinite(score):
+                X_obs.append(self._encode_config(cfg, search_space))
+                y_obs.append(score)
+                trials.append(OptimizationTrial(trial_id=tid, params=cfg, score=round(score, 6), duration_seconds=round(time.perf_counter() - ts, 4)))
         return self._summarize("bayesian_gp_ucb", trials)
 
     def _optimize_grid(
@@ -174,6 +184,8 @@ class HyperparameterOptimizer:
                 axes.append(list(spec["choices"]))
             elif spec.get("type") == "int":
                 axes.append(sorted(set(int(v) for v in np.linspace(spec["low"], spec["high"], 3))))
+            elif spec.get("log", False) and float(spec["low"]) > 0.0 and float(spec["high"]) > 0.0:
+                axes.append([float(v) for v in np.geomspace(float(spec["low"]), float(spec["high"]), 3)])
             else:
                 axes.append([float(v) for v in np.linspace(spec["low"], spec["high"], 3)])
 
@@ -191,7 +203,7 @@ class HyperparameterOptimizer:
     def _optimize_optuna(
         self, search_space: dict[str, dict[str, Any]], objective_fn: Callable[[dict[str, Any]], float]
     ) -> HPOResult:
-        import optuna  # type: ignore[import-not-found]
+        import optuna
 
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         trials: list[OptimizationTrial] = []

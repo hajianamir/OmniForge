@@ -100,7 +100,8 @@ class ResNetTabularModel(BaseOmniForgeModel):
                     )
 
                 def forward(self, x: torch.Tensor) -> torch.Tensor:
-                    return x + self.block(x)
+                    out: torch.Tensor = x + self.block(x)
+                    return out
 
             net = nn.Sequential(
                 nn.Linear(in_dim, d_m),
@@ -146,7 +147,8 @@ class ResNetTabularModel(BaseOmniForgeModel):
             )
             self._fallback.fit(X_s, y)
 
-    def _predict_proba(self, X: np.ndarray) -> np.ndarray:
+    def _predict_proba(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
+        _ = kwargs
         X_s = self._scaler.transform(X).astype(np.float32)
         if self._torch_net is not None:
             import torch
@@ -154,7 +156,7 @@ class ResNetTabularModel(BaseOmniForgeModel):
             self._torch_net.eval()
             with torch.no_grad():
                 logits = self._torch_net(torch.tensor(X_s, dtype=torch.float32))
-                return torch.softmax(logits, dim=-1).cpu().numpy()
+                return np.asarray(torch.softmax(logits, dim=-1).cpu().numpy(), dtype=float)
         assert self._fallback is not None
         return self._fallback.predict_proba(X_s)
 
@@ -170,6 +172,6 @@ class ResNetTabularModel(BaseOmniForgeModel):
                 if self.task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
                     idx = torch.argmax(out, dim=-1).cpu().numpy()
                     return np.array([self._idx_to_label[int(i)] for i in idx])
-                return out.squeeze(-1).cpu().numpy()
+                return np.asarray(out.squeeze(-1).cpu().numpy(), dtype=float)
         assert self._fallback is not None
         return self._fallback.predict(X_s)

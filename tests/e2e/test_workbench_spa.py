@@ -5,12 +5,15 @@ from __future__ import annotations
 import io
 import json
 import uuid
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
+from omniforge.api.auth import get_api_key
 from omniforge.api.main import create_app
 from omniforge.core.utils import to_json_safe
 
@@ -18,7 +21,7 @@ from omniforge.core.utils import to_json_safe
 def test_spa_static_bundle_gzip_and_all_13_studios_e2e() -> None:
     """Verify compiled React SPA serving, GZip compression, and all 13 CRISP-DM Studios + .uap roundtrip."""
     app = create_app()
-    client = TestClient(app)
+    client = TestClient(app, headers={"X-API-Key": get_api_key()})
     sid = f"e2e_{uuid.uuid4().hex[:8]}"
     hdr = {"X-Session-ID": sid}
 
@@ -176,21 +179,35 @@ def test_to_json_safe_strict_rfc8259_compliance() -> None:
     assert decoded["nested"] == [{"x": None, "ok": 7}]
 
 
-def test_dirty_upload_benchmark_csv_and_structured_json_errors() -> None:
-    """Regression suite covering dirty CSV/Excel uploads, benchmark loading, edge endpoints, and JSON 500s."""
+def test_dirty_upload_benchmark_csv_and_structured_json_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression suite covering dirty CSV/Excel uploads, benchmark loading, traversal blocks, and JSON 500s."""
+    sample_bm = pd.DataFrame(
+        {
+            "metric_a": [1.0, np.nan, 3.0, 4.5, 5.2] * 12,
+            "metric_b": [10, 20, 30, np.nan, 50] * 12,
+            "segment": ["A", "B", "A", "C", "B"] * 12,
+            "target": [0, 1, 0, 1, 1] * 12,
+        }
+    )
+    (tmp_path / "synthetic_benchmark.csv").write_text(sample_bm.to_csv(index=False), encoding="utf-8")
+    monkeypatch.setenv("OMNIFORGE_BENCHMARK_DIR", str(tmp_path))
+
     app = create_app()
 
     def _simulated_boom() -> None:
         raise RuntimeError("Simulated internal server error")
 
     app.router.routes.insert(0, APIRoute("/api/workbench/_test_boom", _simulated_boom, methods=["GET"]))
-    client = TestClient(app, raise_server_exceptions=False)
+    client = TestClient(app, raise_server_exceptions=False, headers={"X-API-Key": get_api_key()})
     sid = f"dirty_{uuid.uuid4().hex[:8]}"
     hdr = {"X-Session-ID": sid}
 
-    # 1. Bundled benchmark CSV load (contains real missing values)
+    # 1. Benchmark CSV discovery + safe load + path traversal blocking (CWE-22)
     r_bm = client.get("/api/workbench/benchmarks", headers=hdr)
     assert r_bm.status_code == 200 and len(r_bm.json()["benchmarks"]) >= 1
+    assert "path" not in r_bm.json()["benchmarks"][0]
     first_bm = r_bm.json()["benchmarks"][0]["filename"]
     r_load_bm = client.post(
         "/api/workbench/s01/load-sample",
@@ -199,6 +216,13 @@ def test_dirty_upload_benchmark_csv_and_structured_json_errors() -> None:
     )
     assert r_load_bm.status_code == 200
     assert client.get("/api/workbench/s01/grid?page=1&page_size=15", headers=hdr).status_code == 200
+    for evil_name in ("../../../../etc/passwd", "/etc/passwd", "..\\secret.csv", "foo/bar.csv"):
+        r_trav = client.post(
+            "/api/workbench/s01/load-sample",
+            json={"source_type": "benchmark", "name": evil_name},
+            headers=hdr,
+        )
+        assert r_trav.status_code == 400, (evil_name, r_trav.status_code, r_trav.text)
 
     # 2. Dirty CSV upload with NaN, +/-Inf, nulls, datetime column, and exact duplicates
     rng = np.random.default_rng(11)
@@ -247,11 +271,13 @@ def test_dirty_upload_benchmark_csv_and_structured_json_errors() -> None:
     assert client.post("/api/workbench/s09/nlp", json={"task": "topics"}, headers=hdr).status_code == 200
     assert client.post("/api/workbench/s09/survival", json={"duration_col": "num_c", "event_col": "target"}, headers=hdr).status_code == 200
 
-    # 4. Unhandled server exceptions must ALWAYS return structured JSON (never empty/plain text 500)
+    # 4. Unhandled server exceptions must ALWAYS return structured JSON without leaking internal exception text
     r_500 = client.get("/api/workbench/_test_boom", headers=hdr)
     assert r_500.status_code == 500
     assert r_500.headers["content-type"].startswith("application/json")
     body = json.loads(r_500.text)
-    assert body["error_type"] == "RuntimeError"
-    assert "Simulated internal server error" in body["detail"]
+    assert body["error_type"] == "InternalServerError"
+    assert "error_id" in body and len(body["error_id"]) >= 32
+    assert "Simulated internal server error" not in body["detail"]
+    assert "RuntimeError" not in body["detail"]
 

@@ -78,13 +78,20 @@ class FairnessAuditor:
                 "precision": round(prec, 6),
             }
             sel_rates.append(sel_rate)
-            tprs.append(tpr)
-            fprs.append(fpr)
+            if np.any(pos_mask):
+                tprs.append(tpr)
+            if np.any(neg_mask):
+                fprs.append(fpr)
 
         dp_diff = float(max(sel_rates) - min(sel_rates)) if sel_rates else 0.0
-        di_ratio = float(min(sel_rates) / max(max(sel_rates), 1e-12)) if sel_rates else 1.0
-        eopp_diff = float(max(tprs) - min(tprs)) if tprs else 0.0
-        fpr_diff = float(max(fprs) - min(fprs)) if fprs else 0.0
+        if sel_rates:
+            max_sel, min_sel = max(sel_rates), min(sel_rates)
+            # When all groups have 0 selection rate, parity is exact (ratio = 1.0, matching Fairlearn)
+            di_ratio = 1.0 if max_sel <= 1e-12 else float(min_sel / max_sel)
+        else:
+            di_ratio = 1.0
+        eopp_diff = float(max(tprs) - min(tprs)) if len(tprs) >= 2 else 0.0
+        fpr_diff = float(max(fprs) - min(fprs)) if len(fprs) >= 2 else 0.0
         eodds_diff = max(eopp_diff, fpr_diff)
 
         violations: list[str] = []
@@ -125,6 +132,8 @@ class FairnessAuditor:
         """Compute Kamiran & Calders (2012) pre-processing sample weights to enforce statistical parity."""
         y = np.asarray(y_true)
         s = np.asarray(sensitive_features).astype(str)
+        if len(y) == 0:
+            return np.array([], dtype=float)
         n = float(len(y))
         weights = np.ones(len(y), dtype=float)
         for grp in np.unique(s):
@@ -144,8 +153,11 @@ class FairnessAuditor:
         target_selection_rate: float | None = None,
     ) -> dict[str, float]:
         """Compute group-specific probability thresholds equalizing selection rates across groups."""
-        p = np.asarray(y_proba, dtype=float).ravel()
+        p_arr = np.asarray(y_proba, dtype=float)
+        p = p_arr[:, 1] if (p_arr.ndim == 2 and p_arr.shape[1] >= 2) else p_arr.ravel()
         s = np.asarray(sensitive_features).astype(str)
+        if len(p) == 0:
+            return {}
         target_rate = float(target_selection_rate) if target_selection_rate is not None else float(np.mean(p >= 0.5))
         target_rate = float(np.clip(target_rate, 0.05, 0.95))
         thresholds: dict[str, float] = {}

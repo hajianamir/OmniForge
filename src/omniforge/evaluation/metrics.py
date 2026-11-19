@@ -62,12 +62,18 @@ class MetricsEvaluator:
 
         if y_proba is not None and len(classes) >= 2:
             proba = np.asarray(y_proba, dtype=float)
+            if proba.ndim == 2 and proba.shape[1] >= 2:
+                proba_safe = np.clip(proba, 1e-12, 1.0)
+                row_sums = proba_safe.sum(axis=1, keepdims=True)
+                proba_norm = np.where(row_sums > 0.0, proba_safe / np.where(row_sums > 0.0, row_sums, 1.0), 1.0 / proba.shape[1])
+            else:
+                proba_norm = np.clip(proba, 1e-12, 1.0 - 1e-12)
             try:
-                metrics["log_loss"] = round(float(log_loss(yt, np.clip(proba, 1e-12, 1.0 - 1e-12), labels=classes)), 6)
+                metrics["log_loss"] = round(float(log_loss(yt, proba_norm, labels=classes)), 6)
             except Exception as exc:
                 logger.debug("log_loss_metric_skipped", error=str(exc))
-            if is_binary and proba.ndim == 2 and proba.shape[1] >= 2:
-                pos_p = proba[:, 1]
+            if is_binary and ((proba.ndim == 2 and proba.shape[1] >= 2) or proba.ndim == 1):
+                pos_p = proba_norm[:, 1] if proba.ndim == 2 else proba_norm.ravel()
                 y_bin = (yt == classes[-1]).astype(int)
                 try:
                     auc = float(roc_auc_score(y_bin, pos_p))
@@ -88,7 +94,7 @@ class MetricsEvaluator:
             elif not is_binary and proba.ndim == 2 and proba.shape[1] == len(classes):
                 try:
                     metrics["auc_roc_ovr"] = round(
-                        float(roc_auc_score(yt, proba, multi_class="ovr", average="weighted")), 6
+                        float(roc_auc_score(yt, proba_norm, multi_class="ovr", average="weighted")), 6
                     )
                 except Exception as exc:
                     logger.debug("multiclass_auc_metric_skipped", error=str(exc))
@@ -105,9 +111,11 @@ class MetricsEvaluator:
         rmse = float(np.sqrt(mse))
         mae = float(mean_absolute_error(yt, yp))
         r2 = float(r2_score(yt, yp))
-        non_zero = np.abs(yt) > 1e-9
+        non_zero = np.abs(yt) > 1e-12
         mape = float(np.mean(np.abs((yt[non_zero] - yp[non_zero]) / yt[non_zero])) * 100.0) if np.any(non_zero) else 0.0
-        smape = float(np.mean(np.abs(yt - yp) / ((np.abs(yt) + np.abs(yp)) / 2.0 + 1e-9)) * 100.0)
+        smape_denom = (np.abs(yt) + np.abs(yp)) / 2.0
+        smape_terms = np.where(smape_denom > 0.0, np.abs(yt - yp) / np.where(smape_denom > 0.0, smape_denom, 1.0), 0.0)
+        smape = float(np.mean(smape_terms) * 100.0) if len(yt) > 0 else 0.0
 
         out = {
             "rmse": round(rmse, 6),
@@ -142,7 +150,9 @@ class MetricsEvaluator:
         yp = np.asarray(y_pred, dtype=float).ravel()
         mae = float(mean_absolute_error(yt, yp))
         rmse = float(np.sqrt(mean_squared_error(yt, yp)))
-        smape = float(np.mean(np.abs(yt - yp) / ((np.abs(yt) + np.abs(yp)) / 2.0 + 1e-9)) * 100.0)
+        smape_denom = (np.abs(yt) + np.abs(yp)) / 2.0
+        smape_terms = np.where(smape_denom > 0.0, np.abs(yt - yp) / np.where(smape_denom > 0.0, smape_denom, 1.0), 0.0)
+        smape = float(np.mean(smape_terms) * 100.0) if len(yt) > 0 else 0.0
         res: dict[str, float] = {"rmse": round(rmse, 6), "mae": round(mae, 6), "smape": round(smape, 4)}
 
         if y_train is not None and len(y_train) > seasonal_period:
@@ -176,26 +186,58 @@ class MetricsEvaluator:
         }
 
     @staticmethod
-    def financial_metrics(returns: np.ndarray, periods_per_year: int = 252) -> dict[str, float]:
-        """Compute risk-adjusted financial performance metrics from periodic returns."""
+    def financial_metrics(
+        returns: np.ndarray,
+        periods_per_year: int = 252,
+        *,
+        mar: float = 0.0,
+    ) -> dict[str, float]:
+        """Compute risk-adjusted financial performance metrics from periodic returns.
+
+        Uses the authoritative Target Downside Deviation (TDD = sqrt(LPM_2(MAR)))
+        defined by Sortino & Price (1994) and Rollinger & Hoffman (2013), dividing
+        squared shortfalls below ``mar`` by the full observation count ``N`` rather
+        than only the count of losing periods.
+        """
         r = np.asarray(returns, dtype=float).ravel()
+        r = r[np.isfinite(r)]
         if len(r) == 0:
-            return {"sharpe_ratio": 0.0, "sortino_ratio": 0.0, "max_drawdown": 0.0}
+            return {
+                "annualized_return": 0.0,
+                "annualized_volatility": 0.0,
+                "annualized_downside_deviation": 0.0,
+                "sharpe_ratio": 0.0,
+                "sortino_ratio": 0.0,
+                "max_drawdown": 0.0,
+            }
         mean_r = float(np.mean(r))
+        excess = r - float(mar)
+        mean_excess = float(np.mean(excess))
         std_r = float(np.std(r, ddof=1)) if len(r) > 1 else 0.0
-        downside = r[r < 0]
-        down_std = float(np.std(downside, ddof=1)) if len(downside) > 1 else 1e-9
-        sharpe = (mean_r / max(std_r, 1e-9)) * np.sqrt(periods_per_year)
-        sortino = (mean_r / max(down_std, 1e-9)) * np.sqrt(periods_per_year)
-        # Log-space cumulative equity avoids float64 overflow on extreme stress series
-        log_equity = np.cumsum(np.log1p(np.clip(r, -0.999999, 1e6)))
+
+        # Target Downside Deviation (Sortino & Price 1994): sqrt((1/N) * sum(min(0, r_i - MAR)^2))
+        shortfall = np.minimum(0.0, excess)
+        tdd = float(np.sqrt(np.mean(shortfall**2)))
+
+        ann_scale = float(np.sqrt(max(periods_per_year, 1)))
+        sharpe = (mean_excess / std_r) * ann_scale if std_r > 1e-12 else 0.0
+        if tdd > 1e-12:
+            sortino = (mean_excess / tdd) * ann_scale
+        elif mean_excess > 1e-12:
+            sortino = float("inf")
+        else:
+            sortino = 0.0
+
+        # Log-space cumulative equity starting at initial wealth W_0 = 1.0 (log W_0 = 0.0)
+        log_equity = np.concatenate(([0.0], np.cumsum(np.log1p(np.clip(r, -0.999999, 1e6)))))
         log_peaks = np.maximum.accumulate(log_equity)
         drawdowns = np.expm1(np.clip(log_equity - log_peaks, -700.0, 0.0))
         max_dd = float(np.min(drawdowns))
         return {
             "annualized_return": round(mean_r * periods_per_year, 6),
-            "annualized_volatility": round(std_r * np.sqrt(periods_per_year), 6),
-            "sharpe_ratio": round(float(sharpe), 4),
-            "sortino_ratio": round(float(sortino), 4),
+            "annualized_volatility": round(std_r * ann_scale, 6),
+            "annualized_downside_deviation": round(tdd * ann_scale, 6),
+            "sharpe_ratio": round(float(sharpe), 4) if np.isfinite(sharpe) else float(sharpe),
+            "sortino_ratio": round(float(sortino), 4) if np.isfinite(sortino) else float(sortino),
             "max_drawdown": round(max_dd, 6),
         }

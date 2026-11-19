@@ -17,39 +17,70 @@ from omniforge.models.base import BaseOmniForgeModel
 
 
 class PurgedTimeSeriesSplit:
-    """Walk-forward time-series splitter with purge and embargo gaps to eliminate lookahead leakage."""
+    """Walk-forward time-series splitter enforcing both purge_gap and embargo_pct (Lopez de Prado 2018)."""
 
     def __init__(self, n_splits: int = 5, purge_gap: int = 2, embargo_pct: float = 0.02) -> None:
         self.n_splits = max(2, int(n_splits))
         self.purge_gap = max(0, int(purge_gap))
-        self.embargo_pct = max(0.0, float(embargo_pct))
+        self.embargo_pct = float(np.clip(embargo_pct, 0.0, 0.45))
 
-    def split(self, X: np.ndarray | pd.DataFrame, y: Any = None, groups: Any = None) -> Iterator[tuple[np.ndarray, np.ndarray]]:
-        """Yield ``(train_idx, test_idx)`` with explicit purge gap before each validation block."""
+    def get_n_splits(self, X: Any = None, y: Any = None, groups: Any = None) -> int:
+        """Return configured number of walk-forward splits."""
+        return self.n_splits
+
+    def split(
+        self, X: np.ndarray | pd.DataFrame, y: Any = None, groups: Any = None
+    ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+        """Yield ``(train_idx, test_idx)`` with strictly enforced ``purge_gap + ceil(n * embargo_pct)`` separation."""
         n = len(X)
         fold_size = n // (self.n_splits + 1)
         if fold_size < 2:
             raise EvaluationError("Dataset too small for PurgedTimeSeriesSplit.")
+        embargo_size = int(np.ceil(n * self.embargo_pct)) if self.embargo_pct > 0.0 else 0
+        total_gap = self.purge_gap + embargo_size
+
+        yielded = 0
         for k in range(1, self.n_splits + 1):
             test_start = k * fold_size
             test_end = min(n, (k + 1) * fold_size) if k < self.n_splits else n
-            train_end = max(1, test_start - self.purge_gap)
-            yield np.arange(0, train_end), np.arange(test_start, test_end)
+            train_end = test_start - total_gap
+            if train_end < 1 or test_end <= test_start:
+                continue
+            yielded += 1
+            yield np.arange(0, train_end, dtype=int), np.arange(test_start, test_end, dtype=int)
+
+        if yielded == 0:
+            raise EvaluationError(
+                f"PurgedTimeSeriesSplit could not produce any valid fold for n={n} with "
+                f"purge_gap={self.purge_gap} and embargo_size={embargo_size}."
+            )
 
 
 class CombinatorialPurgedKFold:
     """Combinatorial Purged Cross-Validation (CPCV) after Lopez de Prado (2018) for financial ML."""
 
-    def __init__(self, n_splits: int = 5, n_test_groups: int = 2, purge_gap: int = 2, embargo_gap: int = 2) -> None:
+    def __init__(
+        self,
+        n_splits: int = 5,
+        n_test_groups: int = 2,
+        purge_gap: int = 2,
+        embargo_gap: int = 2,
+        embargo_pct: float | None = None,
+    ) -> None:
         self.n_splits = max(3, int(n_splits))
         self.n_test_groups = min(max(1, int(n_test_groups)), self.n_splits - 1)
         self.purge_gap = max(0, int(purge_gap))
         self.embargo_gap = max(0, int(embargo_gap))
+        self.embargo_pct = float(np.clip(embargo_pct, 0.0, 0.45)) if embargo_pct is not None else None
 
-    def split(self, X: np.ndarray | pd.DataFrame, y: Any = None, groups: Any = None) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    def split(
+        self, X: np.ndarray | pd.DataFrame, y: Any = None, groups: Any = None
+    ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
         """Yield all C(n_splits, n_test_groups) purged & embargoed train/test index pairs."""
         n = len(X)
         blocks = np.array_split(np.arange(n), self.n_splits)
+        embargo_from_pct = int(np.ceil(n * self.embargo_pct)) if (self.embargo_pct is not None and self.embargo_pct > 0.0) else 0
+        effective_embargo = max(self.embargo_gap, embargo_from_pct)
         for test_combo in itertools.combinations(range(self.n_splits), self.n_test_groups):
             test_idx = np.concatenate([blocks[g] for g in test_combo])
             excluded = set(test_idx.tolist())
@@ -57,7 +88,7 @@ class CombinatorialPurgedKFold:
                 b_start, b_end = int(blocks[g][0]), int(blocks[g][-1])
                 for p in range(max(0, b_start - self.purge_gap), b_start):
                     excluded.add(p)
-                for e in range(b_end + 1, min(n, b_end + 1 + self.embargo_gap)):
+                for e in range(b_end + 1, min(n, b_end + 1 + effective_embargo)):
                     excluded.add(e)
             train_idx = np.array([i for i in range(n) if i not in excluded], dtype=int)
             if len(train_idx) > 0 and len(test_idx) > 0:
@@ -84,8 +115,10 @@ class CrossValidator:
             return TimeSeriesSplit(n_splits=self.n_splits)
         if self.strategy == "purged_time_series":
             return PurgedTimeSeriesSplit(n_splits=self.n_splits)
-        if self.strategy in ("cpcv", "purged_kfold"):
-            return CombinatorialPurgedKFold(n_splits=self.n_splits)
+        if self.strategy == "purged_kfold":
+            return CombinatorialPurgedKFold(n_splits=self.n_splits, n_test_groups=1)
+        if self.strategy == "cpcv":
+            return CombinatorialPurgedKFold(n_splits=self.n_splits, n_test_groups=2)
         raise EvaluationError(f"Unknown CV strategy '{self.strategy}'.")
 
     def cross_validate(
@@ -123,13 +156,16 @@ class CrossValidator:
             scalar_m["fold"] = float(fold_idx)
             fold_metrics.append(scalar_m)
 
+        if not fold_metrics:
+            raise EvaluationError(f"Cross-validation strategy '{self.strategy}' yielded zero valid folds.")
+
         metric_keys = [k for k in fold_metrics[0].keys() if k != "fold"]
         summary: dict[str, dict[str, float]] = {}
         for k in metric_keys:
             vals = [fm[k] for fm in fold_metrics if k in fm]
             summary[k] = {
                 "mean": round(float(np.mean(vals)), 6),
-                "std": round(float(np.std(vals)), 6),
+                "std": round(float(np.std(vals, ddof=1) if len(vals) > 1 else 0.0), 6),
             }
 
         return {

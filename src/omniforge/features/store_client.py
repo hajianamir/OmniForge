@@ -28,7 +28,7 @@ class FeatureStoreClient:
         self._feast: Any = None
         if use_feast_backend and is_package_available("feast"):
             try:
-                from feast import FeatureStore  # type: ignore[import-not-found]
+                from feast import FeatureStore
 
                 self._feast = FeatureStore(repo_path=str(self.repo_path))
                 logger.info("feast_backend_connected", repo_path=str(self.repo_path))

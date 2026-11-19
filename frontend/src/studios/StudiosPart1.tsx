@@ -1,22 +1,51 @@
 import React, { useEffect, useState } from 'react';
-import { apiDelete, apiDownload, apiGet, apiPost, apiUpload } from '../api';
+import { apiDelete, apiDownload, apiGet, apiPost, apiUpload, toErrorMessage } from '../api';
 import { BarChartSVG, CanvasScatter, HeatmapGrid } from '../components/Charts';
 import { PaginatedDataGrid, SimpleTable } from '../components/DataGrid';
 import { StudioHelpButton, type HandbookSectionId } from '../components/HelpGuideModal';
-import { MathEquationCard } from '../components/MathEquation';
+import { MathEquationCard, type EquationEntry } from '../components/MathEquation';
 import { ModeBar, type ExecutionMode } from '../components/ModeBar';
-import type { WorkspaceState } from '../types';
+import type {
+  AnomalyResponse,
+  CleanResponse,
+  ClusteringCommitResponse,
+  AnomalyCommitResponse,
+  DeletedLogResponse,
+  ExcelSheetsResponse,
+  IngestResponse,
+  QualityResponse,
+  SampleCatalogItem,
+  SampleCatalogResponse,
+  SQLInspectResponse,
+  TableInfo,
+  CleaningReport,
+  ClusteringResponse,
+  ClusterChoice,
+  DiagnosticsResponse,
+  EDAResponse,
+  EngineerResponse,
+  HypothesisResponse,
+  IntakeAuditPayload,
+  MiningResponse,
+  QualityDimensionScores,
+  SelectionResponse,
+  StateEnvelope,
+} from '../studioTypes';
+import type { StudioCache, StudioPayload, StudioResultKey } from '../studioTypes';
+import type { ScatterPayload, WorkspaceState } from '../types';
 
 export interface StudioProps {
   ws: WorkspaceState;
   onSync: (next?: WorkspaceState) => void;
   gridVersion: number;
   bumpGrid: () => void;
-  studioCache: Record<string, any>;
-  setStudioResult: (key: string, val: any) => void;
+  studioCache: StudioCache;
+  setStudioResult: (key: StudioResultKey, val: StudioPayload) => void;
   refreshCache: () => void;
   openHelp: (section?: HandbookSectionId) => void;
 }
+
+const EMPTY_SCATTER: ScatterPayload = { x: [], y: [], total_points: 0, rendered_points: 0, downsampled: false };
 
 export const ProvenancePill: React.FC<{ ws: WorkspaceState }> = ({ ws }) => {
   if (!ws.has_dataset) return null;
@@ -37,13 +66,13 @@ export const ProvenancePill: React.FC<{ ws: WorkspaceState }> = ({ ws }) => {
 // ============================================================================
 export const Studio01Data: React.FC<StudioProps> = ({ ws, onSync, gridVersion, bumpGrid, studioCache, setStudioResult, refreshCache, openHelp }) => {
   const [ingestTab, setIngestTab] = useState<'file' | 'sql' | 'access' | 'samples'>('file');
-  const [catalog, setCatalog] = useState<{ benchmarks: any[]; domains: any[] }>({ benchmarks: [], domains: [] });
+  const [catalog, setCatalog] = useState<{ benchmarks: SampleCatalogItem[]; domains: SampleCatalogItem[] }>({ benchmarks: [], domains: [] });
   const [viewMode, setViewMode] = useState<'active' | 'raw'>('active');
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const quality = studioCache.s01_quality ?? null;
-  const [deletedLog, setDeletedLog] = useState<any>(null);
+  const [deletedLog, setDeletedLog] = useState<DeletedLogResponse | null>(null);
 
   // Excel multi-sheet upload state
   const [pendingExcel, setPendingExcel] = useState<File | null>(null);
@@ -52,13 +81,13 @@ export const Studio01Data: React.FC<StudioProps> = ({ ws, onSync, gridVersion, b
 
   // SQL Connector state
   const [sqlUrl, setSqlUrl] = useState('');
-  const [sqlTables, setSqlTables] = useState<any[]>([]);
+  const [sqlTables, setSqlTables] = useState<TableInfo[]>([]);
   const [sqlTable, setSqlTable] = useState('');
   const [sqlQuery, setSqlQuery] = useState('');
 
   // MS Access Connector state
   const [accessPath, setAccessPath] = useState('');
-  const [accessTables, setAccessTables] = useState<any[]>([]);
+  const [accessTables, setAccessTables] = useState<TableInfo[]>([]);
   const [accessTable, setAccessTable] = useState('');
 
   // Restored & Expanded Data Cleaning state (Auto / Complete / Custom)
@@ -82,7 +111,9 @@ export const Studio01Data: React.FC<StudioProps> = ({ ws, onSync, gridVersion, b
   const cleanPreview = studioCache.s01_clean ?? null;
 
   useEffect(() => {
-    apiGet('/api/workbench/s01/catalog').then(setCatalog).catch(() => {});
+    apiGet<SampleCatalogResponse>('/api/workbench/s01/catalog')
+      .then((res) => setCatalog({ benchmarks: res.benchmarks || [], domains: res.domains || [] }))
+      .catch(() => {});
   }, []);
 
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -95,12 +126,12 @@ export const Studio01Data: React.FC<StudioProps> = ({ ws, onSync, gridVersion, b
       try {
         const fd = new FormData();
         fd.append('file', file);
-        const info = await apiUpload('/api/workbench/s01/excel-sheets', fd);
+        const info = await apiUpload<ExcelSheetsResponse>('/api/workbench/s01/excel-sheets', fd);
         const sheets: string[] = info.sheets || [];
         if (sheets.length > 1) {
           setPendingExcel(file);
           setExcelSheets(sheets);
-          setSelectedSheet(sheets[0]);
+          setSelectedSheet(sheets[0] ?? '');
           setMsg(`Detected ${sheets.length} Excel worksheets in '${file.name}'. Choose a sheet and click Load Sheet.`);
           setBusy(false);
           e.target.value = '';
@@ -121,93 +152,93 @@ export const Studio01Data: React.FC<StudioProps> = ({ ws, onSync, gridVersion, b
       const fd = new FormData();
       fd.append('file', file);
       if (sheetName) fd.append('sheet_name', sheetName);
-      const res = await apiUpload('/api/workbench/s01/upload', fd);
+      const res = await apiUpload<IngestResponse>('/api/workbench/s01/upload', fd);
       onSync(res.state); bumpGrid();
       setPendingExcel(null); setExcelSheets([]);
       const dc = res.intake_audit?.defect_counts?.total ?? 0;
       setMsg(`Ingested '${file.name}' in ${res.elapsed_seconds}s · Automatic Intake Audit found ${dc} defect(s) (Grade ${res.intake_audit?.quality_grade || 'N/A'}).`);
-    } catch (er: any) { setErr(er.message); } finally { setBusy(false); }
+    } catch (er: unknown) { setErr(toErrorMessage(er)); } finally { setBusy(false); }
   };
 
   const setupDemoSQL = async () => {
     setBusy(true); setErr(null); setMsg(null);
     try {
-      const info = await apiPost('/api/workbench/s01/sql/demo', {});
-      setSqlUrl(info.connection_url);
+      const info = await apiPost<SQLInspectResponse>('/api/workbench/s01/sql/demo', {});
+      setSqlUrl(info.connection_url ?? '');
       setSqlTables(info.tables || []);
-      if (info.tables?.length) setSqlTable(info.tables[0].name);
+      if (info.tables?.length) setSqlTable(info.tables[0]?.name ?? '');
       setMsg(`Connected to built-in OmniForge Enterprise Demo SQLite DB (${(info.tables || []).length} tables ready).`);
-    } catch (er: any) { setErr(er.message); } finally { setBusy(false); }
+    } catch (er: unknown) { setErr(toErrorMessage(er)); } finally { setBusy(false); }
   };
 
   const inspectSQL = async () => {
     if (!sqlUrl.trim()) return;
     setBusy(true); setErr(null);
     try {
-      const info = await apiPost('/api/workbench/s01/sql/inspect', { connection_url: sqlUrl });
+      const info = await apiPost<SQLInspectResponse>('/api/workbench/s01/sql/inspect', { connection_url: sqlUrl });
       setSqlTables(info.tables || []);
       if (info.tables?.length) setSqlTable(info.tables[0].name);
       setMsg(`SQL database inspected: ${(info.tables || []).length} table(s) discovered.`);
-    } catch (er: any) { setErr(er.message); } finally { setBusy(false); }
+    } catch (er: unknown) { setErr(toErrorMessage(er)); } finally { setBusy(false); }
   };
 
   const loadSQL = async () => {
     setBusy(true); setErr(null);
     try {
-      const res = await apiPost('/api/workbench/s01/sql/load', {
+      const res = await apiPost<IngestResponse>('/api/workbench/s01/sql/load', {
         connection_url: sqlUrl,
         table_name: sqlQuery.trim() ? null : (sqlTable || null),
         query: sqlQuery.trim() || null,
       });
       onSync(res.state); bumpGrid();
       setMsg(`Loaded SQL table in ${res.elapsed_seconds}s · Automatic Intake Audit complete (${res.intake_audit?.defect_counts?.total ?? 0} defects).`);
-    } catch (er: any) { setErr(er.message); } finally { setBusy(false); }
+    } catch (er: unknown) { setErr(toErrorMessage(er)); } finally { setBusy(false); }
   };
 
   const inspectAccess = async () => {
     if (!accessPath.trim()) return;
     setBusy(true); setErr(null);
     try {
-      const info = await apiPost('/api/workbench/s01/access/inspect', { file_path: accessPath });
+      const info = await apiPost<SQLInspectResponse>('/api/workbench/s01/access/inspect', { file_path: accessPath });
       setAccessTables(info.tables || []);
-      if (info.tables?.length) setAccessTable(info.tables[0].name);
+      if (info.tables?.length) setAccessTable(info.tables[0]?.name ?? '');
       setMsg(`MS Access database inspected: ${(info.tables || []).length} table(s) found.`);
-    } catch (er: any) { setErr(er.message); } finally { setBusy(false); }
+    } catch (er: unknown) { setErr(toErrorMessage(er)); } finally { setBusy(false); }
   };
 
   const loadAccess = async () => {
     setBusy(true); setErr(null);
     try {
-      const res = await apiPost('/api/workbench/s01/access/load', { file_path: accessPath, table_name: accessTable });
+      const res = await apiPost<IngestResponse>('/api/workbench/s01/access/load', { file_path: accessPath, table_name: accessTable });
       onSync(res.state); bumpGrid();
       setMsg(`Loaded MS Access table '${accessTable}' in ${res.elapsed_seconds}s.`);
-    } catch (er: any) { setErr(er.message); } finally { setBusy(false); }
+    } catch (er: unknown) { setErr(toErrorMessage(er)); } finally { setBusy(false); }
   };
 
   const loadSample = async (sourceType: 'benchmark' | 'domain', name: string) => {
     setBusy(true); setErr(null); setMsg(null);
     try {
-      const res = await apiPost('/api/workbench/s01/load-sample', { source_type: sourceType, name, n_samples: 800 });
+      const res = await apiPost<IngestResponse>('/api/workbench/s01/load-sample', { source_type: sourceType, name, n_samples: 800 });
       onSync(res.state); bumpGrid();
       setMsg(`Loaded '${name}' in ${res.elapsed_seconds}s · Auto Intake Audit: Grade ${res.intake_audit?.quality_grade || 'N/A'} (${res.intake_audit?.defect_counts?.total ?? 0} defects).`);
-    } catch (er: any) { setErr(er.message); } finally { setBusy(false); }
+    } catch (er: unknown) { setErr(toErrorMessage(er)); } finally { setBusy(false); }
   };
 
   const runProfile = async () => {
     setBusy(true); setErr(null);
     try {
-      const res = await apiPost('/api/workbench/s01/profile');
+      const res = await apiPost<QualityResponse>('/api/workbench/s01/profile');
       if (res.state) onSync(res.state);
       setStudioResult('s01_quality', res);
     }
-    catch (er: any) { setErr(er.message); } finally { setBusy(false); }
+    catch (er: unknown) { setErr(toErrorMessage(er)); } finally { setBusy(false); }
   };
 
   const runClean = async (previewOnly = false, overrideMode?: ExecutionMode) => {
     setBusy(true); setErr(null); setMsg(null);
     try {
       const useMode = overrideMode || cleanMode;
-      const res = await apiPost('/api/workbench/s01/clean', {
+      const res = await apiPost<CleanResponse>('/api/workbench/s01/clean', {
         mode: useMode,
         impute_numeric: imputeNum,
         impute_categorical: imputeCat,
@@ -236,7 +267,7 @@ export const Studio01Data: React.FC<StudioProps> = ({ ws, onSync, gridVersion, b
         setStudioResult('s01_clean', res);
         setMsg(`Dry-Run Preview (${useMode.toUpperCase()}): would transform ${res.cleaning_report?.rows_before} → ${res.cleaning_report?.rows_after} rows & ${res.cleaning_report?.missing_before} → ${res.cleaning_report?.missing_after} missing cells.`);
       }
-    } catch (er: any) { setErr(er.message); } finally { setBusy(false); }
+    } catch (er: unknown) { setErr(toErrorMessage(er)); } finally { setBusy(false); }
   };
 
   const ia = ws.intake_audit;
@@ -256,9 +287,9 @@ export const Studio01Data: React.FC<StudioProps> = ({ ws, onSync, gridVersion, b
             <ProvenancePill ws={ws} />
             <button className="btn btn-sm" onClick={() => apiDownload('/api/workbench/s01/export-clean/csv', `${ws.dataset_name || 'dataset'}_clean.csv`)}>Export Clean CSV</button>
             <button className="btn btn-sm" onClick={() => apiDownload('/api/workbench/s01/export-clean/xlsx', `${ws.dataset_name || 'dataset'}_clean.xlsx`)}>Export Clean XLSX</button>
-            <button className="btn btn-sm" disabled={!ws.can_undo} onClick={async () => { const r = await apiPost('/api/workbench/s01/undo'); onSync(r.state); refreshCache(); bumpGrid(); }}>Undo</button>
-            <button className="btn btn-sm" onClick={async () => { const r = await apiPost('/api/workbench/s01/revert'); onSync(r.state); refreshCache(); bumpGrid(); }}>Revert to Raw</button>
-            <button className="btn btn-sm btn-danger" onClick={async () => { const r = await apiDelete('/api/workbench/dataset'); onSync(r.state); refreshCache(); bumpGrid(); }}>Clear Dataset</button>
+            <button className="btn btn-sm" disabled={!ws.can_undo} onClick={async () => { const r = await apiPost<StateEnvelope>('/api/workbench/s01/undo'); onSync(r.state); refreshCache(); bumpGrid(); }}>Undo</button>
+            <button className="btn btn-sm" onClick={async () => { const r = await apiPost<StateEnvelope>('/api/workbench/s01/revert'); onSync(r.state); refreshCache(); bumpGrid(); }}>Revert to Raw</button>
+            <button className="btn btn-sm btn-danger" onClick={async () => { const r = await apiDelete<StateEnvelope>('/api/workbench/dataset'); onSync(r.state); refreshCache(); bumpGrid(); }}>Clear Dataset</button>
           </div>
         )}
       </div>
@@ -310,7 +341,7 @@ export const Studio01Data: React.FC<StudioProps> = ({ ws, onSync, gridVersion, b
                 <button className="btn" disabled={busy || !sqlUrl.trim()} onClick={inspectSQL}>Inspect Tables</button>
                 {sqlTables.length > 0 && (
                   <select value={sqlTable} onChange={(e) => setSqlTable(e.target.value)} style={{ flex: 1 }}>
-                    {sqlTables.map((t: any) => <option key={t.name} value={t.name}>{t.name} ({t.row_count ?? '?'} rows)</option>)}
+                    {sqlTables.map((t) => <option key={t.name} value={t.name}>{t.name} ({t.row_count ?? '?'} rows)</option>)}
                   </select>
                 )}
               </div>
@@ -335,7 +366,7 @@ export const Studio01Data: React.FC<StudioProps> = ({ ws, onSync, gridVersion, b
                 <button className="btn" disabled={busy || !accessPath.trim()} onClick={inspectAccess}>Inspect Access Tables</button>
                 {accessTables.length > 0 && (
                   <select value={accessTable} onChange={(e) => setAccessTable(e.target.value)} style={{ flex: 1 }}>
-                    {accessTables.map((t: any) => <option key={t.name} value={t.name}>{t.name}</option>)}
+                    {accessTables.map((t) => <option key={t.name} value={t.name}>{t.name}</option>)}
                   </select>
                 )}
               </div>
@@ -351,9 +382,9 @@ export const Studio01Data: React.FC<StudioProps> = ({ ws, onSync, gridVersion, b
             <div>
               <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-muted)', marginBottom: 6 }}>Benchmark CSV Datasets</div>
               <div className="row" style={{ gap: 6 }}>
-                {(catalog.benchmarks || []).map((b: any) => (
-                  <button key={b.filename} className="btn btn-sm" disabled={busy} onClick={() => loadSample('benchmark', b.filename)}>
-                    {b.filename.replace('.csv', '')} ({b.size_mb} MB)
+                {(catalog.benchmarks || []).map((b) => (
+                  <button key={b.filename} className="btn btn-sm" disabled={busy} onClick={() => loadSample('benchmark', b.filename ?? b.name)}>
+                    {(b.filename ?? b.name).replace('.csv', '')} ({b.size_mb} MB)
                   </button>
                 ))}
               </div>
@@ -361,9 +392,9 @@ export const Studio01Data: React.FC<StudioProps> = ({ ws, onSync, gridVersion, b
             <div>
               <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-muted)', marginBottom: 6 }}>Universal Synthetic Generators (Instant)</div>
               <div className="row" style={{ gap: 6 }}>
-                {(catalog.domains || []).slice(0, 10).map((d: any) => (
+                {(catalog.domains || []).slice(0, 10).map((d) => (
                   <button key={d.name} className="btn btn-sm" disabled={busy} onClick={() => loadSample('domain', d.name)}>
-                    {d.display_name}
+                    {d.display_name ?? d.name}
                   </button>
                 ))}
               </div>
@@ -404,7 +435,7 @@ export const Studio01Data: React.FC<StudioProps> = ({ ws, onSync, gridVersion, b
 
           {ia.defects?.length > 0 ? (
             <div style={{ marginBottom: 14 }}>
-              <SimpleTable title="Detected Dataset Defects & Recommended Remediations" rows={ia.defects as any} maxRows={100} />
+              <SimpleTable title="Detected Dataset Defects & Recommended Remediations" rows={ia.defects} maxRows={100} />
             </div>
           ) : (
             <div className="alert alert-success">Zero structural, format, missingness, duplicate, or statistical defects detected at intake!</div>
@@ -510,7 +541,7 @@ export const Studio01Data: React.FC<StudioProps> = ({ ws, onSync, gridVersion, b
               {busy ? <span className="spinner" /> : null} Apply &amp; Commit Cleaning ({cleanMode.toUpperCase()})
             </button>
             <button className="btn" disabled={busy} onClick={runProfile}>Run Deep 6D Quality Profile</button>
-            <button className="btn" onClick={() => apiGet('/api/workbench/s01/deleted-log').then(setDeletedLog)}>
+            <button className="btn" onClick={() => apiGet<DeletedLogResponse>('/api/workbench/s01/deleted-log').then(setDeletedLog).catch(() => {})}>
               Deleted Records Audit ({ws.total_deleted_rows})
             </button>
           </div>
@@ -533,7 +564,7 @@ export const Studio01Data: React.FC<StudioProps> = ({ ws, onSync, gridVersion, b
             <span className="badge badge-green">Overall Score: {Number(quality.quality?.overall_score ?? 0).toFixed(1)} / 100</span>
           </div>
           <div className="kpi-grid">
-            {Object.entries(quality.quality?.dimensions || {}).map(([k, v]: any) => (
+            {Object.entries(quality.quality?.dimensions || {}).map(([k, v]) => (
               <div key={k} className="kpi-card">
                 <div className="kpi-label">{k}</div>
                 <div className="kpi-value">{Number(v).toFixed(1)}%</div>
@@ -605,7 +636,7 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
   const runClustering = async () => {
     setBusy(true); setErr(null); setMsg(null);
     try {
-      const res = await apiPost('/api/workbench/s02/clustering', {
+      const res = await apiPost<ClusteringResponse>('/api/workbench/s02/clustering', {
         mode: clMode,
         algorithm: algo,
         n_clusters: k,
@@ -616,7 +647,7 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
       setStudioResult('s02_clustering', res);
       setSelectedDropClusters([]);
       setMsg(`Clustering (${clMode.toUpperCase()}) preview ready: winner=${res.algorithm}, found ${res.n_clusters} clusters.`);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const toggleDropCluster = (cid: number) => {
@@ -628,7 +659,7 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
   const commitClustering = async (mode: 'attach' | 'remove_clusters') => {
     setBusy(true); setErr(null); setMsg(null);
     try {
-      const res = await apiPost('/api/workbench/s02/clustering/commit', {
+      const res = await apiPost<ClusteringCommitResponse>('/api/workbench/s02/clustering/commit', {
         mode,
         remove_cluster_ids: mode === 'remove_clusters' ? selectedDropClusters : [],
         attach_cluster_id: attachAfterDrop,
@@ -643,14 +674,14 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
       }
       bumpGrid();
       setSelectedDropClusters([]);
-      setMsg(`Committed: ${res.action}. Active dataset now has ${res.rows_after.toLocaleString()} rows (Studio 02 green status locked ON).`);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+      setMsg(`Committed: ${res.action}. Active dataset now has ${Number(res.rows_after ?? 0).toLocaleString()} rows (Studio 02 green status locked ON).`);
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const runAnomaly = async () => {
     setBusy(true); setErr(null); setMsg(null);
     try {
-      const res = await apiPost('/api/workbench/s02/anomaly', {
+      const res = await apiPost<AnomalyResponse>('/api/workbench/s02/anomaly', {
         mode: anMode,
         method: anomMethod,
         contamination: contam,
@@ -658,13 +689,13 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
       onSync(res.state);
       setStudioResult('s02_anomaly', res);
       setMsg(`Anomaly Screening (${anMode.toUpperCase()}) flagged ${res.n_anomalies} rows (${res.anomaly_rate_pct}%).`);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const commitAnomaly = async (mode: 'attach' | 'remove_anomalies') => {
     setBusy(true); setErr(null); setMsg(null);
     try {
-      const res = await apiPost('/api/workbench/s02/anomaly/commit', { mode });
+      const res = await apiPost<AnomalyCommitResponse>('/api/workbench/s02/anomaly/commit', { mode });
       onSync(res.state);
       if (anRes) {
         setStudioResult('s02_anomaly', {
@@ -674,8 +705,8 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
         });
       }
       bumpGrid();
-      setMsg(`Committed: ${res.action}. Active dataset now has ${res.rows_after.toLocaleString()} rows.`);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+      setMsg(`Committed: ${res.action}. Active dataset now has ${Number(res.rows_after ?? 0).toLocaleString()} rows.`);
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const toggleMineTask = (t: string) => {
@@ -685,7 +716,7 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
   const runMining = async () => {
     setBusy(true); setErr(null); setMsg(null);
     try {
-      const res = await apiPost('/api/workbench/s02/mining', {
+      const res = await apiPost<MiningResponse>('/api/workbench/s02/mining', {
         mode: mineMode,
         tasks: mineTasks,
         manifold_method: manifoldMethod,
@@ -696,12 +727,12 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
       onSync(res.state);
       setStudioResult('s02_mining', res);
       setMsg(`Data Mining completed (${(res.tasks_executed || []).join(', ')}).`);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const selectedDropRows = (clRes?.cluster_choices || [])
-    .filter((c: any) => selectedDropClusters.includes(c.cluster_id))
-    .reduce((acc: number, c: any) => acc + Number(c.count || 0), 0);
+    .filter((c) => selectedDropClusters.includes(c.cluster_id))
+    .reduce((acc, c) => acc + Number(c.count || 0), 0);
 
   return (
     <div>
@@ -716,7 +747,7 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
         <div className="row">
           <ProvenancePill ws={ws} />
           {ws.s02_cluster_committed && ws.s02_cluster_summary && (
-            <span className="badge badge-green">✓ Studio 02 Committed ({ws.s02_cluster_summary.action})</span>
+            <span className="badge badge-green">✓ Studio 02 Committed ({String(ws.s02_cluster_summary.action ?? '')})</span>
           )}
         </div>
       </div>
@@ -773,13 +804,13 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
                 <span className="badge badge-accent">Silhouette = {Number(clRes.metrics?.silhouette ?? 0).toFixed(4)}</span>
               </div>
 
-              {clRes.algorithm_benchmark?.length > 1 && (
+              {(clRes.algorithm_benchmark?.length ?? 0) > 1 && (
                 <div style={{ marginBottom: 14 }}>
-                  <SimpleTable title="Multi-Algorithm Clustering Benchmark (Ranked by Silhouette)" rows={clRes.algorithm_benchmark} />
+                  <SimpleTable title="Multi-Algorithm Clustering Benchmark (Ranked by Silhouette)" rows={clRes.algorithm_benchmark || []} />
                 </div>
               )}
 
-              <CanvasScatter title={`Cluster Map (${clRes.algorithm})`} data={clRes.scatter} xLabel="PCA 1" yLabel="PCA 2" />
+              <CanvasScatter title={`Cluster Map (${clRes.algorithm})`} data={clRes.scatter ?? EMPTY_SCATTER} xLabel="PCA 1" yLabel="PCA 2" />
 
               {/* FIXED INTERACTIVE CLUSTER SELECTION & REMOVAL PANEL */}
               <div style={{ marginTop: 14, padding: 14, background: 'var(--bg)', borderRadius: 10, border: '1px solid var(--border)' }}>
@@ -788,7 +819,7 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
                   Click one or more cluster tiles below to mark their rows for deletion. All deleted rows are logged into the Forensic Audit Trail and can be undone anytime.
                 </div>
                 <div className="cluster-choice-grid">
-                  {(clRes.cluster_choices || []).map((c: any) => {
+                  {(clRes.cluster_choices || []).map((c) => {
                     const checked = selectedDropClusters.includes(c.cluster_id);
                     return (
                       <button
@@ -825,9 +856,9 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
                 </div>
               </div>
 
-              {clRes.cluster_profiles?.length > 0 && (
+              {(clRes.cluster_profiles?.length ?? 0) > 0 && (
                 <div style={{ marginTop: 14 }}>
-                  <SimpleTable title="Cluster Statistical Profiles" rows={clRes.cluster_profiles} />
+                  <SimpleTable title="Cluster Statistical Profiles" rows={clRes.cluster_profiles || []} />
                 </div>
               )}
             </div>
@@ -873,12 +904,12 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
                   <button className="btn btn-danger btn-sm" onClick={() => commitAnomaly('remove_anomalies')}>Remove {anRes.n_anomalies} Anomalies</button>
                 </div>
               </div>
-              {anRes.detector_comparison?.length > 1 && (
+              {(anRes.detector_comparison?.length ?? 0) > 1 && (
                 <div style={{ marginBottom: 12 }}>
-                  <SimpleTable title="Multi-Detector Anomaly Comparison" rows={anRes.detector_comparison} />
+                  <SimpleTable title="Multi-Detector Anomaly Comparison" rows={anRes.detector_comparison || []} />
                 </div>
               )}
-              <CanvasScatter title="Anomaly Screening Scatter" data={anRes.scatter} xLabel={anRes.x_axis} yLabel={anRes.y_axis} />
+              <CanvasScatter title="Anomaly Screening Scatter" data={anRes.scatter ?? EMPTY_SCATTER} xLabel={anRes.x_axis} yLabel={anRes.y_axis} />
               <div style={{ marginTop: 12 }}>
                 <SimpleTable title="Highest-Scoring Anomalous Records" rows={anRes.top_anomalies || []} maxRows={30} />
               </div>
@@ -939,7 +970,7 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
                       </span>
                     )}
                   </div>
-                  <CanvasScatter title={`2D ${manifoldMethod.toUpperCase()} Manifold Projection`} data={mineRes.manifold.scatter} xLabel="Dim 1" yLabel="Dim 2" />
+                  <CanvasScatter title={`2D ${manifoldMethod.toUpperCase()} Manifold Projection`} data={mineRes.manifold.scatter ?? EMPTY_SCATTER} xLabel="Dim 1" yLabel="Dim 2" />
                 </div>
               )}
               {mineRes.association_rules && (
@@ -998,7 +1029,7 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
     setBusy(true); setErr(null);
     try {
       const apiMode = mode === 'complete' ? 'all' : mode;
-      const res = await apiPost('/api/workbench/s03/run', {
+      const res = await apiPost<DiagnosticsResponse>('/api/workbench/s03/run', {
         mode: apiMode,
         alpha,
         confidence_level: confLevel,
@@ -1012,7 +1043,7 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
       });
       onSync(res.state);
       setStudioResult('s03_diagnostics', res);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   return (
@@ -1114,14 +1145,16 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
                 <span>Ranked Baseline Mathematical Equations &amp; Acceptance Criteria</span>
                 <span className="badge badge-green">Sorted Best → Worst · Ready for Studio 14 Live Monitor</span>
               </div>
-              {Object.entries(report.baseline_equations).map(([tgt, eqList]: any) => {
-                const items = Array.isArray(eqList) ? eqList : Object.values(eqList || {});
+              {Object.entries(report.baseline_equations).map(([tgt, eqList]) => {
+                const items: EquationEntry[] = Array.isArray(eqList)
+                  ? (eqList as EquationEntry[])
+                  : Object.values(eqList || {}) as EquationEntry[];
                 return (
                   <div key={tgt} style={{ marginBottom: 16 }}>
                     <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--accent)', marginBottom: 8 }}>
                       Target Variable: {tgt} ({items.length} ranked baselines evaluated)
                     </div>
-                    {items.map((eq: any, idx: number) => (
+                    {items.map((eq, idx) => (
                       <MathEquationCard key={`${tgt}-${eq.model_name || idx}`} eq={{ ...eq, target_name: eq.target_name || tgt }} />
                     ))}
                   </div>
@@ -1135,10 +1168,10 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
             <SimpleTable title="Universal Statistical Diagnostics Ledger" rows={report.hypothesis_ledger || []} maxRows={80} />
           </div>
 
-          {report.risk_assessment?.column_risks?.length > 0 && (
+          {(report.risk_assessment?.column_risks?.length ?? 0) > 0 && (
             <div className="card">
               <div className="card-title">Distribution &amp; Tail-Risk Profile (VaR / CVaR)</div>
-              <SimpleTable title="Column Risk Metrics" rows={report.risk_assessment.column_risks} />
+              <SimpleTable title="Column Risk Metrics" rows={report.risk_assessment?.column_risks || []} />
             </div>
           )}
         </>
@@ -1169,17 +1202,17 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
   const runEDA = async () => {
     setBusy(true); setErr(null);
     try {
-      const res = await apiPost('/api/workbench/s04/eda');
+      const res = await apiPost<EDAResponse>('/api/workbench/s04/eda');
       onSync(res.state);
       setStudioResult('s04_eda', res);
     }
-    catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const runHyp = async () => {
     setBusy(true); setErr(null);
     try {
-      const res = await apiPost('/api/workbench/s04/hypothesis', {
+      const res = await apiPost<HypothesisResponse>('/api/workbench/s04/hypothesis', {
         mode: hypMode,
         test_type: testType,
         col_a: colA || null,
@@ -1188,7 +1221,7 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
       });
       if (res.state) onSync(res.state);
       setStudioResult('s04_hypothesis', res);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   return (
@@ -1213,22 +1246,22 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
       {eda && (
         <>
           <div className="grid-2">
-            {(eda.distributions || []).map((d: any) => (
-              <div key={d.column} className="card">
-                <div className="card-title"><span>{d.column}</span><span className="badge">μ={d.mean} · σ={d.std}</span></div>
-                <BarChartSVG title={`Distribution: ${d.column}`} items={(d.bins || []).map((b: any) => ({ label: b.label, value: b.count }))} height={175} />
+            {(eda.distributions || []).map((d) => (
+              <div key={String(d.column)} className="card">
+                <div className="card-title"><span>{String(d.column)}</span><span className="badge">μ={String(d.mean)} · σ={String(d.std)}</span></div>
+                <BarChartSVG title={`Distribution: ${String(d.column)}`} items={(Array.isArray(d.bins) ? d.bins : []).map((b) => ({ label: String(b.label), value: Number(b.count) || 0 }))} height={175} />
               </div>
             ))}
           </div>
-          {eda.correlation_matrix?.columns?.length > 1 && (
+          {(eda.correlation_matrix?.columns?.length ?? 0) > 1 && (
             <div className="card">
               <div className="card-title">Correlation Matrix Heatmap</div>
-              <HeatmapGrid title="Numeric Feature Correlation Matrix" columns={eda.correlation_matrix.columns} values={eda.correlation_matrix.values} />
+              <HeatmapGrid title="Numeric Feature Correlation Matrix" columns={eda.correlation_matrix?.columns || []} values={eda.correlation_matrix?.values || []} />
             </div>
           )}
           <div className="card">
             <div className="card-title">Automated Statistical Insights ({eda.insights?.length || 0})</div>
-            <SimpleTable title="Automated EDA Insights" rows={eda.insights || []} />
+            <SimpleTable title="Automated EDA Insights" rows={(eda.insights || []).map((text) => ({ insight: text }))} />
           </div>
         </>
       )}
@@ -1302,7 +1335,7 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
               <div className="kpi-card"><div className="kpi-label">Tests Executed</div><div className="kpi-value">{hypRes.total_tests}</div></div>
               <div className="kpi-card"><div className="kpi-label">Statistically Significant</div><div className="kpi-value">{hypRes.significant_tests}</div></div>
             </div>
-            <SimpleTable title={`Hypothesis Test Battery (${hypRes.mode.toUpperCase()})`} rows={hypRes.battery} maxRows={100} />
+            <SimpleTable title={`Hypothesis Test Battery (${(hypRes.mode || '').toUpperCase()})`} rows={hypRes.battery} maxRows={100} />
           </div>
         )}
 
@@ -1368,13 +1401,13 @@ export const Studio05Features: React.FC<StudioProps> = ({ ws, onSync, bumpGrid, 
           <button className="btn btn-primary" disabled={busy || !ws.has_dataset} onClick={async () => {
             setBusy(true); setErr(null);
             try {
-              const r = await apiPost('/api/workbench/s05/engineer', {
+              const r = await apiPost<EngineerResponse>('/api/workbench/s05/engineer', {
                 mode: engMode, add_interactions: interactions, add_polynomials: poly, correct_skew: skew, add_datetime_features: dtFeat, commit: true,
               });
               onSync(r.state);
               setStudioResult('s05_engineer', r);
               bumpGrid();
-            } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+            } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
           }}>Generate &amp; Commit Features ({engMode.toUpperCase()})</button>
           {engRes && <div className="alert alert-success" style={{ marginTop: 12 }}>Created {engRes.n_created} engineered features.</div>}
         </div>
@@ -1404,19 +1437,19 @@ export const Studio05Features: React.FC<StudioProps> = ({ ws, onSync, bumpGrid, 
             <button className="btn btn-primary" disabled={busy || !ws.has_dataset} onClick={async () => {
               setBusy(true); setErr(null);
               try {
-                const r = await apiPost('/api/workbench/s05/select', { mode: selMode, method, top_k: topK, commit: false });
+                const r = await apiPost<SelectionResponse>('/api/workbench/s05/select', { mode: selMode, method, top_k: topK, commit: false });
                 onSync(r.state);
                 setStudioResult('s05_select', r);
-              } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+              } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
             }}>Rank Features ({selMode.toUpperCase()})</button>
             <button className="btn btn-success" disabled={busy || !ws.has_dataset} onClick={async () => {
               setBusy(true); setErr(null);
               try {
-                const r = await apiPost('/api/workbench/s05/select', { mode: selMode, method, top_k: topK, commit: true });
+                const r = await apiPost<SelectionResponse>('/api/workbench/s05/select', { mode: selMode, method, top_k: topK, commit: true });
                 onSync(r.state);
                 setStudioResult('s05_select', r);
                 bumpGrid();
-              } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+              } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
             }}>Rank &amp; Apply Exclusions</button>
           </div>
         </div>
@@ -1428,7 +1461,7 @@ export const Studio05Features: React.FC<StudioProps> = ({ ws, onSync, bumpGrid, 
           <BarChartSVG
             title="Feature Importance / Consensus Ranking"
             horizontal
-            items={(selRes.rankings || []).map((r: any) => ({ label: r.feature, value: r.score, color: r.selected ? '#34d399' : '#64748b' }))}
+            items={(selRes.rankings || []).map((r) => ({ label: r.feature, value: r.score, color: r.selected ? '#34d399' : '#64748b' }))}
           />
         </div>
       )}

@@ -75,7 +75,7 @@ class CNN1DModel(BaseOmniForgeModel):
             self._fit_torch(X_scaled, y, is_clf)
             return
 
-        self.framework = "uap_numpy_conv1d"
+        self.framework = "omniforge_numpy_conv1d"
         self.metadata_.framework = self.framework
         rng = np.random.default_rng(self.random_seed)
         self._kernels = [
@@ -95,8 +95,8 @@ class CNN1DModel(BaseOmniForgeModel):
         self.loss_history_: list[float] = list(self._head.loss_history_)
 
     def _fit_torch(self, X: np.ndarray, y: np.ndarray, is_clf: bool) -> None:
-        import torch  # type: ignore[import-not-found]
-        import torch.nn as nn  # type: ignore[import-not-found]
+        import torch
+        import torch.nn as nn
 
         self.framework = "pytorch"
         self.metadata_.framework = self.framework
@@ -145,23 +145,23 @@ class CNN1DModel(BaseOmniForgeModel):
     def _predict(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
         X_scaled = self._scaler.transform(X)
         if self._torch_model is not None:
-            import torch  # type: ignore[import-not-found]
+            import torch
 
             with torch.no_grad():
                 out = self._torch_model(torch.tensor(X_scaled.astype(np.float32)).unsqueeze(1)).numpy()
             if self.task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
                 return np.array([self._idx_to_label[int(i)] for i in np.argmax(out, axis=1)])
-            return out.ravel()
+            return np.asarray(out.ravel(), dtype=float)
         assert self._head is not None
         return self._head.predict(self._conv1d_pool_features(X_scaled))
 
     def _predict_proba(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
         X_scaled = self._scaler.transform(X)
         if self._torch_model is not None:
-            import torch  # type: ignore[import-not-found]
+            import torch
 
             with torch.no_grad():
                 logits = self._torch_model(torch.tensor(X_scaled.astype(np.float32)).unsqueeze(1))
-                return torch.softmax(logits, dim=-1).numpy().astype(float)
+                return np.asarray(torch.softmax(logits, dim=-1).numpy(), dtype=float)
         assert self._head is not None
         return self._head.predict_proba(self._conv1d_pool_features(X_scaled))

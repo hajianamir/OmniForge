@@ -132,7 +132,8 @@ echo.
 echo [1/2] Ensuring PyInstaller and icon generator dependencies are installed...
 "%VENV_PY%" -c "import PyInstaller, PIL" >nul 2>&1
 if !errorlevel! neq 0 (
-    "%VENV_PY%" -m pip install -r "%ROOT_DIR%\requirements-build.txt"
+    set "PIP_NO_CACHE_DIR=1"
+    "%VENV_PY%" -m pip install --no-cache-dir --retries 5 --timeout 120 -r "%ROOT_DIR%\requirements-build.txt"
     if !errorlevel! neq 0 (
         echo [ERROR] Failed to install build prerequisites from requirements-build.txt.
         popd

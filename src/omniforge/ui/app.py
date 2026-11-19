@@ -24,6 +24,7 @@ STUDIOS: list[tuple[str, str, str]] = [
     ("11", "MLOps", "server"),
     ("12", "Executive Reporting & Export Center", "file-text"),
     ("13", "AI Analytics Copilot", "message-square"),
+    ("14", "Live Prediction & Supervisory Control-Room Monitor", "gauge"),
 ]
 
 

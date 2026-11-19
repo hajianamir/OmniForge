@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -99,18 +99,27 @@ class DriftDetector:
                     )
                 )
             else:
-                r_counts = ref_s.astype(str).value_counts(normalize=True)
-                c_counts = cur_s.astype(str).value_counts(normalize=True)
-                cats = sorted(set(r_counts.index) | set(c_counts.index))
-                p_ref = np.array([max(float(r_counts.get(k, 0.0)), 1e-6) for k in cats])
-                p_cur = np.array([max(float(c_counts.get(k, 0.0)), 1e-6) for k in cats])
+                r_raw = ref_s.astype(str).value_counts()
+                c_raw = cur_s.astype(str).value_counts()
+                cats = sorted(set(r_raw.index) | set(c_raw.index))
+                r_freq = np.array([float(r_raw.get(k, 0)) / max(len(ref_s), 1) for k in cats], dtype=float)
+                c_freq = np.array([float(c_raw.get(k, 0)) / max(len(cur_s), 1) for k in cats], dtype=float)
+                p_ref = np.clip(r_freq, 1e-6, 1.0)
+                p_cur = np.clip(c_freq, 1e-6, 1.0)
                 p_ref /= p_ref.sum()
                 p_cur /= p_cur.sum()
-                psi = float(np.sum((p_cur - p_ref) * np.log(p_cur / p_ref)))
-                # Chi-square on scaled expected counts
-                obs = p_cur * len(cur_s)
-                exp = p_ref * len(cur_s)
-                _, p_val = stats.chisquare(obs, f_exp=exp)
+                psi = float(max(0.0, np.sum((p_cur - p_ref) * np.log(p_cur / p_ref))))
+                # Two-sample Chi-square test of homogeneity on observed raw counts
+                cont = np.vstack(
+                    [
+                        [float(r_raw.get(k, 0)) for k in cats],
+                        [float(c_raw.get(k, 0)) for k in cats],
+                    ]
+                )
+                if cont.shape[1] >= 2 and np.all(cont.sum(axis=1) > 0):
+                    _, p_val, _, _ = stats.chi2_contingency(cont)
+                else:
+                    p_val = 1.0
                 status = (
                     DriftStatus.CRITICAL
                     if psi >= self.psi_critical
@@ -159,56 +168,209 @@ class DriftDetector:
         )
 
     @staticmethod
-    def compute_psi(reference: np.ndarray, current: np.ndarray, n_bins: int = 10) -> float:
-        """Compute Population Stability Index (PSI) using reference quantile bin edges."""
-        quantiles = np.linspace(0.0, 1.0, n_bins + 1)
-        edges = np.unique(np.quantile(reference, quantiles))
-        if len(edges) < 3:
+    def compute_jensen_shannon_divergence(
+        reference: np.ndarray,
+        current: np.ndarray,
+        n_bins: int = 10,
+    ) -> float:
+        """Compute Jensen-Shannon Divergence (base-2, bounded in [0, 1]) between two 1-D arrays."""
+        ref = np.asarray(reference, dtype=float).ravel()
+        cur = np.asarray(current, dtype=float).ravel()
+        ref = ref[np.isfinite(ref)]
+        cur = cur[np.isfinite(cur)]
+        if len(ref) == 0 or len(cur) == 0:
             return 0.0
-        edges[0] = -np.inf
-        edges[-1] = np.inf
-        ref_hist, _ = np.histogram(reference, bins=edges)
-        cur_hist, _ = np.histogram(current, bins=edges)
-        ref_p = np.clip(ref_hist / max(len(reference), 1), 1e-6, 1.0)
-        cur_p = np.clip(cur_hist / max(len(current), 1), 1e-6, 1.0)
-        return float(np.sum((cur_p - ref_p) * np.log(cur_p / ref_p)))
+        combined = np.concatenate([ref, cur])
+        quantiles = np.linspace(0.0, 1.0, max(2, int(n_bins)) + 1)
+        edges = np.unique(np.quantile(combined, quantiles))
+        if len(edges) < 2:
+            return 0.0
+        ref_counts, _ = np.histogram(ref, bins=edges)
+        cur_counts, _ = np.histogram(cur, bins=edges)
+        p = ref_counts.astype(float) + 1e-9
+        q = cur_counts.astype(float) + 1e-9
+        p /= p.sum()
+        q /= q.sum()
+        m = 0.5 * (p + q)
+        jsd = 0.5 * float(np.sum(p * np.log2(p / m))) + 0.5 * float(np.sum(q * np.log2(q / m)))
+        return float(np.clip(jsd, 0.0, 1.0))
+
+    @staticmethod
+    def compute_psi(reference: np.ndarray, current: np.ndarray, n_bins: int = 10) -> float:
+        """Compute Population Stability Index (PSI) with open outer bins, binary/constant support, and renormalized probabilities."""
+        ref = np.asarray(reference, dtype=float).ravel()
+        cur = np.asarray(current, dtype=float).ravel()
+        ref = ref[np.isfinite(ref)]
+        cur = cur[np.isfinite(cur)]
+        if len(ref) == 0 or len(cur) == 0:
+            return 0.0
+
+        uniq_ref = np.unique(ref)
+        if len(uniq_ref) == 1:
+            # Constant reference distribution: compare mass at constant value vs shifted values
+            c0 = float(uniq_ref[0])
+            cur_match = float(np.mean(np.isclose(cur, c0, rtol=1e-9, atol=1e-12)))
+            ref_p = np.array([1.0, 1e-6], dtype=float)
+            cur_p = np.array([max(cur_match, 1e-6), max(1.0 - cur_match, 1e-6)], dtype=float)
+            ref_p /= ref_p.sum()
+            cur_p /= cur_p.sum()
+            return float(max(0.0, np.sum((cur_p - ref_p) * np.log(cur_p / ref_p))))
+
+        quantiles = np.linspace(0.0, 1.0, max(2, int(n_bins)) + 1)
+        edges = np.unique(np.quantile(ref, quantiles))
+        if len(edges) == 2:
+            # Binary / two-value numeric feature: split cleanly at midpoint so shifts are detected
+            mid = 0.5 * (float(edges[0]) + float(edges[1]))
+            edges = np.array([-np.inf, mid, np.inf], dtype=float)
+        else:
+            edges[0] = -np.inf
+            edges[-1] = np.inf
+
+        ref_hist, _ = np.histogram(ref, bins=edges)
+        cur_hist, _ = np.histogram(cur, bins=edges)
+        ref_p = np.clip(ref_hist / float(len(ref)), 1e-6, 1.0)
+        cur_p = np.clip(cur_hist / float(len(cur)), 1e-6, 1.0)
+        # Renormalize after epsilon floor so both distributions strictly sum to 1 (non-negative divergence)
+        ref_p /= ref_p.sum()
+        cur_p /= cur_p.sum()
+        return float(max(0.0, np.sum((cur_p - ref_p) * np.log(cur_p / ref_p))))
 
     @staticmethod
     def _compute_js_numeric(reference: np.ndarray, current: np.ndarray, n_bins: int = 10) -> float:
-        lo = min(float(np.min(reference)), float(np.min(current)))
-        hi = max(float(np.max(reference)), float(np.max(current)))
+        ref = np.asarray(reference, dtype=float).ravel()
+        cur = np.asarray(current, dtype=float).ravel()
+        ref = ref[np.isfinite(ref)]
+        cur = cur[np.isfinite(cur)]
+        if len(ref) == 0 or len(cur) == 0:
+            return 0.0
+        lo = min(float(np.min(ref)), float(np.min(cur)))
+        hi = max(float(np.max(ref)), float(np.max(cur)))
         if hi <= lo:
             return 0.0
-        bins = np.linspace(lo, hi, n_bins + 1)
-        p, _ = np.histogram(reference, bins=bins)
-        q, _ = np.histogram(current, bins=bins)
-        p_n = np.clip(p / max(p.sum(), 1), 1e-9, 1.0)
-        q_n = np.clip(q / max(q.sum(), 1), 1e-9, 1.0)
+        bins = np.linspace(lo, hi, max(2, int(n_bins)) + 1)
+        p, _ = np.histogram(ref, bins=bins)
+        q, _ = np.histogram(cur, bins=bins)
+        p_n = np.clip(p / max(float(p.sum()), 1.0), 1e-9, 1.0)
+        q_n = np.clip(q / max(float(q.sum()), 1.0), 1e-9, 1.0)
+        p_n /= p_n.sum()
+        q_n /= q_n.sum()
         m = 0.5 * (p_n + q_n)
-        return float(0.5 * np.sum(p_n * np.log(p_n / m)) + 0.5 * np.sum(q_n * np.log(q_n / m)))
+        js = float(0.5 * np.sum(p_n * np.log(p_n / m)) + 0.5 * np.sum(q_n * np.log(q_n / m)))
+        return float(np.clip(js, 0.0, np.log(2.0)))
 
     @staticmethod
     def detect_concept_drift_page_hinkley(
-        error_stream: list[float] | np.ndarray, *, delta: float = 0.005, threshold: float = 5.0
+        error_stream: list[float] | np.ndarray,
+        *,
+        delta: float = 0.005,
+        threshold: float = 5.0,
+        alpha: float = 1.0,
+        min_instances: int = 10,
+        mode: Literal["up", "down", "both"] = "up",
     ) -> dict[str, Any]:
-        """Run sequential Page-Hinkley change-point test over streaming model error values."""
-        errors = np.asarray(error_stream, dtype=float).ravel()
-        mean_err = 0.0
-        cum_sum = 0.0
-        min_cum = 0.0
-        drift_points: list[int] = []
+        """Run sequential Page-Hinkley change-point test (Page 1954; Gama et al. 2014; River).
 
-        for t, val in enumerate(errors, start=1):
-            mean_err += (val - mean_err) / t
-            cum_sum += val - mean_err - delta
-            min_cum = min(min_cum, cum_sum)
-            if (cum_sum - min_cum) > threshold:
-                drift_points.append(t - 1)
-                cum_sum = 0.0
-                min_cum = 0.0
+        Resets the running mean, sample counter, and cumulative extrema upon each detected
+        change-point so a single regime shift does not cause cascading false alarms.
+        """
+        errors = np.asarray(error_stream, dtype=float).ravel()
+        alpha_f = float(np.clip(alpha, 0.9, 1.0))
+        min_n = max(1, int(min_instances))
+
+        sample_count = 0
+        mean_err = 0.0
+        cum_up = 0.0
+        min_cum_up = 0.0
+        cum_down = 0.0
+        max_cum_down = 0.0
+        drift_points: list[int] = []
+        drift_directions: list[str] = []
+
+        for idx, val in enumerate(errors):
+            if not np.isfinite(val):
+                continue
+            sample_count += 1
+            mean_err += (float(val) - mean_err) / float(sample_count)
+
+            # Upward mean shift monitor: m_t = alpha * m_{t-1} + (x_t - x_bar_t - delta), PH_t = m_t - min(m)
+            cum_up = alpha_f * cum_up + (float(val) - mean_err - delta)
+            min_cum_up = min(min_cum_up, cum_up)
+            ph_up = cum_up - min_cum_up
+
+            # Downward mean shift monitor: d_t = alpha * d_{t-1} + (x_t - x_bar_t + delta), PH_down = max(d) - d_t
+            cum_down = alpha_f * cum_down + (float(val) - mean_err + delta)
+            max_cum_down = max(max_cum_down, cum_down)
+            ph_down = max_cum_down - cum_down
+
+            if sample_count < min_n:
+                continue
+
+            triggered_up = mode in ("up", "both") and ph_up > threshold
+            triggered_down = mode in ("down", "both") and ph_down > threshold
+            if triggered_up or triggered_down:
+                drift_points.append(idx)
+                drift_directions.append("up" if triggered_up else "down")
+                # Full state reset (mean, counter, extrema) after confirmed regime change
+                sample_count = 0
+                mean_err = 0.0
+                cum_up = 0.0
+                min_cum_up = 0.0
+                cum_down = 0.0
+                max_cum_down = 0.0
 
         return {
             "drift_detected": len(drift_points) > 0,
             "drift_indices": drift_points,
+            "drift_directions": drift_directions,
             "n_observations": len(errors),
         }
+
+    @staticmethod
+    def detect_concept_drift_adwin(
+        stream: np.ndarray | list[float],
+        delta: float = 0.002,
+        min_window_length: int = 10,
+    ) -> dict[str, Any]:
+        """ADWIN (Bifet & Gavalda, 2007) adaptive windowing concept drift detector."""
+        arr = np.asarray(stream, dtype=float).ravel()
+        arr = arr[np.isfinite(arr)]
+        if len(arr) < max(4, min_window_length):
+            return {
+                "drift_detected": False,
+                "drift_indices": [],
+                "n_observations": int(len(arr)),
+                "final_window_size": int(len(arr)),
+            }
+
+        window: list[float] = []
+        drift_indices: list[int] = []
+        for idx, val in enumerate(arr):
+            window.append(float(val))
+            n = len(window)
+            if n < min_window_length:
+                continue
+            w_arr = np.asarray(window, dtype=float)
+            prefix_sum = np.cumsum(w_arr)
+            total_sum = float(prefix_sum[-1])
+            for cut in range(1, n):
+                n0 = cut
+                n1 = n - cut
+                if n0 < 2 or n1 < 2:
+                    continue
+                mu0 = float(prefix_sum[cut - 1]) / n0
+                mu1 = (total_sum - float(prefix_sum[cut - 1])) / n1
+                m = 1.0 / (1.0 / n0 + 1.0 / n1)
+                ddof = np.log(4.0 * n / max(delta, 1e-12))
+                eps_cut = float(np.sqrt((1.0 / (2.0 * m)) * ddof))
+                if abs(mu0 - mu1) >= eps_cut:
+                    drift_indices.append(idx)
+                    window = window[cut:]
+                    break
+
+        return {
+            "drift_detected": len(drift_indices) > 0,
+            "drift_indices": drift_indices,
+            "n_observations": int(len(arr)),
+            "final_window_size": int(len(window)),
+        }
+

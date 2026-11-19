@@ -15,7 +15,7 @@ class AutoencoderModel(BaseOmniForgeModel):
     """Symmetric Deep Autoencoder trained with Adam MSE reconstruction loss."""
 
     model_family = "deep_autoencoder"
-    framework = "uap_numpy_autograd"
+    framework = "omniforge_numpy_autograd"
 
     def __init__(
         self,
@@ -123,7 +123,7 @@ class AutoencoderModel(BaseOmniForgeModel):
         h = self._scaler.transform(X_arr)
         for li in range(2):
             h = np.tanh(h @ self._weights[li] + self._biases[li])
-        return h
+        return np.asarray(h, dtype=float)
 
     def reconstruct(self, X: Any) -> np.ndarray:
         """Encode and decode ``X`` back into original feature space."""
@@ -134,7 +134,7 @@ class AutoencoderModel(BaseOmniForgeModel):
         for li in range(len(self._weights) - 1):
             h = np.tanh(h @ self._weights[li] + self._biases[li])
         recon_scaled = h @ self._weights[-1] + self._biases[-1]
-        return self._scaler.inverse_transform(recon_scaled)
+        return np.asarray(self._scaler.inverse_transform(recon_scaled), dtype=float)
 
     def reconstruction_error(self, X: Any) -> np.ndarray:
         """Return per-sample MSE reconstruction error (higher indicates stronger anomaly)."""
@@ -147,7 +147,7 @@ class AutoencoderModel(BaseOmniForgeModel):
         for li in range(len(self._weights) - 1):
             h = np.tanh(h @ self._weights[li] + self._biases[li])
         recon = h @ self._weights[-1] + self._biases[-1]
-        return np.mean((recon - X_scaled) ** 2, axis=1)
+        return np.asarray(np.mean((recon - X_scaled) ** 2, axis=1), dtype=float)
 
     def _predict(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
         """Predict anomaly labels (1 = anomaly, 0 = normal) based on calibrated threshold."""

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from html import escape as html_escape
 from pathlib import Path
 
 import pandas as pd
@@ -29,24 +30,30 @@ class EDAReport:
     figures: dict[str, go.Figure] = field(default_factory=dict)
 
     def to_html(self, output_path: str | Path | None = None) -> str:
-        """Render the complete EDA report into a standalone HTML document."""
+        """Render the complete EDA report into a standalone HTML document with escaped data fields."""
         insight_items = "".join(
-            f"<li><strong>[{ins.severity.upper()}] {ins.title}</strong>: {ins.description} "
-            f"<em>({ins.recommendation})</em></li>"
+            f"<li><strong>[{html_escape(str(ins.severity).upper(), quote=True)}] "
+            f"{html_escape(str(ins.title), quote=True)}</strong>: "
+            f"{html_escape(str(ins.description), quote=True)} "
+            f"<em>({html_escape(str(ins.recommendation), quote=True)})</em></li>"
             for ins in self.insights
         )
         col_rows = "".join(
-            f"<tr><td>{c.name}</td><td>{c.dtype}</td><td>{c.semantic_type}</td>"
-            f"<td>{c.missing_pct}%</td><td>{c.unique_count}</td>"
-            f"<td>{c.mean if c.mean is not None else '-'}</td>"
-            f"<td>{c.std if c.std is not None else '-'}</td></tr>"
+            f"<tr><td>{html_escape(str(c.name), quote=True)}</td>"
+            f"<td>{html_escape(str(c.dtype), quote=True)}</td>"
+            f"<td>{html_escape(str(c.semantic_type), quote=True)}</td>"
+            f"<td>{html_escape(str(c.missing_pct), quote=True)}%</td>"
+            f"<td>{html_escape(str(c.unique_count), quote=True)}</td>"
+            f"<td>{html_escape(str(c.mean), quote=True) if c.mean is not None else '-'}</td>"
+            f"<td>{html_escape(str(c.std), quote=True) if c.std is not None else '-'}</td></tr>"
             for c in self.profile.columns
         )
         chart_sections = ""
         for idx, (fig_name, fig) in enumerate(self.figures.items()):
             inc_js = "cdn" if idx == 0 else False
+            safe_fig_title = html_escape(str(fig_name).replace("_", " ").title(), quote=True)
             chart_sections += (
-                f"<section class='card'><h3>{fig_name.replace('_', ' ').title()}</h3>"
+                f"<section class='card'><h3>{safe_fig_title}</h3>"
                 f"{VisualizationEngine.figure_to_html(fig, include_plotlyjs=inc_js)}</section>"
             )
 

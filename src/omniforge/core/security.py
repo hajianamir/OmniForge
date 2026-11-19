@@ -8,6 +8,8 @@ import hmac
 import json
 import os
 import re
+import secrets
+import stat
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -19,24 +21,130 @@ from omniforge.core.exceptions import AuthorizationError, ComplianceError, Secur
 from omniforge.core.logging import get_logger, get_trace_id
 from omniforge.core.types import AuditEvent, Principal
 
-try:
-    import jwt
+# Optional dependencies are bound through explicit ``ModuleType``-free sentinels so the
+# module type-checks identically whether or not pyjwt/cryptography are installed (they are
+# absent in the "simple" install tier and present in "advanced").
+jwt: Any = None
+try:  # pragma: no cover - depends on the install tier
+    import jwt as _jwt_mod
 
+    jwt = _jwt_mod
     _HAS_PYJWT = True
-except ImportError:
-    jwt = None  # type: ignore[assignment]
+except ImportError:  # pragma: no cover
     _HAS_PYJWT = False
 
-try:
-    from cryptography.fernet import Fernet, InvalidToken
+Fernet: Any = None
+AESGCM: Any = None
+InvalidToken: Any = Exception
+try:  # pragma: no cover - depends on the install tier
+    from cryptography.fernet import Fernet as _Fernet
+    from cryptography.fernet import InvalidToken as _InvalidToken
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _AESGCM
 
+    Fernet, AESGCM, InvalidToken = _Fernet, _AESGCM, _InvalidToken
     _HAS_CRYPTOGRAPHY = True
-except ImportError:
-    Fernet = None  # type: ignore[assignment,misc]
-    InvalidToken = Exception  # type: ignore[assignment,misc]
+except ImportError:  # pragma: no cover
     _HAS_CRYPTOGRAPHY = False
 
 logger = get_logger(__name__)
+
+_AESGCM_HEADER = b"OF2GCM\x01"
+_INSECURE_PLACEHOLDER_MARKERS: tuple[str, ...] = (
+    "change-me",
+    "do-not-use-in-prod",
+    "uap-development",
+    "secret-key",
+    "changeme",
+)
+
+
+def _is_production_env() -> bool:
+    env = (os.getenv("OMNIFORGE_ENVIRONMENT") or os.getenv("ENVIRONMENT") or "development").strip().lower()
+    return env in {"prod", "production"}
+
+
+def _default_key_store_dir() -> Path:
+    custom = os.getenv("OMNIFORGE_KEY_DIR")
+    if custom:
+        return Path(custom).expanduser()
+    try:
+        return Path.home() / ".omniforge" / "keys"
+    except Exception:
+        return Path(".omniforge_workspace") / "keys"
+
+
+def _resolve_or_persist_secret(
+    *,
+    key_name: str,
+    explicit: str | bytes | None,
+    env_vars: tuple[str, ...],
+    min_length: int = 32,
+) -> bytes:
+    """Resolve cryptographic secret material from explicit input, env vars, or a 0600 local keyfile.
+
+    In production (``OMNIFORGE_ENVIRONMENT=production``), weak/placeholder or missing secrets raise
+    :class:`SecurityError` immediately instead of silently generating a fallback secret.
+    """
+    raw: str | bytes | None = explicit
+    if raw is None or (isinstance(raw, str) and not raw.strip()) or (isinstance(raw, bytes) and not raw):
+        for var in env_vars:
+            val = os.getenv(var)
+            if val and val.strip():
+                raw = val.strip()
+                break
+
+    if raw is not None and raw != "" and raw != b"":
+        raw_bytes = raw.encode("utf-8") if isinstance(raw, str) else bytes(raw)
+        if _is_production_env():
+            lowered = raw_bytes.decode("utf-8", errors="ignore").lower()
+            if len(raw_bytes) < min_length or any(m in lowered for m in _INSECURE_PLACEHOLDER_MARKERS):
+                raise SecurityError(
+                    f"Weak or placeholder cryptographic secret rejected for '{key_name}' in production.",
+                    suggestions=[
+                        f"Set {env_vars[0]} to a high-entropy random secret (>= {min_length} bytes).",
+                    ],
+                )
+        return raw_bytes
+
+    if _is_production_env():
+        raise SecurityError(
+            f"Required cryptographic secret '{key_name}' is not configured in production.",
+            suggestions=[
+                f"Provide a high-entropy secret via {env_vars[0]} before starting OmniForge in production.",
+            ],
+        )
+
+    # Local/development/test persistence: generate once with 0600 permissions so keys survive restarts
+    # and remain consistent across independent manager instances (fixes R12 & S4).
+    key_dir = _default_key_store_dir()
+    key_file = key_dir / f"{key_name}.key"
+    try:
+        if key_file.is_file():
+            existing = key_file.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing.encode("utf-8")
+        key_dir.mkdir(parents=True, exist_ok=True)
+        generated = secrets.token_urlsafe(48)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            fd = os.open(str(key_file), flags, stat.S_IRUSR | stat.S_IWUSR)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(generated)
+        except FileExistsError:
+            existing = key_file.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing.encode("utf-8")
+            key_file.write_text(generated, encoding="utf-8")
+        try:
+            os.chmod(key_file, stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass
+        return generated.encode("utf-8")
+    except OSError:
+        # Fallback if filesystem is strictly read-only: keep process-wide stable secret in env.
+        generated = secrets.token_urlsafe(48)
+        os.environ[env_vars[0]] = generated
+        return generated.encode("utf-8")
 
 _PII_PATTERNS: dict[str, re.Pattern[str]] = {
     "email": re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
@@ -68,60 +176,86 @@ _PII_COLUMN_KEYWORDS: tuple[str, ...] = (
 
 
 class EncryptionManager:
-    """Symmetric encryption at rest using Fernet (AES-128-CBC + HMAC-SHA256) with XOR-HMAC fallback."""
+    """Authenticated symmetric encryption at rest using NIST AES-256-GCM.
+
+    Supports backward-compatible decryption of legacy Fernet tokens while encrypting all new
+    payloads with AES-256-GCM (256-bit key, unique random 96-bit nonce per encryption, 128-bit
+    authentication tag). Keys persist via ``OMNIFORGE_ENCRYPTION_KEY`` or a local ``0600`` keyfile
+    so independent manager instances can consistently encrypt and decrypt across restarts.
+    """
 
     def __init__(self, key: str | bytes | None = None) -> None:
-        raw_key = key or os.getenv("OMNIFORGE_ENCRYPTION_KEY")
-        if _HAS_CRYPTOGRAPHY and Fernet is not None:
-            if raw_key is None or raw_key == "":
-                self._fernet_key = Fernet.generate_key()
-            else:
-                key_bytes = raw_key.encode("utf-8") if isinstance(raw_key, str) else raw_key
-                try:
-                    Fernet(key_bytes)
-                    self._fernet_key = key_bytes
-                except Exception:
-                    digest = hashlib.sha256(key_bytes).digest()
-                    self._fernet_key = base64.urlsafe_b64encode(digest)
-            self._fernet = Fernet(self._fernet_key)
-            self._raw_secret = self._fernet_key
-        else:
-            seed = (
-                raw_key.encode("utf-8")
-                if isinstance(raw_key, str) and raw_key
-                else (raw_key if isinstance(raw_key, bytes) and raw_key else os.urandom(32))
+        if not _HAS_CRYPTOGRAPHY or AESGCM is None:
+            raise SecurityError(
+                "The 'cryptography' library is required for AES-256-GCM encryption.",
+                suggestions=["Install cryptography>=50.0.2 in the active Python environment."],
             )
-            self._raw_secret = hashlib.sha256(seed).digest()
-            self._fernet_key = base64.urlsafe_b64encode(self._raw_secret)
-            self._fernet = None
+        raw_material = _resolve_or_persist_secret(
+            key_name="encryption",
+            explicit=key,
+            env_vars=("OMNIFORGE_ENCRYPTION_KEY", "OMNIFORGE_SECURITY__ENCRYPTION_KEY"),
+            min_length=32,
+        )
+        # Derive a true 256-bit (32-byte) AES-GCM key cleanly from raw/base64 key material
+        self._aes_key = self._derive_aes256_key(raw_material)
+        self._aesgcm = AESGCM(self._aes_key)
+        # Also keep optional legacy Fernet decoder for reading older Fernet-encrypted payloads
+        self._fernet_key = self._derive_fernet_key(raw_material)
+        self._fernet = Fernet(self._fernet_key) if Fernet is not None else None
+
+    @staticmethod
+    def _derive_aes256_key(raw_material: bytes) -> bytes:
+        # If caller passed exact 32-byte raw bytes or a 32-byte urlsafe base64 key, use it directly;
+        # otherwise deterministically derive a 256-bit key with domain-separated SHA-256.
+        if len(raw_material) == 32:
+            return raw_material
+        try:
+            decoded = base64.urlsafe_b64decode(raw_material)
+            if len(decoded) == 32:
+                return decoded
+        except Exception:
+            pass
+        return hashlib.sha256(b"omniforge:aes256gcm:v1:" + raw_material).digest()
+
+    @staticmethod
+    def _derive_fernet_key(raw_material: bytes) -> bytes:
+        if Fernet is not None:
+            try:
+                Fernet(raw_material)
+                return raw_material
+            except Exception:
+                pass
+        return base64.urlsafe_b64encode(hashlib.sha256(raw_material).digest())
+
+    @property
+    def algorithm(self) -> str:
+        """Return active authenticated cipher suite name."""
+        return "AES-256-GCM"
 
     @property
     def key_b64(self) -> str:
-        """Return base64-encoded key material."""
-        return self._fernet_key.decode("utf-8")
+        """Return urlsafe base64-encoded 256-bit AES-GCM key material."""
+        return base64.urlsafe_b64encode(self._aes_key).decode("ascii")
 
-    def encrypt_bytes(self, plaintext: bytes) -> bytes:
-        """Encrypt raw bytes into an authenticated ciphertext envelope."""
-        if self._fernet is not None:
-            return bytes(self._fernet.encrypt(plaintext))
-        nonce = os.urandom(16)
-        keystream = self._derive_stream(nonce, len(plaintext))
-        cipher = bytes(a ^ b for a, b in zip(plaintext, keystream, strict=False))
-        mac = hmac.new(self._raw_secret, nonce + cipher, hashlib.sha256).digest()
-        return base64.urlsafe_b64encode(nonce + mac + cipher)
+    def encrypt_bytes(self, plaintext: bytes, *, associated_data: bytes | None = None) -> bytes:
+        """Encrypt raw bytes into an authenticated AES-256-GCM ciphertext envelope."""
+        nonce = os.urandom(12)  # Fresh 96-bit NIST-recommended random nonce per encryption
+        ciphertext = self._aesgcm.encrypt(nonce, plaintext, associated_data)
+        return base64.urlsafe_b64encode(_AESGCM_HEADER + nonce + ciphertext)
 
-    def decrypt_bytes(self, token: bytes) -> bytes:
-        """Decrypt and verify authenticated ciphertext bytes."""
+    def decrypt_bytes(self, token: bytes, *, associated_data: bytes | None = None) -> bytes:
+        """Decrypt and authenticate AES-256-GCM ciphertext (with legacy Fernet fallback)."""
         try:
-            if self._fernet is not None:
+            # Backward-compatible decryption for legacy Fernet tokens
+            if token.startswith(b"gAAAAA") and self._fernet is not None and associated_data is None:
                 return bytes(self._fernet.decrypt(token))
             raw = base64.urlsafe_b64decode(token)
-            nonce, mac, cipher = raw[:16], raw[16:48], raw[48:]
-            expected = hmac.new(self._raw_secret, nonce + cipher, hashlib.sha256).digest()
-            if not hmac.compare_digest(mac, expected):
-                raise SecurityError("Ciphertext integrity verification failed.")
-            keystream = self._derive_stream(nonce, len(cipher))
-            return bytes(a ^ b for a, b in zip(cipher, keystream, strict=False))
+            if not raw.startswith(_AESGCM_HEADER) or len(raw) < len(_AESGCM_HEADER) + 12 + 16:
+                raise SecurityError("Unrecognized or truncated ciphertext envelope.")
+            offset = len(_AESGCM_HEADER)
+            nonce = raw[offset : offset + 12]
+            ciphertext = raw[offset + 12 :]
+            return bytes(self._aesgcm.decrypt(nonce, ciphertext, associated_data))
         except SecurityError:
             raise
         except Exception as exc:
@@ -131,24 +265,251 @@ class EncryptionManager:
                 cause=exc,
             ) from exc
 
-    def encrypt_text(self, plaintext: str) -> str:
-        """Encrypt UTF-8 string into an ASCII-safe token."""
-        return self.encrypt_bytes(plaintext.encode("utf-8")).decode("ascii")
+    def encrypt_text(self, plaintext: str, *, associated_data: bytes | None = None) -> str:
+        """Encrypt UTF-8 string into an ASCII-safe AES-256-GCM token."""
+        return self.encrypt_bytes(plaintext.encode("utf-8"), associated_data=associated_data).decode("ascii")
 
-    def decrypt_text(self, token: str) -> str:
+    def decrypt_text(self, token: str, *, associated_data: bytes | None = None) -> str:
         """Decrypt ASCII-safe token back into UTF-8 string."""
-        return self.decrypt_bytes(token.encode("ascii")).decode("utf-8")
+        return self.decrypt_bytes(token.encode("ascii"), associated_data=associated_data).decode("utf-8")
 
-    def _derive_stream(self, nonce: bytes, length: int) -> bytes:
-        out = bytearray()
-        counter = 0
-        while len(out) < length:
-            block = hmac.new(
-                self._raw_secret, nonce + counter.to_bytes(4, "big"), hashlib.sha256
-            ).digest()
-            out.extend(block)
-            counter += 1
-        return bytes(out[:length])
+
+class ArtifactSigner:
+    """HMAC-SHA256 cryptographic signer/verifier for OmniForge workspace, model, and pipeline artifacts."""
+
+    def __init__(self, secret_key: str | bytes | None = None) -> None:
+        raw = _resolve_or_persist_secret(
+            key_name="artifact_signing",
+            explicit=secret_key,
+            env_vars=(
+                "OMNIFORGE_ARTIFACT_SIGNING_KEY",
+                "OMNIFORGE_SECURITY__ARTIFACT_SIGNING_KEY",
+                "OMNIFORGE_JWT_SECRET_KEY",
+            ),
+            min_length=32,
+        )
+        self._key = hashlib.sha256(b"omniforge:artifact-hmac-sha256:v1:" + raw).digest()
+
+    def sign_bytes(self, payload: bytes, *, context: bytes = b"omniforge-artifact") -> str:
+        """Return a hex-encoded HMAC-SHA256 signature bound to ``context`` and ``payload``."""
+        mac = hmac.new(self._key, context + b"\x00" + payload, hashlib.sha256)
+        return mac.hexdigest()
+
+    def verify_bytes(
+        self,
+        payload: bytes,
+        signature_hex: str,
+        *,
+        context: bytes = b"omniforge-artifact",
+    ) -> bool:
+        """Verify ``signature_hex`` in constant time using ``hmac.compare_digest``."""
+        if not signature_hex or not isinstance(signature_hex, str):
+            return False
+        expected = self.sign_bytes(payload, context=context)
+        return hmac.compare_digest(expected, signature_hex.strip().lower())
+
+
+_BLOCKED_UNPICKLE_ROOT_MODULES: frozenset[str] = frozenset(
+    {
+        "os",
+        "posix",
+        "nt",
+        "subprocess",
+        "sys",
+        "importlib",
+        "runpy",
+        "pty",
+        "shutil",
+        "socket",
+        "http",
+        "urllib",
+        "ftplib",
+        "smtplib",
+        "ctypes",
+        "cffi",
+        "marshal",
+        "code",
+        "codeop",
+        "webbrowser",
+        "pdb",
+        "bdb",
+        "signal",
+        "multiprocessing",
+        "threading",
+        "concurrent",
+        "ssl",
+        "xmlrpc",
+        "pickle",
+        "_pickle",
+        "dill",
+        "cloudpickle",
+        "operator",
+        "asyncio",
+        "inspect",
+        "gc",
+        "tempfile",
+        "glob",
+    }
+)
+
+_ALLOWED_UNPICKLE_BUILTINS: frozenset[str] = frozenset(
+    {
+        "dict",
+        "list",
+        "tuple",
+        "set",
+        "frozenset",
+        "str",
+        "bytes",
+        "bytearray",
+        "int",
+        "float",
+        "bool",
+        "complex",
+        "slice",
+        "range",
+        "object",
+    }
+)
+
+_ALLOWED_UNPICKLE_MODULE_PREFIXES: tuple[str, ...] = (
+    "omniforge",
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "scipy",
+    "sklearn",
+    "statsmodels",
+    "networkx",
+    "xgboost",
+    "lightgbm",
+    "catboost",
+    "torch",
+    "pydantic",
+    "joblib",
+    "plotly",
+    "collections",
+    "datetime",
+    "decimal",
+    "fractions",
+    "uuid",
+    "enum",
+    "re",
+    "pathlib",
+    "copyreg",
+    "_codecs",
+    "codecs",
+    "tzdata",
+    "zoneinfo",
+    "pytz",
+    "dateutil",
+    "dataclasses",
+    "typing",
+    "functools",
+)
+
+_BLOCKED_UNPICKLE_SYMBOL_NAMES: frozenset[str] = frozenset(
+    {
+        "eval",
+        "exec",
+        "compile",
+        "__import__",
+        "open",
+        "getattr",
+        "setattr",
+        "delattr",
+        "globals",
+        "locals",
+        "vars",
+        "breakpoint",
+        "input",
+        "system",
+        "popen",
+        "spawn",
+        "call",
+        "check_output",
+        "check_call",
+        "Popen",
+        "unlink",
+        "rmdir",
+        "remove",
+        "rmtree",
+    }
+)
+
+
+_BLOCKED_UNPICKLE_SUBMODULE_PREFIXES: tuple[str, ...] = (
+    "torch.hub",
+    "torch.serialization",
+    "torch.jit",
+    "torch.utils.cpp_extension",
+    "joblib.parallel",
+    "joblib.externals",
+    "pandas.io",
+    "pyarrow.fs",
+    "numpy.testing",
+    "numpy.f2py",
+    "omniforge.data.connectors",
+    "omniforge.api",
+    "omniforge.cli",
+    "omniforge.launcher",
+)
+
+
+def _validate_unpickle_target(module: str, name: str) -> None:
+    """Enforce defense-in-depth allowlist/denylist before resolving any pickled class/global."""
+    root_mod = module.split(".", 1)[0]
+    if root_mod in _BLOCKED_UNPICKLE_ROOT_MODULES:
+        raise SecurityError(
+            f"Blocked unsafe deserialization target '{module}.{name}' (forbidden module '{root_mod}')."
+        )
+    if any(
+        module == prefix or module.startswith(f"{prefix}.")
+        for prefix in _BLOCKED_UNPICKLE_SUBMODULE_PREFIXES
+    ):
+        raise SecurityError(
+            f"Blocked unsafe deserialization submodule '{module}.{name}'."
+        )
+    if name in _BLOCKED_UNPICKLE_SYMBOL_NAMES:
+        raise SecurityError(
+            f"Blocked unsafe deserialization symbol '{module}.{name}'."
+        )
+    if module == "builtins":
+        if name not in _ALLOWED_UNPICKLE_BUILTINS:
+            raise SecurityError(
+                f"Blocked unsafe builtin deserialization target 'builtins.{name}'."
+            )
+        return
+    if module == "functools" and name != "partial":
+        raise SecurityError(f"Blocked unsafe functools target 'functools.{name}'.")
+    if root_mod not in _ALLOWED_UNPICKLE_MODULE_PREFIXES:
+        raise SecurityError(
+            f"Blocked unrecognized deserialization module '{module}.{name}'."
+        )
+
+
+def safe_joblib_load_bytes(payload_bytes: bytes, *, filename: str = "") -> Any:
+    """Deserialize joblib/pickle bytes using a restricted ``NumpyUnpickler`` allowlist.
+
+    Always call AFTER cryptographic HMAC-SHA256 verification (:class:`ArtifactSigner`) so untrusted
+    bytes are rejected before reaching the unpickler, and dangerous globals remain blocked even as
+    a second layer of defense.
+    """
+    import io
+
+    from joblib.numpy_pickle import NumpyUnpickler, _validate_fileobject_and_memmap
+
+    class _RestrictedNumpyUnpickler(NumpyUnpickler):
+        def find_class(self, module: str, name: str) -> Any:
+            _validate_unpickle_target(module, name)
+            return super().find_class(module, name)
+
+    buf = io.BytesIO(payload_bytes)
+    with _validate_fileobject_and_memmap(buf, filename, mmap_mode=None) as (fobj, _):
+        unpickler = _RestrictedNumpyUnpickler(
+            filename, fobj, ensure_native_byte_order=True, mmap_mode=None
+        )
+        return unpickler.load()
 
 
 class JWTManager:
@@ -160,11 +521,13 @@ class JWTManager:
         algorithm: str = "HS256",
         expiration_minutes: int = 60,
     ) -> None:
-        self._secret_key = (
-            secret_key
-            or os.getenv("OMNIFORGE_JWT_SECRET_KEY")
-            or "uap-development-jwt-secret-key-do-not-use-in-prod-0123456789"
+        secret_bytes = _resolve_or_persist_secret(
+            key_name="jwt_secret",
+            explicit=secret_key,
+            env_vars=("OMNIFORGE_JWT_SECRET_KEY", "OMNIFORGE_SECURITY__JWT_SECRET_KEY"),
+            min_length=32,
         )
+        self._secret_key = secret_bytes.decode("utf-8", errors="replace")
         self._algorithm = algorithm
         self._expiration_minutes = expiration_minutes
 

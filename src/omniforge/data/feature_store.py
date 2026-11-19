@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,22 @@ from omniforge.core.logging import get_logger
 from omniforge.core.utils import safe_json_default
 
 logger = get_logger(__name__)
+
+
+@contextmanager
+def _sqlite_conn(db_path: str | Path, **kwargs: Any) -> Iterator[sqlite3.Connection]:
+    """Yield a SQLite connection that is always committed/rolled back **and closed**.
+
+    ``with sqlite3.connect(...)`` only wraps a transaction; the underlying handle
+    stays open until garbage collection, which leaks file descriptors and emits
+    ``ResourceWarning: unclosed database``.
+    """
+    conn = sqlite3.connect(db_path, **kwargs)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 class FeatureEntity(BaseModel):
@@ -61,7 +79,7 @@ class LocalFeatureStore:
             self._registry_path.write_text(
                 json.dumps({"entities": {}, "feature_views": {}}, indent=2), encoding="utf-8"
             )
-        with sqlite3.connect(self._online_db) as conn:
+        with _sqlite_conn(self._online_db) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS online_features (
@@ -167,7 +185,7 @@ class LocalFeatureStore:
             for idx in range(len(df))
         ]
 
-        with sqlite3.connect(self._online_db) as conn:
+        with _sqlite_conn(self._online_db) as conn:
             conn.executemany(
                 """
                 INSERT INTO online_features (view_name, entity_key, event_timestamp, features_json, updated_at)
@@ -245,7 +263,7 @@ class LocalFeatureStore:
         spec = self.get_feature_view(view_name)
         target_feats = features or spec.feature_columns
         output: list[dict[str, Any]] = []
-        with sqlite3.connect(self._online_db) as conn:
+        with _sqlite_conn(self._online_db) as conn:
             for row in entity_rows:
                 key_str = "|".join(str(row[k]) for k in spec.join_keys)
                 cur = conn.execute(

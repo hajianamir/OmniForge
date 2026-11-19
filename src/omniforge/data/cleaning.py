@@ -48,7 +48,7 @@ class CleaningConfig(BaseModel):
     add_missing_indicators: bool = False
     drop_exact_duplicates: bool = True
     fuzzy_dedup_column: str | None = None
-    fuzzy_dedup_threshold: float = Field(default=0.92, ge=0.5, le=1.0)
+    fuzzy_dedup_threshold: float = Field(default=0.97, ge=0.5, le=1.0)
     outlier_method: str = "iqr"  # iqr, zscore, mad, isolation_forest, lof, none
     outlier_action: str = "clip"  # clip, remove, drop, nan, flag, none
     outlier_threshold: float = 1.5
@@ -341,7 +341,9 @@ class DataCleaner:
     def transform(self, df: pd.DataFrame) -> tuple[pd.DataFrame, CleaningReport]:
         """Apply fitted cleaning rules to ``df`` and return cleaned DataFrame and audit report."""
         if not self._is_fitted:
-            self.fit(df)
+            raise RuntimeError(
+                "DataCleaner must be fitted before calling transform(). Call fit() or fit_transform() first."
+            )
 
         input_shape = (int(df.shape[0]), int(df.shape[1]))
         input_checksum = compute_dataframe_checksum(df)
@@ -721,6 +723,14 @@ class DataCleaner:
                 for c, cnt in before_nulls.items():
                     if cnt > 0:
                         imputed[c] = cnt
+        elif self.config.numeric_imputation == "missforest":
+            num_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c not in excluded]
+            before_nulls = {c: int(df[c].isna().sum()) for c in num_cols}
+            if any(v > 0 for v in before_nulls.values()):
+                df = self.missforest_impute(df)
+                for c, cnt in before_nulls.items():
+                    if cnt > 0:
+                        imputed[c] = cnt
         elif self.config.numeric_imputation in ("ffill", "bfill", "interpolate"):
             # Sort chronologically if time_column provided, restore index ordering afterwards
             orig_index = df.index
@@ -770,3 +780,113 @@ class DataCleaner:
                         imputed[col] = nulls
 
         return df, imputed
+
+    @staticmethod
+    def multiple_imputation_rubin(
+        df: pd.DataFrame,
+        m: int = 5,
+        max_iter: int = 10,
+        random_state: int = 42,
+    ) -> dict[str, Any]:
+        """Real MICE (Multiple Imputation by Chained Equations) with Rubin's Rules pooling."""
+
+        num_df = df.select_dtypes(include=[np.number]).copy()
+        if num_df.empty or m < 2:
+            raise ValueError("multiple_imputation_rubin requires numeric columns and m >= 2.")
+
+        imputed_datasets: list[pd.DataFrame] = []
+        means_per_m: list[np.ndarray] = []
+        vars_per_m: list[np.ndarray] = []
+        n = len(num_df)
+
+        for i in range(m):
+            imp = IterativeImputer(
+                max_iter=max_iter,
+                sample_posterior=True,
+                random_state=random_state + i,
+            )
+            arr = imp.fit_transform(num_df)
+            df_i = pd.DataFrame(arr, columns=num_df.columns, index=num_df.index)
+            imputed_datasets.append(df_i)
+            means_per_m.append(arr.mean(axis=0))
+            vars_per_m.append(arr.var(axis=0, ddof=1) / max(n, 1))
+
+        q_mat = np.vstack(means_per_m)
+        u_mat = np.vstack(vars_per_m)
+        q_bar = q_mat.mean(axis=0)
+        u_bar = u_mat.mean(axis=0)
+        b_var = q_mat.var(axis=0, ddof=1)
+        total_var = u_bar + (1.0 + 1.0 / m) * b_var
+
+        pooled = {
+            str(col): {
+                "pooled_mean": round(float(q_bar[j]), 6),
+                "within_variance": round(float(u_bar[j]), 6),
+                "between_variance": round(float(b_var[j]), 6),
+                "total_variance": round(float(total_var[j]), 6),
+                "pooled_se": round(float(np.sqrt(max(0.0, total_var[j]))), 6),
+            }
+            for j, col in enumerate(num_df.columns)
+        }
+        return {"m": int(m), "pooled_estimates": pooled, "imputed_datasets": imputed_datasets}
+
+    @staticmethod
+    def missforest_impute(
+        df: pd.DataFrame,
+        max_iter: int = 5,
+        n_estimators: int = 50,
+        random_state: int = 42,
+    ) -> pd.DataFrame:
+        """Iterative non-parametric Random Forest imputation (MissForest)."""
+        from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+
+        work = df.copy()
+        cols_with_na = [c for c in work.columns if work[c].isna().any()]
+        if not cols_with_na:
+            return work
+
+        num_cols = list(work.select_dtypes(include=[np.number]).columns)
+        cat_cols = [c for c in work.columns if c not in num_cols]
+        na_masks = {c: work[c].isna().to_numpy() for c in cols_with_na}
+
+        # Initial fill
+        for c in num_cols:
+            if work[c].isna().any():
+                med = work[c].median()
+                work[c] = work[c].fillna(0.0 if pd.isna(med) else float(med))
+        for c in cat_cols:
+            if work[c].isna().any():
+                mode_s = work[c].mode(dropna=True)
+                work[c] = work[c].fillna("MISSING" if mode_s.empty else mode_s.iloc[0])
+
+        # Encode categoricals numerically for predictor matrix
+        for _ in range(max_iter):
+            for c in cols_with_na:
+                mask = na_masks[c]
+                if mask.all() or not mask.any():
+                    continue
+                other_cols = [oc for oc in work.columns if oc != c]
+                if not other_cols:
+                    continue
+                X_enc = pd.get_dummies(work[other_cols], drop_first=False, dtype=float)
+                X_obs = X_enc.loc[~mask]
+                X_mis = X_enc.loc[mask]
+                y_obs = work.loc[~mask, c]
+                if c in num_cols:
+                    rf = RandomForestRegressor(
+                        n_estimators=n_estimators,
+                        random_state=random_state,
+                        n_jobs=-1,
+                    )
+                    rf.fit(X_obs, y_obs.to_numpy(dtype=float))
+                    work.loc[mask, c] = rf.predict(X_mis)
+                else:
+                    rf_c = RandomForestClassifier(
+                        n_estimators=n_estimators,
+                        random_state=random_state,
+                        n_jobs=-1,
+                    )
+                    rf_c.fit(X_obs, y_obs.astype(str))
+                    work.loc[mask, c] = rf_c.predict(X_mis)
+        return work
+

@@ -157,10 +157,11 @@ if !errorlevel! neq 0 (
     echo         Please run install.bat ^(or choose option 8^) to automatically upgrade .venv to Python 3.12+.
     exit /b 1
 )
-"%VENV_PY%" -c "import omniforge.launcher, omniforge.api.main, omniforge.models.clustering" >nul 2>&1
+"%VENV_PY%" -c "import os, pathlib, omniforge; expected = pathlib.Path(os.environ['ROOT_DIR']).resolve() / 'src' / 'omniforge'; actual = pathlib.Path(omniforge.__file__).resolve().parent; raise SystemExit(0 if actual == expected else 1)" >nul 2>&1
 if !errorlevel! neq 0 (
-    echo [INFO] Registering OmniForge package in .venv...
-    "%VENV_PY%" -m pip install --no-build-isolation --no-deps -e "%ROOT_DIR%" >nul 2>&1
+    echo [INFO] Re-binding .venv to current OmniForge source folder ^(%ROOT_DIR%\src\omniforge^)...
+    "%VENV_PY%" -m pip uninstall -y omniforge >nul 2>&1
+    "%VENV_PY%" -m pip install --no-cache-dir --no-build-isolation --no-deps -e "%ROOT_DIR%" >nul 2>&1
 )
 "%VENV_PY%" -c "import omniforge.launcher, fastapi, uvicorn, pandas, numpy, sklearn, pyarrow" >nul 2>&1
 if !errorlevel! neq 0 (

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -11,19 +13,21 @@ from omniforge.core.exceptions import ModelError
 
 
 class KaplanMeierEstimator:
-    """Non-parametric Kaplan-Meier survival curve estimator with Greenwood 95% confidence intervals."""
+    """Non-parametric Kaplan-Meier survival curve estimator with Greenwood log-log 95% confidence intervals."""
 
-    def __init__(self) -> None:
+    def __init__(self, alpha: float = 0.05) -> None:
+        self.alpha = float(alpha)
         self.survival_table_: pd.DataFrame = pd.DataFrame()
         self.median_survival_time_: float | None = None
 
     def fit(self, durations: pd.Series | np.ndarray, events: pd.Series | np.ndarray) -> KaplanMeierEstimator:
-        """Compute Kaplan-Meier survival probabilities and Greenwood standard errors."""
+        """Compute Kaplan-Meier survival probabilities and Kalbfleisch-Prentice log-log Greenwood CIs."""
         t = np.asarray(durations, dtype=float).ravel()
         e = np.asarray(events, dtype=int).ravel()
         if len(t) == 0 or len(t) != len(e):
             raise ModelError("durations and events must be non-empty arrays of equal length.")
 
+        z_crit = float(stats.norm.ppf(1.0 - self.alpha / 2.0))
         unique_times = np.sort(np.unique(t))
         rows: list[dict[str, float]] = []
         surv = 1.0
@@ -39,7 +43,14 @@ class KaplanMeierEstimator:
                 cum_hazard += deaths / at_risk
                 if at_risk > deaths:
                     greenwood_sum += deaths / (at_risk * (at_risk - deaths))
-            se = surv * np.sqrt(greenwood_sum)
+            if 0.0 < surv < 1.0 and greenwood_sum > 0.0:
+                se_loglog = float(np.sqrt(greenwood_sum) / abs(np.log(surv)))
+                ci_lower = float(surv ** np.exp(z_crit * se_loglog))
+                ci_upper = float(surv ** np.exp(-z_crit * se_loglog))
+            elif surv >= 1.0:
+                ci_lower, ci_upper = 1.0, 1.0
+            else:
+                ci_lower, ci_upper = 0.0, 0.0
             rows.append(
                 {
                     "time": float(time_pt),
@@ -47,8 +58,8 @@ class KaplanMeierEstimator:
                     "events": float(deaths),
                     "censored": float(censored),
                     "survival_prob": round(float(surv), 6),
-                    "ci_lower": round(float(max(0.0, surv - 1.96 * se)), 6),
-                    "ci_upper": round(float(min(1.0, surv + 1.96 * se)), 6),
+                    "ci_lower": round(float(np.clip(ci_lower, 0.0, 1.0)), 6),
+                    "ci_upper": round(float(np.clip(ci_upper, 0.0, 1.0)), 6),
                     "nelson_aalen_cum_hazard": round(float(cum_hazard), 6),
                 }
             )
@@ -85,19 +96,104 @@ class KaplanMeierEstimator:
 
 
 class CoxPHModel:
-    """Cox Proportional Hazards regression solved via L2-regularized Newton-Raphson partial likelihood."""
+    """Cox Proportional Hazards regression with exact Efron/Breslow tie handling and original-unit inference.
 
-    def __init__(self, l2_penalty: float = 1e-2, max_iter: int = 50, tol: float = 1e-6) -> None:
-        self.l2_penalty = float(l2_penalty)
+    Optimization is executed in standardized covariate coordinates for numerical conditioning,
+    then coefficients, covariance matrix, standard errors, and hazard ratios are transformed
+    back to original covariate units (matching R ``survival::coxph`` and ``statsmodels.PHReg``).
+    """
+
+    def __init__(
+        self,
+        l2_penalty: float = 1e-4,
+        max_iter: int = 100,
+        tol: float = 1e-7,
+        ties: Literal["efron", "breslow"] = "efron",
+    ) -> None:
+        self.l2_penalty = max(0.0, float(l2_penalty))
         self.max_iter = int(max_iter)
         self.tol = float(tol)
+        self.ties: Literal["efron", "breslow"] = ties
         self._scaler = StandardScaler()
         self.coef_: np.ndarray = np.array([], dtype=float)
+        self.standardized_coef_: np.ndarray = np.array([], dtype=float)
+        self.standard_errors_: np.ndarray = np.array([], dtype=float)
+        self.p_values_: dict[str, float] = {}
         self.feature_names_: list[str] = []
         self.hazard_ratios_: dict[str, float] = {}
+        self.hazard_ratio_ci_: dict[str, tuple[float, float]] = {}
+        self.log_partial_likelihood_: float = 0.0
         self.baseline_times_: np.ndarray = np.array([], dtype=float)
         self.baseline_cum_hazard_: np.ndarray = np.array([], dtype=float)
         self.concordance_index_: float = 0.5
+
+    def _partial_loglik_grad_hess(
+        self,
+        X: np.ndarray,
+        T: np.ndarray,
+        E: np.ndarray,
+        unique_event_times: np.ndarray,
+        beta: np.ndarray,
+    ) -> tuple[float, np.ndarray, np.ndarray]:
+        """Compute exact Efron or Breslow penalized partial log-likelihood, gradient, and Fisher info."""
+        p = X.shape[1]
+        eta = np.clip(X @ beta, -30.0, 30.0)
+        exp_eta = np.exp(eta)
+
+        # Reverse cumulative sums sorted ascending by T; index at first occurrence of t_k gives R(t_k) = {j: T_j >= t_k}
+        rev_w = np.cumsum(exp_eta[::-1])[::-1]
+        wx = X * exp_eta[:, None]
+        rev_wx = np.cumsum(wx[::-1], axis=0)[::-1]
+        wxx = (X[:, :, None] * X[:, None, :]) * exp_eta[:, None, None]
+        rev_wxx = np.cumsum(wxx[::-1], axis=0)[::-1]
+
+        ll = 0.0
+        grad = np.zeros(p, dtype=float)
+        info = np.zeros((p, p), dtype=float)
+
+        for t_k in unique_event_times:
+            # First index in sorted T where T >= t_k defines the exact risk set R(t_k) (including ties & censored at t_k)
+            risk_start = int(np.searchsorted(T, t_k, side="left"))
+            w_r = float(rev_w[risk_start])
+            x_r = rev_wx[risk_start]
+            m_r = rev_wxx[risk_start]
+
+            event_mask = (T == t_k) & (E == 1)
+            d_k = int(np.sum(event_mask))
+            if d_k == 0 or w_r <= 1e-15:
+                continue
+
+            ll += float(np.sum(eta[event_mask]))
+            grad += np.sum(X[event_mask], axis=0)
+
+            if self.ties == "breslow" or d_k == 1:
+                inv_w = 1.0 / w_r
+                mean_x = x_r * inv_w
+                ll -= d_k * float(np.log(w_r))
+                grad -= d_k * mean_x
+                info += d_k * (m_r * inv_w - np.outer(mean_x, mean_x))
+            else:
+                # Efron (1977) partial likelihood approximation for tied event times
+                w_d = float(np.sum(exp_eta[event_mask]))
+                x_d = np.sum(wx[event_mask], axis=0)
+                m_d = np.sum(wxx[event_mask], axis=0)
+                for m in range(d_k):
+                    frac = float(m) / float(d_k)
+                    w_m = max(w_r - frac * w_d, 1e-15)
+                    x_m = x_r - frac * x_d
+                    m_m = m_r - frac * m_d
+                    mean_m = x_m / w_m
+                    ll -= float(np.log(w_m))
+                    grad -= mean_m
+                    info += (m_m / w_m) - np.outer(mean_m, mean_m)
+
+        # L2 ridge regularization in standardized coordinates (0.5 * lambda * ||beta||^2)
+        if self.l2_penalty > 0.0:
+            ll -= 0.5 * self.l2_penalty * float(beta @ beta)
+            grad -= self.l2_penalty * beta
+            info += np.eye(p, dtype=float) * self.l2_penalty
+
+        return ll, grad, info
 
     def fit(
         self,
@@ -107,67 +203,103 @@ class CoxPHModel:
         event_col: str = "event",
         feature_cols: list[str] | None = None,
     ) -> CoxPHModel:
-        """Fit Cox PH coefficients via Newton-Raphson on Breslow partial log-likelihood."""
+        """Fit Cox PH via damped Newton-Raphson with exact Efron/Breslow tie handling."""
         cols = feature_cols or [c for c in df.columns if c not in (duration_col, event_col)]
+        if not cols:
+            raise ModelError("CoxPHModel requires at least one covariate column.")
         self.feature_names_ = [str(c) for c in cols]
-        order = np.argsort(df[duration_col].to_numpy(dtype=float))
+
+        order = np.argsort(df[duration_col].to_numpy(dtype=float), kind="mergesort")
         X_raw = df[cols].to_numpy(dtype=float)[order]
         X = self._scaler.fit_transform(X_raw)
         T = df[duration_col].to_numpy(dtype=float)[order]
         E = df[event_col].to_numpy(dtype=int)[order]
+        unique_event_times = np.unique(T[E == 1])
 
-        n, p = X.shape
+        p = X.shape[1]
         beta = np.zeros(p, dtype=float)
+        ll_curr, grad, info = self._partial_loglik_grad_hess(X, T, E, unique_event_times, beta)
 
         for _ in range(self.max_iter):
-            eta = np.clip(X @ beta, -30.0, 30.0)
-            exp_eta = np.exp(eta)
-            # Reverse cumulative sums define risk sets R(t_i)
-            s0 = np.cumsum(exp_eta[::-1])[::-1]
-            s1 = np.cumsum((X * exp_eta[:, None])[::-1], axis=0)[::-1]
+            try:
+                step = np.linalg.solve(info + np.eye(p, dtype=float) * 1e-10, grad)
+            except np.linalg.LinAlgError:
+                step = np.linalg.lstsq(info + np.eye(p, dtype=float) * 1e-6, grad, rcond=None)[0]
 
-            grad = np.zeros(p, dtype=float)
-            hess = np.eye(p, dtype=float) * self.l2_penalty
-            for i in range(n):
-                if E[i] == 1 and s0[i] > 1e-12:
-                    mean_x = s1[i] / s0[i]
-                    grad += X[i] - mean_x
-                    # Outer product variance approximation for positive-definite Hessian
-                    risk_w = exp_eta[i:] / s0[i]
-                    centered = X[i:] - mean_x
-                    hess += (centered * risk_w[:, None]).T @ centered
+            # Step-halving line search guarantees monotonic ascent in penalized partial log-likelihood
+            step_scale = 1.0
+            accepted = False
+            for _ls in range(20):
+                cand = beta + step_scale * step
+                ll_cand, grad_cand, info_cand = self._partial_loglik_grad_hess(
+                    X, T, E, unique_event_times, cand
+                )
+                if np.isfinite(ll_cand) and ll_cand >= ll_curr - 1e-10:
+                    beta = cand
+                    ll_curr, grad, info = ll_cand, grad_cand, info_cand
+                    accepted = True
+                    break
+                step_scale *= 0.5
 
-            grad -= self.l2_penalty * beta
-            step = np.linalg.solve(hess + np.eye(p) * 1e-6, grad)
-            beta += step
-            if float(np.linalg.norm(step)) < self.tol:
+            if not accepted or float(np.linalg.norm(step_scale * step)) < self.tol:
                 break
 
-        self.coef_ = beta
-        self.hazard_ratios_ = {
-            name: round(float(np.exp(b)), 6) for name, b in zip(self.feature_names_, beta, strict=False)
-        }
+        self.standardized_coef_ = beta.copy()
+        self.log_partial_likelihood_ = float(ll_curr)
 
-        # Breslow baseline cumulative hazard
+        # Unscale coefficients & covariance back to original covariate units: beta_orig = beta_std / sigma
+        scales = np.where(self._scaler.scale_ > 1e-12, self._scaler.scale_, 1.0)
+        beta_orig = beta / scales
+        self.coef_ = beta_orig
+
+        # Covariance matrix in original units: D^{-1} I^{-1} D^{-1}
+        try:
+            cov_std = np.linalg.inv(info + np.eye(p, dtype=float) * 1e-12)
+        except np.linalg.LinAlgError:
+            cov_std = np.linalg.pinv(info)
+        cov_orig = cov_std / np.outer(scales, scales)
+        se_orig = np.sqrt(np.maximum(np.diag(cov_orig), 0.0))
+        self.standard_errors_ = se_orig
+
+        z_crit = float(stats.norm.ppf(0.975))
+        self.hazard_ratios_ = {}
+        self.hazard_ratio_ci_ = {}
+        self.p_values_ = {}
+        for name, b, se in zip(self.feature_names_, beta_orig, se_orig, strict=False):
+            hr = float(np.exp(np.clip(b, -30.0, 30.0)))
+            lo = float(np.exp(np.clip(b - z_crit * se, -30.0, 30.0)))
+            hi = float(np.exp(np.clip(b + z_crit * se, -30.0, 30.0)))
+            z_stat = abs(float(b) / se) if se > 1e-12 else 0.0
+            p_val = float(2.0 * stats.norm.sf(z_stat))
+            self.hazard_ratios_[name] = round(hr, 6)
+            self.hazard_ratio_ci_[name] = (round(lo, 6), round(hi, 6))
+            self.p_values_[name] = round(p_val, 6)
+
+        # Exact Efron / Breslow baseline cumulative hazard H_0(t) anchored at covariate mean
         risk_scores = np.exp(np.clip(X @ beta, -30.0, 30.0))
-        event_times = np.unique(T[E == 1])
         cum_h = 0.0
         base_h: list[float] = []
-        for et in event_times:
-            d_i = float(np.sum((T == et) & (E == 1)))
+        for et in unique_event_times:
+            ev_mask = (T == et) & (E == 1)
+            d_i = int(np.sum(ev_mask))
             r_i = float(np.sum(risk_scores[T >= et]))
-            cum_h += d_i / max(r_i, 1e-12)
+            if self.ties == "efron" and d_i > 1:
+                w_d = float(np.sum(risk_scores[ev_mask]))
+                for m in range(d_i):
+                    cum_h += 1.0 / max(r_i - (float(m) / float(d_i)) * w_d, 1e-12)
+            else:
+                cum_h += float(d_i) / max(r_i, 1e-12)
             base_h.append(cum_h)
-        self.baseline_times_ = event_times
+        self.baseline_times_ = unique_event_times
         self.baseline_cum_hazard_ = np.asarray(base_h, dtype=float)
         self.concordance_index_ = self.compute_c_index(T, E, X @ beta)
         return self
 
     def predict_risk(self, X: pd.DataFrame | np.ndarray) -> np.ndarray:
-        """Predict relative hazard risk score exp(X @ beta)."""
+        """Predict mean-centered relative hazard risk score exp((X - mu) @ beta_orig)."""
         arr = X[self.feature_names_].to_numpy(dtype=float) if isinstance(X, pd.DataFrame) else np.asarray(X, dtype=float)
-        X_s = self._scaler.transform(arr)
-        return np.exp(np.clip(X_s @ self.coef_, -30.0, 30.0))
+        centered = arr - self._scaler.mean_
+        return np.asarray(np.exp(np.clip(centered @ self.coef_, -30.0, 30.0)), dtype=float)
 
     def predict_survival_function(self, X: pd.DataFrame | np.ndarray) -> pd.DataFrame:
         """Return predicted survival probability curves S(t | x) across baseline event times."""
@@ -177,18 +309,23 @@ class CoxPHModel:
 
     @staticmethod
     def compute_c_index(durations: np.ndarray, events: np.ndarray, risk_scores: np.ndarray) -> float:
-        """Compute Harrell's Concordance Index (C-index)."""
+        """Compute Harrell's Concordance Index (C-index) properly including tied event/censoring pairs."""
+        t = np.asarray(durations, dtype=float).ravel()
+        e = np.asarray(events, dtype=int).ravel()
+        r = np.asarray(risk_scores, dtype=float).ravel()
         concordant = 0.0
         permissible = 0.0
-        n = len(durations)
+        n = len(t)
         for i in range(n):
-            if events[i] != 1:
+            if e[i] != 1:
                 continue
             for j in range(n):
-                if durations[j] > durations[i]:
+                if i == j:
+                    continue
+                if t[j] > t[i] or (t[j] == t[i] and e[j] == 0):
                     permissible += 1.0
-                    if risk_scores[i] > risk_scores[j]:
+                    if r[i] > r[j]:
                         concordant += 1.0
-                    elif risk_scores[i] == risk_scores[j]:
+                    elif r[i] == r[j]:
                         concordant += 0.5
         return round(concordant / max(permissible, 1.0), 6)

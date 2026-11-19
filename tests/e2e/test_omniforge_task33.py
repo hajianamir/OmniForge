@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from fastapi.testclient import TestClient
 
+from omniforge.api.auth import get_api_key
 from omniforge.api.main import create_app
 
 
@@ -58,7 +59,7 @@ def _make_multi_sheet_excel() -> bytes:
 def test_task33_full_omniforge_workflow_and_all_8_requirements() -> None:
     """Verify all 8 Task 33 requirements end-to-end across FastAPI workbench endpoints."""
     app = create_app()
-    client = TestClient(app)
+    client = TestClient(app, headers={"X-API-Key": get_api_key()})
     hdr = {"X-Session-ID": f"task33_{uuid.uuid4().hex[:8]}"}
 
     # --- Req #4: OmniForge rebranding & compiled SPA served cleanly ---

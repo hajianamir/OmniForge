@@ -16,8 +16,9 @@ import joblib
 import pandas as pd
 from pydantic import BaseModel, Field
 
-from omniforge.core.exceptions import DataValidationError
+from omniforge.core.exceptions import DataValidationError, SecurityError
 from omniforge.core.logging import get_logger
+from omniforge.core.security import ArtifactSigner, safe_joblib_load_bytes
 from omniforge.version import __version__
 
 logger = get_logger(__name__)
@@ -26,7 +27,10 @@ PROJECT_FILE_EXTENSION = ".omniforge"
 LEGACY_PROJECT_EXTENSIONS: tuple[str, ...] = (".omniforge", ".uap")
 MANIFEST_FILENAME = "manifest.json"
 STATE_FILENAME = "session_state.joblib"
-FORMAT_VERSION = "1.0"
+FORMAT_VERSION = "2.0"
+_WORKSPACE_HMAC_CONTEXT = b"omniforge:workspace:v2"
+_MAX_ARCHIVE_ENTRIES = 64
+_MAX_ARCHIVE_UNCOMPRESSED_BYTES = 512 * 1024 * 1024  # 512 MiB zip-bomb guard
 
 # Keys that are runtime-only, non-serializable clients, or UI upload widget transients
 _EXCLUDED_EXACT_KEYS: frozenset[str] = frozenset(
@@ -74,7 +78,7 @@ _EXCLUDED_KEY_PATTERNS: tuple[str, ...] = (
 def _sanitize_project_filename(project_name: str) -> str:
     """Convert any human project name into a clean, filesystem-safe filename stem."""
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", (project_name or "").strip()).strip("._-")
-    return cleaned or f"uap_project_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}"
+    return cleaned or f"omniforge_project_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}"
 
 
 def _should_persist_key(key: str, value: Any) -> bool:
@@ -138,11 +142,11 @@ def _detect_completed_stages(state: Mapping[str, Any]) -> list[str]:
 
 
 class WorkspaceManifest(BaseModel):
-    """Human-readable metadata & integrity manifest embedded inside every ``.uap`` project archive."""
+    """Human-readable metadata & integrity manifest embedded inside every ``.omniforge`` project archive."""
 
     format_version: str = FORMAT_VERSION
     uap_version: str = __version__
-    project_name: str = "uap_project"
+    project_name: str = "omniforge_project"
     notes: str = ""
     saved_at_utc: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     active_studio: str = ""
@@ -163,6 +167,7 @@ class WorkspaceManifest(BaseModel):
     saved_keys: list[str] = Field(default_factory=list)
     skipped_keys: list[dict[str, str]] = Field(default_factory=list)
     payload_sha256: str = ""
+    payload_hmac_sha256: str = ""
     payload_size_bytes: int = 0
 
 
@@ -194,7 +199,7 @@ class WorkspaceSessionManager:
         cls,
         session_state: Mapping[str, Any],
         *,
-        project_name: str = "uap_project",
+        project_name: str = "omniforge_project",
         notes: str = "",
     ) -> tuple[bytes, WorkspaceManifest]:
         """Serialize the entire workspace state into an integrity-verified ``.uap`` byte archive."""
@@ -217,6 +222,7 @@ class WorkspaceSessionManager:
         joblib.dump(serializable, payload_buf, compress=("zlib", 3))
         payload_bytes = payload_buf.getvalue()
         payload_sha = hashlib.sha256(payload_bytes).hexdigest()
+        payload_hmac = ArtifactSigner().sign_bytes(payload_bytes, context=_WORKSPACE_HMAC_CONTEXT)
 
         df = serializable.get("uap_df")
         raw_df = serializable.get("uap_raw_df")
@@ -279,7 +285,7 @@ class WorkspaceSessionManager:
         manifest = WorkspaceManifest(
             format_version=FORMAT_VERSION,
             uap_version=__version__,
-            project_name=(project_name or "").strip() or str(serializable.get("uap_dataset_name") or "uap_project"),
+            project_name=(project_name or "").strip() or str(serializable.get("uap_dataset_name") or "omniforge_project"),
             notes=(notes or "").strip(),
             active_studio=str(serializable.get("uap_selected_studio") or serializable.get("uap_active_studio") or ""),
             theme=str(serializable.get("uap_theme_radio") or serializable.get("uap_theme") or "dark").lower(),
@@ -299,6 +305,7 @@ class WorkspaceSessionManager:
             saved_keys=sorted(serializable.keys()),
             skipped_keys=skipped,
             payload_sha256=payload_sha,
+            payload_hmac_sha256=payload_hmac,
             payload_size_bytes=len(payload_bytes),
         )
 
@@ -356,19 +363,31 @@ class WorkspaceSessionManager:
 
     @classmethod
     def inspect_bytes(cls, data: bytes) -> WorkspaceManifest:
-        """Read and validate the manifest of a ``.uap`` project archive without restoring it."""
+        """Read and validate the manifest of a ``.omniforge`` project archive without restoring it."""
         if not data:
             raise DataValidationError(
                 "Project file is empty.",
-                suggestions=["Select a valid saved .uap workspace project file."],
+                suggestions=["Select a valid saved .omniforge workspace project file."],
             )
         try:
             with zipfile.ZipFile(io.BytesIO(data), mode="r") as zf:
-                names = set(zf.namelist())
+                infos = zf.infolist()
+                if len(infos) > _MAX_ARCHIVE_ENTRIES:
+                    raise DataValidationError(
+                        "Invalid OmniForge project archive: excessive ZIP entry count.",
+                        suggestions=["Only upload archives created by OmniForge Project Save."],
+                    )
+                total_uncompressed = sum(info.file_size for info in infos)
+                if total_uncompressed > _MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+                    raise DataValidationError(
+                        "Invalid OmniForge project archive: uncompressed payload exceeds safety limit.",
+                        suggestions=["Ensure the workspace archive is legitimate and within size limits."],
+                    )
+                names = {info.filename for info in infos}
                 if MANIFEST_FILENAME not in names or STATE_FILENAME not in names:
                     raise DataValidationError(
                         "Invalid OmniForge project archive: missing required manifest or state payload.",
-                        suggestions=["Ensure the uploaded file was saved by OmniForge Project Save (.uap)."],
+                        suggestions=["Ensure the uploaded file was saved by OmniForge Project Save (.omniforge)."],
                     )
                 raw_manifest = json.loads(zf.read(MANIFEST_FILENAME).decode("utf-8"))
                 return WorkspaceManifest.model_validate(raw_manifest)
@@ -377,21 +396,26 @@ class WorkspaceSessionManager:
         except Exception as exc:
             raise DataValidationError(
                 f"Could not inspect OmniForge project file: {exc}",
-                suggestions=["Verify the file is a valid, uncorrupted .uap project archive."],
+                suggestions=["Verify the file is a valid, uncorrupted .omniforge project archive."],
                 cause=exc,
             ) from exc
 
     @classmethod
     def inspect_file(cls, path: str | Path) -> WorkspaceManifest:
-        """Read and validate the manifest of a ``.uap`` project file on disk."""
+        """Read and validate the manifest of a ``.omniforge`` project file on disk."""
         src = Path(path)
         if not src.exists():
             raise DataValidationError(f"Workspace project file not found: {src}")
         return cls.inspect_bytes(src.read_bytes())
 
     @classmethod
-    def load_from_bytes(cls, data: bytes) -> tuple[dict[str, Any], WorkspaceManifest]:
-        """Verify SHA-256 integrity and deserialize a complete ``.uap`` workspace state archive."""
+    def load_from_bytes(
+        cls,
+        data: bytes,
+        *,
+        require_signature: bool = True,
+    ) -> tuple[dict[str, Any], WorkspaceManifest]:
+        """Verify SHA-256 + HMAC-SHA256 signature and safely deserialize a ``.omniforge`` archive."""
         manifest = cls.inspect_bytes(data)
         try:
             with zipfile.ZipFile(io.BytesIO(data), mode="r") as zf:
@@ -401,9 +425,24 @@ class WorkspaceSessionManager:
                 raise DataValidationError(
                     "Workspace project integrity check failed (SHA-256 mismatch — file may be corrupted).",
                     context={"expected_sha256": manifest.payload_sha256, "actual_sha256": actual_sha},
-                    suggestions=["Re-export the .uap project file or choose an intact backup snapshot."],
+                    suggestions=["Re-export the .omniforge project file or choose an intact backup snapshot."],
                 )
-            loaded = joblib.load(io.BytesIO(payload_bytes))
+            if require_signature:
+                signer = ArtifactSigner()
+                if not manifest.payload_hmac_sha256 or not signer.verify_bytes(
+                    payload_bytes,
+                    manifest.payload_hmac_sha256,
+                    context=_WORKSPACE_HMAC_CONTEXT,
+                ):
+                    raise SecurityError(
+                        "Workspace archive failed cryptographic HMAC-SHA256 signature verification. "
+                        "Refusing to deserialize untrusted or externally modified project archive.",
+                        suggestions=[
+                            "Only load .omniforge project files signed by this OmniForge instance "
+                            "or configure a shared OMNIFORGE_ARTIFACT_SIGNING_KEY across trusted instances."
+                        ],
+                    )
+            loaded = safe_joblib_load_bytes(payload_bytes, filename=STATE_FILENAME)
             if not isinstance(loaded, dict):
                 raise DataValidationError("Deserialized project payload is not a valid session state mapping.")
             logger.info(
@@ -413,7 +452,7 @@ class WorkspaceSessionManager:
                 dataset=manifest.dataset_name,
             )
             return loaded, manifest
-        except DataValidationError:
+        except (DataValidationError, SecurityError):
             raise
         except Exception as exc:
             raise DataValidationError(

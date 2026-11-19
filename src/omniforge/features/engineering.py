@@ -48,6 +48,7 @@ class _FittedFeatureState:
     categorical_cols: list[str] = field(default_factory=list)
     datetime_cols: list[str] = field(default_factory=list)
     skewed_cols: list[str] = field(default_factory=list)
+    skewed_medians: dict[str, float] = field(default_factory=dict)
     power_transformer: PowerTransformer | None = None
     scaler: Any = None
     scaled_cols: list[str] = field(default_factory=list)
@@ -97,9 +98,10 @@ class FeatureEngineeringPipeline:
                 y_num = pd.factorize(y_series)[0].astype(float)
             self._state.global_target_mean = float(np.nanmean(y_num)) if len(y_num) > 0 else 0.0
 
-        # Categorical encodings
+        # Categorical encodings (with out-of-fold target encoding cached for leak-free training transform)
+        oof_target_enc: dict[str, np.ndarray] = {}
         for col in self._state.categorical_cols:
-            s = X[col].astype(str).fillna("MISSING")
+            s = X[col].fillna("MISSING").astype(str)
             n_uniq = int(s.nunique())
             enc_mode = self.config.categorical_encoding
             if enc_mode == "onehot" or (enc_mode == "auto" and n_uniq <= self.config.max_onehot_cardinality):
@@ -109,14 +111,34 @@ class FeatureEngineeringPipeline:
                 freqs = (s.value_counts(normalize=True)).to_dict()
                 self._state.freq_maps[col] = {str(k): float(v) for k, v in freqs.items()}
                 if (enc_mode == "target" or enc_mode == "auto") and y_num is not None and len(y_num) == len(s):
-                    tmp = pd.DataFrame({"cat": s.values, "y": y_num})
-                    stats_df = tmp.groupby("cat")["y"].agg(["count", "mean"])
-                    smooth = self.config.target_encoding_smoothing
+                    smooth = float(self.config.target_encoding_smoothing)
                     gmean = self._state.global_target_mean
+                    tmp = pd.DataFrame({"cat": s.to_numpy(), "y": y_num})
+                    stats_df = tmp.groupby("cat")["y"].agg(["count", "mean"])
                     smoothed = (stats_df["count"] * stats_df["mean"] + smooth * gmean) / (
                         stats_df["count"] + smooth
                     )
                     self._state.target_maps[col] = {str(k): float(v) for k, v in smoothed.items()}
+
+                    # Out-of-fold Empirical Bayes smoothing (Micci-Barreca 2001) to prevent training self-leakage
+                    n_rows = len(s)
+                    n_folds = min(5, max(2, n_rows // 4))
+                    oof_vals = np.full(n_rows, gmean, dtype=float)
+                    if n_rows >= 4:
+                        fold_ids = np.arange(n_rows) % n_folds
+                        cat_arr = s.to_numpy()
+                        for f_idx in range(n_folds):
+                            tr_mask = fold_ids != f_idx
+                            va_mask = fold_ids == f_idx
+                            f_gmean = float(np.nanmean(y_num[tr_mask])) if np.any(tr_mask) else gmean
+                            f_df = pd.DataFrame({"cat": cat_arr[tr_mask], "y": y_num[tr_mask]})
+                            f_stats = f_df.groupby("cat")["y"].agg(["count", "mean"])
+                            f_smooth = (f_stats["count"] * f_stats["mean"] + smooth * f_gmean) / (
+                                f_stats["count"] + smooth
+                            )
+                            f_map = {str(k): float(v) for k, v in f_smooth.items()}
+                            oof_vals[va_mask] = [f_map.get(str(v), f_gmean) for v in cat_arr[va_mask]]
+                    oof_target_enc[col] = oof_vals
 
         # Group aggregations
         for group_col, agg_cols in self.config.group_aggregations.items():
@@ -140,13 +162,23 @@ class FeatureEngineeringPipeline:
                     self._state.skewed_cols.append(col)
             if self._state.skewed_cols:
                 pt = PowerTransformer(method="yeo-johnson", standardize=False)
-                mat = X[self._state.skewed_cols].fillna(X[self._state.skewed_cols].median()).fillna(0.0)
+                meds = {
+                    col: (float(X[col].median()) if X[col].notna().any() else 0.0)
+                    for col in self._state.skewed_cols
+                }
+                self._state.skewed_medians = meds
+                mat = X[self._state.skewed_cols].copy()
+                for col, med_val in meds.items():
+                    mat[col] = pd.to_numeric(mat[col], errors="coerce").fillna(med_val)
                 pt.fit(mat)
                 self._state.power_transformer = pt
 
-        # Build engineered training preview to fit Train-only medians & scaler cleanly (ZERO test-batch leakage!)
+        # Build engineered training preview using leak-free OOF target encodings to fit medians & scaler cleanly
         self._is_fitted = True
-        engineered_unscaled = self._transform_internal(X, apply_scaling=False, fit_medians=True)
+        self._last_train_oof_target_enc: dict[str, np.ndarray] = oof_target_enc
+        engineered_unscaled = self._transform_internal(
+            X, apply_scaling=False, fit_medians=True, oof_target_override=oof_target_enc
+        )
         num_after = [
             str(c)
             for c in engineered_unscaled.select_dtypes(include=[np.number]).columns
@@ -179,9 +211,11 @@ class FeatureEngineeringPipeline:
         return self._transform_internal(X, apply_scaling=True, fit_medians=False)
 
     def fit_transform(self, X: pd.DataFrame, y: pd.Series | np.ndarray | None = None) -> pd.DataFrame:
-        """Fit pipeline on ``X`` (and optional ``y``) and return transformed features."""
+        """Fit pipeline on ``X`` (and optional ``y``) and return leak-free OOF-encoded training features."""
         self.fit(X, y)
-        return self.transform(X)
+        return self._transform_internal(
+            X, apply_scaling=True, fit_medians=False, oof_target_override=getattr(self, "_last_train_oof_target_enc", None)
+        )
 
     def fit_transform_split(
         self,
@@ -189,12 +223,17 @@ class FeatureEngineeringPipeline:
         X_test: pd.DataFrame,
         y_train: pd.Series | np.ndarray | None = None,
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """Leakage-free split transformation: fit strictly on ``X_train`` (+ ``y_train``), then transform both partitions."""
-        self.fit(X_train, y_train)
-        return self.transform(X_train), self.transform(X_test)
+        """Leakage-free split transformation: OOF target encoding on ``X_train``, full-train map on ``X_test``."""
+        X_train_out = self.fit_transform(X_train, y_train)
+        return X_train_out, self.transform(X_test)
 
     def _transform_internal(
-        self, X: pd.DataFrame, *, apply_scaling: bool, fit_medians: bool = False
+        self,
+        X: pd.DataFrame,
+        *,
+        apply_scaling: bool,
+        fit_medians: bool = False,
+        oof_target_override: dict[str, np.ndarray] | None = None,
     ) -> pd.DataFrame:
         out = pd.DataFrame(index=X.index)
 
@@ -203,7 +242,7 @@ class FeatureEngineeringPipeline:
             if col in X.columns:
                 out[col] = X[col]
 
-        # Numeric columns (with optional skew correction)
+        # Numeric columns (with optional skew correction using fitted training medians)
         if self._state.numeric_cols:
             num_df = X[[c for c in self._state.numeric_cols if c in X.columns]].copy()
             for col in num_df.columns:
@@ -211,7 +250,9 @@ class FeatureEngineeringPipeline:
             if self._state.power_transformer is not None and self._state.skewed_cols:
                 present = [c for c in self._state.skewed_cols if c in num_df.columns]
                 if len(present) == len(self._state.skewed_cols):
-                    filled = num_df[present].fillna(0.0)
+                    filled = num_df[present].copy()
+                    for c in present:
+                        filled[c] = filled[c].fillna(self._state.skewed_medians.get(c, 0.0))
                     num_df[present] = self._state.power_transformer.transform(filled)
             for col in num_df.columns:
                 out[col] = num_df[col]
@@ -225,10 +266,10 @@ class FeatureEngineeringPipeline:
                 out[f"{col}_year"] = dt.dt.year.fillna(0).astype(np.int32)
                 out[f"{col}_month"] = dt.dt.month.fillna(1).astype(np.int16)
                 out[f"{col}_day"] = dt.dt.day.fillna(1).astype(np.int16)
-                out[f"{col}_dayofweek"] = dt.dt.dayofweek.fillna(0).astype(np.int16)
-                out[f"{col}_dayofyear"] = dt.dt.dayofyear.fillna(1).astype(np.int16)
+                out[f"{col}_dayofweek"] = dt.dt.day_of_week.fillna(0).astype(np.int16)
+                out[f"{col}_dayofyear"] = dt.dt.day_of_year.fillna(1).astype(np.int16)
                 out[f"{col}_quarter"] = dt.dt.quarter.fillna(1).astype(np.int16)
-                out[f"{col}_is_weekend"] = (dt.dt.dayofweek >= 5).fillna(False).astype(np.int8)
+                out[f"{col}_is_weekend"] = (dt.dt.day_of_week >= 5).fillna(False).astype(np.int8)
                 if self.config.add_cyclical_time:
                     out[f"{col}_month_sin"] = np.sin(2.0 * np.pi * out[f"{col}_month"] / 12.0)
                     out[f"{col}_month_cos"] = np.cos(2.0 * np.pi * out[f"{col}_month"] / 12.0)
@@ -239,7 +280,7 @@ class FeatureEngineeringPipeline:
         for col in self._state.categorical_cols:
             if col not in X.columns:
                 continue
-            s = X[col].astype(str).fillna("MISSING")
+            s = X[col].fillna("MISSING").astype(str)
             if col in self._state.onehot_categories:
                 for cat in self._state.onehot_categories[col]:
                     safe_cat = "".join(ch if ch.isalnum() else "_" for ch in str(cat))[:32]
@@ -248,9 +289,12 @@ class FeatureEngineeringPipeline:
                 fmap = self._state.freq_maps[col]
                 out[f"{col}__freq"] = s.map(lambda v, _m=fmap: _m.get(v, 0.0)).astype(np.float32)
             if col in self._state.target_maps:
-                tmap = self._state.target_maps[col]
-                gmean = self._state.global_target_mean
-                out[f"{col}__target_enc"] = s.map(lambda v, _m=tmap, _g=gmean: _m.get(v, _g)).astype(np.float32)
+                if oof_target_override is not None and col in oof_target_override and len(oof_target_override[col]) == len(s):
+                    out[f"{col}__target_enc"] = oof_target_override[col].astype(np.float32)
+                else:
+                    tmap = self._state.target_maps[col]
+                    gmean = self._state.global_target_mean
+                    out[f"{col}__target_enc"] = s.map(lambda v, _m=tmap, _g=gmean: _m.get(v, _g)).astype(np.float32)
 
         # Pairwise interactions & ratios
         if self.config.create_interactions and len(self._state.interaction_cols) >= 2:
@@ -294,6 +338,9 @@ class FeatureEngineeringPipeline:
                     out[f"{ts_target}_roll_std_{win}"] = shifted.groupby(X[grp_col], observed=True).transform(
                         lambda s, _w=win: s.rolling(_w, min_periods=1).std().fillna(0.0)
                     )
+                if self.config.lags:
+                    # Strictly causal lagged first difference: y_{t-1} - y_{t-2} (never uses current y_t)
+                    out[f"{ts_target}_diff_1"] = grouped.shift(1) - grouped.shift(2)
             else:
                 for lag in self.config.lags:
                     out[f"{ts_target}_lag_{lag}"] = series.shift(lag)
@@ -304,7 +351,8 @@ class FeatureEngineeringPipeline:
                     out[f"{ts_target}_roll_min_{win}"] = shifted.rolling(win, min_periods=1).min()
                     out[f"{ts_target}_roll_max_{win}"] = shifted.rolling(win, min_periods=1).max()
                 if self.config.lags:
-                    out[f"{ts_target}_diff_1"] = series.diff(1)
+                    # Strictly causal lagged first difference: y_{t-1} - y_{t-2} (never leaks current y_t)
+                    out[f"{ts_target}_diff_1"] = series.shift(1).diff(1)
 
             if self.config.fourier_periods:
                 t_idx = np.arange(len(X), dtype=float)

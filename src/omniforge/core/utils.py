@@ -34,7 +34,7 @@ def set_global_seed(seed: int = DEFAULT_RANDOM_SEED) -> int:
     random.seed(seed)
     np.random.seed(seed)
     if is_package_available("torch"):
-        import torch  # type: ignore[import-not-found]
+        import torch
 
         torch.manual_seed(seed)
         if torch.cuda.is_available():
@@ -185,8 +185,26 @@ def safe_json_default(obj: Any) -> Any:
     return str(obj)
 
 
+def to_json_object(data: Any) -> dict[str, Any]:
+    """``to_json_safe`` narrowed to a JSON object (empty dict for non-mapping input)."""
+    safe = to_json_safe(data)
+    return safe if isinstance(safe, dict) else {}
+
+
+def to_json_list(data: Any) -> list[Any]:
+    """``to_json_safe`` narrowed to a JSON array (empty list for non-sequence input)."""
+    safe = to_json_safe(data)
+    return safe if isinstance(safe, list) else []
+
+
 def to_json_safe(data: Any) -> Any:
-    """Deep-convert an arbitrary structure into strictly RFC-8259 JSON-compliant primitives (no NaN/Inf/NaT)."""
+    """Deep-convert an arbitrary structure into strictly RFC-8259 JSON-compliant primitives (no NaN/Inf/NaT).
+
+    The return value is JSON-native (dict/list/str/int/float/bool/None) but is
+    deliberately annotated ``Any`` because the concrete shape depends on the
+    input. Endpoints that must expose a stricter contract should funnel their
+    payload through :func:`to_json_object` / :func:`to_json_list`.
+    """
     if data is None or data is pd.NA or data is pd.NaT:
         return None
     if isinstance(data, bool):
@@ -261,7 +279,7 @@ def detect_hardware_profile() -> dict[str, Any]:
     gpu_count = 0
 
     if is_package_available("torch"):
-        import torch  # type: ignore[import-not-found]
+        import torch
 
         if torch.cuda.is_available():
             gpu_available = True

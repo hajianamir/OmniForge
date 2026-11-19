@@ -1,38 +1,171 @@
-"""JWT Bearer Authentication and RBAC/ABAC FastAPI dependencies backed by OmniForge Security primitives."""
+"""JWT Bearer, API-Key, and CSRF-Protected Local Workbench Authentication & RBAC Dependencies."""
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import secrets
 from collections.abc import Callable
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, Response, status
 
+from omniforge.config.settings import get_settings
 from omniforge.core.exceptions import AuthorizationError
-from omniforge.core.security import AccessController, JWTManager
+from omniforge.core.security import AccessController, JWTManager, _is_production_env, _resolve_or_persist_secret
 from omniforge.core.types import Principal
 
 jwt_manager = JWTManager()
 access_controller = AccessController()
 
+WORKBENCH_AUTH_COOKIE = "omniforge_wb_auth"
+WORKBENCH_CSRF_COOKIE = "omniforge_csrf"
+_WORKBENCH_COOKIE_CONTEXT = b"omniforge:workbench-cookie:v1"
+_STATE_CHANGING_METHODS: frozenset[str] = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def get_api_key() -> str:
+    """Resolve the active server API key from config/env or persistent 0600 local keyfile."""
+    settings_key = get_settings().security.api_key or None
+    raw = _resolve_or_persist_secret(
+        key_name="api_key",
+        explicit=settings_key,
+        env_vars=("OMNIFORGE_API_KEY", "OMNIFORGE_SECURITY__API_KEY"),
+        min_length=24,
+    )
+    return raw.decode("utf-8", errors="replace")
+
+
+def verify_api_key(candidate: str | None) -> bool:
+    """Verify an API key or workbench token in constant time."""
+    if not candidate or not isinstance(candidate, str):
+        return False
+    expected = get_api_key()
+    return hmac.compare_digest(candidate.strip(), expected)
+
+
+def _derive_workbench_cookie_token() -> str:
+    """Derive a deterministic HMAC-authenticated cookie value bound to the server API key."""
+    key_bytes = get_api_key().encode("utf-8")
+    return hmac.new(key_bytes, _WORKBENCH_COOKIE_CONTEXT, hashlib.sha256).hexdigest()
+
+
+def issue_local_workbench_cookies(response: Response, *, secure: bool = False) -> None:
+    """Attach HttpOnly SameSite=Strict auth + CSRF double-submit cookies for local SPA bootstrap."""
+    wb_token = _derive_workbench_cookie_token()
+    csrf_token = secrets.token_urlsafe(32)
+    response.set_cookie(
+        key=WORKBENCH_AUTH_COOKIE,
+        value=wb_token,
+        httponly=True,
+        secure=secure,
+        samesite="strict",
+        path="/",
+    )
+    response.set_cookie(
+        key=WORKBENCH_CSRF_COOKIE,
+        value=csrf_token,
+        httponly=False,
+        secure=secure,
+        samesite="strict",
+        path="/",
+    )
+
+
+def should_auto_bootstrap_local_ui() -> bool:
+    """Return True only when non-production local UI cookie bootstrap is explicitly enabled."""
+    if _is_production_env():
+        return False
+    return bool(get_settings().security.auto_bootstrap_local_ui)
+
+
+def _authenticate_from_cookie(request: Request) -> Principal | None:
+    """Verify HttpOnly workbench auth cookie plus X-CSRF-Token double-submit on mutations."""
+    cookie_token = request.cookies.get(WORKBENCH_AUTH_COOKIE)
+    if not cookie_token:
+        return None
+    expected_cookie = _derive_workbench_cookie_token()
+    if not hmac.compare_digest(cookie_token, expected_cookie):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid workbench session cookie.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if request.method.upper() in _STATE_CHANGING_METHODS:
+        csrf_cookie = request.cookies.get(WORKBENCH_CSRF_COOKIE) or ""
+        csrf_header = request.headers.get("x-csrf-token") or ""
+        if not csrf_cookie or not csrf_header or not hmac.compare_digest(csrf_cookie, csrf_header):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="CSRF verification failed: missing or mismatched X-CSRF-Token header.",
+            )
+    return Principal(
+        subject="local_workbench_user",
+        roles=["admin"],
+        tenant_id=get_settings().default_tenant_id,
+    )
+
 
 def get_current_principal(
+    request: Request,
     authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_workbench_token: str | None = Header(default=None, alias="X-Workbench-Token"),
 ) -> Principal:
-    """Extract and validate a Bearer JWT token; falls back to dev admin Principal if omitted."""
-    if not authorization:
-        return Principal(subject="local_dev", roles=["admin"], tenant_id="default-tenant")
-    parts = authorization.split()
-    if len(parts) != 2 or parts[0].lower() != "bearer":
+    """Authenticate callers via Bearer JWT, X-API-Key, or CSRF-verified local workbench cookie.
+
+    Never falls back to an unauthenticated admin principal. Missing or invalid credentials always
+    result in HTTP 401 Unauthorized.
+    """
+    # 1. Bearer JWT authentication
+    if authorization:
+        parts = authorization.split()
+        if len(parts) != 2 or parts[0].lower() != "bearer":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Authorization header must use 'Bearer <token>' scheme.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        try:
+            return jwt_manager.verify_token(parts[1])
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired JWT token.",
+                headers={"WWW-Authenticate": "Bearer"},
+            ) from exc
+
+    # 2. API Key / Workbench Token header authentication
+    api_candidate = x_api_key or x_workbench_token
+    if api_candidate:
+        if verify_api_key(api_candidate):
+            return Principal(
+                subject="api_key_principal",
+                roles=["admin"],
+                tenant_id=get_settings().default_tenant_id,
+            )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authorization header must use 'Bearer <token>' scheme.",
+            detail="Invalid API key.",
+            headers={"WWW-Authenticate": "Bearer"},
         )
-    try:
-        return jwt_manager.verify_token(parts[1])
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Invalid or expired JWT token: {exc}",
-        ) from exc
+
+    # 3. Same-origin local workbench HttpOnly cookie + CSRF verification
+    cookie_principal = _authenticate_from_cookie(request)
+    if cookie_principal is not None:
+        return cookie_principal
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Authentication required. Provide a valid Bearer JWT token or X-API-Key header.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def require_workbench_auth(
+    principal: Principal = Depends(get_current_principal),
+) -> Principal:
+    """FastAPI dependency protecting all /api/workbench/* routes."""
+    return principal
 
 
 def require_permission(permission: str) -> Callable[..., Principal]:

@@ -63,8 +63,16 @@ class MonteCarloSimulator:
             corr = np.asarray(correlation_matrix, dtype=float)
             if corr.shape != (d, d):
                 raise SimulationError("correlation_matrix shape must match number of input_specs.")
+            corr = 0.5 * (corr + corr.T)
+            eigvals, eigvecs = np.linalg.eigh(corr)
+            eigvals = np.clip(eigvals, 1e-6, None)
+            corr = (eigvecs * eigvals) @ eigvecs.T
+            diag_std = np.sqrt(np.maximum(np.diag(corr), 1e-12))
+            corr = corr / np.outer(diag_std, diag_std)
+            corr = 0.5 * (corr + corr.T)
+            np.fill_diagonal(corr, 1.0)
             z = rng.multivariate_normal(np.zeros(d), corr, size=self.n_simulations)
-            u_draws = stats.norm.cdf(z)
+            u_draws = np.clip(stats.norm.cdf(z), 1e-9, 1.0 - 1e-9)
         else:
             # Stratified Latin Hypercube style sampling per dimension
             u_draws = np.empty((self.n_simulations, d), dtype=float)
@@ -79,20 +87,24 @@ class MonteCarloSimulator:
             dist = str(spec.get("dist", "normal")).lower()
             u = u_draws[:, j]
             if dist == "normal":
-                samples[name] = stats.norm.ppf(u, loc=float(spec.get("mean", 0.0)), scale=float(spec.get("std", 1.0)))
+                samples[name] = stats.norm.ppf(u, loc=float(spec.get("mean", 0.0)), scale=max(float(spec.get("std", 1.0)), 1e-12))
             elif dist == "lognormal":
-                samples[name] = stats.lognorm.ppf(u, s=float(spec.get("sigma", 0.5)), scale=np.exp(float(spec.get("mean", 0.0))))
+                samples[name] = stats.lognorm.ppf(u, s=max(float(spec.get("sigma", 0.5)), 1e-12), scale=np.exp(float(spec.get("mean", 0.0))))
             elif dist == "uniform":
                 low, high = float(spec.get("low", 0.0)), float(spec.get("high", 1.0))
+                if high < low:
+                    raise SimulationError(f"Uniform input '{name}' requires high >= low.")
                 samples[name] = low + u * (high - low)
             elif dist == "triangular":
                 left, mode, right = float(spec["left"]), float(spec["mode"]), float(spec["right"])
-                c = (mode - left) / max(right - left, 1e-12)
+                if not (left <= mode <= right) or right <= left:
+                    raise SimulationError(f"Triangular input '{name}' requires left <= mode <= right and right > left.")
+                c = (mode - left) / (right - left)
                 samples[name] = stats.triang.ppf(u, c=c, loc=left, scale=right - left)
             elif dist == "poisson":
-                samples[name] = stats.poisson.ppf(u, mu=float(spec.get("lam", 5.0)))
+                samples[name] = stats.poisson.ppf(u, mu=max(float(spec.get("lam", 5.0)), 1e-12))
             elif dist == "beta":
-                samples[name] = stats.beta.ppf(u, a=float(spec.get("a", 2.0)), b=float(spec.get("b", 2.0)))
+                samples[name] = stats.beta.ppf(u, a=max(float(spec.get("a", 2.0)), 1e-12), b=max(float(spec.get("b", 2.0)), 1e-12))
             else:
                 raise SimulationError(f"Unsupported distribution '{dist}' for input '{name}'.")
 
@@ -102,15 +114,19 @@ class MonteCarloSimulator:
         cvar_95 = float(np.mean(tail)) if len(tail) > 0 else q05
 
         sens: dict[str, float] = {}
+        out_const = float(np.std(outcomes)) <= 1e-12
         for name in names:
-            rho, _ = stats.spearmanr(samples[name], outcomes)
-            sens[name] = round(0.0 if np.isnan(rho) else float(rho), 4)
+            if out_const or float(np.std(samples[name])) <= 1e-12:
+                sens[name] = 0.0
+            else:
+                rho, _ = stats.spearmanr(samples[name], outcomes)
+                sens[name] = round(0.0 if np.isnan(rho) else float(rho), 4)
         sens = dict(sorted(sens.items(), key=lambda kv: abs(kv[1]), reverse=True))
 
         result = MonteCarloResult(
             n_simulations=self.n_simulations,
             mean=round(float(np.mean(outcomes)), 6),
-            std=round(float(np.std(outcomes)), 6),
+            std=round(float(np.std(outcomes, ddof=1) if len(outcomes) > 1 else 0.0), 6),
             median=round(float(np.median(outcomes)), 6),
             min=round(float(np.min(outcomes)), 6),
             max=round(float(np.max(outcomes)), 6),
@@ -294,7 +310,10 @@ class DigitalTwinEngine:
         S = self.H @ P_pred @ self.H.T + self.R
         K = P_pred @ self.H.T @ np.linalg.pinv(S)
         self.x = x_pred + K @ y
-        self.P = (np.eye(len(self.x)) - K @ self.H) @ P_pred
+        # Joseph stabilized covariance update (Bucy & Joseph 1968): guarantees symmetry & PSD
+        ikh = np.eye(len(self.x), dtype=float) - K @ self.H
+        self.P = ikh @ P_pred @ ikh.T + K @ self.R @ K.T
+        self.P = 0.5 * (self.P + self.P.T)
         return self.x.copy()
 
     def simulate_scenario(

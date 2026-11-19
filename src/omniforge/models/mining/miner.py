@@ -56,9 +56,21 @@ class AssociationRuleMiner:
                         item_cols[f"{col}={v}"] = (clean == v).to_numpy(dtype=bool)
                 elif clean.notna().sum() >= 10:
                     try:
-                        q = pd.qcut(clean, q=3, labels=["Low", "Mid", "High"], duplicates="drop")
-                        for lvl in q.cat.categories:
-                            item_cols[f"{col}={lvl}"] = (q == lvl).to_numpy(dtype=bool)
+                        q_raw = pd.qcut(clean, q=3, duplicates="drop")
+                        n_bins = len(q_raw.cat.categories)
+                        if n_bins >= 2:
+                            lvl_labels = ["Low", "High"] if n_bins == 2 else ["Low", "Mid", "High"][:n_bins]
+                            q = q_raw.cat.rename_categories(lvl_labels)
+                            for lvl in q.cat.categories:
+                                item_cols[f"{col}={lvl}"] = (q == lvl).to_numpy(dtype=bool)
+                        else:
+                            # Heavily tied/zero-inflated numeric column: split around median/mode boundary
+                            med_v = float(clean.median())
+                            low_mask = (clean <= med_v).to_numpy(dtype=bool)
+                            high_mask = (clean > med_v).to_numpy(dtype=bool)
+                            if low_mask.any() and high_mask.any():
+                                item_cols[f"{col}=Low"] = low_mask
+                                item_cols[f"{col}=High"] = high_mask
                     except Exception:
                         pass
             else:
@@ -150,15 +162,17 @@ class AssociationRuleMiner:
         ]
 
         logger.info("association_rules_mined", transactions=n, rules=len(rules[:max_rules]))
-        return to_json_safe(
-            {
-                "n_transactions": n,
-                "n_items_evaluated": len(names),
-                "n_frequent_itemsets": len(all_freq),
-                "frequent_itemsets": itemsets_out,
-                "rules": rules[:max_rules],
-                "summary": f"Discovered {len(rules[:max_rules])} strong association rules (min support={min_support:.2f}, confidence={min_confidence:.2f}, lift>={min_lift:.2f}).",
-            }
+        return dict(
+            to_json_safe(
+                {
+                    "n_transactions": n,
+                    "n_items_evaluated": len(names),
+                    "n_frequent_itemsets": len(all_freq),
+                    "frequent_itemsets": itemsets_out,
+                    "rules": rules[:max_rules],
+                    "summary": f"Discovered {len(rules[:max_rules])} strong association rules (min support={min_support:.2f}, confidence={min_confidence:.2f}, lift>={min_lift:.2f}).",
+                }
+            )
         )
 
 
@@ -245,15 +259,25 @@ class SubgroupDiscoveryMiner:
                     }
                 )
 
-        subgroups.sort(key=lambda r: (abs(r["wracc"]), -r["p_value"]), reverse=True)
-        return to_json_safe(
-            {
-                "target": target_col,
-                "metric_label": target_label,
-                "global_baseline": round(global_mean, 4),
-                "subgroups": subgroups[:max_subgroups],
-                "summary": f"Evaluated feature cohorts against {target_label} (global={global_mean:.4f}); top {min(len(subgroups), max_subgroups)} subgroups ranked by WRAcc & Welch significance.",
-            }
+        if subgroups:
+            from omniforge.eda.statistics import StatisticalAnalyzer
+
+            adj_ps = StatisticalAnalyzer.adjust_p_values([float(r["p_value"]) for r in subgroups], method="fdr_bh")
+            for row, adj_p in zip(subgroups, adj_ps, strict=False):
+                row["adjusted_p_value"] = round(float(adj_p), 6)
+                row["significant"] = "Yes (FDR<0.05)" if adj_p < 0.05 else "No"
+
+        subgroups.sort(key=lambda r: (abs(r["wracc"]), -r["adjusted_p_value"]), reverse=True)
+        return dict(
+            to_json_safe(
+                {
+                    "target": target_col,
+                    "metric_label": target_label,
+                    "global_baseline": round(global_mean, 4),
+                    "subgroups": subgroups[:max_subgroups],
+                    "summary": f"Evaluated feature cohorts against {target_label} (global={global_mean:.4f}); top {min(len(subgroups), max_subgroups)} subgroups ranked by WRAcc & Welch significance.",
+                }
+            )
         )
 
 
@@ -330,16 +354,18 @@ class ManifoldProjector:
                     groups = None
 
         scatter = compact_scatter_payload(emb[:, 0], emb[:, 1], groups=groups, max_points=cap)
-        return to_json_safe(
-            {
-                "method": m.upper(),
-                "n_points": len(emb),
-                "was_sampled": was_sampled,
-                "explained_variance_pct": explained,
-                "total_explained_pct": round(sum(explained), 2) if explained else None,
-                "loadings": loadings[:20],
-                "scatter": scatter,
-                "x_label": f"{m.upper()} Component 1" + (f" ({explained[0]}%)" if len(explained) >= 1 else ""),
-                "y_label": f"{m.upper()} Component 2" + (f" ({explained[1]}%)" if len(explained) >= 2 else ""),
-            }
+        return dict(
+            to_json_safe(
+                {
+                    "method": m.upper(),
+                    "n_points": len(emb),
+                    "was_sampled": was_sampled,
+                    "explained_variance_pct": explained,
+                    "total_explained_pct": round(sum(explained), 2) if explained else None,
+                    "loadings": loadings[:20],
+                    "scatter": scatter,
+                    "x_label": f"{m.upper()} Component 1" + (f" ({explained[0]}%)" if len(explained) >= 1 else ""),
+                    "y_label": f"{m.upper()} Component 2" + (f" ({explained[1]}%)" if len(explained) >= 2 else ""),
+                }
+            )
         )

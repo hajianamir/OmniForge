@@ -32,14 +32,17 @@ class GraphLinkPredictionSuite(GraphAnalyticsEngine):
 
     @staticmethod
     def _katz_matrix(undir: nx.Graph, nodes: list[Any], beta: float = 0.05, max_len: int = 4) -> np.ndarray:
-        adj = nx.to_numpy_array(undir, nodelist=nodes, dtype=float)
-        acc = np.zeros_like(adj)
+        adj = np.asarray(nx.to_numpy_array(undir, nodelist=nodes, dtype=float), dtype=float)
+        # Ensure strict Katz convergence: beta_eff < 1 / spectral_radius(A)
+        max_deg = float(np.max(np.sum(adj, axis=1))) if adj.size > 0 else 1.0
+        beta_eff = min(float(beta), 0.85 / max(max_deg, 1.0))
+        acc: np.ndarray = np.zeros_like(adj)
         pwr = adj.copy()
-        b = beta
+        b = beta_eff
         for _ in range(max_len):
             acc += b * pwr
             pwr = pwr @ adj
-            b *= beta
+            b *= beta_eff
         return acc
 
     def predict_links_advanced(
@@ -128,12 +131,12 @@ class GraphLinkPredictionSuite(GraphAnalyticsEngine):
     @staticmethod
     def _edge_operator(emb_u: np.ndarray, emb_v: np.ndarray, op: str) -> np.ndarray:
         if op == "l1":
-            return np.abs(emb_u - emb_v)
+            return np.asarray(np.abs(emb_u - emb_v), dtype=float)
         if op == "l2":
-            return (emb_u - emb_v) ** 2
+            return np.asarray((emb_u - emb_v) ** 2, dtype=float)
         if op == "average":
-            return 0.5 * (emb_u + emb_v)
-        return emb_u * emb_v  # Hadamard (Grover & Leskovec, Node2Vec 2016)
+            return np.asarray(0.5 * (emb_u + emb_v), dtype=float)
+        return np.asarray(emb_u * emb_v, dtype=float)  # Hadamard (Grover & Leskovec, Node2Vec 2016)
 
     def train_supervised_link_predictor(
         self,
@@ -217,22 +220,45 @@ class GraphLinkPredictionSuite(GraphAnalyticsEngine):
         roc_auc = float(roc_auc_score(y_te, te_probs)) if len(np.unique(y_te)) == 2 else 0.5
         ap = float(average_precision_score(y_te, te_probs)) if len(np.unique(y_te)) == 2 else 0.5
 
-        # Score candidate unseen non-edges on full graph
+        # Score candidate unseen non-edges on full graph by refitting classifier on full-graph embedding basis
+        # (prevents SVD sign/rotation mismatch between train_g embeddings and undir embeddings)
         full_emb = self.compute_node_embeddings(undir, embedding_dim=embedding_dim)
-        cand_edges = all_non_edges[: min(len(all_non_edges), 2500)]
-        top_preds: list[dict[str, Any]] = []
-        if cand_edges:
-            rows_c = []
-            for u, v in cand_edges:
-                eu = full_emb.get(u, np.zeros(dim))
-                ev = full_emb.get(v, np.zeros(dim))
+        full_dim = len(next(iter(full_emb.values()))) if full_emb else 1
+
+        def _full_pair_features(pairs: list[tuple[Any, Any]]) -> np.ndarray:
+            rows_f = []
+            for u, v in pairs:
+                eu = full_emb.get(u, np.zeros(full_dim))
+                ev = full_emb.get(v, np.zeros(full_dim))
                 op_vec = self._edge_operator(eu, ev, edge_operator)
                 cn = float(len(list(nx.common_neighbors(undir, u, v))))
                 du, dv = float(undir.degree(u)), float(undir.degree(v))
                 aa = sum(1.0 / np.log(max(undir.degree(w), 2)) for w in nx.common_neighbors(undir, u, v))
                 jac = cn / max(du + dv - cn, 1.0)
-                rows_c.append(np.concatenate([op_vec, [cn, du * dv, aa, jac]]))
-            cand_probs = clf.predict_proba(np.vstack(rows_c))[:, 1]
+                rows_f.append(np.concatenate([op_vec, [cn, du * dv, aa, jac]]))
+            return np.vstack(rows_f) if rows_f else np.zeros((0, full_dim + 4))
+
+        if len(all_non_edges) <= 2500:
+            cand_edges = all_non_edges
+        else:
+            cand_pick = rng.choice(len(all_non_edges), size=2500, replace=False)
+            cand_edges = [all_non_edges[int(i)] for i in cand_pick]
+
+        top_preds: list[dict[str, Any]] = []
+        if cand_edges:
+            neg_full_n = min(len(all_non_edges), len(edges))
+            neg_full_pick = rng.choice(len(all_non_edges), size=neg_full_n, replace=False)
+            neg_full = [all_non_edges[int(i)] for i in neg_full_pick]
+            X_full_tr = _full_pair_features([*edges, *neg_full])
+            y_full_tr = np.array([1] * len(edges) + [0] * len(neg_full), dtype=int)
+            if clf_k == "hgb":
+                clf_full: Any = HistGradientBoostingClassifier(max_iter=100, random_state=self.random_seed)
+            elif clf_k == "logistic":
+                clf_full = LogisticRegression(max_iter=500, random_state=self.random_seed)
+            else:
+                clf_full = RandomForestClassifier(n_estimators=120, random_state=self.random_seed, n_jobs=-1)
+            clf_full.fit(X_full_tr, y_full_tr)
+            cand_probs = clf_full.predict_proba(_full_pair_features(cand_edges))[:, 1]
             order = np.argsort(cand_probs)[::-1][:top_k]
             top_preds = [
                 {"source": cand_edges[int(i)][0], "target": cand_edges[int(i)][1], "probability": round(float(cand_probs[int(i)]), 5), "method": f"supervised_{clf_k}_{edge_operator}"}
@@ -267,20 +293,42 @@ class GraphLinkPredictionSuite(GraphAnalyticsEngine):
         if n < 4 or undir.number_of_edges() < 4:
             raise ModelError("Graph requires at least 4 nodes and 4 edges for Neural GAE/VGAE.")
         node_to_idx = {nd: i for i, nd in enumerate(nodes)}
-        edges = [(node_to_idx[u], node_to_idx[v]) for u, v in undir.edges()]
+        raw_edges = list(undir.edges())
         rng = np.random.default_rng(self.random_seed)
-        perm = rng.permutation(len(edges))
-        n_test = max(1, int(len(edges) * 0.2))
-        pos_test = [edges[int(i)] for i in perm[:n_test]]
-        pos_train = [edges[int(i)] for i in perm[n_test:]]
+        # Preserve spanning forest connectivity during held-out edge split
+        mst_edges = {tuple(sorted((u, v), key=str)) for u, v in nx.minimum_spanning_edges(undir, data=False)}
+        removable = [e for e in raw_edges if tuple(sorted((e[0], e[1]), key=str)) not in mst_edges]
+        n_test = max(1, int(len(raw_edges) * 0.2))
+        if len(removable) >= n_test:
+            perm = rng.permutation(len(removable))
+            pos_test_raw = [removable[int(i)] for i in perm[:n_test]]
+            test_key = {tuple(sorted((u, v), key=str)) for u, v in pos_test_raw}
+            pos_train_raw = [e for e in raw_edges if tuple(sorted((e[0], e[1]), key=str)) not in test_key]
+        else:
+            perm = rng.permutation(len(raw_edges))
+            pos_test_raw = [raw_edges[int(i)] for i in perm[:n_test]]
+            pos_train_raw = [raw_edges[int(i)] for i in perm[n_test:]]
+
+        pos_test = [(node_to_idx[u], node_to_idx[v]) for u, v in pos_test_raw]
+        pos_train = [(node_to_idx[u], node_to_idx[v]) for u, v in pos_train_raw]
 
         train_adj = np.zeros((n, n), dtype=float)
         for u, v in pos_train:
             train_adj[u, v] = 1.0
             train_adj[v, u] = 1.0
         full_adj = nx.to_numpy_array(undir, nodelist=nodes, dtype=float)
-        non_edges_idx = [(node_to_idx[u], node_to_idx[v]) for u, v in list(nx.non_edges(undir))[:2000]]
-        neg_test = non_edges_idx[: len(pos_test)] if len(non_edges_idx) >= len(pos_test) else non_edges_idx
+        all_non_edges_idx = [(node_to_idx[u], node_to_idx[v]) for u, v in nx.non_edges(undir)]
+        # Sample held-out negatives UNIFORMLY at random across all non-edges (not lexicographical node-0 slice!)
+        if len(all_non_edges_idx) > len(pos_test):
+            neg_pick = rng.choice(len(all_non_edges_idx), size=len(pos_test), replace=False)
+            neg_test = [all_non_edges_idx[int(i)] for i in neg_pick]
+        else:
+            neg_test = list(all_non_edges_idx)
+        if len(all_non_edges_idx) > 2000:
+            cand_pick = rng.choice(len(all_non_edges_idx), size=2000, replace=False)
+            non_edges_idx = [all_non_edges_idx[int(i)] for i in cand_pick]
+        else:
+            non_edges_idx = all_non_edges_idx
 
         gae = GraphAutoencoderLinkModel(embedding_dim=embedding_dim, variational=variational, epochs=epochs, random_seed=self.random_seed)
         eval_metrics = gae.evaluate_link_split(train_adj, pos_test, neg_test) if neg_test else {"roc_auc": 0.5, "average_precision": 0.5}

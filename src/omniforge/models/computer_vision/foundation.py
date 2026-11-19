@@ -124,7 +124,7 @@ class VisionFoundationHub:
 
         vec = np.concatenate(parts)
         norm = float(np.linalg.norm(vec))
-        return (vec / norm) if norm > 1e-12 else vec
+        return np.asarray((vec / norm) if norm > 1e-12 else vec, dtype=float)
 
     def extract_foundation_embedding(
         self,
@@ -137,7 +137,7 @@ class VisionFoundationHub:
         rgb = self._base_cv.load_image(image_or_path)
         if is_package_available("timm") and is_package_available("torch"):
             try:
-                import timm  # type: ignore[import-not-found]
+                import timm
                 import torch
 
                 key = f"timm:{backbone}:{pretrained}"
@@ -157,7 +157,7 @@ class VisionFoundationHub:
         if is_package_available("torchvision") and is_package_available("torch"):
             try:
                 import torch
-                import torchvision.models as tvm  # type: ignore[import-not-found]
+                import torchvision.models as tvm
 
                 key = f"tv:{backbone}:{pretrained}"
                 if key not in self._cached_models:
@@ -195,7 +195,7 @@ class VisionFoundationHub:
         rgb = self._base_cv.load_image(image_or_path)
         if is_package_available("open_clip") and is_package_available("torch"):
             try:
-                import open_clip  # type: ignore[import-not-found]
+                import open_clip
                 import torch
                 from PIL import Image
 
@@ -215,7 +215,7 @@ class VisionFoundationHub:
                     probs = (100.0 * img_f @ txt_f.T).softmax(dim=-1).cpu().numpy()[0]
                 ranked = sorted(
                     [{"label": lb, "probability": round(float(p), 5)} for lb, p in zip(labels, probs, strict=False)],
-                    key=lambda r: r["probability"],
+                    key=lambda r: float(np.asarray(r["probability"], dtype=float)),
                     reverse=True,
                 )
                 return {"backend": f"open_clip:{model_name}", "predictions": ranked, "top_label": ranked[0]["label"]}
@@ -251,7 +251,7 @@ class VisionFoundationHub:
         probs = ex / np.sum(ex)
         ranked = sorted(
             [{"label": lb, "probability": round(float(p), 5)} for lb, p in zip(labels, probs, strict=False)],
-            key=lambda r: r["probability"],
+            key=lambda r: float(np.asarray(r["probability"], dtype=float)),
             reverse=True,
         )
         return {
@@ -272,7 +272,7 @@ class VisionFoundationHub:
         rgb = self._base_cv.load_image(image_or_path)
         if is_package_available("ultralytics"):
             try:
-                from ultralytics import YOLO  # type: ignore[import-not-found]
+                from ultralytics import YOLO
 
                 if "yolo" not in self._cached_models:
                     self._cached_models["yolo"] = YOLO("yolov8n.pt")

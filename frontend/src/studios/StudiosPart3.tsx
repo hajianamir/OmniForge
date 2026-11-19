@@ -1,9 +1,27 @@
 import React, { useEffect, useState } from 'react';
-import { apiDownload, apiGet, apiPost, apiUpload } from '../api';
+import { apiDownload, apiGet, apiPost, apiUpload, toErrorMessage } from '../api';
 import { BarChartSVG, NetworkGraphSVG } from '../components/Charts';
 import { SimpleTable } from '../components/DataGrid';
 import { StudioHelpButton } from '../components/HelpGuideModal';
 import { InspectableBox } from '../components/InspectModal';
+import type {
+  BackendsProbeResponse,
+  ChatResponse,
+  ChatTurn,
+  CompiledReportResponse,
+  DAGResponse,
+  DriftResponse,
+  GraphResponse,
+  MLOpsOverviewResponse,
+  NLPResponse,
+  RecommendResponse,
+  RegisterResponse,
+  ReportCatalogResponse,
+  ReportSection,
+  StateEnvelope,
+  SurvivalResponse,
+  VisionResponse,
+} from '../studioTypes';
 import { ProvenancePill, type StudioProps } from './StudiosPart1';
 
 // ============================================================================
@@ -11,7 +29,7 @@ import { ProvenancePill, type StudioProps } from './StudiosPart1';
 // ============================================================================
 export const Studio09Specialized: React.FC<StudioProps> = ({ ws, studioCache, setStudioResult, openHelp }) => {
   const [tab, setTab] = useState<'nlp' | 'vision' | 'graph' | 'recsys' | 'survival'>('nlp');
-  const [backends, setBackends] = useState<any>(null);
+  const [backends, setBackends] = useState<BackendsProbeResponse | null>(null);
 
   // NLP
   const [nlpTask, setNlpTask] = useState('overview');
@@ -41,13 +59,13 @@ export const Studio09Specialized: React.FC<StudioProps> = ({ ws, studioCache, se
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
-    apiGet('/api/workbench/s09/backends').then(setBackends).catch(() => {});
+    apiGet<BackendsProbeResponse>('/api/workbench/s09/backends').then(setBackends).catch(() => {});
   }, []);
 
   const runNLP = async () => {
     setBusy(true); setErr(null);
     try {
-      const res = await apiPost('/api/workbench/s09/nlp', {
+      const res = await apiPost<NLPResponse>('/api/workbench/s09/nlp', {
         task: nlpTask,
         custom_texts: nlpText.split('\n').filter((s) => s.trim()),
         candidate_labels: nlpLabels.split(',').map((s) => s.trim()).filter(Boolean),
@@ -55,7 +73,7 @@ export const Studio09Specialized: React.FC<StudioProps> = ({ ws, studioCache, se
         query: nlpQuery,
       });
       setStudioResult('s09_nlp', res);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const runVision = async (file?: File) => {
@@ -65,21 +83,21 @@ export const Studio09Specialized: React.FC<StudioProps> = ({ ws, studioCache, se
       if (file) fd.append('file', file);
       fd.append('candidate_labels', visLabels);
       fd.append('n_segments', '4');
-      setStudioResult('s09_vision', await apiUpload('/api/workbench/s09/vision', fd));
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+      setStudioResult('s09_vision', await apiUpload<VisionResponse>('/api/workbench/s09/vision', fd));
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const runGraph = async () => {
     setBusy(true); setErr(null);
     try {
-      setStudioResult('s09_graph', await apiPost('/api/workbench/s09/graph', {
+      setStudioResult('s09_graph', await apiPost<GraphResponse>('/api/workbench/s09/graph', {
         link_method: linkMethod,
         edge_operator: edgeOp,
         run_supervised: true,
         run_neural_gae: true,
         top_k: 12,
       }));
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   return (
@@ -106,7 +124,7 @@ export const Studio09Specialized: React.FC<StudioProps> = ({ ws, studioCache, se
       {tab === 'nlp' && (
         <div className="card">
           <div className="row" style={{ marginBottom: 10 }}>
-            {(backends?.nlp || []).map((b: any) => (
+            {(backends?.nlp || []).map((b) => (
               <span key={b.id} className={`badge ${b.available ? 'badge-green' : ''}`}>{b.id}: {b.available ? (b.version || 'ON') : 'optional'}</span>
             ))}
           </div>
@@ -139,7 +157,7 @@ export const Studio09Specialized: React.FC<StudioProps> = ({ ws, studioCache, se
         <div className="card">
           <div className="row" style={{ marginBottom: 10 }}>
             <span className="badge badge-accent">Device: {backends?.vision?.device || 'cpu'}</span>
-            {(backends?.vision?.backends || []).map((b: any) => (
+            {(backends?.vision?.backends || []).map((b) => (
               <span key={b.id} className={`badge ${b.available ? 'badge-green' : ''}`}>{b.id}</span>
             ))}
           </div>
@@ -154,7 +172,7 @@ export const Studio09Specialized: React.FC<StudioProps> = ({ ws, studioCache, se
             <div className="grid-2">
               <div>
                 <h4>Zero-Shot Classification ({visRes.zero_shot?.backend})</h4>
-                <BarChartSVG horizontal items={(visRes.zero_shot?.predictions || []).map((p: any) => ({ label: p.label, value: p.probability }))} />
+                <BarChartSVG horizontal items={(visRes.zero_shot?.predictions || []).map((p) => ({ label: p.label, value: p.probability }))} />
               </div>
               <div>
                 <h4>Detections ({visRes.detections?.n_detections}) &amp; Regions ({visRes.segmentation?.n_segments})</h4>
@@ -197,15 +215,15 @@ export const Studio09Specialized: React.FC<StudioProps> = ({ ws, studioCache, se
           {graphRes && (
             <>
               <div className="kpi-grid">
-                <div className="kpi-card"><div className="kpi-label">Nodes / Edges</div><div className="kpi-value">{graphRes.structure.n_nodes} / {graphRes.structure.n_edges}</div></div>
+                <div className="kpi-card"><div className="kpi-label">Nodes / Edges</div><div className="kpi-value">{graphRes.structure?.n_nodes} / {graphRes.structure?.n_edges}</div></div>
                 <div className="kpi-card"><div className="kpi-label">Supervised Link ROC-AUC</div><div className="kpi-value">{Number(graphRes.supervised_link_prediction?.metrics?.roc_auc ?? 0).toFixed(4)}</div></div>
                 <div className="kpi-card"><div className="kpi-label">Neural VGAE ROC-AUC</div><div className="kpi-value">{Number(graphRes.neural_gae_link_prediction?.metrics?.roc_auc ?? 0).toFixed(4)}</div></div>
-                <div className="kpi-card"><div className="kpi-label">Max K-Core / Bridges</div><div className="kpi-value">{graphRes.structure.max_k_core} / {graphRes.structure.n_bridges}</div></div>
+                <div className="kpi-card"><div className="kpi-label">Max K-Core / Bridges</div><div className="kpi-value">{graphRes.structure?.max_k_core} / {graphRes.structure?.n_bridges}</div></div>
               </div>
               <NetworkGraphSVG
-                nodes={graphRes.visualization.nodes}
-                edges={graphRes.visualization.edges}
-                predictedEdges={graphRes.topological_links}
+                nodes={graphRes.visualization?.nodes || []}
+                edges={graphRes.visualization?.edges || []}
+                predictedEdges={(graphRes.topological_links || []).map((e) => ({ source: String(e.source), target: String(e.target) }))}
               />
               <div className="grid-2" style={{ marginTop: 14 }}>
                 <div>
@@ -225,7 +243,7 @@ export const Studio09Specialized: React.FC<StudioProps> = ({ ws, studioCache, se
       {tab === 'recsys' && (
         <div className="card">
           <button className="btn btn-primary" disabled={busy} onClick={async () => {
-            setBusy(true); try { setStudioResult('s09_recommend', await apiPost('/api/workbench/s09/recommend', {})); } finally { setBusy(false); }
+            setBusy(true); try { setStudioResult('s09_recommend', await apiPost<RecommendResponse>('/api/workbench/s09/recommend', {})); } finally { setBusy(false); }
           }}>Run Hybrid Recommender</button>
           {recRes && <div style={{ marginTop: 12 }}><SimpleTable rows={recRes.recommendations || []} /></div>}
         </div>
@@ -241,7 +259,7 @@ export const Studio09Specialized: React.FC<StudioProps> = ({ ws, studioCache, se
               <select value={evtCol} onChange={(e) => setEvtCol(e.target.value)}>{ws.numeric_columns.map((c) => <option key={c} value={c}>{c}</option>)}</select>
             </label>
             <button className="btn btn-primary" disabled={busy || !ws.has_dataset} onClick={async () => {
-              setBusy(true); try { setStudioResult('s09_survival', await apiPost('/api/workbench/s09/survival', { duration_col: durCol || ws.numeric_columns[0], event_col: evtCol || ws.numeric_columns[1] })); } finally { setBusy(false); }
+              setBusy(true); try { setStudioResult('s09_survival', await apiPost<SurvivalResponse>('/api/workbench/s09/survival', { duration_col: durCol || ws.numeric_columns[0], event_col: evtCol || ws.numeric_columns[1] })); } finally { setBusy(false); }
             }}>Fit Kaplan-Meier &amp; CoxPH</button>
           </div>
           {survRes && <pre className="code-block">{JSON.stringify({ median_survival: survRes.median_survival, cox: survRes.cox, points: survRes.km_curve?.length }, null, 2)}</pre>}
@@ -264,7 +282,7 @@ export const Studio10DAG: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
   const runDag = async () => {
     setBusy(true);
     try {
-      const res = await apiPost('/api/workbench/s10/run', { stages });
+      const res = await apiPost<DAGResponse>('/api/workbench/s10/run', { stages });
       onSync(res.state);
       setStudioResult('s10_dag', res);
     } finally { setBusy(false); }
@@ -315,12 +333,12 @@ export const Studio10DAG: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
 // Studio 11 — MLOps (Registry, Experiments & Drift)
 // ============================================================================
 export const Studio11MLOps: React.FC<StudioProps> = ({ ws, studioCache, setStudioResult, openHelp }) => {
-  const [overview, setOverview] = useState<any>({ registered_models: [], experiment_runs: [] });
+  const [overview, setOverview] = useState<MLOpsOverviewResponse>({ registered_models: [], experiment_runs: [] });
   const [modelName, setModelName] = useState('omniforge_champion');
   const driftRes = studioCache.s11_drift?.drift_report ?? null;
   const [busy, setBusy] = useState(false);
 
-  const refresh = () => apiGet('/api/workbench/s11/overview').then(setOverview).catch(() => {});
+  const refresh = () => apiGet<MLOpsOverviewResponse>('/api/workbench/s11/overview').then(setOverview).catch(() => {});
   useEffect(() => { refresh(); }, []);
 
   return (
@@ -341,7 +359,7 @@ export const Studio11MLOps: React.FC<StudioProps> = ({ ws, studioCache, setStudi
           <div className="row" style={{ marginBottom: 12 }}>
             <input type="text" value={modelName} onChange={(e) => setModelName(e.target.value)} />
             <button className="btn btn-primary" disabled={busy || !ws.active_model_name} onClick={async () => {
-              setBusy(true); try { const r = await apiPost('/api/workbench/s11/register', { model_name: modelName, stage: 'Staging' }); setOverview((o: any) => ({ ...o, registered_models: r.registered_models })); setStudioResult('s11_registered', r); } finally { setBusy(false); }
+              setBusy(true); try { const r = await apiPost<RegisterResponse>('/api/workbench/s11/register', { model_name: modelName, stage: 'Staging' }); setOverview((o) => ({ ...o, registered_models: r.registered_models ?? o.registered_models })); setStudioResult('s11_registered', r); } finally { setBusy(false); }
             }}>Register Active Model</button>
           </div>
           <SimpleTable rows={overview.registered_models || []} />
@@ -349,7 +367,7 @@ export const Studio11MLOps: React.FC<StudioProps> = ({ ws, studioCache, setStudi
         <div className="card">
           <div className="card-title">Dataset Drift Monitor (PSI / KS-Test)</div>
           <button className="btn btn-primary" disabled={busy || !ws.has_dataset} onClick={async () => {
-            setBusy(true); try { const r = await apiPost('/api/workbench/s11/drift', { split_ratio: 0.5 }); setStudioResult('s11_drift', r); } finally { setBusy(false); }
+            setBusy(true); try { const r = await apiPost<DriftResponse>('/api/workbench/s11/drift', { split_ratio: 0.5 }); setStudioResult('s11_drift', r); } finally { setBusy(false); }
           }}>Run Drift Detection</button>
           {driftRes && <pre className="code-block" style={{ marginTop: 12, maxHeight: 300 }}>{JSON.stringify(driftRes, null, 2)}</pre>}
         </div>
@@ -364,7 +382,7 @@ export const Studio11MLOps: React.FC<StudioProps> = ({ ws, studioCache, setStudi
 export const Studio12Reporting: React.FC<StudioProps> = ({ ws, onSync, studioCache, setStudioResult, openHelp }) => {
   const [title, setTitle] = useState('OmniForge Executive Analytics & Supervisory Report');
   const [author, setAuthor] = useState('OmniForge Enterprise Analytics');
-  const [catalog, setCatalog] = useState<any[]>([]);
+  const [catalog, setCatalog] = useState<ReportSection[]>([]);
   const [presets, setPresets] = useState<Record<string, string[]>>({});
   const [selectedSections, setSelectedSections] = useState<string[]>([]);
   const [includeCharts, setIncludeCharts] = useState(true);
@@ -376,12 +394,12 @@ export const Studio12Reporting: React.FC<StudioProps> = ({ ws, onSync, studioCac
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
-    apiGet('/api/workbench/s12/catalog')
+    apiGet<ReportCatalogResponse>('/api/workbench/s12/catalog')
       .then((res) => {
         const secs = res.sections || [];
         setCatalog(secs);
         setPresets(res.presets || {});
-        setSelectedSections((prev) => (prev.length ? prev : secs.filter((s: any) => s.default_on !== false).map((s: any) => s.key)));
+        setSelectedSections((prev) => (prev.length ? prev : secs.filter((s) => s.default_on !== false).map((s) => s.key ?? '')));
       })
       .catch(() => {});
   }, [ws.n_rows, ws.active_model_name, ws.supervisory_status]);
@@ -397,7 +415,7 @@ export const Studio12Reporting: React.FC<StudioProps> = ({ ws, onSync, studioCac
   const compile = async () => {
     setBusy(true); setErr(null);
     try {
-      const res = await apiPost('/api/workbench/s12/compile', {
+      const res = await apiPost<CompiledReportResponse>('/api/workbench/s12/compile', {
         title,
         author,
         selected_sections: selectedSections.length ? selectedSections : null,
@@ -408,7 +426,7 @@ export const Studio12Reporting: React.FC<StudioProps> = ({ ws, onSync, studioCac
       });
       onSync(res.state);
       setStudioResult('s12_report', res);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const primaryFormats = [
@@ -427,9 +445,9 @@ export const Studio12Reporting: React.FC<StudioProps> = ({ ws, onSync, studioCac
   ];
 
   // Group catalog sections by category
-  const byCategory: Record<string, any[]> = {};
+  const byCategory: Record<string, ReportSection[]> = {};
   catalog.forEach((sec) => {
-    const cat = sec.category || 'Core';
+    const cat = sec.category ?? 'Core';
     (byCategory[cat] = byCategory[cat] || []).push(sec);
   });
 
@@ -451,8 +469,8 @@ export const Studio12Reporting: React.FC<StudioProps> = ({ ws, onSync, studioCac
         <div className="card-title">
           <span>1. Report Metadata &amp; Section Customization ({selectedSections.length} / {catalog.length} sections selected)</span>
           <div className="row" style={{ gap: 6 }}>
-            <button className="btn btn-sm" onClick={() => applyPreset(catalog.map((c) => c.key))}>Select All</button>
-            <button className="btn btn-sm" onClick={() => applyPreset(catalog.filter((c) => c.has_data).map((c) => c.key))}>Auto (Ready Only)</button>
+            <button className="btn btn-sm" onClick={() => applyPreset(catalog.map((c) => c.key ?? ''))}>Select All</button>
+            <button className="btn btn-sm" onClick={() => applyPreset(catalog.filter((c) => c.has_data).map((c) => c.key ?? ''))}>Auto (Ready Only)</button>
             {Object.entries(presets).slice(0, 3).map(([pName, pKeys]) => (
               <button key={pName} className="btn btn-sm" onClick={() => applyPreset(pKeys)}>{pName}</button>
             ))}
@@ -484,11 +502,12 @@ export const Studio12Reporting: React.FC<StudioProps> = ({ ws, onSync, studioCac
             <div key={cat} style={{ padding: 12, borderRadius: 10, background: 'var(--bg)', border: '1px solid var(--border)' }}>
               <div style={{ fontSize: 11.5, fontWeight: 800, textTransform: 'uppercase', color: 'var(--accent)', marginBottom: 8 }}>{cat}</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                {secs.map((sec: any) => {
-                  const checked = selectedSections.includes(sec.key);
+                {secs.map((sec) => {
+                  const sectionKey = sec.key ?? '';
+                  const checked = selectedSections.includes(sectionKey);
                   return (
                     <label
-                      key={sec.key}
+                      key={sectionKey}
                       style={{
                         display: 'flex',
                         alignItems: 'flex-start',
@@ -499,7 +518,7 @@ export const Studio12Reporting: React.FC<StudioProps> = ({ ws, onSync, studioCac
                         cursor: 'pointer',
                       }}
                     >
-                      <input type="checkbox" checked={checked} onChange={() => toggleSection(sec.key)} style={{ marginTop: 3 }} />
+                      <input type="checkbox" checked={checked} onChange={() => toggleSection(sectionKey)} style={{ marginTop: 3 }} />
                       <div style={{ flex: 1 }}>
                         <div className="row" style={{ justifyContent: 'space-between', gap: 6 }}>
                           <strong style={{ fontSize: 12.5 }}>{sec.title}</strong>
@@ -554,30 +573,30 @@ export const Studio12Reporting: React.FC<StudioProps> = ({ ws, onSync, studioCac
             <div className="card-title">
               <span>{compiled.title}</span>
               <span className="badge badge-green">
-                {compiled.sections?.length || 0} sections · {compiled.table_names?.length || 0} tables · {compiled.n_charts || 0} charts
+                {(compiled.sections ?? []).length} sections · {compiled.table_names?.length || 0} tables · {compiled.n_charts || 0} charts
               </span>
             </div>
             <p style={{ color: 'var(--text-muted)', marginTop: 0 }}>{compiled.executive_summary}</p>
-            {(compiled.sections || []).map((s: any, idx: number) => (
+            {(compiled.sections || []).map((s, idx) => (
               <div key={`${s.id}-${idx}`} style={{ padding: '10px 0', borderTop: '1px solid var(--border)' }}>
                 <strong>{s.title}</strong>
                 <p style={{ margin: '4px 0 0', color: 'var(--text-muted)', fontSize: 12.8 }}>{s.narrative}</p>
-                {s.highlights?.length > 0 && (
+                {(s.highlights?.length ?? 0) > 0 && (
                   <ul style={{ margin: '6px 0 0', paddingLeft: 18, fontSize: 12, color: 'var(--text-dim)' }}>
-                    {s.highlights.map((h: string, i: number) => <li key={i}>{h}</li>)}
+                    {(s.highlights ?? []).map((h, i) => <li key={i}>{h}</li>)}
                   </ul>
                 )}
               </div>
             ))}
           </div>
 
-          {compiled.chart_previews?.length > 0 && (
+          {(compiled.chart_previews?.length ?? 0) > 0 && (
             <div className="card">
               <div className="card-title">Embedded Report Charts &amp; Visuals (Zoom / Pop-Out Supported)</div>
               <div className="report-chart-grid">
-                {compiled.chart_previews.map((ch: any, idx: number) => (
+                {(compiled.chart_previews ?? []).map((ch, idx) => (
                   <InspectableBox key={idx} title={ch.title} subtitle={ch.caption || ch.section} compact>
-                    <img src={ch.image_data_url} alt={ch.title} className="report-chart-img" />
+                    <img src={ch.image_data_url ?? ''} alt={ch.title ?? 'Report chart'} className="report-chart-img" />
                   </InspectableBox>
                 ))}
               </div>
@@ -588,7 +607,7 @@ export const Studio12Reporting: React.FC<StudioProps> = ({ ws, onSync, studioCac
             <div className="card">
               <div className="card-title">Compiled Analytical Tables ({Object.keys(compiled.table_previews).length})</div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-                {Object.entries(compiled.table_previews).map(([tname, tinfo]: any) => (
+                {Object.entries(compiled.table_previews ?? {}).map(([tname, tinfo]) => (
                   <SimpleTable key={tname} title={`${tname} (${tinfo.rows} total rows)`} rows={tinfo.preview || []} maxRows={25} />
                 ))}
               </div>
@@ -608,7 +627,7 @@ export const Studio13Copilot: React.FC<StudioProps> = ({ ws, studioCache, setStu
     role: 'assistant' as const,
     text: 'Welcome to OmniForge AI Analytics Copilot. Ask about your active dataset, statistical diagnostics, AutoML strategy, or next analytical steps.',
   };
-  const cachedHistory: { role: 'user' | 'assistant'; text: string }[] | undefined = studioCache.s13_chat?.history;
+  const cachedHistory: ChatTurn[] | undefined = studioCache.s13_chat?.history;
   const messages = cachedHistory && cachedHistory.length > 0 ? [defaultMsg, ...cachedHistory] : [defaultMsg];
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
@@ -621,12 +640,12 @@ export const Studio13Copilot: React.FC<StudioProps> = ({ ws, studioCache, setStu
     setInput('');
     setBusy(true);
     try {
-      const res = await apiPost('/api/workbench/s13/chat', { message: q });
+      const res = await apiPost<ChatResponse>('/api/workbench/s13/chat', { message: q });
       setStudioResult('s13_chat', res);
-    } catch (e: any) {
+    } catch (e: unknown) {
       setStudioResult('s13_chat', {
         ...(studioCache.s13_chat || {}),
-        history: [...prevHist, { role: 'user', text: q }, { role: 'assistant', text: `Error: ${e.message}` }],
+        history: [...prevHist, { role: 'user', text: q }, { role: 'assistant', text: `Error: ${toErrorMessage(e)}` }],
       });
     } finally { setBusy(false); }
   };

@@ -80,7 +80,8 @@ body,
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 8px 10px;
   min-height: 58px;
   padding: 7px 16px;
   background: var(--bg-elev);
@@ -125,6 +126,7 @@ body,
   align-items: center;
   gap: 6px;
   flex-shrink: 0;
+  margin-left: auto;
   padding-left: 10px;
   border-left: 1px solid var(--border);
 }

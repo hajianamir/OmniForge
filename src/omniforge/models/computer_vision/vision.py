@@ -16,12 +16,15 @@ from sklearn.preprocessing import StandardScaler
 
 from omniforge.core.exceptions import ModelError
 
-try:
-    import cv2  # type: ignore[import-not-found]
+# Bound through an ``Any`` sentinel so the module type-checks identically whether or not
+# OpenCV is installed (absent in the "simple" tier, present once the ``vision`` pack is added).
+cv2: Any = None
+try:  # pragma: no cover - depends on the install tier
+    import cv2 as _cv2
 
+    cv2 = _cv2
     _HAS_CV2 = True
 except ImportError:  # pragma: no cover - verified via explicit fallback tests
-    cv2 = None  # type: ignore[assignment]
     _HAS_CV2 = False
 
 
@@ -55,12 +58,14 @@ class ComputerVisionEngine:
     def _rgb_to_gray(rgb: np.ndarray) -> np.ndarray:
         """Convert RGB uint8 image to float32 grayscale array."""
         if _HAS_CV2 and cv2 is not None:
-            return cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
-        return (
-            0.299 * rgb[:, :, 0].astype(np.float32)
-            + 0.587 * rgb[:, :, 1].astype(np.float32)
-            + 0.114 * rgb[:, :, 2].astype(np.float32)
+            gray_cv = np.asarray(cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY), dtype=np.float64)
+            return np.asarray(gray_cv, dtype=np.float32)
+        luma = (
+            0.299 * np.asarray(rgb[:, :, 0], dtype=np.float64)
+            + 0.587 * np.asarray(rgb[:, :, 1], dtype=np.float64)
+            + 0.114 * np.asarray(rgb[:, :, 2], dtype=np.float64)
         )
+        return np.asarray(luma, dtype=np.float32)
 
     def load_image(self, image_or_path: np.ndarray | str | Path) -> np.ndarray:
         """Load and resize an image to canonical RGB uint8 format."""
@@ -90,7 +95,7 @@ class ComputerVisionEngine:
 
         target_w, target_h = self.image_size
         if _HAS_CV2 and cv2 is not None:
-            return cv2.resize(rgb, (target_w, target_h))
+            return np.asarray(cv2.resize(rgb, (target_w, target_h)))
 
         try:
             from PIL import Image
@@ -101,7 +106,7 @@ class ComputerVisionEngine:
             zoom_y = target_h / max(rgb.shape[0], 1)
             zoom_x = target_w / max(rgb.shape[1], 1)
             zoomed = ndimage.zoom(rgb, (zoom_y, zoom_x, 1.0), order=1)
-            return np.clip(zoomed, 0, 255).astype(np.uint8)
+            return np.asarray(np.clip(zoomed, 0, 255), dtype=np.uint8)
 
     def extract_descriptor(self, image_or_path: np.ndarray | str | Path) -> np.ndarray:
         """Extract combined RGB color histogram + gradient orientation histogram (HOG-like) + edge statistics."""
@@ -131,8 +136,8 @@ class ComputerVisionEngine:
             edge_thresh = max(float(np.percentile(mag, 85)), 20.0)
             edge_density = float(np.mean(mag >= edge_thresh))
 
-        orient_hist, _ = np.histogram(ang, bins=8, range=(0, 360), weights=mag)
-        orient_hist = orient_hist / (float(np.sum(orient_hist)) + 1e-6)
+        orient_counts, _ = np.histogram(ang, bins=8, range=(0, 360), weights=mag)
+        orient_hist = np.asarray(orient_counts, dtype=np.float64) / (float(np.sum(orient_counts)) + 1e-6)
 
         stats_vec = np.array(
             [

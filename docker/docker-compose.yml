@@ -6,13 +6,20 @@ services:
     image: omniforge-enterprise:2.0.0
     container_name: omniforge-api
     command: ["api"]
-    env_file:
-      - ../.env.example
     environment:
-      OMNIFORGE_ENVIRONMENT: production
+      OMNIFORGE_ENVIRONMENT: ${OMNIFORGE_ENVIRONMENT:-production}
       OMNIFORGE_API_HOST: 0.0.0.0
       OMNIFORGE_API_PORT: 8000
+      OMNIFORGE_API_WORKERS: ${OMNIFORGE_API_WORKERS:-1}
       OMNIFORGE_WORKSPACE_DIR: /var/lib/omniforge
+      OMNIFORGE_PATHS__WORKSPACE_DIR: /var/lib/omniforge
+      OMNIFORGE_API__CORS_ORIGINS: ${OMNIFORGE_API__CORS_ORIGINS:-["http://localhost:8501","http://127.0.0.1:8501","http://localhost:8000","http://127.0.0.1:8000"]}
+      # Provide strong >=32-byte secrets in .env or host environment before starting in production:
+      OMNIFORGE_SECURITY__JWT_SECRET_KEY: ${OMNIFORGE_SECURITY__JWT_SECRET_KEY:-}
+      OMNIFORGE_SECURITY__ENCRYPTION_KEY: ${OMNIFORGE_SECURITY__ENCRYPTION_KEY:-}
+      OMNIFORGE_SECURITY__ARTIFACT_SIGNING_KEY: ${OMNIFORGE_SECURITY__ARTIFACT_SIGNING_KEY:-}
+      OMNIFORGE_SECURITY__API_KEY: ${OMNIFORGE_SECURITY__API_KEY:-}
+      OMNIFORGE_SECURITY__AUTO_BOOTSTRAP_LOCAL_UI: ${OMNIFORGE_SECURITY__AUTO_BOOTSTRAP_LOCAL_UI:-false}
     ports:
       - "8000:8000"
     volumes:
@@ -35,20 +42,30 @@ services:
     depends_on:
       omniforge-api:
         condition: service_healthy
-    env_file:
-      - ../.env.example
     environment:
-      OMNIFORGE_ENVIRONMENT: production
+      OMNIFORGE_ENVIRONMENT: ${OMNIFORGE_ENVIRONMENT:-production}
       OMNIFORGE_UI_HOST: 0.0.0.0
       OMNIFORGE_UI_PORT: 8501
       OMNIFORGE_API_BASE_URL: http://omniforge-api:8000
       OMNIFORGE_WORKSPACE_DIR: /var/lib/omniforge
+      OMNIFORGE_PATHS__WORKSPACE_DIR: /var/lib/omniforge
+      OMNIFORGE_API__CORS_ORIGINS: ${OMNIFORGE_API__CORS_ORIGINS:-["http://localhost:8501","http://127.0.0.1:8501","http://localhost:8000","http://127.0.0.1:8000"]}
+      OMNIFORGE_SECURITY__JWT_SECRET_KEY: ${OMNIFORGE_SECURITY__JWT_SECRET_KEY:-}
+      OMNIFORGE_SECURITY__ENCRYPTION_KEY: ${OMNIFORGE_SECURITY__ENCRYPTION_KEY:-}
+      OMNIFORGE_SECURITY__ARTIFACT_SIGNING_KEY: ${OMNIFORGE_SECURITY__ARTIFACT_SIGNING_KEY:-}
+      OMNIFORGE_SECURITY__API_KEY: ${OMNIFORGE_SECURITY__API_KEY:-}
+      OMNIFORGE_SECURITY__AUTO_BOOTSTRAP_LOCAL_UI: ${OMNIFORGE_SECURITY__AUTO_BOOTSTRAP_LOCAL_UI:-false}
     ports:
       - "8501:8501"
     volumes:
       - omniforge_workspace:/var/lib/omniforge
       - ../configs:/app/configs:ro
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8501/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
 volumes:
   omniforge_workspace:

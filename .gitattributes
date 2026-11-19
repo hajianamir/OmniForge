@@ -1,2 +1,55 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# OmniForge line-ending and binary attributes.
+# Windows batch files MUST stay CRLF; all source text stays LF in the repo.
+
+# Default: normalize text files to LF on commit, checkout as-is.
+* text=auto eol=lf
+
+# Windows batch / cmd scripts: CRLF required for correct execution.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Source code: LF.
+*.py text eol=lf
+*.pyi text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.jsx text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.sh text eol=lf
+*.iss text eol=lf
+*.spec text eol=lf
+*.ipynb text eol=lf
+*.env.example text eol=lf
+
+# Binary assets: never normalize.
+*.ico binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.exe binary
+*.dll binary
+*.so binary
+*.pyd binary
+*.db binary
+*.sqlite binary
+*.sqlite3 binary
+*.omniforge binary
+*.uap binary
+*.pkl binary
+*.joblib binary
+*.parquet binary
+*.xlsx binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.whl binary

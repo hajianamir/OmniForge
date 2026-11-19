@@ -9,7 +9,7 @@ import re
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from omniforge.core.constants import SENSITIVE_KEY_PATTERNS
@@ -23,10 +23,10 @@ except ImportError:
     _HAS_STRUCTLOG = False
 
 _TRACE_ID_CTX: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "uap_trace_id", default=""
+    "omniforge_trace_id", default=""
 )
 _TENANT_ID_CTX: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "uap_tenant_id", default="default-tenant"
+    "omniforge_tenant_id", default="default-tenant"
 )
 
 _SECRET_VALUE_REGEXES: tuple[re.Pattern[str], ...] = (
@@ -106,7 +106,7 @@ def _structlog_redact_processor(
     """Structlog processor that injects trace/tenant IDs and redacts secrets."""
     event_dict.setdefault("trace_id", get_trace_id())
     event_dict.setdefault("tenant_id", get_tenant_context())
-    return redact_sensitive_value(event_dict)
+    return cast(dict[str, Any], redact_sensitive_value(event_dict))
 
 
 class RedactingJsonFormatter(logging.Formatter):
@@ -143,13 +143,17 @@ def configure_logging(
     global _CONFIGURED
     numeric_level = getattr(logging, level.upper(), logging.INFO)
 
-    root_logger = logging.getLogger("uap")
+    root_logger = logging.getLogger("omniforge")
     root_logger.setLevel(numeric_level)
+    root_logger.propagate = False
     root_logger.handlers.clear()
 
+    use_structlog = _HAS_STRUCTLOG and structlog is not None
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setLevel(numeric_level)
-    if log_format.lower() == "json":
+    if use_structlog:
+        stream_handler.setFormatter(logging.Formatter("%(message)s"))
+    elif log_format.lower() == "json":
         stream_handler.setFormatter(RedactingJsonFormatter())
     else:
         stream_handler.setFormatter(
@@ -162,10 +166,12 @@ def configure_logging(
         path.parent.mkdir(parents=True, exist_ok=True)
         file_handler = logging.FileHandler(path, encoding="utf-8")
         file_handler.setLevel(numeric_level)
-        file_handler.setFormatter(RedactingJsonFormatter())
+        file_handler.setFormatter(
+            logging.Formatter("%(message)s") if use_structlog else RedactingJsonFormatter()
+        )
         root_logger.addHandler(file_handler)
 
-    if _HAS_STRUCTLOG and structlog is not None:
+    if use_structlog and structlog is not None:
         processors: list[Any] = [
             structlog.stdlib.filter_by_level,
             structlog.stdlib.add_logger_name,
@@ -188,7 +194,7 @@ def configure_logging(
             context_class=dict,
             logger_factory=structlog.stdlib.LoggerFactory(),
             wrapper_class=structlog.stdlib.BoundLogger,
-            cache_logger_on_first_use=True,
+            cache_logger_on_first_use=False,
         )
 
     _CONFIGURED = True
@@ -238,7 +244,15 @@ class OmniForgeLoggerAdapter:
         self._emit("critical", event, **kwargs)
 
 
-def get_logger(name: str = "uap") -> OmniForgeLoggerAdapter:
-    """Return a structured logger bound to ``name``."""
-    canonical = name if name.startswith("uap") else f"omniforge.{name}"
+def get_logger(name: str = "omniforge") -> OmniForgeLoggerAdapter:
+    """Return a structured logger bound under the canonical ``omniforge`` hierarchy."""
+    cleaned = (name or "omniforge").strip()
+    if cleaned == "omniforge" or cleaned.startswith("omniforge."):
+        canonical = cleaned
+    elif cleaned == "uap":
+        canonical = "omniforge"
+    elif cleaned.startswith("uap."):
+        canonical = f"omniforge.{cleaned[4:]}"
+    else:
+        canonical = f"omniforge.{cleaned}"
     return OmniForgeLoggerAdapter(canonical)

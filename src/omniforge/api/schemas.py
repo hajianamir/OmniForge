@@ -8,9 +8,10 @@ from pydantic import BaseModel, Field
 
 
 class TokenRequest(BaseModel):
-    username: str = "admin"
-    role: str = "admin"
+    username: str = "analyst"
+    role: str = "analyst"
     tenant_id: str = "default"
+    api_key: str | None = None
 
 
 class TokenResponse(BaseModel):

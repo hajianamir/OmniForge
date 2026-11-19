@@ -226,9 +226,9 @@ class ForecastingEngine:
                                     "model": m_name,
                                     "cv_strategy": f"TimeSeriesSplit(n_splits={len(fold_rmses)}, gap={self.gap})",
                                     "cv_rmse_mean": round(float(np.mean(fold_rmses)), 6),
-                                    "cv_rmse_std": round(float(np.std(fold_rmses)), 6),
+                                    "cv_rmse_std": round(float(np.std(fold_rmses, ddof=1) if len(fold_rmses) > 1 else 0.0), 6),
                                     "cv_smape_mean": round(float(np.mean(fold_smapes)), 4),
-                                    "cv_smape_std": round(float(np.std(fold_smapes)), 4),
+                                    "cv_smape_std": round(float(np.std(fold_smapes, ddof=1) if len(fold_smapes) > 1 else 0.0), 4),
                                 }
                             )
 

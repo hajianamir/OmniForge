@@ -25,7 +25,7 @@ class HierarchicalReconciler:
         E = np.asarray(residuals, dtype=float)
         n_total, T = E.shape
         if T <= 2:
-            diag = np.diag(np.var(E, axis=1) + 1e-6)
+            diag = np.diag(np.var(E, axis=1, ddof=1 if T > 1 else 0) + 1e-6)
             return diag, 1.0
         # Centered residuals
         E_c = E - E.mean(axis=1, keepdims=True)
@@ -33,7 +33,7 @@ class HierarchicalReconciler:
         stds = np.sqrt(np.maximum(np.diag(W_sample), 1e-12))
         Z = E_c / stds[:, None]  # standardized residuals (n_total, T)
         R_hat = (Z @ Z.T) / max(T - 1, 1)
-        # Variance of off-diagonal correlation estimates:
+        # Variance of off-diagonal correlation estimates (Schäfer & Strimmer 2005, Appendix A):
         # Var(r_ij) = (T / (T - 1)^3) * sum_t (z_it * z_jt - r_bar_ij)^2
         r_bar = (Z @ Z.T) / T
         num = 0.0
@@ -44,9 +44,10 @@ class HierarchicalReconciler:
                 var_rij = float(np.sum((prod_t - r_bar[i, j]) ** 2)) * (T / ((T - 1) ** 3))
                 num += var_rij
                 den += float(R_hat[i, j] ** 2)
-        lam = float(np.clip(num / max(den, 1e-12), 0.0, 1.0))
+        lam = float(np.clip(num / max(den, 1e-12), 0.0, 1.0)) if den > 1e-12 else (1.0 if num > 0.0 else 0.0)
         W_diag = np.diag(np.diag(W_sample))
-        W_shrunk = (1.0 - lam) * W_sample + lam * W_diag + np.eye(n_total) * 1e-6
+        ridge = max(1e-12, 1e-8 * float(np.mean(np.diag(W_sample))))
+        W_shrunk = (1.0 - lam) * W_sample + lam * W_diag + np.eye(n_total) * ridge
         return W_shrunk, lam
 
     def reconcile(
@@ -70,7 +71,7 @@ class HierarchicalReconciler:
 
         if self.method == "bottom_up":
             bottom = Y[-n_bottom:, :]
-            return S @ bottom
+            return np.asarray(S @ bottom, dtype=float)
 
         if self.method == "top_down":
             top = Y[0:1, :]
@@ -79,28 +80,30 @@ class HierarchicalReconciler:
             else:
                 sh = np.asarray(historical_bottom_shares, dtype=float).reshape(n_bottom, 1)
                 shares = sh / max(float(sh.sum()), 1e-12)
-            return S @ (shares @ top)
+            return np.asarray(S @ (shares @ top), dtype=float)
 
         if self.method in ("wls", "wls_var", "wls_struct"):
             if self.method != "wls_struct" and residuals is not None and residuals.shape[0] == n_total:
-                variances = np.var(residuals, axis=1) + 1e-6
+                res_arr = np.asarray(residuals, dtype=float)
+                ddof_val = 1 if res_arr.ndim >= 2 and res_arr.shape[1] > 1 else 0
+                variances = np.var(res_arr, axis=1, ddof=ddof_val) + 1e-6
             else:
                 # Structural WLS: weight proportional to number of bottom series summed
                 variances = np.maximum(np.sum(S, axis=1), 1.0)
             W_inv = np.diag(1.0 / variances)
             G = np.linalg.pinv(S.T @ W_inv @ S) @ S.T @ W_inv
-            return S @ G @ Y
+            return np.asarray(S @ G @ Y, dtype=float)
 
         if self.method == "mint_shrink" and residuals is not None and residuals.shape[0] == n_total:
             W, lam = self._schafer_strimmer_shrinkage(residuals)
             self.last_shrinkage_lambda_ = round(lam, 6)
             W_inv = np.linalg.pinv(W)
             G = np.linalg.pinv(S.T @ W_inv @ S) @ S.T @ W_inv
-            return S @ G @ Y
+            return np.asarray(S @ G @ Y, dtype=float)
 
         # Default OLS projection: S (S^T S)^{-1} S^T Y
         G = np.linalg.pinv(S.T @ S) @ S.T
-        return S @ G @ Y
+        return np.asarray(S @ G @ Y, dtype=float)
 
     @staticmethod
     def verify_coherence(summing_matrix: np.ndarray, reconciled: np.ndarray, tol: float = 1e-6) -> dict[str, float | bool]:

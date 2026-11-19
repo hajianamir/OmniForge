@@ -1,6 +1,8 @@
 # OmniForge — Multi-Discipline Benchmark CSV Datasets
 
-This directory contains **6 realistic medium-to-massive CSV benchmark datasets** spanning 6 distinct scientific, engineering, clinical, financial, energy, and commercial disciplines — plus **2 matching future incoming CSV batches** (without target columns) for testing **Studio 06 · Future Target Prediction (File Upload)**.
+> **Repository Footprint Note:** Pre-generated CSV files are intentionally omitted from this repository to keep the codebase lightweight. Run the generator script below to recreate all 6 primary datasets and 2 future-incoming batches locally on demand, or use any of OmniForge's 18 built-in instant synthetic domain generators directly in Studio 01.
+
+This directory provides a deterministic generator for **6 realistic medium-to-massive CSV benchmark datasets** spanning 6 distinct scientific, engineering, clinical, financial, energy, and commercial disciplines — plus **2 matching future incoming CSV batches** (without target columns) for testing **Studio 06 · Future Target Prediction (File Upload)**.
 
 Every dataset intentionally embeds realistic **data-quality hazards, extreme outliers, corrupt sensor/entry anomalies, missing values, messy string formatting, exact duplicate records, and latent cluster structure** so you can evaluate the entire 13-studio CRISP-DM workflow end-to-end.
 

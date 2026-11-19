@@ -67,7 +67,7 @@ class ClassicalMLModel(BaseOmniForgeModel):
 
         if self.algorithm == "xgboost":
             if is_package_available("xgboost"):
-                import xgboost as xgb  # type: ignore[import-not-found]
+                import xgboost as xgb
 
                 self.framework = "xgboost"
                 if is_clf:
@@ -103,7 +103,7 @@ class ClassicalMLModel(BaseOmniForgeModel):
 
         if self.algorithm == "lightgbm":
             if is_package_available("lightgbm"):
-                import lightgbm as lgb  # type: ignore[import-not-found]
+                import lightgbm as lgb
 
                 self.framework = "lightgbm"
                 if is_clf:
@@ -140,7 +140,7 @@ class ClassicalMLModel(BaseOmniForgeModel):
 
         if self.algorithm == "catboost":
             if is_package_available("catboost"):
-                from catboost import CatBoostClassifier, CatBoostRegressor  # type: ignore[import-not-found]
+                from catboost import CatBoostClassifier, CatBoostRegressor
 
                 self.framework = "catboost"
                 if is_clf:

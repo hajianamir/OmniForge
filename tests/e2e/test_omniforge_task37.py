@@ -192,7 +192,9 @@ def test_supervisory_signed_root_cause_increase_and_decrease_attribution() -> No
 
 def test_api_s06_export_formula_and_s14_equations_and_root_cause() -> None:
     """End-to-end FastAPI test covering S01 load -> S06 AutoML + .py export -> S14 equations + root-cause evaluation."""
-    client = TestClient(app)
+    from omniforge.api.auth import get_api_key
+
+    client = TestClient(app, headers={"X-API-Key": get_api_key()})
 
     # 1. Load bundled regression dataset
     r_load = client.post("/api/workbench/s01/load-sample", json={"dataset_key": "02_industrial_predictive_maint"})

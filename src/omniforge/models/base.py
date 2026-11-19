@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -14,11 +15,13 @@ from sklearn.metrics import accuracy_score, r2_score
 
 from omniforge.core.carbon import CarbonTracker
 from omniforge.core.constants import DEFAULT_RANDOM_SEED
-from omniforge.core.exceptions import ModelNotFittedError, ModelSerializationError, ModelTrainingError
+from omniforge.core.exceptions import ModelNotFittedError, ModelSerializationError, ModelTrainingError, SecurityError
 from omniforge.core.logging import get_logger
-from omniforge.core.security import EncryptionManager
+from omniforge.core.security import ArtifactSigner, EncryptionManager, safe_joblib_load_bytes
 from omniforge.core.types import ModelMetadata, TaskType
 from omniforge.core.utils import compute_file_checksum, set_global_seed
+
+_MODEL_HMAC_CONTEXT = b"omniforge:model:v1"
 
 logger = get_logger(__name__)
 
@@ -160,7 +163,7 @@ class BaseOmniForgeModel(ABC):
         encrypt: bool = False,
         encryption_key: str | bytes | None = None,
     ) -> Path:
-        """Persist model artifact to disk with SHA-256 checksum and optional encryption."""
+        """Persist model artifact to disk with SHA-256 checksum, HMAC-SHA256 signature, and optional AES-256-GCM encryption."""
         self._check_is_fitted()
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -170,9 +173,13 @@ class BaseOmniForgeModel(ABC):
                 enc = EncryptionManager(encryption_key)
                 raw = target.read_bytes()
                 target.write_bytes(enc.encrypt_bytes(raw))
+            persisted_bytes = target.read_bytes()
             self.metadata_.artifact_checksum = compute_file_checksum(target)
+            hmac_sig = ArtifactSigner().sign_bytes(persisted_bytes, context=_MODEL_HMAC_CONTEXT)
+            meta_dict = self.metadata_.model_dump(mode="json")
+            meta_dict["artifact_hmac_sha256"] = hmac_sig
             meta_path = target.with_suffix(target.suffix + ".meta.json")
-            meta_path.write_text(self.metadata_.model_dump_json(indent=2), encoding="utf-8")
+            meta_path.write_text(json.dumps(meta_dict, indent=2), encoding="utf-8")
             return target
         except Exception as exc:
             raise ModelSerializationError(
@@ -186,24 +193,37 @@ class BaseOmniForgeModel(ABC):
         *,
         encrypted: bool = False,
         encryption_key: str | bytes | None = None,
+        require_signature: bool = True,
     ) -> BaseOmniForgeModel:
-        """Load a serialized OmniForge model from disk."""
+        """Verify HMAC-SHA256 signature and safely load a serialized OmniForge model from disk."""
         src = Path(path)
         if not src.exists():
             raise ModelSerializationError(f"Model artifact not found: {src}")
         try:
+            raw_bytes = src.read_bytes()
+            if require_signature:
+                meta_path = src.with_suffix(src.suffix + ".meta.json")
+                if not meta_path.is_file():
+                    raise SecurityError(
+                        f"Missing metadata signature file '{meta_path.name}' for model artifact '{src.name}'. "
+                        "Refusing to deserialize unsigned model artifact."
+                    )
+                meta_payload = json.loads(meta_path.read_text(encoding="utf-8"))
+                expected_hmac = str(meta_payload.get("artifact_hmac_sha256") or "")
+                if not ArtifactSigner().verify_bytes(raw_bytes, expected_hmac, context=_MODEL_HMAC_CONTEXT):
+                    raise SecurityError(
+                        f"Model artifact '{src.name}' failed HMAC-SHA256 signature verification."
+                    )
             if encrypted:
-                import io
-
                 enc = EncryptionManager(encryption_key)
-                decrypted = enc.decrypt_bytes(src.read_bytes())
-                loaded = joblib.load(io.BytesIO(decrypted))
+                payload_bytes = enc.decrypt_bytes(raw_bytes)
             else:
-                loaded = joblib.load(src)
+                payload_bytes = raw_bytes
+            loaded = safe_joblib_load_bytes(payload_bytes, filename=src.name)
             if not isinstance(loaded, BaseOmniForgeModel):
                 raise ModelSerializationError(f"Loaded artifact is not a BaseOmniForgeModel: {type(loaded).__name__}")
             return loaded
-        except ModelSerializationError:
+        except (ModelSerializationError, SecurityError):
             raise
         except Exception as exc:
             raise ModelSerializationError(f"Failed to load model artifact '{src}'.", cause=exc) from exc

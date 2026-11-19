@@ -22,7 +22,7 @@ def sparsemax_numpy(z: np.ndarray, axis: int = -1) -> np.ndarray:
     support = (1.0 + k_range * z_sorted) > z_cumsum
     k_z = np.sum(support, axis=axis, keepdims=True)
     tau = (np.take_along_axis(z_cumsum, np.maximum(k_z - 1, 0), axis=axis) - 1.0) / np.maximum(k_z, 1.0)
-    return np.maximum(z_shift - tau, 0.0)
+    return np.asarray(np.maximum(z_shift - tau, 0.0), dtype=float)
 
 
 class TabNetModel(BaseOmniForgeModel):
@@ -60,8 +60,8 @@ class TabNetModel(BaseOmniForgeModel):
         self.n_d = max(4, int(n_d))
         self.n_a = max(4, int(n_a))
         self.n_steps = max(1, int(n_steps))
-        self.gamma = float(gamma)
-        self.lambda_sparse = float(lambda_sparse)
+        self.gamma = max(1.0, float(gamma))
+        self.lambda_sparse = max(0.0, float(lambda_sparse))
         self.epochs = int(epochs)
         self.batch_size = max(16, int(batch_size))
         self.learning_rate = float(learning_rate)
@@ -122,7 +122,7 @@ class TabNetModel(BaseOmniForgeModel):
             def forward(self, x: torch.Tensor) -> torch.Tensor:
                 h = self.bn(self.fc(x))
                 a, b = h.chunk(2, dim=-1)
-                return a * torch.sigmoid(b)
+                return torch.mul(a, torch.sigmoid(b))
 
         class _TabNetModule(nn.Module):
             def __init__(self) -> None:
@@ -225,9 +225,11 @@ class TabNetModel(BaseOmniForgeModel):
             total_mask += mask
         return np.hstack([X_s, agg]), total_mask / float(max(len(self._np_step_w), 1))
 
-    def explain(self, X: np.ndarray) -> np.ndarray:
+    def explain(self, X: Any) -> np.ndarray:
         """Return per-instance TabNet sparse feature attribution matrix of shape ``(n_samples, n_features)``."""
-        X_s = self._scaler.transform(X).astype(np.float32)
+        self._check_is_fitted()
+        X_arr, _ = self._prepare_X(X, fitting=False)
+        X_s = self._scaler.transform(X_arr).astype(np.float32)
         if self._torch_net is not None:
             import torch
 
@@ -238,7 +240,8 @@ class TabNetModel(BaseOmniForgeModel):
         _, masks = self._encode_numpy(X_s)
         return masks
 
-    def _predict_proba(self, X: np.ndarray) -> np.ndarray:
+    def _predict_proba(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
+        _ = kwargs
         X_s = self._scaler.transform(X).astype(np.float32)
         if self._torch_net is not None:
             import torch
@@ -246,7 +249,7 @@ class TabNetModel(BaseOmniForgeModel):
             self._torch_net.eval()
             with torch.no_grad():
                 logits, _, _ = self._torch_net(torch.tensor(X_s, dtype=torch.float32))
-                return torch.softmax(logits, dim=-1).cpu().numpy()
+                return np.asarray(torch.softmax(logits, dim=-1).cpu().numpy(), dtype=float)
         assert self._np_head is not None
         feats, _ = self._encode_numpy(X_s)
         return self._np_head.predict_proba(feats)
@@ -263,7 +266,7 @@ class TabNetModel(BaseOmniForgeModel):
                 if self.task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
                     idx = torch.argmax(out, dim=-1).cpu().numpy()
                     return np.array([self._idx_to_label[int(i)] for i in idx])
-                return out.squeeze(-1).cpu().numpy()
+                return np.asarray(out.squeeze(-1).cpu().numpy(), dtype=float)
         assert self._np_head is not None
         feats, _ = self._encode_numpy(X_s)
         return self._np_head.predict(feats)

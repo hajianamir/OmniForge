@@ -490,7 +490,7 @@ class UniversalDiagnosticsSuite:
                         if any(tok in name.lower() for tok in ("most_frequent", "stratified", "mean", "median", "dummy"))
                     ]
                     naive_floor = max((float(v) for _, v in naive_candidates), default=0.0)
-                    max_vif = max((float(v) for v in report.vif_scores.values() if np.isfinite(v)), default=1.0)
+                    max_vif = max((float(v) for v in report.vif_scores.values() if not np.isnan(v)), default=1.0)
 
                     # Rank all baselines best -> worst
                     def _rank_key(
@@ -641,13 +641,13 @@ class UniversalDiagnosticsSuite:
                     if pd.api.types.is_numeric_dtype(df[t_col]):
                         vals = df[t_col].dropna().to_numpy(dtype=float)
                         split_i = max(10, int(len(vals) * (1.0 - cfg.holdout_ratio)))
-                        bl_metrics, bl_models = BaselineBenchmarkSuite.run_forecasting_detailed(
+                        fc_metrics, fc_models = BaselineBenchmarkSuite.run_forecasting_detailed(
                             vals[:split_i], vals[split_i:]
                         )
-                        report.baseline_benchmarks[t_col] = bl_metrics
-                        self.last_baseline_models_[t_col] = bl_models
-                        for bl_m in bl_models.values():
-                            eq_rep = ModelEquationExtractor.extract(bl_m, target_name=t_col)
+                        report.baseline_benchmarks[t_col] = fc_metrics
+                        self.last_baseline_models_[t_col] = fc_models
+                        for fc_m in fc_models.values():
+                            eq_rep = ModelEquationExtractor.extract(fc_m, target_name=t_col)
                             report.baseline_equations.setdefault(t_col, []).append(eq_rep.model_dump())
 
         # 9. Quantitative Risk & Uncertainty Assessment (VaR, CVaR, Tail Risk, Structural Risk Index, Target Uncertainty)
@@ -679,8 +679,8 @@ class UniversalDiagnosticsSuite:
             high_tail = vals[vals >= var_high]
             cvar_low = float(np.mean(low_tail)) if len(low_tail) else var_low
             cvar_high = float(np.mean(high_tail)) if len(high_tail) else var_high
-            downside_vals = vals[vals < mean_v]
-            downside_std = float(np.sqrt(np.mean((downside_vals - mean_v) ** 2))) if len(downside_vals) else 0.0
+            # Below-mean semi-deviation: sqrt((1/N) * sum(min(0, x_i - mean)^2)) (Markowitz 1959; Sortino & Price 1994)
+            downside_std = float(np.sqrt(np.mean(np.minimum(0.0, vals - mean_v) ** 2)))
             kurt = float(stats.kurtosis(vals)) if std_v > 1e-12 else 0.0
             if kurt > 3.0:
                 fat_tail_count += 1
@@ -750,14 +750,15 @@ class UniversalDiagnosticsSuite:
                 )
             else:
                 vals = s.to_numpy(dtype=float)
-                q_low = float(np.quantile(vals, cfg.risk_tail_alpha))
-                q_high = float(np.quantile(vals, 1.0 - cfg.risk_tail_alpha))
-                cv = float(np.std(vals, ddof=1) / max(abs(float(np.mean(vals))), 1e-12))
+                tail_p = max(0.0, min(0.4999, (1.0 - cfg.confidence_level) / 2.0))
+                q_low = float(np.quantile(vals, tail_p))
+                q_high = float(np.quantile(vals, 1.0 - tail_p))
+                cv = float(np.std(vals, ddof=1) / max(abs(float(np.mean(vals))), 1e-12)) if len(vals) > 1 else 0.0
                 target_uncertainty.append(
                     {
                         "Target": t_col,
                         "Type": "Regression",
-                        "Risk Metric": f"{int(cfg.confidence_level * 100)}% Empirical Range [{q_low:.3g}, {q_high:.3g}] | Coeff. of Variation = {cv:.2f}",
+                        "Risk Metric": f"{round(cfg.confidence_level * 100, 1):g}% Empirical Range [{q_low:.3g}, {q_high:.3g}] | Coeff. of Variation = {cv:.2f}",
                         "Normalized Entropy": None,
                         "Risk Level": "High" if cv >= 1.5 else ("Moderate" if cv >= 0.7 else "Low"),
                     }

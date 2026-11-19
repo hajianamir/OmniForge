@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -570,3 +570,77 @@ class DataValidator:
             message=f"Unknown expectation type '{etype}'.",
             remediation="Register custom validator or verify expectation_type spelling.",
         )
+
+
+class ColumnContract(BaseModel):
+    """Formal schema & domain contract for a single column."""
+
+    name: str
+    required: bool = True
+    dtype: Literal["numeric", "string", "datetime", "boolean", "any"] = "any"
+    unique: bool = False
+    max_missing_ratio: float = Field(default=1.0, ge=0.0, le=1.0)
+    min_value: float | None = None
+    max_value: float | None = None
+    allowed_values: list[Any] | None = None
+
+
+class DataContract(BaseModel):
+    """Dataset-level Data Contract separating hard errors from soft warnings."""
+
+    name: str = "default_contract"
+    columns: list[ColumnContract] = Field(default_factory=list)
+    allow_extra_columns: bool = True
+
+    def validate_dataframe(self, df: pd.DataFrame) -> dict[str, Any]:
+        errors: list[str] = []
+        warnings: list[str] = []
+        spec_names = {c.name for c in self.columns}
+
+        if not self.allow_extra_columns:
+            extra = [str(c) for c in df.columns if str(c) not in spec_names]
+            if extra:
+                warnings.append(f"Unexpected extra columns: {extra}")
+
+        for col_spec in self.columns:
+            if col_spec.name not in df.columns:
+                if col_spec.required:
+                    errors.append(f"Missing required column '{col_spec.name}'.")
+                else:
+                    warnings.append(f"Optional column '{col_spec.name}' is absent.")
+                continue
+
+            s = df[col_spec.name]
+            miss_ratio = float(s.isna().mean()) if len(s) > 0 else 0.0
+            if miss_ratio > col_spec.max_missing_ratio:
+                errors.append(
+                    f"Column '{col_spec.name}' missing ratio {miss_ratio:.3f} > {col_spec.max_missing_ratio:.3f}."
+                )
+
+            if col_spec.unique and s.dropna().duplicated().any():
+                errors.append(f"Column '{col_spec.name}' violates uniqueness constraint.")
+
+            if col_spec.dtype == "numeric" and not pd.api.types.is_numeric_dtype(s):
+                errors.append(f"Column '{col_spec.name}' expected numeric dtype, got {s.dtype}.")
+            elif col_spec.dtype == "datetime" and not pd.api.types.is_datetime64_any_dtype(s):
+                warnings.append(f"Column '{col_spec.name}' is not datetime64 (dtype={s.dtype}).")
+
+            if pd.api.types.is_numeric_dtype(s):
+                non_na = s.dropna()
+                if not non_na.empty:
+                    if col_spec.min_value is not None and float(non_na.min()) < col_spec.min_value:
+                        errors.append(
+                            f"Column '{col_spec.name}' min {float(non_na.min())} < {col_spec.min_value}."
+                        )
+                    if col_spec.max_value is not None and float(non_na.max()) > col_spec.max_value:
+                        errors.append(
+                            f"Column '{col_spec.name}' max {float(non_na.max())} > {col_spec.max_value}."
+                        )
+
+            if col_spec.allowed_values is not None:
+                bad = set(s.dropna().unique().tolist()) - set(col_spec.allowed_values)
+                if bad:
+                    errors.append(f"Column '{col_spec.name}' contains disallowed values: {sorted(map(str, bad))[:5]}.")
+
+        return {"passed": len(errors) == 0, "errors": errors, "warnings": warnings}
+

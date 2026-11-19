@@ -10,11 +10,77 @@ interface InspectableBoxProps {
   compact?: boolean;
 }
 
+const FORBIDDEN_POPOUT_TAGS = new Set([
+  'script',
+  'iframe',
+  'object',
+  'embed',
+  'applet',
+  'base',
+  'meta',
+  'link',
+  'foreignobject',
+  'form',
+  'input',
+  'textarea',
+]);
+
+const SAFE_IMAGE_DATA_URI_RE = /^data:image\/(?:png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=\s]+$/i;
+const SAFE_HTTP_OR_RELATIVE_RE = /^(?:https?:\/\/|\/|\.\/|#)/i;
+
+function isSafeAttributeUrl(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return true;
+  if (SAFE_IMAGE_DATA_URI_RE.test(trimmed)) return true;
+  if (SAFE_HTTP_OR_RELATIVE_RE.test(trimmed)) return true;
+  return false;
+}
+
+/**
+ * Recursively sanitize a cloned DOM subtree before inserting it into a pop-out window.
+ * Removes executable elements, inline event handlers (on*), and unsafe URI schemes.
+ */
+function sanitizeClonedSubtree(root: HTMLElement): void {
+  const toRemove: Element[] = [];
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+  let node = walker.nextNode();
+  while (node) {
+    const el = node as Element;
+    const tag = el.tagName.toLowerCase();
+    if (FORBIDDEN_POPOUT_TAGS.has(tag)) {
+      toRemove.push(el);
+    } else {
+      const attrNames = Array.from(el.attributes).map((a) => a.name);
+      for (const attrName of attrNames) {
+        const lower = attrName.toLowerCase();
+        const val = el.getAttribute(attrName) || '';
+        if (lower.startsWith('on') || lower === 'srcdoc' || lower === 'formaction') {
+          el.removeAttribute(attrName);
+        } else if (
+          lower === 'href' ||
+          lower === 'xlink:href' ||
+          lower === 'src' ||
+          lower === 'action'
+        ) {
+          if (!isSafeAttributeUrl(val)) {
+            el.removeAttribute(attrName);
+          }
+        }
+      }
+    }
+    node = walker.nextNode();
+  }
+  for (const el of toRemove) {
+    el.remove();
+  }
+}
+
 /**
  * Universal inspection wrapper that equips EVERY chart, graph, image, equation card,
  * and data table across OmniForge with:
- *   1. Full-viewport interactive Zoom Modal (50% - 225% magnification + Escape to close)
- *   2. Dedicated Pop-Out Browser Window (standalone self-contained offline inspection view)
+ *   1. Full-viewport interactive Zoom Modal (60% - 220% magnification + Escape to close)
+ *   2. Dedicated Pop-Out Browser Window built strictly via sanitized DOM APIs and a
+ *      script-free Content-Security-Policy (zero document.write / innerHTML sinks).
  */
 export const InspectableBox: React.FC<InspectableBoxProps> = ({
   title = 'Visual / Table Inspector',
@@ -41,7 +107,7 @@ export const InspectableBox: React.FC<InspectableBoxProps> = ({
     const srcEl = contentRef.current;
     if (!srcEl) return;
 
-    // Clone node and convert any live <canvas> elements into crisp data-URL <img> elements
+    // Clone node and convert any live <canvas> elements into crisp PNG data-URL <img> elements
     const clone = srcEl.cloneNode(true) as HTMLElement;
     const origCanvases = srcEl.querySelectorAll('canvas');
     const cloneCanvases = clone.querySelectorAll('canvas');
@@ -51,6 +117,7 @@ export const InspectableBox: React.FC<InspectableBoxProps> = ({
       try {
         const img = document.createElement('img');
         img.src = origC.toDataURL('image/png');
+        img.alt = title;
         img.style.width = '100%';
         img.style.height = 'auto';
         img.style.borderRadius = '10px';
@@ -60,11 +127,14 @@ export const InspectableBox: React.FC<InspectableBoxProps> = ({
         // Keep canvas fallback if tainted
       }
     });
+    sanitizeClonedSubtree(clone);
 
-    const theme = document.documentElement.getAttribute('data-theme') || 'dark';
+    const rawTheme = document.documentElement.getAttribute('data-theme');
+    const theme = rawTheme === 'light' ? 'light' : 'dark';
     const isLight = theme === 'light';
     const bg = isLight ? '#f4f7fb' : '#070b14';
     const card = isLight ? '#ffffff' : '#111b2e';
+    const subtle = isLight ? '#eef3fa' : '#17233b';
     const text = isLight ? '#0f172a' : '#edf2ff';
     const muted = isLight ? '#475569' : '#94a3b8';
     const border = isLight ? '#d7e1ef' : '#22314f';
@@ -76,65 +146,111 @@ export const InspectableBox: React.FC<InspectableBoxProps> = ({
       return;
     }
 
-    const safeTitle = title.replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    const safeSub = (subtitle || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const pDoc = popup.document;
+    pDoc.documentElement.setAttribute('data-theme', theme);
+    pDoc.head.replaceChildren();
+    pDoc.body.replaceChildren();
 
-    popup.document.open();
-    popup.document.write(`<!doctype html>
-<html data-theme="${theme}">
-<head>
-<meta charset="utf-8" />
-<title>OmniForge Inspector — ${safeTitle}</title>
-<style>
-  :root { --bg: ${bg}; --bg-card: ${card}; --bg-subtle: ${isLight ? '#eef3fa' : '#17233b'}; --text: ${text}; --text-muted: ${muted}; --text-dim: ${muted}; --border: ${border}; --accent: #38bdf8; --green: #34d399; --amber: #fbbf24; --red: #f87171; }
-  * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif; font-size: 13.5px; }
-  .bar { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 20px; background: var(--bg-card); border-bottom: 1px solid var(--border); }
-  .bar h2 { margin: 0; font-size: 15px; }
-  .bar small { color: var(--text-muted); font-size: 12px; }
-  .ctrl { display: flex; align-items: center; gap: 8px; }
-  .ctrl button { padding: 6px 12px; border-radius: 7px; border: 1px solid var(--border); background: var(--bg-subtle); color: var(--text); cursor: pointer; font-weight: 600; }
-  .ctrl button:hover { border-color: var(--accent); }
-  .stage { padding: 20px; overflow: auto; }
-  .zoom-wrap { transform-origin: top left; transition: transform 0.12s ease; background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 18px; }
-  .table-wrap { overflow: auto; max-height: none !important; border: 1px solid var(--border); border-radius: 8px; }
-  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-  th, td { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: left; white-space: nowrap; }
-  th { background: var(--bg-subtle); font-weight: 700; position: sticky; top: 0; }
-  .badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 99px; font-size: 11px; font-weight: 600; border: 1px solid var(--border); }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
-  svg { max-width: 100%; height: auto !important; }
-  img { max-width: 100%; height: auto; }
-</style>
-</head>
-<body>
-  <div class="bar">
-    <div>
-      <h2>Ω OmniForge · ${safeTitle}</h2>
-      ${safeSub ? `<small>${safeSub}</small>` : ''}
-    </div>
-    <div class="ctrl">
-      <button onclick="setZ(z - 15)">− Zoom</button>
-      <span id="zlabel" class="mono">100%</span>
-      <button onclick="setZ(z + 15)">+ Zoom</button>
-      <button onclick="setZ(100)">Reset</button>
-      <button onclick="window.print()">Print / Save PDF</button>
-    </div>
-  </div>
-  <div class="stage">
-    <div id="zw" class="zoom-wrap">${clone.innerHTML}</div>
-  </div>
-  <script>
-    var z = 100;
-    function setZ(val) {
-      z = Math.max(50, Math.min(250, val));
-      document.getElementById('zlabel').textContent = z + '%';
-      document.getElementById('zw').style.transform = 'scale(' + (z / 100) + ')';
+    const metaCharset = pDoc.createElement('meta');
+    metaCharset.setAttribute('charset', 'utf-8');
+    pDoc.head.appendChild(metaCharset);
+
+    // Enforce strict script-free CSP inside the pop-out window
+    const metaCsp = pDoc.createElement('meta');
+    metaCsp.setAttribute('http-equiv', 'Content-Security-Policy');
+    metaCsp.setAttribute(
+      'content',
+      "default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; font-src data:;"
+    );
+    pDoc.head.appendChild(metaCsp);
+
+    const titleEl = pDoc.createElement('title');
+    titleEl.textContent = `OmniForge Inspector — ${title}`;
+    pDoc.head.appendChild(titleEl);
+
+    const styleEl = pDoc.createElement('style');
+    styleEl.textContent = `
+      :root { --bg: ${bg}; --bg-card: ${card}; --bg-subtle: ${subtle}; --text: ${text}; --text-muted: ${muted}; --text-dim: ${muted}; --border: ${border}; --accent: #38bdf8; --green: #34d399; --amber: #fbbf24; --red: #f87171; }
+      * { box-sizing: border-box; }
+      body { margin: 0; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif; font-size: 13.5px; }
+      .bar { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 20px; background: var(--bg-card); border-bottom: 1px solid var(--border); }
+      .bar h2 { margin: 0; font-size: 15px; }
+      .bar small { color: var(--text-muted); font-size: 12px; }
+      .ctrl { display: flex; align-items: center; gap: 8px; }
+      .ctrl button { padding: 6px 12px; border-radius: 7px; border: 1px solid var(--border); background: var(--bg-subtle); color: var(--text); cursor: pointer; font-weight: 600; }
+      .ctrl button:hover { border-color: var(--accent); }
+      .stage { padding: 20px; overflow: auto; }
+      .zoom-wrap { transform-origin: top left; transition: transform 0.12s ease; background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 18px; }
+      .table-wrap { overflow: auto; max-height: none !important; border: 1px solid var(--border); border-radius: 8px; }
+      table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+      th, td { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: left; white-space: nowrap; }
+      th { background: var(--bg-subtle); font-weight: 700; position: sticky; top: 0; }
+      .badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 99px; font-size: 11px; font-weight: 600; border: 1px solid var(--border); }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+      svg { max-width: 100%; height: auto !important; }
+      img { max-width: 100%; height: auto; }
+    `;
+    pDoc.head.appendChild(styleEl);
+
+    const bar = pDoc.createElement('div');
+    bar.className = 'bar';
+
+    const metaBox = pDoc.createElement('div');
+    const heading = pDoc.createElement('h2');
+    heading.textContent = `Ω OmniForge · ${title}`;
+    metaBox.appendChild(heading);
+    if (subtitle) {
+      const subEl = pDoc.createElement('small');
+      subEl.textContent = subtitle;
+      metaBox.appendChild(subEl);
     }
-  </script>
-</body>
-</html>`);
-    popup.document.close();
+
+    const ctrl = pDoc.createElement('div');
+    ctrl.className = 'ctrl';
+
+    const btnOut = pDoc.createElement('button');
+    btnOut.type = 'button';
+    btnOut.textContent = '− Zoom';
+
+    const zLabel = pDoc.createElement('span');
+    zLabel.className = 'mono';
+    zLabel.textContent = '100%';
+
+    const btnIn = pDoc.createElement('button');
+    btnIn.type = 'button';
+    btnIn.textContent = '+ Zoom';
+
+    const btnReset = pDoc.createElement('button');
+    btnReset.type = 'button';
+    btnReset.textContent = 'Reset';
+
+    const btnPrint = pDoc.createElement('button');
+    btnPrint.type = 'button';
+    btnPrint.textContent = 'Print / Save PDF';
+
+    ctrl.append(btnOut, zLabel, btnIn, btnReset, btnPrint);
+    bar.append(metaBox, ctrl);
+
+    const stage = pDoc.createElement('div');
+    stage.className = 'stage';
+    const zoomWrap = pDoc.createElement('div');
+    zoomWrap.className = 'zoom-wrap';
+    const importedClone = pDoc.importNode(clone, true);
+    zoomWrap.appendChild(importedClone);
+    stage.appendChild(zoomWrap);
+
+    pDoc.body.append(bar, stage);
+
+    let popZoom = 100;
+    const applyZoom = (nextVal: number) => {
+      popZoom = Math.max(50, Math.min(250, nextVal));
+      zLabel.textContent = `${popZoom}%`;
+      zoomWrap.style.transform = `scale(${popZoom / 100})`;
+    };
+    btnOut.addEventListener('click', () => applyZoom(popZoom - 15));
+    btnIn.addEventListener('click', () => applyZoom(popZoom + 15));
+    btnReset.addEventListener('click', () => applyZoom(100));
+    btnPrint.addEventListener('click', () => popup.print());
   };
 
   return (

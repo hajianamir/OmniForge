@@ -30,7 +30,7 @@ class CarbonTracker:
 
     def __init__(
         self,
-        operation_name: str = "uap_operation",
+        operation_name: str = "omniforge_operation",
         *,
         country_iso: str = "DEU",
         grid_intensity_g_per_kwh: float | None = None,
@@ -70,7 +70,7 @@ class CarbonTracker:
         self._start_cpu_time = float(cpu_times.user + cpu_times.system)
         if self.use_codecarbon:
             try:
-                from codecarbon import OfflineEmissionsTracker  # type: ignore[import-not-found]
+                from codecarbon import OfflineEmissionsTracker
 
                 self._cc_tracker = OfflineEmissionsTracker(
                     project_name=self.operation_name,
@@ -112,7 +112,7 @@ class CarbonTracker:
 
         gpu_power_w = 0.0
         if is_package_available("torch"):
-            import torch  # type: ignore[import-not-found]
+            import torch
 
             if torch.cuda.is_available():
                 gpu_power_w = self.gpu_tdp_watts * 0.6
@@ -121,7 +121,7 @@ class CarbonTracker:
         energy_kwh = (total_power_w * (duration_s / 3600.0)) / 1000.0
         emissions_g = energy_kwh * self.grid_intensity
         emissions_kg = emissions_g / 1000.0
-        backend = "uap_hardware_estimator"
+        backend = "omniforge_hardware_estimator"
 
         if self._cc_tracker is not None:
             try:

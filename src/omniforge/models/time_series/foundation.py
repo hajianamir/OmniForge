@@ -47,8 +47,8 @@ class FoundationForecaster:
             raise ForecastingError("FoundationForecaster requires at least 6 context observations.")
 
         if self.use_pretrained_chronos:
-            import torch  # type: ignore[import-not-found]
-            from chronos import ChronosPipeline  # type: ignore[import-not-found]
+            import torch
+            from chronos import ChronosPipeline
 
             if self._pipeline is None:
                 self._pipeline = ChronosPipeline.from_pretrained(self.chronos_model_id)
@@ -59,7 +59,9 @@ class FoundationForecaster:
         p_len = min(self.patch_length, max(4, len(arr) // 3))
         query = arr[-p_len:]
         q_mean = float(np.mean(query))
-        q_std = float(np.std(query)) + 1e-6
+        q_std_raw = float(np.std(query, ddof=1)) if p_len > 1 else 0.0
+        q_flat = q_std_raw < 1e-8 * max(abs(q_mean), 1.0)
+        q_std = q_std_raw if not q_flat else 1.0
         q_norm = (query - q_mean) / q_std
 
         trajectories: list[np.ndarray] = []
@@ -71,9 +73,14 @@ class FoundationForecaster:
             dists: list[tuple[float, int]] = []
             for start in range(0, max_start + 1):
                 cand = arr[start : start + p_len]
-                c_std = float(np.std(cand)) + 1e-6
-                c_norm = (cand - float(np.mean(cand))) / c_std
-                dist = float(np.sqrt(np.mean((q_norm - c_norm) ** 2)))
+                c_mean = float(np.mean(cand))
+                c_std_raw = float(np.std(cand, ddof=1)) if p_len > 1 else 0.0
+                if c_std_raw < 1e-8 * max(abs(c_mean), 1.0):
+                    # Flat historical patch: avoid 1e6 scale explosion by comparing raw level deviation
+                    dist = float(np.sqrt(np.mean((q_norm - 0.0) ** 2))) + 1.0
+                else:
+                    c_norm = (cand - c_mean) / c_std_raw
+                    dist = float(np.sqrt(np.mean((q_norm - c_norm) ** 2)))
                 dists.append((dist, start))
             dists.sort(key=lambda pair: pair[0])
 
@@ -81,16 +88,20 @@ class FoundationForecaster:
                 cand = arr[start : start + p_len]
                 fut = arr[start + p_len : start + p_len + h]
                 c_mean = float(np.mean(cand))
-                c_std = float(np.std(cand)) + 1e-6
-                # Rescale future trajectory back to current query scale and anchor to last level
-                rescaled = ((fut - c_mean) / c_std) * q_std + q_mean
-                anchor_shift = arr[-1] - (((cand[-1] - c_mean) / c_std) * q_std + q_mean)
-                trajectories.append(rescaled + 0.5 * anchor_shift)
+                c_std_raw = float(np.std(cand, ddof=1)) if p_len > 1 else 0.0
+                if q_flat or c_std_raw < 1e-8 * max(abs(c_mean), 1.0):
+                    # Additive shift continuation when either query or historical patch is flat (no division blow-up)
+                    trajectories.append(arr[-1] + (fut - cand[-1]))
+                else:
+                    # Rescale future trajectory back to current query scale and anchor to last level
+                    rescaled = ((fut - c_mean) / c_std_raw) * q_std + q_mean
+                    anchor_shift = arr[-1] - (((cand[-1] - c_mean) / c_std_raw) * q_std + q_mean)
+                    trajectories.append(rescaled + 0.5 * anchor_shift)
                 weights.append(float(np.exp(-dist)))
 
-        # Add damped local trend + FFT harmonic continuation paths for robustness
+        # Add damped local trend continuation path for robustness
         t_ctx = np.arange(len(arr), dtype=float)
-        slope, intercept = np.polyfit(t_ctx[-min(len(arr), 28) :], arr[-min(len(arr), 28) :], 1)
+        slope, _ = np.polyfit(t_ctx[-min(len(arr), 28) :], arr[-min(len(arr), 28) :], 1)
         damp = np.cumsum(0.92 ** np.arange(1, h + 1))
         trend_path = arr[-1] + slope * damp
         trajectories.append(trend_path)
@@ -101,7 +112,8 @@ class FoundationForecaster:
         w_arr = np.asarray(weights, dtype=float)
         w_arr /= np.sum(w_arr)
         traj_mat = np.vstack(trajectories)
-        resid_scale = float(np.std(np.diff(arr[-min(len(arr), 30) :])))
+        diffs_tail = np.diff(arr[-min(len(arr), 30) :])
+        resid_scale = float(np.std(diffs_tail, ddof=1)) if len(diffs_tail) > 1 else 0.0
         n_draws = 100
         draws = np.empty((n_draws, h), dtype=float)
         step_scale = np.sqrt(np.arange(1, h + 1, dtype=float))

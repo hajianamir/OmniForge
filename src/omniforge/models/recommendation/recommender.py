@@ -32,6 +32,7 @@ class HybridRecommender:
         self._item_to_idx: dict[Any, int] = {}
         self._idx_to_item: dict[int, Any] = {}
         self._interaction_mat: np.ndarray = np.empty((0, 0))
+        self._observed_mask: np.ndarray = np.empty((0, 0), dtype=bool)
         self._cf_scores: np.ndarray = np.empty((0, 0))
         self._item_sim: np.ndarray = np.empty((0, 0))
         self._popularity_scores: np.ndarray = np.empty(0)
@@ -59,18 +60,34 @@ class HybridRecommender:
         self._idx_to_item = {i: it for i, it in enumerate(items)}
 
         mat = np.zeros((len(users), len(items)), dtype=float)
+        counts = np.zeros((len(users), len(items)), dtype=float)
         has_rating = rating_col in interactions.columns
-        for _, row in interactions.iterrows():
-            u_i = self._user_to_idx[row[user_col]]
-            it_i = self._item_to_idx[row[item_col]]
-            mat[u_i, it_i] = float(row[rating_col]) if has_rating else 1.0
+        for row_u, row_it, row_r in zip(
+            interactions[user_col],
+            interactions[item_col],
+            interactions[rating_col] if has_rating else [1.0] * len(interactions),
+            strict=False,
+        ):
+            val = float(row_r) if has_rating else 1.0
+            if not np.isfinite(val):
+                continue
+            u_i = self._user_to_idx[row_u]
+            it_i = self._item_to_idx[row_it]
+            mat[u_i, it_i] += val
+            counts[u_i, it_i] += 1.0
 
+        observed = counts > 0
+        if has_rating:
+            mat = np.where(observed, mat / np.where(observed, counts, 1.0), 0.0)
         self._interaction_mat = mat
-        self._popularity_scores = mat.sum(axis=0) / max(float(mat.sum()), 1e-12)
+        self._observed_mask = observed
+        pop_raw = observed.sum(axis=0).astype(float)
+        self._popularity_scores = pop_raw / max(float(pop_raw.sum()), 1e-12)
 
-        # Collaborative filtering via TruncatedSVD (with user mean centering)
-        user_means = np.where(mat.sum(axis=1) > 0, mat.sum(axis=1) / np.maximum((mat > 0).sum(axis=1), 1), 0.0)
-        centered = np.where(mat > 0, mat - user_means[:, None], 0.0)
+        # Collaborative filtering via TruncatedSVD (with user mean centering over observed entries)
+        obs_counts = observed.sum(axis=1)
+        user_means = np.where(obs_counts > 0, (mat * observed).sum(axis=1) / np.maximum(obs_counts, 1), 0.0)
+        centered = np.where(observed, mat - user_means[:, None], 0.0)
         k = max(1, min(self.n_factors, min(mat.shape) - 1))
         if min(mat.shape) > 2:
             svd = TruncatedSVD(n_components=k, random_state=self.random_seed)
@@ -88,6 +105,8 @@ class HybridRecommender:
             self._item_sim = cosine_similarity(tfidf)
         else:
             self._item_sim = cosine_similarity(mat.T) if mat.shape[1] > 0 else np.empty((0, 0))
+        if self._item_sim.size > 0:
+            np.fill_diagonal(self._item_sim, 0.0)
 
         self._is_fitted = True
         return self
@@ -114,15 +133,32 @@ class HybridRecommender:
 
         u_idx = self._user_to_idx[user_id]
         user_hist = self._interaction_mat[u_idx]
-        cf = self._cf_scores[u_idx]
-        cf_norm = (cf - cf.min()) / max(float(cf.max() - cf.min()), 1e-12)
+        seen_mask = self._observed_mask[u_idx]
+        cand_mask = (~seen_mask) if exclude_seen else np.ones(n_items, dtype=bool)
+        if not np.any(cand_mask):
+            return []
 
-        content_raw = user_hist @ self._item_sim if self._item_sim.size > 0 else np.zeros(n_items)
-        c_norm = (content_raw - content_raw.min()) / max(float(content_raw.max() - content_raw.min()), 1e-12)
-        scores = self.cf_weight * cf_norm + self.content_weight * c_norm
+        cf = self._cf_scores[u_idx]
+        cf_c = cf[cand_mask]
+        cf_span = float(cf_c.max() - cf_c.min())
+        cf_norm = (cf - float(cf_c.min())) / cf_span if cf_span > 1e-12 else np.full(n_items, 0.5, dtype=float)
+
+        if self._item_sim.size > 0:
+            # Sarwar et al. (2001) similarity-weighted item-KNN score (self-diagonal already zeroed)
+            sim_num = user_hist @ self._item_sim
+            sim_den = np.asarray(seen_mask, dtype=float) @ np.abs(self._item_sim)
+            content_raw = np.where(sim_den > 1e-12, sim_num / np.where(sim_den > 1e-12, sim_den, 1.0), 0.0)
+        else:
+            content_raw = np.zeros(n_items, dtype=float)
+        c_c = content_raw[cand_mask]
+        c_span = float(c_c.max() - c_c.min())
+        c_norm = (content_raw - float(c_c.min())) / c_span if c_span > 1e-12 else np.full(n_items, 0.5, dtype=float)
+
+        w_sum = max(self.cf_weight + self.content_weight, 1e-12)
+        scores = (self.cf_weight * cf_norm + self.content_weight * c_norm) / w_sum
 
         if exclude_seen:
-            scores = np.where(user_hist > 0, -np.inf, scores)
+            scores = np.where(seen_mask, -np.inf, scores)
 
         order = np.argsort(-scores)[: min(top_k, n_items)]
         return [
@@ -135,17 +171,19 @@ class HybridRecommender:
     def evaluate_ranking(
         recommended_items: list[Any], relevant_items: set[Any], k: int = 10
     ) -> dict[str, float]:
-        """Compute Precision@K, Recall@K, and NDCG@K ranking metrics."""
-        top = recommended_items[:k]
+        """Compute deduplicated Precision@K, Recall@K, and binary NDCG@K ranking metrics."""
+        k_eff = max(1, int(k))
+        # Deduplicate preserving rank order so repeated recommendations cannot inflate Recall/NDCG > 1.0
+        top = list(dict.fromkeys(recommended_items))[:k_eff]
         hits = [1.0 if item in relevant_items else 0.0 for item in top]
         precision = sum(hits) / max(len(top), 1)
-        recall = sum(hits) / max(len(relevant_items), 1)
+        recall = sum(hits) / max(len(relevant_items), 1) if relevant_items else 0.0
         dcg = sum(h / np.log2(idx + 2.0) for idx, h in enumerate(hits))
-        ideal_hits = [1.0] * min(len(relevant_items), k)
+        ideal_hits = [1.0] * min(len(relevant_items), k_eff)
         idcg = sum(h / np.log2(idx + 2.0) for idx, h in enumerate(ideal_hits))
-        ndcg = dcg / max(idcg, 1e-12)
+        ndcg = dcg / max(idcg, 1e-12) if idcg > 0.0 else 0.0
         return {
-            f"precision_at_{k}": round(precision, 4),
-            f"recall_at_{k}": round(recall, 4),
-            f"ndcg_at_{k}": round(ndcg, 4),
+            f"precision_at_{k_eff}": round(precision, 4),
+            f"recall_at_{k_eff}": round(recall, 4),
+            f"ndcg_at_{k_eff}": round(ndcg, 4),
         }

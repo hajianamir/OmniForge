@@ -39,7 +39,9 @@ class MultimodalFusionModel(BaseOmniForgeModel):
         self.embedding_dim = int(embedding_dim)
         self.hidden_dims = list(hidden_dims)
         self.epochs = int(epochs)
-        self._text_embedder = EmbeddingGenerator(embedding_dim=self.embedding_dim, random_seed=self.random_seed)
+        self._text_embedders: dict[str, EmbeddingGenerator] = {}
+        self._df_cols: dict[str, list[str]] = {}
+        self._df_medians: dict[str, dict[str, float]] = {}
         self._scalers: dict[str, StandardScaler] = {}
         self._modality_gates: dict[str, np.ndarray] = {}
         self._fusion_head: MLPModel | None = None
@@ -76,14 +78,38 @@ class MultimodalFusionModel(BaseOmniForgeModel):
 
         for key in keys:
             data = modalities[key]
-            if key == "text" or (isinstance(data, list) and data and isinstance(data[0], str)):
+            if key == "text" or key in self._text_embedders or (isinstance(data, list) and data and isinstance(data[0], str)):
                 if fitting:
                     self._has_text = True
-                    arr = self._text_embedder.fit_transform_text([str(x) for x in data])
+                    emb = EmbeddingGenerator(embedding_dim=self.embedding_dim, random_seed=self.random_seed)
+                    arr = emb.fit_transform_text([str(x) for x in data]).astype(np.float64)
+                    self._text_embedders[key] = emb
                 else:
-                    arr = self._text_embedder.transform_text([str(x) for x in data])
+                    arr = self._text_embedders[key].transform_text([str(x) for x in data]).astype(np.float64)
             elif isinstance(data, pd.DataFrame):
-                arr = data.select_dtypes(include=[np.number]).fillna(0.0).to_numpy(dtype=np.float64)
+                if fitting:
+                    num_df = data.select_dtypes(include=[np.number]).copy()
+                    cols = list(num_df.columns)
+                    self._df_cols[key] = cols
+                    meds: dict[str, float] = {}
+                    for col in cols:
+                        vals = pd.to_numeric(num_df[col], errors="coerce")
+                        med = float(vals.median()) if vals.notna().any() else 0.0
+                        meds[str(col)] = med
+                        num_df[col] = vals.fillna(med)
+                    self._df_medians[key] = meds
+                    arr = num_df.to_numpy(dtype=np.float64)
+                else:
+                    cols = self._df_cols.get(key, list(data.select_dtypes(include=[np.number]).columns))
+                    meds = self._df_medians.get(key, {})
+                    aligned = pd.DataFrame(index=data.index)
+                    for col in cols:
+                        med = meds.get(str(col), 0.0)
+                        if col in data.columns:
+                            aligned[col] = pd.to_numeric(data[col], errors="coerce").fillna(med)
+                        else:
+                            aligned[col] = med
+                    arr = aligned.to_numpy(dtype=np.float64)
             else:
                 arr = np.asarray(data, dtype=np.float64)
                 if arr.ndim == 1:

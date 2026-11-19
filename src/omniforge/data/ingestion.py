@@ -61,11 +61,13 @@ class DataIngestionEngine:
         compute_checksum: bool = True,
         default_encoding: str = "utf-8",
         tenant_id: str = "default-tenant",
+        allow_unsafe_pickle: bool = False,
     ) -> None:
         self.optimize_dtypes = optimize_dtypes
         self.compute_checksum = compute_checksum
         self.default_encoding = default_encoding
         self.tenant_id = tenant_id
+        self.allow_unsafe_pickle = allow_unsafe_pickle
 
     def load_file(self, path: str | Path, **kwargs: Any) -> pd.DataFrame:
         """Convenience wrapper around :meth:`ingest` returning the loaded DataFrame directly."""
@@ -335,7 +337,7 @@ class DataIngestionEngine:
                     yield chunk
             elif fmt == "parquet":
                 if is_package_available("pyarrow"):
-                    import pyarrow.parquet as pq  # type: ignore[import-not-found]
+                    import pyarrow.parquet as pq
 
                     pf = pq.ParquetFile(source_str)
                     for batch in pf.iter_batches(batch_size=chunk_size):
@@ -485,7 +487,7 @@ class DataIngestionEngine:
             if fmt == "arrow":
                 if not is_package_available("pyarrow"):
                     raise DependencyMissingError("Install 'pyarrow' to read Arrow IPC files.")
-                import pyarrow.ipc as pa_ipc  # type: ignore[import-not-found]
+                import pyarrow.ipc as pa_ipc
 
                 with open(path_or_uri, "rb") as handle:
                     try:
@@ -509,7 +511,7 @@ class DataIngestionEngine:
                         "Install 'fastavro' to read Apache Avro files.",
                         suggestions=["Run: pip install fastavro"],
                     )
-                import fastavro  # type: ignore[import-not-found]
+                import fastavro
 
                 with open(path_or_uri, "rb") as handle:
                     records = list(fastavro.reader(handle))
@@ -517,14 +519,34 @@ class DataIngestionEngine:
             if fmt == "hdf5":
                 return pd.read_hdf(path_or_uri, **kwargs)
             if fmt == "pickle":
+                if not self.allow_unsafe_pickle:
+                    raise DataIngestionError(
+                        "Pickle file ingestion (.pkl/.pickle) is disabled by default for security (CWE-502: unsafe deserialization).",
+                        context={"path": path_or_uri, "format": fmt},
+                        suggestions=[
+                            "Convert your dataset to a safe tabular format such as Parquet (.parquet), CSV (.csv), JSON (.json), or Excel (.xlsx)."
+                        ],
+                    )
                 obj = pd.read_pickle(path_or_uri, **so, **kwargs)
                 return obj if isinstance(obj, pd.DataFrame) else pd.DataFrame(obj)
             if fmt == "xml":
+                raw_xml = Path(path_or_uri).read_text(encoding=self.default_encoding, errors="replace")
+                xml_upper = raw_xml.upper()
+                if "<!DOCTYPE" in xml_upper or "<!ENTITY" in xml_upper:
+                    raise DataIngestionError(
+                        "Unsafe XML document rejected: DOCTYPE and ENTITY declarations are forbidden (XXE protection).",
+                        context={"path": path_or_uri, "format": fmt},
+                        suggestions=["Remove DTD/DOCTYPE/ENTITY declarations from the XML file before ingesting."],
+                    )
                 try:
-                    return pd.read_xml(path_or_uri, **kwargs)
+                    return pd.read_xml(io.StringIO(raw_xml), **kwargs)
                 except Exception:
-                    tree = ET.parse(path_or_uri)
-                    root = tree.getroot()
+                    try:
+                        import defusedxml.ElementTree as safe_et
+
+                        root = safe_et.fromstring(raw_xml)
+                    except ImportError:
+                        root = ET.fromstring(raw_xml)
                     rows = [{child.tag: child.text for child in elem} for elem in root]
                     return pd.DataFrame(rows)
             if fmt == "yaml":
@@ -567,18 +589,21 @@ class DataIngestionEngine:
         try:
             if scheme == "sqlite" or uri.lower().endswith((".db", ".sqlite", ".sqlite3")):
                 db_path = uri.replace("sqlite:///", "") if scheme == "sqlite" else uri
-                with sqlite3.connect(db_path) as conn:
+                sqlite_conn = sqlite3.connect(db_path)
+                try:
                     sql = query or (
                         f"SELECT * FROM {table_name}"
                         if table_name
-                        else self._first_sqlite_table_query(conn)
+                        else self._first_sqlite_table_query(sqlite_conn)
                     )
-                    return pd.read_sql_query(sql, conn, **kwargs), "sqlite"
+                    return pd.read_sql_query(sql, sqlite_conn, **kwargs), "sqlite"
+                finally:
+                    sqlite_conn.close()
 
             if scheme == "duckdb" or uri.lower().endswith(".duckdb"):
                 if not is_package_available("duckdb"):
                     raise DependencyMissingError("Install 'duckdb' to ingest from DuckDB.")
-                import duckdb  # type: ignore[import-not-found]
+                import duckdb
 
                 db_path = uri.replace("duckdb:///", "") if scheme == "duckdb" else uri
                 with duckdb.connect(db_path, read_only=True) as conn:
@@ -594,7 +619,7 @@ class DataIngestionEngine:
             if scheme.startswith("mongodb"):
                 if not is_package_available("pymongo"):
                     raise DependencyMissingError("Install 'pymongo' to ingest from MongoDB.")
-                from pymongo import MongoClient  # type: ignore[import-not-found]
+                from pymongo import MongoClient
 
                 db_name = kwargs.pop("database", parsed.path.lstrip("/") or "default")
                 collection_name = kwargs.pop("collection", table_name or query)
@@ -615,7 +640,7 @@ class DataIngestionEngine:
                 raise DependencyMissingError(
                     f"Install 'sqlalchemy' and the database driver for '{scheme}'."
                 )
-            from sqlalchemy import create_engine, inspect  # type: ignore[import-not-found]
+            from sqlalchemy import create_engine, inspect
 
             engine = create_engine(uri)
             try:
@@ -623,10 +648,10 @@ class DataIngestionEngine:
                     return pd.read_sql_query(query, engine, **kwargs), scheme
                 if table_name:
                     return pd.read_sql_table(table_name, engine, **kwargs), scheme
-                tables = inspect(engine).get_table_names()
-                if not tables:
+                sa_tables = inspect(engine).get_table_names()
+                if not sa_tables:
                     return pd.DataFrame(), scheme
-                return pd.read_sql_table(tables[0], engine, **kwargs), scheme
+                return pd.read_sql_table(sa_tables[0], engine, **kwargs), scheme
             finally:
                 engine.dispose()
         except (DataIngestionError, DependencyMissingError):
@@ -711,7 +736,7 @@ class DataIngestionEngine:
                 "Install 'kafka-python' to consume live Kafka topics.",
                 suggestions=["Run: pip install kafka-python"],
             )
-        from kafka import KafkaConsumer  # type: ignore[import-not-found]
+        from kafka import KafkaConsumer
 
         consumer = KafkaConsumer(
             topic,

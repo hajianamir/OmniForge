@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -16,6 +18,22 @@ from omniforge.core.types import ModelStage
 from omniforge.models.base import BaseOmniForgeModel
 
 logger = get_logger(__name__)
+
+
+@contextmanager
+def _sqlite_conn(db_path: str | Path, **kwargs: Any) -> Iterator[sqlite3.Connection]:
+    """Yield a SQLite connection that is always committed/rolled back **and closed**.
+
+    ``with sqlite3.connect(...)`` only wraps a transaction; the underlying handle
+    stays open until garbage collection, which leaks file descriptors and emits
+    ``ResourceWarning: unclosed database``.
+    """
+    conn = sqlite3.connect(db_path, **kwargs)
+    try:
+        with conn:  # transaction scope: commit on success, rollback on error
+            yield conn
+    finally:
+        conn.close()
 
 
 class RegisteredModelVersion(BaseModel):
@@ -48,7 +66,7 @@ class ModelRegistry:
         self._init_db()
 
     def _init_db(self) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with _sqlite_conn(self.db_path) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS model_versions (
@@ -80,7 +98,7 @@ class ModelRegistry:
         encrypt: bool = False,
     ) -> RegisteredModelVersion:
         """Persist a fitted OmniForge model as the next monotonically increasing version."""
-        with sqlite3.connect(self.db_path) as conn:
+        with _sqlite_conn(self.db_path) as conn:
             row = conn.execute(
                 "SELECT MAX(version) FROM model_versions WHERE model_name = ?", (model_name,)
             ).fetchone()
@@ -106,7 +124,7 @@ class ModelRegistry:
             updated_at=now,
         )
 
-        with sqlite3.connect(self.db_path) as conn:
+        with _sqlite_conn(self.db_path) as conn:
             if stage == ModelStage.PRODUCTION:
                 conn.execute(
                     "UPDATE model_versions SET stage = ?, updated_at = ? WHERE model_name = ? AND stage = ?",
@@ -145,7 +163,7 @@ class ModelRegistry:
     ) -> RegisteredModelVersion:
         """Promote or transition a registered model version across lifecycle stages."""
         now = datetime.now(UTC).isoformat()
-        with sqlite3.connect(self.db_path) as conn:
+        with _sqlite_conn(self.db_path) as conn:
             cur = conn.execute(
                 "SELECT 1 FROM model_versions WHERE model_name = ? AND version = ?",
                 (model_name, version),
@@ -167,7 +185,7 @@ class ModelRegistry:
 
     def get_version(self, model_name: str, version: int) -> RegisteredModelVersion:
         """Fetch metadata for a specific model version."""
-        with sqlite3.connect(self.db_path) as conn:
+        with _sqlite_conn(self.db_path) as conn:
             row = conn.execute(
                 "SELECT model_name, version, stage, artifact_path, checksum_sha256, metrics_json, tags_json, description, registered_at, updated_at FROM model_versions WHERE model_name = ? AND version = ?",
                 (model_name, version),
@@ -201,7 +219,7 @@ class ModelRegistry:
 
     def list_versions(self, model_name: str | None = None) -> list[RegisteredModelVersion]:
         """List registered model versions, optionally scoped to one model name."""
-        with sqlite3.connect(self.db_path) as conn:
+        with _sqlite_conn(self.db_path) as conn:
             if model_name:
                 rows = conn.execute(
                     "SELECT model_name, version, stage, artifact_path, checksum_sha256, metrics_json, tags_json, description, registered_at, updated_at FROM model_versions WHERE model_name = ? ORDER BY version ASC",

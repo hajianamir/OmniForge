@@ -221,12 +221,15 @@ class ReportExporters:
             blocks = []
             for ch in ch_list:
                 b64 = ch.get("png_base64")
-                if not b64:
+                if not b64 or not isinstance(b64, str):
+                    continue
+                safe_b64 = "".join(c for c in b64 if c.isalnum() or c in "+/=")
+                if not safe_b64:
                     continue
                 blocks.append(
                     f"<figure class='chart-box'>"
-                    f"<img src='data:image/png;base64,{b64}' alt='{html_escape(str(ch.get('title', 'Chart')))}' />"
-                    f"<figcaption><strong>{html_escape(str(ch.get('title', '')))}:</strong> {html_escape(str(ch.get('caption', '')))}</figcaption>"
+                    f"<img src='data:image/png;base64,{safe_b64}' alt='{html_escape(str(ch.get('title', 'Chart')), quote=True)}' />"
+                    f"<figcaption><strong>{html_escape(str(ch.get('title', '')), quote=True)}:</strong> {html_escape(str(ch.get('caption', '')), quote=True)}</figcaption>"
                     f"</figure>"
                 )
             return "".join(blocks)

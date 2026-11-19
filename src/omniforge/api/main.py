@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 import io
+import uuid
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from omniforge.api.auth import jwt_manager, require_permission
+from omniforge.api.auth import (
+    issue_local_workbench_cookies,
+    jwt_manager,
+    require_permission,
+    should_auto_bootstrap_local_ui,
+    verify_api_key,
+)
 from omniforge.api.schemas import (
     AutoMLRequest,
     CausalRequest,
@@ -30,12 +37,13 @@ from omniforge.api.schemas import (
 )
 from omniforge.automl.pipeline_search import AutoMLPipelineSearch
 from omniforge.causal.inference import CausalInferenceEngine
+from omniforge.config.settings import get_settings
 from omniforge.copilot.agent import OmniForgeCopilotAgent
 from omniforge.core.constants import RBAC_ROLE_PERMISSIONS
-from omniforge.core.exceptions import OmniForgeError
+from omniforge.core.exceptions import OmniForgeError, SecurityError
 from omniforge.core.logging import get_logger
 from omniforge.core.types import ModelStage, Principal
-from omniforge.core.utils import to_json_safe
+from omniforge.core.utils import to_json_object, to_json_safe
 from omniforge.data.cleaning import DataCleaner
 from omniforge.data.quality import DataQualityProfiler
 from omniforge.domains import default_domain_registry
@@ -62,14 +70,33 @@ def create_app() -> FastAPI:
         redoc_url="/redoc",
     )
 
+    settings = get_settings()
+    allowed_origins = [o.strip() for o in settings.api.cors_origins if o and o.strip()]
+    allow_credentials = bool(settings.api.cors_allow_credentials) and ("*" not in allowed_origins)
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=allowed_origins,
+        allow_credentials=allow_credentials,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "X-API-Key",
+            "X-Workbench-Token",
+            "X-Session-ID",
+            "X-CSRF-Token",
+        ],
     )
     app.add_middleware(GZipMiddleware, minimum_size=500)
+
+    @app.middleware("http")
+    async def security_headers_middleware(request: Request, call_next: Any) -> Any:
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+        response.headers.setdefault("Referrer-Policy", "same-origin")
+        return response
 
     from omniforge.api.workbench import router as workbench_router
 
@@ -81,39 +108,86 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(OmniForgeError)
     async def uap_error_handler(request: Request, exc: OmniForgeError) -> JSONResponse:
-        return JSONResponse(status_code=400, content=to_json_safe(exc.to_dict()))
+        status_code = 403 if isinstance(exc, SecurityError) else 400
+        return JSONResponse(status_code=status_code, content=to_json_safe(exc.to_dict()))
 
     @app.exception_handler(Exception)
     async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
+        error_id = str(uuid.uuid4())
         logger.error(
             "unhandled_api_error",
+            error_id=error_id,
             path=str(request.url.path),
             error_type=type(exc).__name__,
             error=str(exc),
         )
-        return JSONResponse(
-            status_code=500,
-            content=to_json_safe(
-                {
-                    "error_type": type(exc).__name__,
-                    "detail": f"{type(exc).__name__}: {exc}",
-                    "message": str(exc),
-                    "path": str(request.url.path),
-                }
-            ),
-        )
+        payload: dict[str, Any] = {
+            "error_type": "InternalServerError",
+            "detail": f"An internal server error occurred. Reference ID: {error_id}",
+            "error_id": error_id,
+            "path": str(request.url.path),
+        }
+        return JSONResponse(status_code=500, content=to_json_safe(payload))
+
+    def _resolve_static_dir() -> Path | None:
+        local_dir = Path(__file__).resolve().parent.parent / "ui" / "static_app"
+        candidates: list[Path] = [local_dir]
+        try:
+            from omniforge.launcher import is_frozen, resolve_resource_path
+
+            frozen_candidate = resolve_resource_path("omniforge/ui/static_app")
+            if is_frozen():
+                candidates.insert(0, frozen_candidate)
+            else:
+                candidates.append(frozen_candidate)
+        except Exception:
+            pass
+        return next((p for p in candidates if p.is_dir() and (p / "index.html").is_file()), None)
+
+    static_dir = _resolve_static_dir()
+    spa_bundle_name: str | None = None
+    if static_dir is not None and (static_dir / "assets").is_dir():
+        js_files = sorted(p.name for p in (static_dir / "assets").glob("index-*.js"))
+        spa_bundle_name = js_files[-1] if js_files else None
 
     @app.get("/health", tags=["System"])
     @app.get("/api/v1/health", tags=["System"])
     def health() -> dict[str, Any]:
-        return {"status": "healthy", **get_version_info()}
+        return {
+            "status": "healthy",
+            **get_version_info(),
+            "spa_ready": static_dir is not None,
+            "spa_bundle": spa_bundle_name,
+        }
 
     @app.get("/api/v1/version", tags=["System"])
     def version() -> dict[str, Any]:
         return get_version_info()
 
     @app.post("/api/v1/auth/token", response_model=TokenResponse, tags=["Security"])
-    def issue_token(req: TokenRequest) -> TokenResponse:
+    def issue_token(
+        req: TokenRequest,
+        x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+        authorization: str | None = Header(default=None),
+    ) -> TokenResponse:
+        # Require valid API key (header or body) or existing admin Bearer JWT before minting any token.
+        authenticated = False
+        if verify_api_key(x_api_key) or verify_api_key(req.api_key):
+            authenticated = True
+        elif authorization and authorization.lower().startswith("bearer "):
+            try:
+                caller = jwt_manager.verify_token(authorization.split(None, 1)[1])
+                if "admin" in caller.roles:
+                    authenticated = True
+            except Exception:
+                authenticated = False
+
+        if not authenticated:
+            raise HTTPException(
+                status_code=401,
+                detail="Valid X-API-Key header, body api_key, or admin Bearer token is required to mint a JWT.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
         if req.role not in RBAC_ROLE_PERMISSIONS:
             raise HTTPException(
                 status_code=422,
@@ -124,16 +198,22 @@ def create_app() -> FastAPI:
         return TokenResponse(access_token=token, role=req.role, tenant_id=req.tenant_id)
 
     @app.get("/api/v1/domains", tags=["Domains"])
-    def list_domains() -> dict[str, Any]:
+    def list_domains(
+        _principal: Principal = Depends(require_permission("data:read")),
+    ) -> dict[str, Any]:
         return {"domains": [p.summary() for p in default_domain_registry.list_plugins()]}
 
     @app.get("/api/v1/domains/{domain_name}/sample", tags=["Domains"])
-    def domain_sample(domain_name: str, n_samples: int = 50) -> dict[str, Any]:
+    def domain_sample(
+        domain_name: str,
+        n_samples: int = 50,
+        _principal: Principal = Depends(require_permission("data:read")),
+    ) -> dict[str, Any]:
         plugin = default_domain_registry.get(domain_name)
         df = plugin.generate_sample_dataset(n_samples=max(10, min(n_samples, 2000)))
         df_feat = plugin.engineer_domain_features(df)
         kpis = plugin.compute_domain_kpis(df_feat)
-        return to_json_safe(
+        return to_json_object(
             {
                 "domain": plugin.metadata.name,
                 "kpis": kpis,
@@ -150,6 +230,11 @@ def create_app() -> FastAPI:
     ) -> dict[str, Any]:
         raw = await file.read()
         fname = (file.filename or "upload.csv").lower()
+        if fname.endswith((".pkl", ".pickle", ".joblib", ".dill")):
+            raise HTTPException(
+                status_code=400,
+                detail="Pickle/joblib uploads are blocked for security (CWE-502). Use CSV, Parquet, or JSON.",
+            )
         if fname.endswith(".parquet"):
             df = pd.read_parquet(io.BytesIO(raw))
         elif fname.endswith(".json"):
@@ -158,7 +243,7 @@ def create_app() -> FastAPI:
             df = pd.read_csv(io.BytesIO(raw))
         copilot.load_dataframe(df, name=fname)
         quality = DataQualityProfiler().profile(df)
-        return to_json_safe(
+        return to_json_object(
             {
                 "filename": file.filename,
                 "rows": len(df),
@@ -173,7 +258,7 @@ def create_app() -> FastAPI:
         _principal: Principal = Depends(require_permission("data:read")),
     ) -> dict[str, Any]:
         df = pd.DataFrame(payload.records)
-        return to_json_safe(DataQualityProfiler().profile(df).model_dump())
+        return to_json_object(DataQualityProfiler().profile(df).model_dump())
 
     @app.post("/api/v1/data/clean", tags=["Data"])
     def clean_data(
@@ -182,7 +267,7 @@ def create_app() -> FastAPI:
     ) -> dict[str, Any]:
         df = pd.DataFrame(payload.records)
         cleaned, report = DataCleaner().fit_transform(df)
-        return to_json_safe(
+        return to_json_object(
             {
                 "report": report.model_dump(),
                 "cleaned_records": cleaned.to_dict(orient="records"),
@@ -197,7 +282,7 @@ def create_app() -> FastAPI:
     ) -> dict[str, Any]:
         df = pd.DataFrame(payload.records)
         rep = AutomatedEDA().run(df, target_column=target_column, generate_figures=False)
-        return to_json_safe(
+        return to_json_object(
             {
                 "profile": rep.profile.model_dump(),
                 "insights": [i.model_dump() for i in rep.insights],
@@ -231,7 +316,7 @@ def create_app() -> FastAPI:
         if req.deploy_endpoint:
             serving.deploy_model(req.deploy_endpoint, res.best_model, version="v1")
 
-        return to_json_safe(
+        return to_json_object(
             {
                 "best_model_name": res.best_model_name,
                 "task_type": res.task_type.value,
@@ -257,7 +342,7 @@ def create_app() -> FastAPI:
             time_col=req.time_column if (req.time_column and req.time_column in df.columns) else None,
             horizon=req.horizon,
         )
-        return to_json_safe(
+        return to_json_object(
             {
                 "champion_model": rep.champion_model,
                 "leaderboard": rep.leaderboard,
@@ -278,30 +363,42 @@ def create_app() -> FastAPI:
             confounders=req.confounders,
             method=req.method,
         )
-        return to_json_safe(res.model_dump())
+        return to_json_object(res.model_dump())
 
     @app.post("/api/v1/optimization/portfolio", tags=["Optimization"])
-    def optimize_portfolio(req: PortfolioOptimizationRequest) -> dict[str, Any]:
+    def optimize_portfolio(
+        req: PortfolioOptimizationRequest,
+        _principal: Principal = Depends(require_permission("model:train")),
+    ) -> dict[str, Any]:
         res = OptimizationEngine().optimize_portfolio(
             req.expected_returns,
             req.covariance_matrix,
             risk_aversion=req.risk_aversion,
             max_weight=req.max_weight,
         )
-        return to_json_safe(res.model_dump())
+        return to_json_object(res.model_dump())
 
     @app.get("/api/v1/serving/endpoints", tags=["MLOps"])
-    def list_endpoints() -> dict[str, Any]:
+    def list_endpoints(
+        _principal: Principal = Depends(require_permission("data:read")),
+    ) -> dict[str, Any]:
         return {"endpoints": serving.list_endpoints()}
 
     @app.post("/api/v1/serving/{endpoint}/predict", tags=["MLOps"])
-    def serve_predict(endpoint: str, req: PredictRequest) -> dict[str, Any]:
-        return to_json_safe(
+    def serve_predict(
+        endpoint: str,
+        req: PredictRequest,
+        _principal: Principal = Depends(require_permission("data:read")),
+    ) -> dict[str, Any]:
+        return to_json_object(
             serving.predict(endpoint, req.records, return_probabilities=req.return_probabilities)
         )
 
     @app.get("/api/v1/registry/models", tags=["MLOps"])
-    def list_registered_models(model_name: str | None = None) -> dict[str, Any]:
+    def list_registered_models(
+        model_name: str | None = None,
+        _principal: Principal = Depends(require_permission("data:read")),
+    ) -> dict[str, Any]:
         return {"versions": [v.model_dump() for v in registry.list_versions(model_name)]}
 
     @app.post("/api/v1/registry/{model_name}/v{version}/stage", tags=["MLOps"])
@@ -312,21 +409,27 @@ def create_app() -> FastAPI:
         _principal: Principal = Depends(require_permission("model:deploy")),
     ) -> dict[str, Any]:
         ver = registry.transition_stage(model_name, version, ModelStage(req.target_stage))
-        return to_json_safe(ver.model_dump())
+        return to_json_object(ver.model_dump())
 
     @app.post("/api/v1/mlops/drift", tags=["MLOps"])
-    def check_drift(req: DriftRequest) -> dict[str, Any]:
+    def check_drift(
+        req: DriftRequest,
+        _principal: Principal = Depends(require_permission("data:read")),
+    ) -> dict[str, Any]:
         ref_df = pd.DataFrame(req.reference_records)
         cur_df = pd.DataFrame(req.current_records)
-        return to_json_safe(DriftDetector().detect(ref_df, cur_df).model_dump())
+        return to_json_object(DriftDetector().detect(ref_df, cur_df).model_dump())
 
     @app.post("/api/v1/copilot/chat", tags=["Copilot"])
-    def copilot_chat(req: CopilotChatRequest) -> dict[str, Any]:
+    def copilot_chat(
+        req: CopilotChatRequest,
+        _principal: Principal = Depends(require_permission("data:read")),
+    ) -> dict[str, Any]:
         if req.records:
             copilot.load_dataframe(pd.DataFrame(req.records), name="api_chat_dataset")
         copilot.provider = req.provider
         resp = copilot.chat(req.message)
-        return to_json_safe(resp.model_dump())
+        return to_json_object(resp.model_dump())
 
     @app.post("/api/v1/pipelines/execute", tags=["Pipelines"])
     def execute_pipeline(
@@ -338,19 +441,9 @@ def create_app() -> FastAPI:
         if req.records:
             initial["data"] = pd.DataFrame(req.records)
         res = PipelineExecutor().execute(dag, initial_artifacts=initial)
-        return to_json_safe(res.model_dump())
+        return to_json_object(res.to_dict())
 
     # Serve compiled React/Vite TypeScript SPA (OmniForge Enterprise Workbench)
-    static_candidates = [
-        Path(__file__).resolve().parent.parent / "ui" / "static_app",
-    ]
-    try:
-        from omniforge.launcher import resolve_resource_path
-
-        static_candidates.insert(0, resolve_resource_path("omniforge/ui/static_app"))
-    except Exception:
-        pass
-    static_dir = next((p for p in static_candidates if p.is_dir() and (p / "index.html").is_file()), None)
     if static_dir is not None:
         assets_dir = static_dir / "assets"
         if assets_dir.is_dir():
@@ -358,16 +451,20 @@ def create_app() -> FastAPI:
 
         @app.get("/", include_in_schema=False)
         @app.get("/{full_path:path}", include_in_schema=False)
-        def serve_spa(full_path: str = "") -> Any:
+        def serve_spa(request: Request, full_path: str = "") -> Any:
             if full_path.startswith(("api/", "docs", "redoc", "openapi.json", "health")):
                 raise HTTPException(status_code=404, detail="Not found")
-            candidate = (static_dir / full_path).resolve()
-            if full_path and candidate.is_file() and str(candidate).startswith(str(static_dir.resolve())):
+            static_root = static_dir.resolve()
+            candidate = (static_root / full_path).resolve()
+            if full_path and candidate.is_file() and candidate.is_relative_to(static_root):
                 return FileResponse(str(candidate))
-            return FileResponse(
-                str(static_dir / "index.html"),
+            resp = FileResponse(
+                str(static_root / "index.html"),
                 headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
             )
+            if should_auto_bootstrap_local_ui():
+                issue_local_workbench_cookies(resp, secure=(request.url.scheme == "https"))
+            return resp
     else:
 
         @app.get("/", include_in_schema=False)

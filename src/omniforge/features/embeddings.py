@@ -22,6 +22,8 @@ class EmbeddingGenerator:
         self._svd: TruncatedSVD | None = None
         self._pca: PCA | None = None
         self._scaler: StandardScaler | None = None
+        self._tabular_cols: list[str] = []
+        self._tabular_medians: dict[str, float] = {}
         self._entity_embeddings: dict[str, np.ndarray] = {}
         self._mode: str = ""
 
@@ -47,7 +49,7 @@ class EmbeddingGenerator:
         """Encode ``texts`` into L2-normalized dense embeddings."""
         cleaned = [str(t) if t is not None else "" for t in texts]
         if self._mode == "sentence_transformers":
-            from sentence_transformers import SentenceTransformer  # type: ignore[import-not-found]
+            from sentence_transformers import SentenceTransformer
 
             model = SentenceTransformer("all-MiniLM-L6-v2")
             return np.asarray(model.encode(cleaned, normalize_embeddings=True), dtype=np.float32)
@@ -57,7 +59,7 @@ class EmbeddingGenerator:
         tfidf = self._vectorizer.transform(cleaned)
         dense = self._svd.transform(tfidf) if self._svd is not None else tfidf.toarray()
         norms = np.linalg.norm(dense, axis=1, keepdims=True)
-        return (dense / np.maximum(norms, 1e-12)).astype(np.float32)
+        return np.asarray(dense / np.maximum(norms, 1e-12), dtype=np.float32)
 
     def fit_transform_text(self, texts: list[str]) -> np.ndarray:
         """Fit text embedder and return dense embeddings."""
@@ -65,10 +67,17 @@ class EmbeddingGenerator:
         return self.transform_text(texts)
 
     def fit_tabular(self, df: pd.DataFrame) -> EmbeddingGenerator:
-        """Fit a dense tabular projection via standardized PCA."""
-        num = df.select_dtypes(include=[np.number]).fillna(0.0)
+        """Fit a dense tabular projection via standardized PCA with persisted column schema & medians."""
+        num = df.select_dtypes(include=[np.number]).copy()
         if num.shape[1] == 0:
             raise FeatureEngineeringError("No numeric columns available for tabular embeddings.")
+        self._tabular_cols = list(num.columns)
+        self._tabular_medians = {}
+        for col in self._tabular_cols:
+            vals = pd.to_numeric(num[col], errors="coerce")
+            med = float(vals.median()) if vals.notna().any() else 0.0
+            self._tabular_medians[str(col)] = med
+            num[col] = vals.fillna(med)
         self._scaler = StandardScaler()
         scaled = self._scaler.fit_transform(num.to_numpy(dtype=float))
         n_comp = max(1, min(self.embedding_dim, scaled.shape[0], scaled.shape[1]))
@@ -78,11 +87,17 @@ class EmbeddingGenerator:
         return self
 
     def transform_tabular(self, df: pd.DataFrame) -> np.ndarray:
-        """Project tabular rows into dense embedding vectors."""
-        if self._scaler is None or self._pca is None:
+        """Project tabular rows into dense embedding vectors aligned to the fitted column schema."""
+        if self._scaler is None or self._pca is None or not self._tabular_cols:
             raise FeatureEngineeringError("Call fit_tabular() before transform_tabular().")
-        num = df.select_dtypes(include=[np.number]).fillna(0.0)
-        scaled = self._scaler.transform(num.to_numpy(dtype=float))
+        aligned = pd.DataFrame(index=df.index)
+        for col in self._tabular_cols:
+            med = self._tabular_medians.get(str(col), 0.0)
+            if col in df.columns:
+                aligned[col] = pd.to_numeric(df[col], errors="coerce").fillna(med)
+            else:
+                aligned[col] = med
+        scaled = self._scaler.transform(aligned.to_numpy(dtype=float))
         return np.asarray(self._pca.transform(scaled), dtype=np.float32)
 
     def fit_entity_embeddings(
@@ -113,6 +128,10 @@ class EmbeddingGenerator:
         """Return ``(index, cosine_similarity)`` for the ``top_k`` closest vectors."""
         q = np.asarray(query_vec, dtype=float).ravel()
         c = np.asarray(corpus_vecs, dtype=float)
+        if c.size == 0 or top_k <= 0:
+            return []
+        if c.ndim == 1:
+            c = c.reshape(1, -1)
         q_norm = np.linalg.norm(q) + 1e-12
         c_norms = np.linalg.norm(c, axis=1) + 1e-12
         sims = (c @ q) / (c_norms * q_norm)

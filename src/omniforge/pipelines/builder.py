@@ -161,7 +161,7 @@ def _builtin_step_handlers() -> dict[str, Callable[..., Any]]:
 class PipelineBuilder:
     """Fluent & declarative pipeline builder supporting YAML/JSON specs and Python code export."""
 
-    def __init__(self, name: str = "uap_pipeline") -> None:
+    def __init__(self, name: str = "omniforge_pipeline") -> None:
         self._dag = PipelineDAG(name=name)
         self._last_step_id: str | None = None
         self._handlers = _builtin_step_handlers()

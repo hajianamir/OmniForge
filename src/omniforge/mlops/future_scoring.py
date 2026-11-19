@@ -145,13 +145,13 @@ class FutureTargetPredictor:
         predictions_df: pd.DataFrame,
         connection_uri: str,
         *,
-        table_name: str = "uap_future_predictions",
+        table_name: str = "omniforge_future_predictions",
         if_exists: Literal["append", "replace"] = "replace",
     ) -> dict[str, Any]:
         """Persist scored future target predictions back into a SQL database table."""
         if not connection_uri.strip():
             raise DataIngestionError("SQL connection URI cannot be empty.")
-        clean_table = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in table_name.strip()) or "uap_future_predictions"
+        clean_table = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in table_name.strip()) or "omniforge_future_predictions"
         engine = create_engine(connection_uri.strip())
         try:
             predictions_df.to_sql(clean_table, engine, if_exists=if_exists, index=False)

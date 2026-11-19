@@ -67,13 +67,15 @@ class BacktestingEngine:
             all_preds.extend(yhat.tolist())
             cursor += max(1, step_size)
 
+        if not folds:
+            raise EvaluationError("No valid walk-forward folds could be evaluated (all training windows were empty/NaN).")
         overall = MetricsEvaluator.forecasting_metrics(np.asarray(all_actuals), np.asarray(all_preds))
         fold_summary: dict[str, float] = {}
         for metric_key in ("rmse", "mae", "smape", "mase", "interval_coverage"):
             vals = [float(f[metric_key]) for f in folds if metric_key in f and np.isfinite(float(f[metric_key]))]
             if vals:
                 fold_summary[f"{metric_key}_mean"] = round(float(np.mean(vals)), 6)
-                fold_summary[f"{metric_key}_std"] = round(float(np.std(vals)), 6)
+                fold_summary[f"{metric_key}_std"] = round(float(np.std(vals, ddof=1 if len(vals) > 1 else 0)), 6)
 
         return {
             "window_type": window_type,
@@ -108,15 +110,16 @@ class BacktestingEngine:
         cost = turnover * total_bps
         strat_returns = pos * asset_returns - cost
         rf_per_period = risk_free_rate_annual / max(periods_per_year, 1)
-        excess_returns = strat_returns - rf_per_period
 
-        fin = MetricsEvaluator.financial_metrics(excess_returns, periods_per_year=periods_per_year)
+        fin = MetricsEvaluator.financial_metrics(
+            strat_returns, periods_per_year=periods_per_year, mar=rf_per_period
+        )
         safe_strat = np.clip(strat_returns, -0.999999, 10.0)
         safe_asset = np.clip(asset_returns, -0.999999, 10.0)
-        equity = np.exp(np.clip(np.cumsum(np.log1p(safe_strat)), -50.0, 50.0))
-        bh_equity = np.exp(np.clip(np.cumsum(np.log1p(safe_asset)), -50.0, 50.0))
+        equity = np.concatenate(([1.0], np.exp(np.clip(np.cumsum(np.log1p(safe_strat)), -50.0, 50.0))))
+        bh_equity = np.concatenate(([1.0], np.exp(np.clip(np.cumsum(np.log1p(safe_asset)), -50.0, 50.0))))
         running_peak = np.maximum.accumulate(equity)
-        underwater = equity < running_peak
+        underwater = equity[1:] < running_peak[1:]
         max_dd_duration = 0
         cur_dur = 0
         for flag in underwater:

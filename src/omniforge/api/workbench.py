@@ -5,18 +5,20 @@ from __future__ import annotations
 import dataclasses
 import io
 import math
+import os
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import networkx as nx
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter, File, Form, Header, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
+from omniforge.api.auth import require_workbench_auth
 from omniforge.api.jobs import job_manager
 from omniforge.automl.backends import AutoMLBackendHub, probe_automl_backends
 from omniforge.causal.inference import CausalInferenceEngine
@@ -28,7 +30,7 @@ from omniforge.core.performance import (
     smart_sample_df,
 )
 from omniforge.core.types import ModelMetadata, ModelStage, TaskType
-from omniforge.core.utils import to_json_safe
+from omniforge.core.utils import to_json_object, to_json_safe
 from omniforge.data.cleaning import CleaningConfig, DataCleaner
 from omniforge.data.connectors import (
     access_inspect_database,
@@ -123,7 +125,11 @@ from omniforge.version import get_version_info
 
 logger = get_logger(__name__)
 
-router = APIRouter(prefix="/api/workbench", tags=["OmniForge Workbench"])
+router = APIRouter(
+    prefix="/api/workbench",
+    tags=["OmniForge Workbench"],
+    dependencies=[Depends(require_workbench_auth)],
+)
 
 _SHARED_REGISTRY = ModelRegistry()
 _SHARED_TRACKER = ExperimentTracker()
@@ -146,19 +152,34 @@ def _require_df(state: dict[str, Any]) -> pd.DataFrame:
     return df
 
 
-def _discover_benchmark_csvs() -> list[dict[str, Any]]:
-    """Locate bundled benchmark CSV datasets under examples/datasets."""
+def _benchmark_datasets_dir() -> Path:
+    """Resolve the canonical directory for local benchmark CSV datasets."""
+    env_dir = os.getenv("OMNIFORGE_BENCHMARK_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir).expanduser().resolve()
     repo_root = Path(__file__).resolve().parents[3]
-    ds_dir = repo_root / "examples" / "datasets"
+    return (repo_root / "examples" / "datasets").resolve()
+
+
+def _discover_benchmark_csvs() -> list[dict[str, Any]]:
+    """Locate benchmark CSV datasets under the canonical benchmark datasets directory."""
+    ds_dir = _benchmark_datasets_dir()
     if not ds_dir.is_dir():
         return []
     items: list[dict[str, Any]] = []
     for p in sorted(ds_dir.glob("*.csv")):
-        size_mb = round(p.stat().st_size / (1024 * 1024), 2)
+        if not p.is_file():
+            continue
+        try:
+            resolved = p.resolve()
+            if not resolved.is_relative_to(ds_dir):
+                continue
+        except OSError:
+            continue
+        size_mb = round(resolved.stat().st_size / (1024 * 1024), 2)
         items.append(
             {
                 "filename": p.name,
-                "path": str(p),
                 "size_mb": size_mb,
                 "label": f"{p.stem.replace('_', ' ').title()} ({size_mb} MB)",
             }
@@ -170,8 +191,9 @@ def _state_summary(state: dict[str, Any], session_id: str) -> dict[str, Any]:
     df = state.get("uap_df")
     raw_df = state.get("uap_raw_df")
     has_df = isinstance(df, pd.DataFrame) and not df.empty
-    cols = list(df.columns) if has_df else []
-    num_cols = list(df.select_dtypes(include=[np.number]).columns) if has_df else []
+    df_ok: pd.DataFrame | None = df if isinstance(df, pd.DataFrame) and not df.empty else None
+    cols = list(df_ok.columns) if df_ok is not None else []
+    num_cols = list(df_ok.select_dtypes(include=[np.number]).columns) if df_ok is not None else []
     cat_cols = [c for c in cols if c not in num_cols]
     excluded = get_excluded_columns(state, df) if has_df else []
     targets = get_selected_targets(state, df) if has_df else []
@@ -192,15 +214,15 @@ def _state_summary(state: dict[str, Any], session_id: str) -> dict[str, Any]:
     total_deleted = int(sum(int(entry.get("rows_removed", entry.get("rows_deleted", 0))) for entry in deleted_log))
     fmt_audit = state.get("uap_format_audit") or {}
 
-    return to_json_safe(
+    return to_json_object(
         {
             "session_id": session_id,
             "platform": get_version_info(),
             "has_dataset": has_df,
             "dataset_name": state.get("uap_dataset_name"),
             "dataset_source": state.get("uap_dataset_source"),
-            "n_rows": int(len(df)) if has_df else 0,
-            "n_cols": int(df.shape[1]) if has_df else 0,
+            "n_rows": int(len(df_ok)) if df_ok is not None else 0,
+            "n_cols": int(df_ok.shape[1]) if df_ok is not None else 0,
             "raw_rows": int(len(raw_df)) if isinstance(raw_df, pd.DataFrame) else 0,
             "raw_cols": int(raw_df.shape[1]) if isinstance(raw_df, pd.DataFrame) else 0,
             "columns": cols,
@@ -248,7 +270,7 @@ def _cache_and_respond(
     include_state: bool = True,
 ) -> dict[str, Any]:
     """Save the JSON-safe result payload BEFORE computing ``_state_summary`` so ``cached_result_keys`` always includes ``cache_key``."""
-    safe_body = to_json_safe(body)
+    safe_body = to_json_object(body)
     save_studio_result(state, cache_key, safe_body)
     if include_state:
         safe_body["state"] = to_json_safe(_state_summary(state, sid))
@@ -370,7 +392,24 @@ class ClusterReq(BaseModel):
     k_max: int = 8
     scaler: str = "standard"
     linkage: str = "ward"
+
     features: list[str] | None = None
+
+
+# ClusteringEngine requires Literal-typed hyper-parameters; the HTTP layer accepts
+# free-form strings, so normalise (and defensively fall back) before construction.
+_CLUSTER_SCALERS: dict[str, Literal["standard", "robust", "minmax", "none"]] = {
+    "standard": "standard",
+    "robust": "robust",
+    "minmax": "minmax",
+    "none": "none",
+}
+_CLUSTER_LINKAGES: dict[str, Literal["ward", "complete", "average", "single"]] = {
+    "ward": "ward",
+    "complete": "complete",
+    "average": "average",
+    "single": "single",
+}
 
 
 class ClusterCommitReq(BaseModel):
@@ -640,7 +679,7 @@ def get_cached_studio_results(x_session_id: str | None = Header(default="default
     sid = _sid(x_session_id)
     state = get_session_state(sid)
     cached = get_studio_results(state)
-    return to_json_safe(
+    return to_json_object(
         {
             "results": cached,
             "studio_results": cached,
@@ -652,7 +691,7 @@ def get_cached_studio_results(x_session_id: str | None = Header(default="default
 @router.get("/benchmarks")
 def list_benchmarks() -> dict[str, Any]:
     domains = [p.summary() for p in default_domain_registry.list_plugins()]
-    return to_json_safe({"benchmarks": _discover_benchmark_csvs(), "domains": domains})
+    return to_json_object({"benchmarks": _discover_benchmark_csvs(), "domains": domains})
 
 
 @router.post("/theme")
@@ -700,7 +739,7 @@ def apply_split_lock(req: SplitLockReq, x_session_id: str | None = Header(defaul
         target_col=req.target_col,
         gap=req.gap,
     )
-    return to_json_safe({"split_lock": lock, "state": _state_summary(state, sid)})
+    return to_json_object({"split_lock": lock, "state": _state_summary(state, sid)})
 
 
 @router.delete("/split-lock")
@@ -744,8 +783,17 @@ async def load_workspace_uap(
     sid = _sid(x_session_id)
     state = get_session_state(sid)
     raw = await file.read()
-    info = restore_workspace_project_bytes(state, raw, source_label=file.filename or "Uploaded .uap")
-    return to_json_safe({"restored": info, "state": _state_summary(state, sid)})
+    try:
+        info = restore_workspace_project_bytes(state, raw, source_label=file.filename or "Uploaded .omniforge")
+    except Exception as exc:
+        from omniforge.core.exceptions import DataValidationError, SecurityError
+
+        if isinstance(exc, SecurityError):
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        if isinstance(exc, DataValidationError):
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise
+    return to_json_object({"restored": info, "state": _state_summary(state, sid)})
 
 
 @router.get("/jobs")
@@ -767,22 +815,12 @@ def poll_job(job_id: str) -> dict[str, Any]:
 @router.get("/s01/catalog")
 def s01_catalog() -> dict[str, Any]:
     """Return available benchmark CSV datasets and instant domain generators."""
-    repo_root = Path(__file__).resolve().parents[3]
-    ds_dir = repo_root / "examples" / "datasets"
-    benchmarks: list[dict[str, Any]] = []
-    if ds_dir.is_dir():
-        for csv_path in sorted(ds_dir.glob("*.csv")):
-            benchmarks.append(
-                {
-                    "filename": csv_path.name,
-                    "size_mb": round(csv_path.stat().st_size / (1024 * 1024), 2),
-                }
-            )
+    benchmarks = _discover_benchmark_csvs()
     domains = [
         {"name": plugin.metadata.name, "display_name": plugin.metadata.display_name}
         for plugin in sorted(default_domain_registry.list_plugins(), key=lambda p: p.metadata.name)
     ]
-    return to_json_safe({"benchmarks": benchmarks, "domains": domains})
+    return to_json_object({"benchmarks": benchmarks, "domains": domains})
 
 
 @router.delete("/dataset")
@@ -791,14 +829,14 @@ def delete_active_dataset(x_session_id: str | None = Header(default="default")) 
     sid = _sid(x_session_id)
     state = get_session_state(sid)
     clear_workspace_dataset(state)
-    return to_json_safe({"cleared": True, "state": _state_summary(state, sid)})
+    return to_json_object({"cleared": True, "state": _state_summary(state, sid)})
 
 
 @router.post("/s01/excel-sheets")
 async def s01_excel_sheets(file: UploadFile = File(...)) -> dict[str, Any]:
     raw = await file.read()
     sheets = list_excel_sheets(raw)
-    return to_json_safe({"filename": file.filename or "workbook.xlsx", "sheets": sheets})
+    return to_json_object({"filename": file.filename or "workbook.xlsx", "sheets": sheets})
 
 
 @router.post("/s01/upload")
@@ -811,6 +849,11 @@ async def s01_upload_dataset(
     state = get_session_state(sid)
     fname = file.filename or "uploaded.csv"
     suffix = Path(fname).suffix.lower() or ".csv"
+    if suffix in {".pkl", ".pickle", ".joblib", ".dill"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Pickle/joblib uploads are blocked for security (CWE-502). Please upload CSV, Parquet, Excel, or JSON.",
+        )
     raw = await file.read()
     t0 = time.perf_counter()
     if suffix in {".xlsx", ".xls", ".xlsm"} and sheet_name:
@@ -826,7 +869,7 @@ async def s01_upload_dataset(
             tmp_path.unlink(missing_ok=True)
         src_label = f"File Upload ({fname})"
     load_new_dataset(state, df, name=Path(fname).stem, source=src_label)
-    return to_json_safe(
+    return to_json_object(
         {
             "elapsed_seconds": round(time.perf_counter() - t0, 3),
             "format_audit": state.get("uap_format_audit"),
@@ -842,12 +885,12 @@ def s01_sql_demo_db() -> dict[str, Any]:
     db_path = ensure_demo_sqlite_database()
     conn_url = f"sqlite:///{db_path.as_posix()}"
     info = sql_inspect_database(conn_url)
-    return to_json_safe({"connection_url": conn_url, "db_path": str(db_path), **info})
+    return to_json_object({"connection_url": conn_url, "db_path": str(db_path), **info})
 
 
 @router.post("/s01/sql/inspect")
 def s01_sql_inspect(req: SQLInspectReq) -> dict[str, Any]:
-    return to_json_safe(sql_inspect_database(req.connection_url))
+    return to_json_object(sql_inspect_database(req.connection_url))
 
 
 @router.post("/s01/sql/load")
@@ -858,7 +901,7 @@ def s01_sql_load(req: SQLLoadReq, x_session_id: str | None = Header(default="def
     df = sql_load_dataframe(req.connection_url, table_name=req.table_name, query=req.query, limit=req.limit)
     label = req.table_name or "sql_query_result"
     load_new_dataset(state, df, name=label, source=f"SQL Database ({label})")
-    return to_json_safe(
+    return to_json_object(
         {
             "elapsed_seconds": round(time.perf_counter() - t0, 3),
             "format_audit": state.get("uap_format_audit"),
@@ -870,7 +913,7 @@ def s01_sql_load(req: SQLLoadReq, x_session_id: str | None = Header(default="def
 
 @router.post("/s01/access/inspect")
 def s01_access_inspect(req: AccessInspectReq) -> dict[str, Any]:
-    return to_json_safe(access_inspect_database(req.file_path))
+    return to_json_object(access_inspect_database(req.file_path))
 
 
 @router.post("/s01/access/load")
@@ -880,7 +923,7 @@ def s01_access_load(req: AccessLoadReq, x_session_id: str | None = Header(defaul
     t0 = time.perf_counter()
     df = access_load_table(req.file_path, req.table_name, limit=req.limit)
     load_new_dataset(state, df, name=req.table_name, source=f"MS Access ({Path(req.file_path).name} · {req.table_name})")
-    return to_json_safe(
+    return to_json_object(
         {
             "elapsed_seconds": round(time.perf_counter() - t0, 3),
             "format_audit": state.get("uap_format_audit"),
@@ -896,10 +939,28 @@ def s01_load_sample(req: LoadSampleReq, x_session_id: str | None = Header(defaul
     state = get_session_state(sid)
     t0 = time.perf_counter()
     if req.source_type == "benchmark":
-        repo_root = Path(__file__).resolve().parents[3]
-        csv_path = (repo_root / "examples" / "datasets" / req.name).resolve()
+        raw_name = (req.name or "").strip()
+        if (
+            not raw_name
+            or "\x00" in raw_name
+            or "/" in raw_name
+            or "\\" in raw_name
+            or Path(raw_name).name != raw_name
+            or not raw_name.lower().endswith(".csv")
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid benchmark dataset name. Provide a plain '.csv' filename without path separators.",
+            )
+        ds_root = _benchmark_datasets_dir().resolve()
+        csv_path = (ds_root / raw_name).resolve()
+        if not csv_path.is_relative_to(ds_root):
+            raise HTTPException(
+                status_code=400,
+                detail="Benchmark dataset path escapes the allowed datasets directory.",
+            )
         if not csv_path.is_file():
-            raise HTTPException(status_code=404, detail=f"Benchmark dataset '{req.name}' not found.")
+            raise HTTPException(status_code=404, detail=f"Benchmark dataset '{raw_name}' not found.")
         df = DataIngestionEngine().ingest(csv_path).data
         load_new_dataset(state, df, name=csv_path.stem, source=f"Benchmark CSV ({csv_path.name})")
     else:
@@ -911,7 +972,7 @@ def s01_load_sample(req: LoadSampleReq, x_session_id: str | None = Header(defaul
             name=f"{plugin.metadata.name}_sample",
             source=f"Domain Generator ({plugin.metadata.display_name})",
         )
-    return to_json_safe(
+    return to_json_object(
         {
             "elapsed_seconds": round(time.perf_counter() - t0, 3),
             "format_audit": state.get("uap_format_audit"),
@@ -962,7 +1023,7 @@ def s01_paginated_grid(
         }
         for c in base_df.columns
     ]
-    return to_json_safe(
+    return to_json_object(
         {
             "columns": col_meta,
             "rows": page_df.to_dict(orient="records"),
@@ -1036,8 +1097,9 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
         drop_const = True
         std_col_names = False
     else:
-        lock_cfg = state.get("uap_split_lock")
-        has_time_lock = isinstance(lock_cfg, dict) and bool(lock_cfg.get("active")) and bool(lock_cfg.get("time_col"))
+        _lock_raw = state.get("uap_split_lock")
+        lock_cfg: dict[str, Any] = _lock_raw if isinstance(_lock_raw, dict) else {}
+        has_time_lock = bool(lock_cfg.get("active")) and bool(lock_cfg.get("time_col"))
         cfg = CleaningConfig(
             standardize_missing_tokens=req.standardize_missing_tokens,
             clean_strings=req.clean_strings,
@@ -1272,7 +1334,7 @@ def s01_deleted_audit(x_session_id: str | None = Header(default="default")) -> d
         for entry in raw_log
     ]
     del_df = get_all_deleted_records_df(state)
-    return to_json_safe(
+    return to_json_object(
         {
             "log": log,
             "total_deleted": int(len(del_df)),
@@ -1327,8 +1389,8 @@ def s02_run_clustering(req: ClusterReq, x_session_id: str | None = Header(defaul
             engine = ClusteringEngine(
                 algorithm=algo_name,
                 n_clusters=req.n_clusters,
-                scaler=req.scaler,
-                linkage=req.linkage,
+                scaler=_CLUSTER_SCALERS.get(req.scaler, "standard"),
+                linkage=_CLUSTER_LINKAGES.get(req.linkage, "ward"),
             )
             use_auto_k = req.run_auto_k if len(algos_to_run) == 1 else (algo_name == "kmeans")
             if test_df is not None:
@@ -1552,7 +1614,7 @@ def s02_commit_clustering(req: ClusterCommitReq, x_session_id: str | None = Head
         updated_cached["n_clusters"] = int(sum(1 for c in remaining_choices if not c["is_noise"]))
         save_studio_result(state, "s02_clustering", updated_cached)
 
-    return to_json_safe(
+    return to_json_object(
         {
             "committed": True,
             "mode": req.mode,
@@ -1733,7 +1795,7 @@ def s02_commit_anomaly(req: AnomalyCommitReq, x_session_id: str | None = Header(
         updated_a["provenance"] = "COMMITTED"
         updated_a["committed_action"] = action
         save_studio_result(state, "s02_anomaly", updated_a)
-    return to_json_safe(
+    return to_json_object(
         {
             "committed": True,
             "rows_before": rows_before,
@@ -1785,7 +1847,7 @@ def s02_data_mining(req: MiningReq, x_session_id: str | None = Header(default="d
 # ---------------------------------------------------------------------------
 @router.get("/s03/catalog")
 def s03_catalog() -> dict[str, Any]:
-    return to_json_safe(
+    return to_json_object(
         {
             "diagnostic_tests": DIAGNOSTIC_TEST_CATALOG,
             "downstream_modules": DOWNSTREAM_MODULE_CATALOG,
@@ -1802,7 +1864,7 @@ def s03_run_diagnostics(req: DiagnosticsReq, x_session_id: str | None = Header(d
     criteria = StatisticalCriteriaConfig(
         alpha=req.alpha,
         confidence_level=req.confidence_level,
-        fdr_method=req.fdr_method,  # type: ignore[arg-type]
+        multiple_testing_correction=req.fdr_method,  # type: ignore[arg-type]
         parametric_mode=req.parametric_mode,  # type: ignore[arg-type]
         normality_method=req.normality_method,  # type: ignore[arg-type]
         correlation_method=req.correlation_method,  # type: ignore[arg-type]
@@ -1812,10 +1874,11 @@ def s03_run_diagnostics(req: DiagnosticsReq, x_session_id: str | None = Header(d
         holdout_ratio=req.holdout_ratio,
     )
     suite = UniversalDiagnosticsSuite()
+    modules: list[str] | None
     if req.mode == "auto":
-        modules = suite.recommend_modules(df, target_cols=targets)
+        modules = list(suite.recommend_modules(df, target_cols=targets).keys())
     elif req.mode == "custom" and req.selected_modules:
-        modules = req.selected_modules
+        modules = list(req.selected_modules)
     else:
         modules = None  # Complete / Select All
     report = suite.run(df, target_cols=targets, selected_modules=modules, criteria=criteria)
@@ -1967,8 +2030,8 @@ def _run_single_stat_test(
                 fits.append({"distribution": dname, "ks_stat": round(float(ks_s), 5), "p_value": round(float(ks_p), 5), "good_fit": bool(ks_p >= alpha)})
             except Exception:
                 continue
-        fits.sort(key=lambda r: r["ks_stat"])
-        best = fits[0] if fits else {"distribution": "Normal", "ks_stat": 0.0, "p_value": 1.0}
+        fits.sort(key=lambda r: float(str(r["ks_stat"])))
+        best: dict[str, Any] = fits[0] if fits else {"distribution": "Normal", "ks_stat": 0.0, "p_value": 1.0}
         return {
             "test_name": f"Distribution Goodness-of-Fit ({col_a})",
             "statistic": best["ks_stat"],
@@ -2156,7 +2219,12 @@ def s05_engineer_features(req: FeatureEngReq, x_session_id: str | None = Header(
             extract_datetime_features=req.add_datetime_features,
         )
     fe = FeatureEngineeringPipeline(cfg)
-    transformed = fe.fit_transform(df[feat_cols])
+    train_df = state.get("active_train_df")
+    if isinstance(train_df, pd.DataFrame) and not train_df.empty and all(c in train_df.columns for c in feat_cols):
+        fe.fit(train_df[feat_cols])
+        transformed = fe.transform(df[feat_cols])
+    else:
+        transformed = fe.fit_transform(df[feat_cols])
     new_cols = [c for c in transformed.columns if c not in df.columns]
     if req.commit and new_cols:
         merged = pd.concat([df, transformed[new_cols]], axis=1)
@@ -2182,6 +2250,11 @@ def s05_select_features(req: FeatureSelReq, x_session_id: str | None = Header(de
     if not target:
         raise HTTPException(status_code=400, detail="Select a target column before running Feature Selection.")
     X, y, task = _prepare_xy(df, target)
+    train_df = state.get("active_train_df")
+    if isinstance(train_df, pd.DataFrame) and not train_df.empty and target in train_df.columns:
+        X_fit, y_fit, _ = _prepare_xy(train_df, target)
+    else:
+        X_fit, y_fit = X, y
     task_str = "classification" if task in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION) else "regression"
     mode = req.mode.lower()
     methods = ["mutual_info", "f_test", "importance", "l1"] if mode in ("complete", "auto") else [req.method]
@@ -2193,8 +2266,8 @@ def s05_select_features(req: FeatureSelReq, x_session_id: str | None = Header(de
 
     for m_name in methods:
         try:
-            selector = FeatureSelector(method=m_name, task=task_str, max_features=min(req.top_k, X.shape[1]))
-            selector.fit(X, y)
+            selector = FeatureSelector(method=m_name, task=task_str, max_features=min(req.top_k, X_fit.shape[1]))
+            selector.fit(X_fit, y_fit)
             s_dict = dict(selector.scores_)
             max_v = max((abs(float(v)) for v in s_dict.values()), default=1.0) or 1.0
             for k, v in s_dict.items():
@@ -2213,7 +2286,7 @@ def s05_select_features(req: FeatureSelReq, x_session_id: str | None = Header(de
 
     ranked = sorted(
         [{"feature": k, "score": round(float(v), 6), "selected": k in selected} for k, v in scores.items()],
-        key=lambda r: r["score"],
+        key=lambda r: float(str(r["score"])),
         reverse=True,
     )
     state["uap_fs_selected_cols"] = selected
@@ -2257,7 +2330,7 @@ def s05_select_features(req: FeatureSelReq, x_session_id: str | None = Header(de
 # ---------------------------------------------------------------------------
 @router.get("/s06/backends")
 def s06_list_backends() -> dict[str, Any]:
-    return to_json_safe({"automl_backends": probe_automl_backends()})
+    return to_json_object({"automl_backends": probe_automl_backends()})
 
 
 @router.post("/s06/automl")
@@ -2567,8 +2640,9 @@ def s06_run_deep_benchmark(req: DeepBenchReq, x_session_id: str | None = Header(
                 "metrics": {"f1_weighted" if is_clf else "r2": round(sc, 5), "elapsed_sec": elapsed},
                 "target": target,
             }
-            if getattr(m, "feature_importances_", None) is not None:
-                fi = np.asarray(m.feature_importances_, dtype=float)
+            _fi_raw = getattr(m, "feature_importances_", None)
+            if _fi_raw is not None:
+                fi = np.asarray(_fi_raw, dtype=float)
                 top_i = np.argsort(fi)[::-1][:10]
                 feature_importances[m.name] = [
                     {"feature": str(X_tr.columns[int(i)]), "importance": round(float(fi[int(i)]), 5)}
@@ -2684,7 +2758,7 @@ def s07_explain(req: ExplainReq, x_session_id: str | None = Header(default="defa
     pdp_col = req.feature_for_pdp if (req.feature_for_pdp and req.feature_for_pdp in X_te.columns) else str(X_te.columns[0])
     pdp = eng.partial_dependence(model, X_te, feature=pdp_col, grid_resolution=15)
     state["uap_shap_result"] = {"global": perm, "local": local_shap, "pdp": pdp}
-    payload = to_json_safe({"global_importance": perm, "local_explanation": local_shap, "pdp": pdp, "pdp_feature": pdp_col})
+    payload = to_json_object({"global_importance": perm, "local_explanation": local_shap, "pdp": pdp, "pdp_feature": pdp_col})
     save_studio_result(state, "s07_explain", payload)
     return payload
 
@@ -2727,7 +2801,7 @@ def s07_fairness(req: FairnessReq, x_session_id: str | None = Header(default="de
         fairness_report=report,
     )
     state["uap_model_card"] = card.to_markdown()
-    payload = to_json_safe({"fairness": report.model_dump(), "model_card_markdown": card.to_markdown()})
+    payload = to_json_object({"fairness": report.model_dump(), "model_card_markdown": card.to_markdown()})
     save_studio_result(state, "s07_fairness", payload)
     return payload
 
@@ -2810,7 +2884,7 @@ def s08_optimize(req: OptimizeReq, x_session_id: str | None = Header(default="de
     res = OptimizationEngine().optimize_portfolio(mu, cov, risk_aversion=req.risk_aversion, asset_names=cols)
     out = res.model_dump() if hasattr(res, "model_dump") else res
     state["uap_opt_result"] = out
-    payload = to_json_safe({"optimization": out})
+    payload = to_json_object({"optimization": out})
     save_studio_result(state, "s08_optimize", payload)
     return payload
 
@@ -2823,16 +2897,16 @@ def s08_simulate(req: SimulateReq, x_session_id: str | None = Header(default="de
         raise HTTPException(status_code=400, detail=f"Column '{req.target_col}' not found.")
     vals = pd.to_numeric(df[req.target_col], errors="coerce").dropna().to_numpy(dtype=float)
     mu, sigma = float(np.mean(vals)), max(float(np.std(vals)), 1e-6)
-    sim = MonteCarloSimulator(n_simulations=req.n_simulations).run(
+    sim_res, _samples = MonteCarloSimulator(n_simulations=req.n_simulations).run(
         input_specs={
-            "base": {"distribution": "normal", "mean": mu, "std": sigma},
-            "drift": {"distribution": "normal", "mean": 0.0, "std": sigma * 0.25},
+            "base": {"dist": "normal", "mean": mu, "std": sigma},
+            "drift": {"dist": "normal", "mean": 0.0, "std": sigma * 0.25},
         },
         model_fn=lambda s: s["base"] + np.sqrt(req.horizon_steps) * s["drift"],
     )
-    out = sim.model_dump() if hasattr(sim, "model_dump") else sim
+    out = sim_res.model_dump()
     state["uap_sim_result"] = out
-    payload = to_json_safe({"simulation": out})
+    payload = to_json_object({"simulation": out})
     save_studio_result(state, "s08_simulate", payload)
     return payload
 
@@ -2842,7 +2916,7 @@ def s08_simulate(req: SimulateReq, x_session_id: str | None = Header(default="de
 # ---------------------------------------------------------------------------
 @router.get("/s09/backends")
 def s09_backends() -> dict[str, Any]:
-    return to_json_safe({"vision": probe_vision_backends(), "nlp": probe_nlp_backends()})
+    return to_json_object({"vision": probe_vision_backends(), "nlp": probe_nlp_backends()})
 
 
 @router.post("/s09/nlp")
@@ -2866,24 +2940,24 @@ def s09_run_nlp(req: NLPReq, x_session_id: str | None = Header(default="default"
 
     t = req.task.lower()
     if t == "zero_shot":
-        payload = to_json_safe({"task": t, "results": suite.zero_shot_classify(texts[:50], req.candidate_labels)})
+        payload = to_json_object({"task": t, "results": suite.zero_shot_classify(texts[:50], req.candidate_labels)})
     elif t == "qa":
         ctx = req.context.strip() or " ".join(texts[:10])
         q = req.question.strip() or "What grew by 18%?"
-        payload = to_json_safe({"task": t, "result": suite.answer_question(q, ctx)})
+        payload = to_json_object({"task": t, "result": suite.answer_question(q, ctx)})
     elif t == "semantic_search":
         q = req.query.strip() or "revenue growth and customer trust"
-        payload = to_json_safe({"task": t, "results": suite.semantic_search(q, texts[:200], top_k=8)})
+        payload = to_json_object({"task": t, "results": suite.semantic_search(q, texts[:200], top_k=8)})
     elif t == "emotions":
-        payload = to_json_safe({"task": t, "results": suite.detect_emotions_and_aspects(texts[:50], aspects=req.aspects or ["revenue", "service", "security"])})
+        payload = to_json_object({"task": t, "results": suite.detect_emotions_and_aspects(texts[:50], aspects=req.aspects or ["revenue", "service", "security"])})
     elif t == "pii_toxicity":
-        payload = to_json_safe({"task": t, "results": suite.screen_toxicity_and_pii(texts[:50])})
+        payload = to_json_object({"task": t, "results": suite.screen_toxicity_and_pii(texts[:50])})
     elif t == "topics":
-        payload = to_json_safe({"task": t, "lda_topics": suite.extract_topics_lda(texts, n_topics=req.n_topics), "nmf_topics": suite.discover_topics(texts, n_topics=req.n_topics)})
+        payload = to_json_object({"task": t, "lda_topics": suite.extract_topics_lda(texts, n_topics=req.n_topics), "nmf_topics": suite.discover_topics(texts, n_topics=req.n_topics)})
     elif t == "cluster":
-        payload = to_json_safe({"task": t, "clustering": suite.cluster_documents(texts[:150], n_clusters=req.n_clusters), "near_duplicates": suite.find_near_duplicates(texts[:150])})
+        payload = to_json_object({"task": t, "clustering": suite.cluster_documents(texts[:150], n_clusters=req.n_clusters), "near_duplicates": suite.find_near_duplicates(texts[:150])})
     else:
-        payload = to_json_safe(
+        payload = to_json_object(
             {
                 "task": "overview",
                 "n_documents": len(texts),
@@ -2926,7 +3000,7 @@ async def s09_run_vision(
     emb = hub.extract_foundation_embedding(img_arr, backbone=backbone, pretrained=False)
     dets = hub.detect_objects(img_arr)
     segs = hub.segment_image(img_arr, n_segments=n_segments)
-    payload = to_json_safe(
+    payload = to_json_object(
         {
             "image_shape": list(img_arr.shape),
             "zero_shot": zs,
@@ -2948,7 +3022,7 @@ def s09_run_graph(req: GraphReq, x_session_id: str | None = Header(default="defa
     suite = GraphLinkPredictionSuite()
     if isinstance(df, pd.DataFrame) and req.source_col and req.target_col and req.source_col in df.columns and req.target_col in df.columns:
         edge_df = df[[req.source_col, req.target_col]].dropna().head(400)
-        g = suite.build_graph_from_edges(edge_df, source_col=req.source_col, target_col=req.target_col)
+        g = suite.build_graph(edge_df, source_col=req.source_col, target_col=req.target_col)
     else:
         g = nx.karate_club_graph()
         g = nx.relabel_nodes(g, {n: f"Node_{n:02d}" for n in g.nodes()})
@@ -2982,7 +3056,7 @@ def s09_run_graph(req: GraphReq, x_session_id: str | None = Header(default="defa
     ]
     edges_vis = [{"source": str(u), "target": str(v)} for u, v in list(sub_g.edges())[:400]]
 
-    payload = to_json_safe(
+    payload = to_json_object(
         {
             "structure": structure,
             "centrality": centrality,
@@ -3015,7 +3089,7 @@ def s09_recommend(req: RecommendReq, x_session_id: str | None = Header(default="
     rec = HybridRecommender().fit(interactions)
     sample_user = str(interactions["user_id"].iloc[0])
     recs = rec.recommend(sample_user, top_k=req.top_k)
-    payload = to_json_safe({"user_id": sample_user, "recommendations": recs})
+    payload = to_json_object({"user_id": sample_user, "recommendations": recs})
     save_studio_result(state, "s09_recommend", payload)
     return payload
 
@@ -3052,7 +3126,7 @@ def s09_survival(req: SurvivalReq, x_session_id: str | None = Header(default="de
             }
         except Exception as exc:
             cox_summary = {"error": str(exc)}
-    payload = to_json_safe({"km_curve": curve[:120], "median_survival": getattr(km, "median_survival_time_", None), "cox": cox_summary})
+    payload = to_json_object({"km_curve": curve[:120], "median_survival": getattr(km, "median_survival_time_", None), "cox": cox_summary})
     save_studio_result(state, "s09_survival", payload)
     return payload
 
@@ -3113,7 +3187,7 @@ def s10_run_dag(req: DAGRunReq, x_session_id: str | None = Header(default="defau
 def s11_overview() -> dict[str, Any]:
     models = [v.model_dump() for v in _SHARED_REGISTRY.list_versions()]
     runs = _SHARED_TRACKER.list_runs()
-    return to_json_safe({"registered_models": models, "experiment_runs": runs})
+    return to_json_object({"registered_models": models, "experiment_runs": runs})
 
 
 @router.post("/s11/register")
@@ -3128,7 +3202,7 @@ def s11_register(req: RegisterModelReq, x_session_id: str | None = Header(defaul
         metrics={k: float(v) for k, v in (state.get("uap_active_model_metrics") or {}).items() if isinstance(v, (int, float))},
         stage=ModelStage(req.stage) if req.stage in [s.value for s in ModelStage] else ModelStage.STAGING,
     )
-    payload = to_json_safe({"registered": ver.model_dump(), "registered_models": [v.model_dump() for v in _SHARED_REGISTRY.list_versions()]})
+    payload = to_json_object({"registered": ver.model_dump(), "registered_models": [v.model_dump() for v in _SHARED_REGISTRY.list_versions()]})
     save_studio_result(state, "s11_registered", payload)
     return payload
 
@@ -3136,7 +3210,7 @@ def s11_register(req: RegisterModelReq, x_session_id: str | None = Header(defaul
 @router.post("/s11/promote")
 def s11_promote(req: PromoteModelReq) -> dict[str, Any]:
     updated = _SHARED_REGISTRY.transition_stage(req.model_name, req.version, ModelStage(req.stage))
-    return to_json_safe({"updated": updated.model_dump(), "registered_models": [v.model_dump() for v in _SHARED_REGISTRY.list_versions()]})
+    return to_json_object({"updated": updated.model_dump(), "registered_models": [v.model_dump() for v in _SHARED_REGISTRY.list_versions()]})
 
 
 @router.post("/s11/drift")
@@ -3148,7 +3222,7 @@ def s11_drift(req: DriftReq, x_session_id: str | None = Header(default="default"
         raise HTTPException(status_code=400, detail="Drift detection requires at least 20 numeric rows.")
     cut = int(len(num_df) * req.split_ratio)
     report = DriftDetector().detect(num_df.iloc[:cut], num_df.iloc[cut:])
-    payload = to_json_safe({"drift_report": report.model_dump()})
+    payload = to_json_object({"drift_report": report.model_dump()})
     save_studio_result(state, "s11_drift", payload)
     return payload
 
@@ -3192,7 +3266,7 @@ def s12_report_catalog(x_session_id: str | None = Header(default="default")) -> 
         }
         for spec in REPORT_SECTIONS_CATALOG
     ]
-    return to_json_safe(
+    return to_json_object(
         {
             "sections": catalog,
             "presets": REPORT_PRESETS,
@@ -3208,7 +3282,9 @@ def _compile_report_payload(state: dict[str, Any], req: ReportCompileReq) -> dic
     if quality is None:
         quality = DataQualityProfiler().profile(df)
         state["uap_quality"] = quality
-    q_dict = quality.model_dump() if hasattr(quality, "model_dump") else quality
+    q_dict: dict[str, Any] = to_json_object(
+        quality.model_dump() if hasattr(quality, "model_dump") else quality
+    )
     targets = get_selected_targets(state, df)
     gen = ReportGenerator()
     payload = gen.build_report(
@@ -3428,7 +3504,7 @@ def s13_chat(req: CopilotReq, x_session_id: str | None = Header(default="default
     history = state.setdefault("uap_chat_history", [])
     history.append({"role": "user", "text": req.message})
     history.append({"role": "assistant", "text": ans})
-    payload = to_json_safe(
+    payload = to_json_object(
         {
             "reply": ans,
             "suggested_actions": dump.get("suggested_actions") or [],
@@ -3450,7 +3526,7 @@ def s14_list_models(x_session_id: str | None = Header(default="default")) -> dic
     raw_models = SupervisoryPredictionMonitor.catalog_available_models(state)
     models = [{k: v for k, v in m.items() if k != "_estimator"} for m in raw_models]
     last_eval = state.get("uap_supervisory_result")
-    return to_json_safe(
+    return to_json_object(
         {
             "models": models,
             "last_evaluation": last_eval,
@@ -3472,7 +3548,7 @@ def s14_get_model_equations(
     state = get_session_state(sid)
     catalog = SupervisoryPredictionMonitor.catalog_available_models(state)
     if not catalog:
-        return to_json_safe({"champion_equation": None, "baseline_equation": None})
+        return to_json_object({"champion_equation": None, "baseline_equation": None})
     primary_entry = next((m for m in catalog if m["model_id"] == model_id), catalog[0])
     baseline_entry = None
     if baseline_model_id:
@@ -3485,7 +3561,7 @@ def s14_get_model_equations(
     ref_df = state.get("uap_df") if isinstance(state.get("uap_df"), pd.DataFrame) else None
     champ_eq = SupervisoryPredictionMonitor.extract_model_equation(primary_entry, ref_df=ref_df)
     base_eq = SupervisoryPredictionMonitor.extract_model_equation(baseline_entry, ref_df=ref_df)
-    return to_json_safe(
+    return to_json_object(
         {
             "champion_model_id": primary_entry["model_id"],
             "baseline_model_id": baseline_entry["model_id"] if baseline_entry else None,
@@ -3569,7 +3645,8 @@ def s14_quick_train(req: SupervisoryQuickTrainReq, x_session_id: str | None = He
     metric_name = "f1_weighted" if is_clf else "r2"
 
     if family == "Deep Learning":
-        dl_dict = state.get("uap_dl_models") if isinstance(state.get("uap_dl_models"), dict) else {}
+        _dl_raw = state.get("uap_dl_models")
+        dl_dict: dict[str, Any] = dict(_dl_raw) if isinstance(_dl_raw, dict) else {}
         dl_dict[m_key] = {
             "model": model,
             "name": label,
@@ -3579,8 +3656,10 @@ def s14_quick_train(req: SupervisoryQuickTrainReq, x_session_id: str | None = He
         }
         state["uap_dl_models"] = dl_dict
     elif family == "Baseline":
-        bl_all = state.get("uap_baseline_models") if isinstance(state.get("uap_baseline_models"), dict) else {}
-        t_bl = bl_all.get(target) if isinstance(bl_all.get(target), dict) else {}
+        _bl_raw = state.get("uap_baseline_models")
+        bl_all: dict[str, Any] = dict(_bl_raw) if isinstance(_bl_raw, dict) else {}
+        _t_bl_raw = bl_all.get(target)
+        t_bl: dict[str, Any] = _t_bl_raw if isinstance(_t_bl_raw, dict) else {}
         t_bl[label] = {
             "model": model,
             "feature_cols": list(X.columns),
@@ -3597,7 +3676,7 @@ def s14_quick_train(req: SupervisoryQuickTrainReq, x_session_id: str | None = He
     record_lineage(state, "Supervisory Monitor", f"Quick-trained {label}", f"{metric_name}={score:.4f}")
     raw_models = SupervisoryPredictionMonitor.catalog_available_models(state)
     models_clean = [{k: v for k, v in m.items() if k != "_estimator"} for m in raw_models]
-    return to_json_safe(
+    return to_json_object(
         {
             "trained_model": label,
             "family": family,
@@ -3691,6 +3770,11 @@ async def s14_evaluate_file(
     state = get_session_state(sid)
     fname = file.filename or "live_batch.xlsx"
     suffix = Path(fname).suffix.lower() or ".csv"
+    if suffix in {".pkl", ".pickle", ".joblib", ".dill"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Pickle/joblib uploads are blocked for security (CWE-502). Please upload CSV, Parquet, Excel, or JSON.",
+        )
     raw = await file.read()
     if suffix in {".xlsx", ".xls", ".xlsm"} and sheet_name:
         incoming = read_excel_sheet(raw, sheet_name=sheet_name)

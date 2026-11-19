@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from fastapi.testclient import TestClient
 
+from omniforge.api.auth import get_api_key
 from omniforge.api.main import app
 from omniforge.core.types import TaskType
 from omniforge.evaluation.equations import ModelEquationExtractor
@@ -22,7 +23,7 @@ from omniforge.models.nonparametric import (
 )
 from omniforge.ui.state import get_session_state
 
-client = TestClient(app)
+client = TestClient(app, headers={"X-API-Key": get_api_key()})
 
 
 def _make_nonlinear_dirty_df(seed: int = 42) -> pd.DataFrame:

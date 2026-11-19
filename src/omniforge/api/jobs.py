@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
-from omniforge.core.utils import to_json_safe
+from omniforge.core.utils import to_json_object, to_json_safe
 
 
 @dataclass
@@ -33,7 +33,7 @@ class JobRecord:
         if self.started_at is not None:
             end = self.finished_at if self.finished_at is not None else time.time()
             duration = round(end - self.started_at, 3)
-        return to_json_safe(
+        return to_json_object(
             {
                 "job_id": self.job_id,
                 "name": self.name,

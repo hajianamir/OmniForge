@@ -661,7 +661,7 @@ class ModelEquationExtractor:
         notes: list[str] = []
         coef_rows: list[dict[str, Any]] = []
 
-        if hasattr(dummy, "constant_") and dummy.constant_ is not None:
+        if dummy is not None and hasattr(dummy, "constant_") and dummy.constant_ is not None:
             const_val = float(np.asarray(dummy.constant_).ravel()[0])
             plain = f"{target_name}_hat = {_fmt_num(const_val)}   [constant {strategy} baseline — independent of inputs x]"
             latex = rf"\widehat{{\text{{{t_tex}}}}} = {_fmt_num(const_val)} \quad (\text{{constant {strategy}}})"
@@ -1018,24 +1018,44 @@ class ModelEquationExtractor:
                         arch_plain.append(f"Hidden Layer {idx}:  h^({idx}) = {act}(W^({idx})^T {inp_sym} + b^({idx}))  [{w_arr.shape[0]} -> {w_arr.shape[1]}]")
                         arch_latex.append(rf"h^{{({idx})}} = {act_tex}\!\left((W^{{({idx})}})^\top {inp_tex} + b^{{({idx})}}\right)")
             elif torch_net is not None:
-                l_idx = 0
-                for mod in torch_net.modules():
-                    if hasattr(mod, "weight") and mod.weight is not None:
-                        l_idx += 1
-                        w_arr = mod.weight.detach().cpu().numpy()
-                        b_arr = mod.bias.detach().cpu().numpy() if getattr(mod, "bias", None) is not None else np.zeros(0)
-                        n_p = int(w_arr.size + b_arr.size)
-                        total_params += n_p
-                        layer_rows.append(
-                            {
-                                "Layer": f"Linear {l_idx}",
-                                "Weight Shape": f"{w_arr.shape[1]} -> {w_arr.shape[0]}",
-                                "Activation": act,
-                                "Parameters": n_p,
-                                "||W||_F": round(float(np.linalg.norm(w_arr)), 4),
-                                "||b||_2": round(float(np.linalg.norm(b_arr)), 4),
-                            }
+                linear_mods = [
+                    mod
+                    for mod in torch_net.modules()
+                    if hasattr(mod, "weight") and mod.weight is not None and getattr(mod.weight, "ndim", 0) == 2
+                ]
+                for l_idx, mod in enumerate(linear_mods, start=1):
+                    w_arr = mod.weight.detach().cpu().numpy()
+                    b_arr = mod.bias.detach().cpu().numpy() if getattr(mod, "bias", None) is not None else np.zeros(0)
+                    n_p = int(w_arr.size + b_arr.size)
+                    total_params += n_p
+                    is_last = l_idx == len(linear_mods)
+                    layer_act = ("Softmax / Logits" if is_clf else "Linear") if is_last else act
+                    layer_rows.append(
+                        {
+                            "Layer": f"Dense {l_idx}" + (" (Output)" if is_last else f" (Hidden {l_idx})"),
+                            "Weight Shape": f"{w_arr.shape[1]} -> {w_arr.shape[0]}",
+                            "Activation": layer_act,
+                            "Parameters": n_p,
+                            "||W||_F": round(float(np.linalg.norm(w_arr)), 4),
+                            "||b||_2": round(float(np.linalg.norm(b_arr)), 4),
+                        }
+                    )
+                    inp_sym = "z" if l_idx == 1 else f"h^({l_idx - 1})"
+                    inp_tex = "z" if l_idx == 1 else f"h^{{({l_idx - 1})}}"
+                    if is_last:
+                        arch_plain.append(
+                            f"Output Layer {l_idx}:  {target_name}_hat = {'softmax(' if is_clf else ''}W^({l_idx})^T {inp_sym} + b^({l_idx}){')' if is_clf else ''}"
                         )
+                        arch_latex.append(
+                            rf"\widehat{{\text{{{t_tex}}}}} = {out_desc}\!\left((W^{{({l_idx})}})^\top {inp_tex} + b^{{({l_idx})}}\right)"
+                            if is_clf
+                            else rf"\widehat{{\text{{{t_tex}}}}} = (W^{{({l_idx})}})^\top {inp_tex} + b^{{({l_idx})}}"
+                        )
+                    else:
+                        arch_plain.append(
+                            f"Hidden Layer {l_idx}:  h^({l_idx}) = {act}(W^({l_idx})^T {inp_sym} + b^({l_idx}))  [{w_arr.shape[1]} -> {w_arr.shape[0]}]"
+                        )
+                        arch_latex.append(rf"h^{{({l_idx})}} = {act_tex}\!\left((W^{{({l_idx})}})^\top {inp_tex} + b^{{({l_idx})}}\right)")
             classes_attr = getattr(model, "classes_", None)
             out_sz = len(classes_attr) if classes_attr is not None else 1
             dims_str = " -> ".join([str(n_feat)] + [str(d) for d in getattr(model, "hidden_dims", [])] + [str(out_sz)])
@@ -1209,6 +1229,36 @@ class ModelEquationExtractor:
             latex = rf"\widehat{{\text{{{t_tex}}}}} = \mathrm{{MLP}}_{{\text{{head}}}}\!\left(\mathrm{{GCN}}_{{{n_hops}\text{{-hop}}}}(\tilde{{A}}, z)\right)"
             notes.append(f"Graph Convolutional Network propagating messages across k={knn_k} nearest neighbors for {n_hops} hops.")
 
+        # Fallback inspection for PyTorch backends (_torch_net / _torch_model on model or head) when NumPy buffers are absent
+        if not layer_rows:
+            torch_mod = getattr(model, "_torch_net", None) or getattr(model, "_torch_model", None)
+            if torch_mod is None:
+                head_obj = getattr(model, "_head", None)
+                if head_obj is not None:
+                    torch_mod = getattr(head_obj, "_torch_net", None) or getattr(head_obj, "_torch_model", None)
+            if torch_mod is not None and hasattr(torch_mod, "named_modules"):
+                t_idx = 0
+                for mod_name, mod in torch_mod.named_modules():
+                    w_param = getattr(mod, "weight", None)
+                    if w_param is None or not hasattr(w_param, "detach"):
+                        continue
+                    t_idx += 1
+                    w_arr = w_param.detach().cpu().numpy()
+                    b_param = getattr(mod, "bias", None)
+                    b_arr = b_param.detach().cpu().numpy() if (b_param is not None and hasattr(b_param, "detach")) else np.zeros(0)
+                    n_p = int(w_arr.size + b_arr.size)
+                    total_params += n_p
+                    layer_rows.append(
+                        {
+                            "Layer": f"{mod.__class__.__name__} ({mod_name or t_idx})",
+                            "Weight Shape": " x ".join(str(s) for s in w_arr.shape),
+                            "Activation": mod.__class__.__name__,
+                            "Parameters": n_p,
+                            "||W||_F": round(float(np.linalg.norm(w_arr)), 4),
+                            "||b||_2": round(float(np.linalg.norm(b_arr)), 4),
+                        }
+                    )
+
         # Fit high-fidelity Global Linear Surrogate over the network's actual predictions
         surr_plain, surr_latex, surr_r2, surr_table, surr_b0, surr_coefs = cls._fit_linear_surrogate(
             model, X_reference, feature_names, target_name, is_clf, max_terms=max_terms
@@ -1332,7 +1382,11 @@ class ModelEquationExtractor:
             latex = rf"\widehat{{\text{{{t_tex}}}}}(x) = \frac{{1}}{{{n_trees}}}\sum_{{m=1}}^{{{n_trees}}} T_m(x)"
             trees = getattr(estimator, "estimators_", [])
             if trees:
-                param_count = sum(int(getattr(t, "tree_", None).node_count) for t in trees if hasattr(t, "tree_"))
+                param_count = sum(
+                    int(tree_obj.node_count)
+                    for t in trees
+                    if (tree_obj := getattr(t, "tree_", None)) is not None
+                )
                 try:
                     n_f = int(trees[0].n_features_in_)
                     fnames = list(feature_names[:n_f]) if len(feature_names) >= n_f else [f"x_{i + 1}" for i in range(n_f)]

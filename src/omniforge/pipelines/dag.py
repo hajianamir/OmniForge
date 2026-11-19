@@ -12,7 +12,7 @@ from omniforge.pipelines.base import PipelineStep
 class PipelineDAG:
     """Validated DAG of :class:`PipelineStep` nodes supporting topological sorting and visual export."""
 
-    def __init__(self, name: str = "uap_pipeline") -> None:
+    def __init__(self, name: str = "omniforge_pipeline") -> None:
         self.name = name
         self._steps: dict[str, PipelineStep] = {}
 

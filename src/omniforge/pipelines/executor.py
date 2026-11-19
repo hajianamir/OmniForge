@@ -15,12 +15,14 @@ import joblib
 from omniforge.core.carbon import CarbonTracker
 from omniforge.core.exceptions import PipelineError
 from omniforge.core.logging import get_logger
+from omniforge.core.security import ArtifactSigner, safe_joblib_load_bytes
 from omniforge.core.types import CarbonReport
 from omniforge.core.utils import safe_json_default
 from omniforge.pipelines.base import PipelineContext, StepExecutionRecord
 from omniforge.pipelines.dag import PipelineDAG
 
 logger = get_logger(__name__)
+_CACHE_HMAC_CONTEXT = b"omniforge:pipeline-cache:v1"
 
 
 @dataclass
@@ -34,6 +36,18 @@ class PipelineExecutionResult:
     step_records: list[StepExecutionRecord] = field(default_factory=list)
     total_duration_seconds: float = 0.0
     carbon_report: CarbonReport | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize pipeline execution metadata, step records, and carbon telemetry to JSON-safe dicts."""
+        return {
+            "pipeline_name": self.pipeline_name,
+            "run_id": self.run_id,
+            "status": self.status,
+            "total_duration_seconds": round(float(self.total_duration_seconds), 4),
+            "step_records": [r.model_dump() for r in self.step_records],
+            "artifact_keys": sorted(str(k) for k in self.context.artifacts.keys()),
+            "carbon_report": self.carbon_report.model_dump() if self.carbon_report is not None else None,
+        }
 
 
 class PipelineExecutor:
@@ -79,19 +93,30 @@ class PipelineExecutor:
                 cache_path = self._cache_key_path(dag.name, step.step_id, step.config) if (step.cacheable and self.cache_dir) else None
 
                 if cache_path is not None and cache_path.exists():
-                    cached_out = joblib.load(cache_path)
-                    ctx.step_outputs[sid] = cached_out
-                    rec = StepExecutionRecord(
-                        step_id=sid,
-                        step_type=step.step_type,
-                        status="cached",
-                        started_at=started_at,
-                        finished_at=datetime.now(UTC).isoformat(),
-                        duration_seconds=round(time.perf_counter() - t0, 6),
-                        cache_hit=True,
-                    )
-                    ctx.records.append(rec)
-                    continue
+                    sig_path = cache_path.with_suffix(cache_path.suffix + ".hmac")
+                    cached_bytes = cache_path.read_bytes()
+                    expected_sig = sig_path.read_text(encoding="utf-8").strip() if sig_path.is_file() else ""
+                    if expected_sig and ArtifactSigner().verify_bytes(
+                        cached_bytes, expected_sig, context=_CACHE_HMAC_CONTEXT
+                    ):
+                        try:
+                            cached_out = safe_joblib_load_bytes(cached_bytes, filename=cache_path.name)
+                            ctx.step_outputs[sid] = cached_out
+                            rec = StepExecutionRecord(
+                                step_id=sid,
+                                step_type=step.step_type,
+                                status="cached",
+                                started_at=started_at,
+                                finished_at=datetime.now(UTC).isoformat(),
+                                duration_seconds=round(time.perf_counter() - t0, 6),
+                                cache_hit=True,
+                            )
+                            ctx.records.append(rec)
+                            continue
+                        except Exception as exc:
+                            logger.warning("pipeline_step_cache_invalid_recomputing", step_id=sid, error=str(exc))
+                    else:
+                        logger.warning("pipeline_step_cache_signature_rejected", step_id=sid)
 
                 attempt = 0
                 last_exc: Exception | None = None
@@ -102,6 +127,12 @@ class PipelineExecutor:
                         if cache_path is not None:
                             try:
                                 joblib.dump(output, cache_path)
+                                sig = ArtifactSigner().sign_bytes(
+                                    cache_path.read_bytes(), context=_CACHE_HMAC_CONTEXT
+                                )
+                                cache_path.with_suffix(cache_path.suffix + ".hmac").write_text(
+                                    sig, encoding="utf-8"
+                                )
                             except Exception as exc:
                                 logger.debug("pipeline_step_cache_write_skipped", step_id=sid, error=str(exc))
                         rec = StepExecutionRecord(

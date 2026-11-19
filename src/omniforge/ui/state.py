@@ -210,7 +210,7 @@ def default_workspace_dict() -> dict[str, Any]:
         "uap_s01_pending_feedback": None,
         "_uap_remount_studio": False,
         "uap_theme": "dark",
-        "uap_project_name": "uap_analytics_project",
+        "uap_project_name": "omniforge_analytics_project",
         "uap_project_notes": "",
         "uap_last_project_notice": None,
         "uap_experiment_runs": [],
@@ -996,7 +996,7 @@ def lock_leakage_safe_split(
         "test_indices": list(res.test_indices),
         "n_train": int(len(res.train_indices)),
         "n_test": int(len(res.test_indices)),
-        "audit_report": res.audit_report.model_dump(),
+        "audit_report": (res.audit_report.model_dump() if res.audit_report is not None else {}),
         "locked_at": datetime.now().strftime("%H:%M:%S"),
     }
     state["uap_split_lock"] = lock_payload
@@ -1006,7 +1006,8 @@ def lock_leakage_safe_split(
         state,
         "Split Lock",
         f"Locked leakage-safe {res.strategy_used.upper()} split",
-        f"Train={len(res.train_indices):,} | Test={len(res.test_indices):,} | CV={cv_folds}-fold | Audit={'PASS' if res.audit_report.passed else 'WARN'}",
+        f"Train={len(res.train_indices):,} | Test={len(res.test_indices):,} | CV={cv_folds}-fold | "
+        f"Audit={'PASS' if (res.audit_report is not None and res.audit_report.passed) else 'WARN'}",
     )
     return lock_payload
 
@@ -1140,7 +1141,7 @@ def export_workspace_project_bytes(
     resolved_name = (
         project_name
         if project_name is not None
-        else str(state.get("uap_project_name") or state.get("uap_dataset_name") or "uap_project")
+        else str(state.get("uap_project_name") or state.get("uap_dataset_name") or "omniforge_project")
     )
     resolved_notes = notes if notes is not None else str(state.get("uap_project_notes") or "")
     return WorkspaceSessionManager.export_to_bytes(state, project_name=resolved_name, notes=resolved_notes)

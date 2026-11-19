@@ -34,8 +34,39 @@ from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.preprocessing import SplineTransformer, StandardScaler
 
+from omniforge.core.logging import get_logger
 from omniforge.core.types import TaskType
 from omniforge.models.base import BaseOmniForgeModel
+
+logger = get_logger(__name__)
+
+
+def _leak_free_val_split(
+    n_samples: int,
+    y: np.ndarray,
+    *,
+    is_clf: bool,
+    random_seed: int,
+    val_fraction: float = 0.2,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build deterministic shuffled (stratified for classification) train/validation indices."""
+    rng = np.random.default_rng(random_seed)
+    n_val = max(2, int(round(n_samples * val_fraction)))
+    if is_clf:
+        classes, counts = np.unique(y, return_counts=True)
+        if len(classes) >= 2 and int(np.min(counts)) >= 2:
+            tr_parts: list[np.ndarray] = []
+            va_parts: list[np.ndarray] = []
+            for cls_v in classes:
+                cls_idx = np.where(y == cls_v)[0]
+                rng.shuffle(cls_idx)
+                n_c_val = max(1, min(len(cls_idx) - 1, int(round(len(cls_idx) * val_fraction))))
+                va_parts.append(cls_idx[:n_c_val])
+                tr_parts.append(cls_idx[n_c_val:])
+            return np.concatenate(tr_parts), np.concatenate(va_parts)
+    perm = rng.permutation(n_samples)
+    cut = max(2, n_samples - n_val)
+    return perm[:cut], perm[cut:]
 
 
 def _safe_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -53,7 +84,7 @@ def _clean_matrix(X: np.ndarray) -> np.ndarray:
     arr = np.asarray(X, dtype=float)
     if arr.ndim == 1:
         arr = arr.reshape(-1, 1)
-    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    return np.asarray(np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0), dtype=float)
 
 
 class PenalizedSplineGAMModel(BaseOmniForgeModel):
@@ -106,6 +137,35 @@ class PenalizedSplineGAMModel(BaseOmniForgeModel):
         effective_knots = min(self.n_knots, max(3, n_samples // 10))
         effective_degree = min(self.degree, max(1, effective_knots - 1))
 
+        # Select smoothing penalty alpha via leak-free shuffled inner validation
+        # (StandardScaler and quantile B-spline knots fit strictly on inner training fold)
+        best_a = self.alpha
+        if not self._is_clf and n_samples >= 25:
+            y_arr = np.asarray(y, dtype=float)
+            tr_i, va_i = _leak_free_val_split(n_samples, y_arr, is_clf=False, random_seed=self.random_seed)
+            inner_knots = min(self.n_knots, max(3, len(tr_i) // 10))
+            inner_deg = min(self.degree, max(1, inner_knots - 1))
+            sc_in = StandardScaler()
+            sp_in = SplineTransformer(
+                n_knots=inner_knots,
+                degree=inner_deg,
+                knots="quantile",
+                extrapolation="linear",
+                include_bias=False,
+            )
+            B_tr = np.nan_to_num(sp_in.fit_transform(sc_in.fit_transform(arr[tr_i])), nan=0.0, posinf=0.0, neginf=0.0)
+            B_va = np.nan_to_num(sp_in.transform(sc_in.transform(arr[va_i])), nan=0.0, posinf=0.0, neginf=0.0)
+            best_mse = float("inf")
+            for cand_a in (0.2, 1.0, 5.0, 20.0):
+                m_try = Ridge(alpha=cand_a, random_state=self.random_seed)
+                m_try.fit(B_tr, y_arr[tr_i])
+                pred_v = m_try.predict(B_va)
+                mse = float(np.mean((y_arr[va_i] - pred_v) ** 2))
+                if mse < best_mse:
+                    best_mse = mse
+                    best_a = cand_a
+            self.alpha = best_a
+
         X_scaled = self._scaler.fit_transform(arr)
         self._spline = SplineTransformer(
             n_knots=effective_knots,
@@ -136,22 +196,7 @@ class PenalizedSplineGAMModel(BaseOmniForgeModel):
                 else np.asarray(self._estimator.coef_, dtype=float).ravel()
             )
         else:
-            # Select smoothing penalty alpha via fast GCV/holdout heuristic over small grid
-            best_a = self.alpha
-            if n_samples >= 25:
-                y_arr = np.asarray(y, dtype=float)
-                split = max(12, int(n_samples * 0.8))
-                best_mse = float("inf")
-                for cand_a in (0.2, 1.0, 5.0, 20.0):
-                    m_try = Ridge(alpha=cand_a, random_state=self.random_seed)
-                    m_try.fit(B[:split], y_arr[:split])
-                    pred_v = m_try.predict(B[split:])
-                    mse = float(np.mean((y_arr[split:] - pred_v) ** 2))
-                    if mse < best_mse:
-                        best_mse = mse
-                        best_a = cand_a
-            self.alpha = best_a
-            self._estimator = Ridge(alpha=best_a, random_state=self.random_seed)
+            self._estimator = Ridge(alpha=self.alpha, random_state=self.random_seed)
             self._estimator.fit(B, np.asarray(y, dtype=float))
             signed_coef = np.asarray(self._estimator.coef_, dtype=float).ravel()
             coef_vec = np.abs(signed_coef)
@@ -253,22 +298,25 @@ class NadarayaWatsonKernelModel(BaseOmniForgeModel):
         self,
         *,
         task_type: TaskType = TaskType.REGRESSION,
-        bandwidth: float | None = None,
+        bandwidth: float | str | None = None,
         max_anchors: int = 800,
         random_seed: int = 42,
         **kwargs: Any,
     ) -> None:
         is_clf = task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION)
+        parsed_bw: float | None = None
+        if isinstance(bandwidth, (int, float)) and not isinstance(bandwidth, bool) and float(bandwidth) > 0:
+            parsed_bw = float(bandwidth)
         super().__init__(
             name="NonParametric_NadarayaWatson_Clf" if is_clf else "NonParametric_NadarayaWatson",
             task_type=task_type,
             random_seed=random_seed,
-            bandwidth=bandwidth,
+            bandwidth=parsed_bw,
             max_anchors=max_anchors,
             **kwargs,
         )
         self._is_clf = is_clf
-        self._requested_bw = bandwidth
+        self._requested_bw: float | None = parsed_bw
         self.max_anchors = max(50, int(max_anchors))
         self._scaler = StandardScaler()
         self._X_anchors: np.ndarray = np.empty((0, 0), dtype=float)
@@ -305,31 +353,34 @@ class NadarayaWatsonKernelModel(BaseOmniForgeModel):
         arr = _clean_matrix(X)
         y_arr = np.asarray(y)
         n, d = arr.shape
-        X_s = self._scaler.fit_transform(arr)
 
         if self._is_clf:
             self.classes_ = np.unique(y_arr)
 
-        # Stratified/uniform subsampling of prototype anchors on large datasets
+        # Deterministic subsampling of prototype anchors BEFORE scaling
         if n > self.max_anchors:
             rng = np.random.default_rng(self.random_seed)
             idx = rng.choice(n, size=self.max_anchors, replace=False)
-            X_use = X_s[idx]
+            arr_use = arr[idx]
             y_use = y_arr[idx]
         else:
-            X_use = X_s
+            arr_use = arr
             y_use = y_arr
 
         # Silverman-inspired multivariate rule of thumb on standardized features
-        silverman = float(max(0.25, (len(X_use) ** (-1.0 / (d + 4.0))) * math.sqrt(max(d, 1))))
+        silverman = float(max(0.25, (len(arr_use) ** (-1.0 / (d + 4.0))) * math.sqrt(max(d, 1))))
 
         if self._requested_bw is not None and self._requested_bw > 0:
             best_bw = float(self._requested_bw)
-        elif len(X_use) >= 20:
-            # Fast holdout bandwidth selection over 5 scales around Silverman's rule
-            cut = max(10, int(len(X_use) * 0.8))
-            X_tr, y_tr = X_use[:cut], y_use[:cut]
-            X_va, y_va = X_use[cut:], y_use[cut:]
+        elif len(arr_use) >= 20:
+            # Leak-free shuffled (stratified for clf) inner validation: StandardScaler fits strictly on inner train
+            tr_i, va_i = _leak_free_val_split(
+                len(arr_use), y_use, is_clf=self._is_clf, random_seed=self.random_seed
+            )
+            sc_in = StandardScaler()
+            X_tr = sc_in.fit_transform(arr_use[tr_i])
+            X_va = sc_in.transform(arr_use[va_i])
+            y_tr, y_va = y_use[tr_i], y_use[va_i]
             candidates = [silverman * mult for mult in (0.35, 0.6, 1.0, 1.6, 2.5)]
             best_bw = silverman
             best_score = -float("inf")
@@ -346,21 +397,22 @@ class NadarayaWatsonKernelModel(BaseOmniForgeModel):
         else:
             best_bw = silverman
 
+        # Fit final scaler on full training data and store standardized anchors
+        X_s = self._scaler.fit_transform(arr)
+        X_use = self._scaler.transform(arr_use) if n > self.max_anchors else X_s
+
         self.bandwidth_ = round(float(best_bw), 4)
         self._X_anchors = X_use
         self._y_anchors = y_use
         self.n_anchors_ = int(len(X_use))
 
-        # Estimate effective degrees of freedom: trace of smoother matrix S (self-weight sum)
+        # Exact smoother matrix trace tr(S) = sum_i K_h(0) / sum_j K_h(x_i - x_j) over all anchors (<= max_anchors)
         try:
-            n_sub = min(len(X_use), 250)
-            Xs_sub = X_use[:n_sub]
-            q_n = np.sum(Xs_sub * Xs_sub, axis=1, keepdims=True)
-            sq_d = np.maximum(0.0, q_n + q_n.T - 2.0 * (Xs_sub @ Xs_sub.T))
-            W_sub = np.exp(-sq_d / max(2.0 * best_bw * best_bw, 1e-8))
-            row_sums = np.sum(W_sub, axis=1)
-            edf_sub = float(np.sum(1.0 / np.maximum(row_sums, 1.0)))
-            self.effective_df_ = round(edf_sub * (len(X_use) / max(n_sub, 1)), 2)
+            q_n = np.sum(X_use * X_use, axis=1, keepdims=True)
+            sq_d = np.maximum(0.0, q_n + q_n.T - 2.0 * (X_use @ X_use.T))
+            W_all = np.exp(-sq_d / max(2.0 * best_bw * best_bw, 1e-8))
+            row_sums = np.sum(W_all, axis=1)
+            self.effective_df_ = round(float(np.sum(1.0 / np.maximum(row_sums, 1.0))), 2)
         except Exception:
             self.effective_df_ = float(max(1.0, math.sqrt(len(X_use))))
 
@@ -417,30 +469,35 @@ class RBFKernelRidgeModel(BaseOmniForgeModel):
         assert y is not None
         arr = _clean_matrix(X)
         y_arr = np.asarray(y, dtype=float)
-        X_s = self._scaler.fit_transform(arr)
-        n, d = X_s.shape
+        n, d = arr.shape
         if n > self.max_anchors:
             rng = np.random.default_rng(self.random_seed)
             idx = rng.choice(n, size=self.max_anchors, replace=False)
-            X_fit, y_fit = X_s[idx], y_arr[idx]
+            arr_fit, y_fit = arr[idx], y_arr[idx]
         else:
-            X_fit, y_fit = X_s, y_arr
+            arr_fit, y_fit = arr, y_arr
 
         base_gamma = self.gamma if (self.gamma is not None and self.gamma > 0) else (1.0 / max(float(d), 1.0))
         best_g, best_a = base_gamma, self.alpha
-        if len(X_fit) >= 25 and self.gamma is None:
-            cut = max(12, int(len(X_fit) * 0.8))
+        if len(arr_fit) >= 25 and self.gamma is None:
+            tr_i, va_i = _leak_free_val_split(len(arr_fit), y_fit, is_clf=False, random_seed=self.random_seed)
+            sc_in = StandardScaler()
+            X_tr = sc_in.fit_transform(arr_fit[tr_i])
+            X_va = sc_in.transform(arr_fit[va_i])
             best_mse = float("inf")
             for g_mult in (0.25, 1.0, 3.0):
                 for a_val in (0.05, 0.5, 2.0):
                     g_try = base_gamma * g_mult
                     kr = KernelRidge(alpha=a_val, kernel="rbf", gamma=g_try)
-                    kr.fit(X_fit[:cut], y_fit[:cut])
-                    mse = float(np.mean((y_fit[cut:] - kr.predict(X_fit[cut:])) ** 2))
+                    kr.fit(X_tr, y_fit[tr_i])
+                    mse = float(np.mean((y_fit[va_i] - kr.predict(X_va)) ** 2))
                     if mse < best_mse:
                         best_mse = mse
                         best_g = g_try
                         best_a = a_val
+
+        X_s = self._scaler.fit_transform(arr)
+        X_fit = self._scaler.transform(arr_fit) if n > self.max_anchors else X_s
 
         self.fitted_gamma_ = round(float(best_g), 6)
         self.fitted_alpha_ = round(float(best_a), 5)
@@ -496,39 +553,43 @@ class DistanceWeightedKNNModel(BaseOmniForgeModel):
     def _fit(self, X: np.ndarray, y: np.ndarray | None, **kwargs: Any) -> None:
         assert y is not None
         arr = _clean_matrix(X)
-        X_s = self._scaler.fit_transform(arr)
-        n = len(X_s)
+        y_arr = np.asarray(y)
+        n = len(arr)
 
         if self._requested_k is not None:
             best_k = min(max(1, int(self._requested_k)), max(1, n - 1))
         elif n >= 25:
-            cut = max(12, int(n * 0.8))
-            best_k = min(5, max(1, cut - 1))
+            tr_i, va_i = _leak_free_val_split(n, y_arr, is_clf=self._is_clf, random_seed=self.random_seed)
+            sc_in = StandardScaler()
+            X_tr = sc_in.fit_transform(arr[tr_i])
+            X_va = sc_in.transform(arr[va_i])
+            best_k = min(5, max(1, len(tr_i) - 1))
             best_score = -float("inf")
             for k in (3, 5, 9, 15):
-                if k >= cut:
+                if k >= len(tr_i):
                     continue
                 if self._is_clf:
                     m = KNeighborsClassifier(n_neighbors=k, weights="distance")
-                    m.fit(X_s[:cut], y[:cut])
-                    sc = float(f1_score(y[cut:], m.predict(X_s[cut:]), average="weighted", zero_division=0))
+                    m.fit(X_tr, y_arr[tr_i])
+                    sc = float(f1_score(y_arr[va_i], m.predict(X_va), average="weighted", zero_division=0))
                 else:
                     m = KNeighborsRegressor(n_neighbors=k, weights="distance")
-                    m.fit(X_s[:cut], np.asarray(y[:cut], dtype=float))
-                    sc = _safe_r2(np.asarray(y[cut:], dtype=float), m.predict(X_s[cut:]))
+                    m.fit(X_tr, np.asarray(y_arr[tr_i], dtype=float))
+                    sc = _safe_r2(np.asarray(y_arr[va_i], dtype=float), m.predict(X_va))
                 if sc > best_score:
                     best_score = sc
                     best_k = k
         else:
             best_k = min(5, max(1, n - 1))
 
+        X_s = self._scaler.fit_transform(arr)
         self.fitted_k_ = int(best_k)
         if self._is_clf:
             self._estimator = KNeighborsClassifier(n_neighbors=best_k, weights="distance")
-            self._estimator.fit(X_s, y)
+            self._estimator.fit(X_s, y_arr)
         else:
             self._estimator = KNeighborsRegressor(n_neighbors=best_k, weights="distance")
-            self._estimator.fit(X_s, np.asarray(y, dtype=float))
+            self._estimator.fit(X_s, np.asarray(y_arr, dtype=float))
 
     def _predict(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
         assert self._estimator is not None
@@ -622,10 +683,16 @@ class NonParametricAnalyticalSuite:
         n_knots: int = 5,
         spline_degree: int = 3,
         bandwidth: float | None = None,
-        n_neighbors: int = 11,
+        n_neighbors: int | None = 11,
         rbf_gamma: float | None = None,
+        X_test: pd.DataFrame | None = None,
+        y_test: pd.Series | np.ndarray | None = None,
     ) -> dict[str, Any]:
-        """Fit, cross-validate, and extract mathematical equations for all non-parametric analytical models."""
+        """Fit, cross-validate, and extract mathematical equations for all non-parametric analytical models.
+
+        When an external holdout ``X_test``/``y_test`` pair is provided, cross-validation and model
+        fitting run strictly on ``X``/``y`` and holdout generalization scores are reported separately.
+        """
         import time as _time
 
         from omniforge.evaluation.equations import ModelEquationExtractor
@@ -636,7 +703,7 @@ class NonParametricAnalyticalSuite:
         n = len(X)
         k_folds = max(2, min(int(cv_folds), 5, n // 4)) if n >= 12 else 2
         sel = {m.strip().lower() for m in models} if models else None
-        bw_val: float | str = float(bandwidth) if bandwidth is not None and bandwidth > 0 else "auto"
+        bw_val: float | None = float(bandwidth) if bandwidth is not None and bandwidth > 0 else None
         gamma_val: float | None = float(rbf_gamma) if rbf_gamma is not None and rbf_gamma > 0 else None
 
         if is_clf:
@@ -699,7 +766,7 @@ class NonParametricAnalyticalSuite:
                 fitted_models[name] = full_model
 
                 mean_p = round(float(np.mean(fold_primary)), 5)
-                std_p = round(float(np.std(fold_primary)), 5)
+                std_p = round(float(np.std(fold_primary, ddof=1) if len(fold_primary) > 1 else 0.0), 5)
                 mean_s = round(float(np.mean(fold_sec)), 5)
                 if name.startswith("Parametric_"):
                     param_score = mean_p
@@ -714,6 +781,22 @@ class NonParametricAnalyticalSuite:
                     "secondary_metric": "Accuracy" if is_clf else "RMSE",
                     "secondary_score": mean_s,
                 }
+                if X_test is not None and y_test is not None and len(X_test) > 0:
+                    y_te = np.asarray(y_test)
+                    te_preds = full_model.predict(X_test)
+                    if is_clf:
+                        row["holdout_primary_score"] = round(
+                            float(f1_score(y_te, te_preds, average="weighted", zero_division=0)), 5
+                        )
+                        row["holdout_secondary_score"] = round(float(accuracy_score(y_te, te_preds)), 5)
+                    else:
+                        row["holdout_primary_score"] = round(
+                            _safe_r2(np.asarray(y_te, dtype=float), np.asarray(te_preds, dtype=float)), 5
+                        )
+                        row["holdout_secondary_score"] = round(
+                            float(root_mean_squared_error(np.asarray(y_te, dtype=float), np.asarray(te_preds, dtype=float))),
+                            5,
+                        )
                 if hasattr(full_model, "effective_df_"):
                     row["effective_df"] = float(full_model.effective_df_)
                 if hasattr(full_model, "bandwidth_"):
@@ -721,7 +804,8 @@ class NonParametricAnalyticalSuite:
                 if hasattr(full_model, "fitted_k_"):
                     row["k_neighbors"] = int(full_model.fitted_k_)
                 leaderboard.append(row)
-            except Exception:
+            except Exception as exc:
+                logger.warning("nonparametric_candidate_failed", model=name, error=str(exc))
                 continue
 
         leaderboard.sort(key=lambda r: float(r["primary_score"]), reverse=True)

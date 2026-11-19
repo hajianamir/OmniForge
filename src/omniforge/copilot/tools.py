@@ -10,7 +10,7 @@ import pandas as pd
 
 from omniforge.copilot.memory import CopilotMemory
 from omniforge.core.exceptions import CopilotError
-from omniforge.core.utils import to_json_safe
+from omniforge.core.utils import to_json_object
 
 
 @dataclass
@@ -55,7 +55,7 @@ class CopilotToolRegistry:
             )
         try:
             res = self._tools[tool_name].handler(**(arguments or {}))
-            return to_json_safe(res)
+            return to_json_object(res)
         except Exception as exc:
             raise CopilotError(
                 f"Copilot tool '{tool_name}' execution failed: {exc}",

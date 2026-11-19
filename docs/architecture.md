@@ -5,8 +5,8 @@
 ```text
 +-----------------------------------------------------------------------+
 | Presentation & Interfaces:                                            |
-|   FastAPI + React Enterprise Workbench (13 CRISP-DM Studios) | FastAPI API    |
-|   Typer + Rich CLI (`uap`) | Desktop Launcher (`OmniForge.exe` / `start.bat`)|
+|   FastAPI + React Enterprise Workbench (14 CRISP-DM Studios) | FastAPI API    |
+|   Typer + Rich CLI (`omniforge`) | Desktop Launcher (`OmniForge.exe` / `start.bat`)|
 +-----------------------------------------------------------------------+
 | Intelligence & Domain Layer:                                          |
 |   AI Copilot (Multi-LLM + Offline Planner + 14 Tools)                 |
@@ -52,12 +52,12 @@
 - `src/omniforge/{forecasting,causal,optimization,simulation}/`: Decision-intelligence engines.
 - `src/omniforge/{evaluation,automl,pipelines,mlops,copilot,reporting}/`: Full evaluation/Responsible AI, HPO/AutoML/NAS, DAG pipelines, MLOps lifecycle (including batch & ONNX/edge serving), AI Copilot, and multi-format reporting.
 - `src/omniforge/domains/` & `configs/domains/`: Plugin SDK + 18 ready vertical plugins and YAML profiles.
-- `src/omniforge/{api,cli,ui,launcher.py}`: FastAPI backend, Typer CLI, 13-studio CRISP-DM FastAPI + React TypeScript workbench (`src/omniforge/api/workbench.py` + pre-compiled `src/omniforge/ui/static_app/`), and frozen-safe desktop launcher.
+- `src/omniforge/{api,cli,ui,launcher.py}`: FastAPI backend, Typer CLI, 14-studio CRISP-DM FastAPI + React TypeScript workbench (`src/omniforge/api/workbench.py` + pre-compiled `src/omniforge/ui/static_app/`), and frozen-safe desktop launcher.
 - `packaging/`, `install.bat`, `start.bat`, `build_exe.bat`, `docker/`: Windows `.exe` PyInstaller & Inno Setup packaging plus multi-stage Python 3.15 Docker containers.
 
 ## 3. Architectural Guarantees
 
 1. **Mandatory Baseline Benchmarking**: Every AutoML run and forecasting tournament evaluates strong baselines first and reports explicit lift over the strongest baseline.
 2. **Leakage-Safe Fit/Transform Semantics**: `DataCleaner` and `FeatureEngineeringPipeline` strictly learn statistics on training splits and transform unseen validation/production batches deterministically.
-3. **Modern Python 3.12–3.15 & 2026 Ecosystem Alignment**: Native `StrEnum`, `datetime.UTC`, PEP 604/585 typing, Pydantic v2, Pandas 3 Copy-on-Write/StringDtype/datetime64[us] compatibility, NumPy 2.5+, SciPy 1.18+, scikit-learn 1.9+, FastAPI 0.163+, FastAPI 0.163+ & pre-compiled React 18/Vite TypeScript SPA.
-4. **Defense-in-Depth Governance**: Automatic secret redaction in logs, Fernet/AES-256 encryption, SHA-256 checksums, immutable hash-chained audit logs, RBAC enforcement, and automated Model & Data Cards.
+3. **Modern Python 3.12–3.15 & 2026 Ecosystem Alignment**: Native `StrEnum`, `datetime.UTC`, PEP 604/585 typing, Pydantic v2, Pandas 3 Copy-on-Write/StringDtype/datetime64[us] compatibility, NumPy 2.5+, SciPy 1.18+, scikit-learn 1.9+, FastAPI 0.163+, and a pre-compiled React 18/Vite TypeScript SPA that code-splits vendor libraries and all 14 studios into lazily-loaded chunks.
+4. **Defense-in-Depth Governance**: Automatic secret redaction in logs, NIST AES-256-GCM authenticated encryption, HMAC-SHA256 artifact signing, immutable hash-chained audit logs, RBAC enforcement, and automated Model & Data Cards.

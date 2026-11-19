@@ -34,7 +34,7 @@ def is_frozen() -> bool:
 def get_bundle_root() -> Path:
     """Return the primary root directory for bundled or source resources."""
     if is_frozen():
-        return Path(sys._MEIPASS).resolve()
+        return Path(str(getattr(sys, "_MEIPASS", ""))).resolve()
     return Path(__file__).resolve().parents[2]
 
 
@@ -60,7 +60,7 @@ def resolve_resource_path(relative_path: str | Path) -> Path:
 
     candidates: list[Path] = []
     if is_frozen():
-        meipass = Path(sys._MEIPASS).resolve()
+        meipass = Path(str(getattr(sys, "_MEIPASS", ""))).resolve()
         exe_dir = Path(sys.executable).resolve().parent
         candidates.extend(
             [
@@ -215,7 +215,7 @@ def run_environment_check() -> dict[str, Any]:
     from omniforge.domains import default_domain_registry
 
     domains = [p.metadata.name for p in default_domain_registry.list_plugins()]
-    ui_app_path = resolve_resource_path("uap/ui/app.py")
+    ui_app_path = resolve_resource_path("omniforge/ui/app.py")
     if not ui_app_path.exists():
         ui_app_path = resolve_resource_path("ui/app.py")
     config_path = resolve_resource_path("configs/default.yaml")
@@ -314,18 +314,6 @@ def launch_api(host: str = "127.0.0.1", port: int = 8000, log_level: str = "info
     uvicorn.run(fastapi_app, host=host, port=chosen_port, log_level=log_level)
 
 
-def _locate_ui_script() -> Path:
-    """Locate ``uap/ui/app.py`` across frozen and development environments."""
-    for rel in ("uap/ui/app.py", "ui/app.py", "src/omniforge/ui/app.py"):
-        candidate = resolve_resource_path(rel)
-        if candidate.is_file():
-            return candidate
-    raise FileNotFoundError(
-        "Could not locate OmniForge Workbench entry module 'uap/ui/app.py'. "
-        "Reinstall the package or rebuild the executable bundle."
-    )
-
-
 def launch_ui(
     host: str = "127.0.0.1",
     port: int = 8501,
@@ -337,9 +325,18 @@ def launch_ui(
     chosen_port = find_available_port(host, port)
     if chosen_port != port:
         logger.warning("Requested UI port busy; switched to available port", requested=port, chosen=chosen_port)
+        print(
+            f"[WARN] Port {port} is ALREADY IN USE by another process (possibly an older OmniForge instance)!\n"
+            f"       Launching this updated OmniForge UI on port {chosen_port} instead.\n"
+            f"       Open http://{('127.0.0.1' if host == '0.0.0.0' else host)}:{chosen_port} (NOT port {port})!"
+        )
 
     display_host = "127.0.0.1" if host == "0.0.0.0" else host
     url = f"http://{display_host}:{chosen_port}"
+    static_dir = Path(__file__).resolve().parent / "ui" / "static_app"
+    js_files = sorted(p.name for p in (static_dir / "assets").glob("index-*.js")) if (static_dir / "assets").is_dir() else []
+    print(f"[OmniForge UI] Package Path  : {Path(__file__).resolve().parent}")
+    print(f"[OmniForge UI] SPA Bundle    : {js_files[-1] if js_files else 'MISSING'}")
     print(f"[OmniForge UI] Starting FastAPI + React Enterprise Workbench at {url}")
 
     if open_browser:
@@ -350,7 +347,7 @@ def launch_ui(
                 except Exception as exc:
                     logger.debug("browser_auto_open_skipped", url=url, error=str(exc))
 
-        threading.Thread(target=_open_when_ready, daemon=True, name="uap-browser-opener").start()
+        threading.Thread(target=_open_when_ready, daemon=True, name="omniforge-browser-opener").start()
 
     run_workbench_server(host=host, port=chosen_port, debug=False, open_browser=False)
 
@@ -380,7 +377,7 @@ def launch_full(
     api_thread = threading.Thread(
         target=api_server.run,
         daemon=True,
-        name="uap-fastapi-server",
+        name="omniforge-fastapi-server",
     )
     api_thread.start()
 
@@ -408,7 +405,7 @@ def launch_cli(cli_args: list[str]) -> None:
     """Delegate execution to the Typer CLI."""
     from omniforge.cli.main import cli
 
-    sys.argv = ["uap", *cli_args]
+    sys.argv = ["omniforge", *cli_args]
     cli()
 
 
@@ -460,7 +457,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Primary entry point for ``uap-desktop`` and standalone ``OmniForge.exe``."""
+    """Primary entry point for ``omniforge-desktop`` and standalone ``OmniForge.exe``."""
     multiprocessing.freeze_support()
     load_dotenv_file()
 

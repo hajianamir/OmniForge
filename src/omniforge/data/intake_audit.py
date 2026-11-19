@@ -11,7 +11,7 @@ from scipy import stats
 
 from omniforge.core.logging import get_logger
 from omniforge.core.performance import smart_sample_df
-from omniforge.core.utils import to_json_safe
+from omniforge.core.utils import to_json_object
 from omniforge.data.format_audit import DataFormatAuditor
 from omniforge.data.quality import DataQualityProfiler
 
@@ -354,7 +354,7 @@ class InitialIntakeAuditor:
             critical=counts["critical"],
         )
 
-        return to_json_safe(
+        return to_json_object(
             {
                 "overall_health": health,
                 "quality_score": round(float(quality_report.overall_score), 2),

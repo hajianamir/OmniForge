@@ -35,7 +35,7 @@ class ModelCatalog:
         """Return sorted names of all registered model identifiers."""
         return sorted(self._builders.keys())
 
-    def create(self, model_name: str, **kwargs: Any) -> Any:
+    def create(self, model_name: str, **kwargs: Any) -> BaseOmniForgeModel:
         """Instantiate a registered model by name."""
         key = model_name.lower()
         if key not in self._builders:
@@ -43,7 +43,8 @@ class ModelCatalog:
                 f"Unknown model identifier '{model_name}'.",
                 suggestions=[f"Available models: {', '.join(self.list_models()[:20])}"],
             )
-        return self._builders[key](**kwargs)
+        model: BaseOmniForgeModel = self._builders[key](**kwargs)
+        return model
 
     def _register_defaults(self) -> None:
         # Baselines

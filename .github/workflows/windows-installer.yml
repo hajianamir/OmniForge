@@ -1,0 +1,184 @@
+name: Windows installer
+
+# Builds the small bootstrap installer:
+#   1. regenerate the hash-pinned locks (windows / cp313)
+#   2. stage app + embeddable CPython + uv.exe + locks + OmniForge.exe shim
+#      (scripts/build_bootstrap.py - NO PyInstaller, no C compiler)
+#   3. compile the Inno Setup wizard                      (installer/omniforge_installer_tiers.iss)
+#   4. smoke-test the payload in a *clean* venv      (tests/unit/test_capability_packs.py + a real install)
+#   5. publish the .exe + SHA256SUMS
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+    paths:
+      - "src/**"
+      - "installer/**"
+      - "scripts/build_bootstrap.py"
+      - "scripts/build_locks.py"
+      - "locks/**"
+      - "pyproject.toml"
+
+concurrency:
+  group: windows-installer-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.13"
+  UV_VERSION: "0.13.9"
+
+jobs:
+  build-installer:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install uv (build-machine only)
+        run: |
+          python -m pip install --upgrade pip uv==${{ env.UV_VERSION }}
+          uv --version
+
+      # ---------------------------------------------------------------- locks
+      - name: Regenerate hash-pinned locks (windows/cp313)
+        run: python scripts/build_locks.py
+
+      - name: Fail if committed locks are stale
+        shell: bash
+        run: |
+          git diff --exit-code -- locks/ || {
+            echo "::error::locks/*.lock are out of date — run 'python scripts/build_locks.py' and commit";
+            exit 1;
+          }
+
+      # ------------------------------------------------------------- staging
+      - name: Fetch the CPython launcher images (venvlauncher.exe)
+        shell: bash
+        run: |
+          # venvlauncher.exe/venvwlauncher.exe are the official retargetable launchers.
+          curl -sSLo "$RUNNER_TEMP/python-amd64.zip" \
+            https://www.python.org/ftp/python/3.13.9/python-3.13.9-amd64.zip
+          ls -la "$RUNNER_TEMP/python-amd64.zip"
+
+      - name: Stage the bootstrap payload
+        run: python scripts/build_bootstrap.py --cache "${{ runner.temp }}\bootstrap-cache" --launcher-zip "${{ runner.temp }}\python-amd64.zip"
+
+      - name: Verify the launcher shim is a real PE (GUI + console flavours)
+        shell: bash
+        run: |
+          ls -la dist/omniforge-bootstrap/runtime/python/OmniForge*.exe
+          # the launcher block must be appended (interpreter + script + args)
+          python -c "import pathlib; d=pathlib.Path('dist/omniforge-bootstrap/runtime/python/OmniForge.exe').read_bytes(); assert b'#!%APP_DIR%' in d[-256:], 'launcher block missing'; print('launcher block OK')"
+          python -c "import struct, pathlib; d=pathlib.Path('dist/omniforge-bootstrap/runtime/python/OmniForge.exe').read_bytes(); pe=struct.unpack_from('<I', d, 0x3C)[0]; print('machine', hex(struct.unpack_from('<H', d, pe+4)[0]), 'subsystem', struct.unpack_from('<H', d, pe+4+20+68)[0])"
+
+      - name: Show payload composition
+        shell: bash
+        run: |
+          du -sh dist/omniforge-bootstrap
+          du -sh dist/omniforge-bootstrap/*
+          echo "payload MB: $(du -sm dist/omniforge-bootstrap | cut -f1)"
+
+      # ------------------------------------------------------------ dry checks
+      - name: Lint + type-check the installers / catalogue
+        run: |
+          python -m pip install --quiet ruff mypy
+          python -m ruff check src/omniforge/capabilities.py installer/ scripts/
+          python -m mypy installer/provision.py src/omniforge/capabilities.py
+
+      # Inno's own compiler stops at the first bad line and only runs on Windows.
+      # This gate surfaces every .iss problem (identifier characters, undefined defines,
+      # missing payload paths, dead IsComponentSelected refs) on any platform, in one pass.
+      - name: Validate the .iss against the staged payload
+        run: python scripts/check_iss.py --stage dist/omniforge-bootstrap
+
+      - name: Planner smoke test (no network)
+        run: |
+          python installer/provision.py --list-packs
+          python installer/provision.py --tier advanced --check-only --app-dir dist/omniforge-bootstrap
+          python installer/provision.py --tier simple  --check-only --app-dir dist/omniforge-bootstrap
+
+      # tests/conftest.py imports omniforge, which imports the mlops/data stack: installing
+      # only pytest makes this step fail on `import sqlalchemy`. Install the package instead.
+      - name: Capability catalogue + installer-script tests
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m pip install --quiet -e ".[dev,api,ui,reporting,data,forecasting]"
+          python -m pytest tests/unit/test_capability_packs.py tests/unit/test_installer_iss.py -q
+
+      # ------------------------------------------------- real provisioning run
+      - name: Provision the Simple tier into a clean directory
+        run: |
+          python installer/provision.py --tier simple --app-dir dist/omniforge-bootstrap --data-dir "${{ runner.temp }}\\omniforge-simple" --status "${{ runner.temp }}\\simple.json"
+          type "%TEMP%\\simple.json"
+
+      - name: Provision the Advanced tier into a clean directory
+        run: |
+          python installer/provision.py --tier advanced --app-dir dist/omniforge-bootstrap --data-dir "${{ runner.temp }}\\omniforge-advanced" --status "${{ runner.temp }}\\advanced.json"
+          type "%TEMP%\\advanced.json"
+
+      - name: Prove the provisioned environment runs the product
+        shell: bash
+        run: |
+          VENV="$RUNNER_TEMP/omniforge-advanced/venv/Scripts/python.exe"
+          "$VENV" -c "import sys; sys.path.insert(0,'src'); import omniforge; print('omniforge', omniforge.__version__)"
+          "$VENV" -c "import fastapi, pandas, sklearn, statsmodels; print('advanced tier imports OK')"
+
+      # ---------------------------------------------------------------- Inno
+      - name: Install Inno Setup 6
+        run: |
+          choco install innosetup --no-progress -y
+
+      - name: Re-validate the .iss (guards against a stale local edit)
+        run: python scripts/check_iss.py --stage dist/omniforge-bootstrap
+
+      - name: Compile the installer
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            "/DStagingDir=${{ github.workspace }}\dist\omniforge-bootstrap" `
+            "installer\omniforge_installer_tiers.iss"
+
+      - name: Check installer size (budget guard)
+        shell: bash
+        run: |
+          EXE=$(ls dist/installer/*.exe | head -n1)
+          MB=$(( $(stat -c%s "$EXE") / 1000000 ))
+          echo "installer: $EXE — ${MB} MB"
+          if [ "$MB" -gt 120 ]; then
+            echo "::error::installer exceeded the 120 MB budget (got ${MB} MB) — payload grew unexpectedly"
+            exit 1
+          fi
+
+      - name: Silent-install smoke test
+        run: |
+          $EXE = Get-ChildItem dist\installer\*.exe | Select-Object -First 1
+          Start-Process -FilePath $EXE.FullName -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=${{ runner.temp }}\OmniForgeTest","/LOG=${{ runner.temp }}\install.log" -Wait
+          Get-Content "${{ runner.temp }}\install.log" -Tail 40
+          Test-Path "${{ runner.temp }}\OmniForgeTest\runtime\python\OmniForge.exe"
+          Test-Path "${{ runner.temp }}\OmniForgeTest\runtime\uv.exe"
+          Test-Path "${{ runner.temp }}\OmniForgeTest\locks\advanced.lock"
+
+      # ------------------------------------------------------------- artifacts
+      - name: Write SHA256SUMS
+        shell: bash
+        run: |
+          cd dist/installer
+          sha256sum *.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: omniforge-windows-installer
+          path: |
+            dist/installer/*.exe
+            dist/installer/SHA256SUMS.txt
+            dist/omniforge-bootstrap/manifest.json
+          retention-days: 30

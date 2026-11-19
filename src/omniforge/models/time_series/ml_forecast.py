@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 
 from omniforge.core.exceptions import ForecastingError
 from omniforge.core.types import TaskType
@@ -78,7 +79,8 @@ class MLForecaster:
         X_mat = np.vstack(rows)
         y_vec = np.asarray(targets, dtype=float)
 
-        # Hold out last 20% for split conformal interval calibration
+        # Hold out last 20% for split conformal interval calibration (Angelopoulos & Bates 2021)
+        alpha = float(np.clip(1.0 - self.confidence_level, 1e-4, 0.5))
         cal_size = max(5, int(len(X_mat) * 0.2))
         if len(X_mat) > cal_size + 10:
             cal_model = ClassicalMLModel(
@@ -89,9 +91,12 @@ class MLForecaster:
             )
             cal_model.fit(X_mat[:-cal_size], y_vec[:-cal_size])
             cal_resid = np.abs(y_vec[-cal_size:] - cal_model.predict(X_mat[-cal_size:]))
-            self._conformal_q = float(np.quantile(cal_resid, min(self.confidence_level, 0.99)))
+            n_cal = len(cal_resid)
+            k = min(max(int(np.ceil((n_cal + 1) * (1.0 - alpha))), 1), n_cal)
+            self._conformal_q = float(np.partition(cal_resid, k - 1)[k - 1])
         else:
-            self._conformal_q = float(np.std(np.diff(arr))) * 1.96
+            z_crit = float(stats.norm.ppf(1.0 - alpha / 2.0))
+            self._conformal_q = float(np.std(np.diff(arr), ddof=1)) * z_crit if len(arr) > 2 else 1.0
 
         self._model = ClassicalMLModel(
             algorithm=self.algorithm,

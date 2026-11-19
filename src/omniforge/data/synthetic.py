@@ -67,8 +67,15 @@ class SyntheticDataGenerator:
             if z_matrix.shape[1] == 1:
                 corr = np.array([[1.0]])
             else:
-                corr = np.corrcoef(z_matrix, rowvar=False)
-                corr = np.nan_to_num(corr, nan=0.0)
+                z_std = np.std(z_matrix, axis=0)
+                non_const = z_std > 1e-12
+                corr = np.eye(z_matrix.shape[1], dtype=float)
+                if int(np.sum(non_const)) >= 2:
+                    sub_corr = np.corrcoef(z_matrix[:, non_const], rowvar=False)
+                    sub_corr = np.nan_to_num(sub_corr, nan=0.0)
+                    idx_nc = np.where(non_const)[0]
+                    corr[np.ix_(idx_nc, idx_nc)] = sub_corr
+                corr = 0.5 * (corr + corr.T)
                 np.fill_diagonal(corr, 1.0)
                 # Ensure positive semi-definiteness via eigenvalue clipping
                 eigvals, eigvecs = np.linalg.eigh(corr)
@@ -101,9 +108,9 @@ class SyntheticDataGenerator:
                 if len(non_null) == 0:
                     out[col] = pd.NaT
                 else:
-                    ts_int = non_null.astype("int64").to_numpy()
+                    ts_int = non_null.astype("datetime64[ns]").astype("int64").to_numpy()
                     sampled_ts = rng.uniform(float(ts_int.min()), float(ts_int.max()), size=n).astype("int64")
-                    out[col] = pd.to_datetime(sampled_ts)
+                    out[col] = pd.to_datetime(sampled_ts, unit="ns")
             else:
                 counts = series.value_counts(dropna=False)
                 probs = (counts / counts.sum()).to_numpy(dtype=float)

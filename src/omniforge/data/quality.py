@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -266,13 +267,13 @@ class DataQualityProfiler:
         ts = pd.to_datetime(df[ts_col], errors="coerce", utc=True).dropna()
         if len(ts) == 0:
             return 50.0
-        latest = ts.max().to_pydatetime()
+        latest = pd.Timestamp(ts.max()).to_pydatetime()
         now = datetime.now(UTC)
         age_days = max(0.0, (now - latest).total_seconds() / 86400.0)
         if age_days <= max_freshness_days * 0.25:
             return 100.0
         decay = max(0.0, 1.0 - age_days / max(max_freshness_days * 2.0, 1.0))
-        return round(decay * 100.0, 2)
+        return float(round(decay * 100.0, 2))
 
     @staticmethod
     def _score_to_grade(score: float) -> str:
@@ -287,3 +288,78 @@ class DataQualityProfiler:
         if score >= 60.0:
             return "D"
         return "F"
+
+    @staticmethod
+    def little_mcar_test(df: pd.DataFrame, alpha: float = 0.05) -> dict[str, Any]:
+        """Little's (1988) MCAR chi-square test on numeric columns with missing values."""
+        from scipy import stats
+
+        num_df = df.select_dtypes(include=[np.number]).copy()
+        num_df = num_df.loc[:, num_df.isna().any(axis=0) & ~num_df.isna().all(axis=0)]
+        if num_df.shape[1] < 2 or len(num_df) < 10:
+            return {
+                "status": "not_applicable",
+                "reason": "Need at least 2 numeric columns with partial missingness and >= 10 rows.",
+                "statistic": None,
+                "df": None,
+                "p_value": None,
+                "is_mcar": None,
+            }
+
+        mu_hat = num_df.mean(axis=0).to_numpy(dtype=float)
+        sigma_hat = num_df.cov().to_numpy(dtype=float)
+        if np.any(~np.isfinite(mu_hat)) or np.any(~np.isfinite(sigma_hat)):
+            return {
+                "status": "not_applicable",
+                "reason": "Insufficient pairwise observations to estimate covariance.",
+                "statistic": None,
+                "df": None,
+                "p_value": None,
+                "is_mcar": None,
+            }
+
+        patterns = num_df.notna().apply(lambda r: tuple(r.tolist()), axis=1)
+        chi2_stat = 0.0
+        total_obs_dims = 0
+        n_patterns = 0
+        p = num_df.shape[1]
+
+        for pat, idx in patterns.groupby(patterns).groups.items():
+            obs_mask = np.asarray(pat, dtype=bool)
+            p_j = int(obs_mask.sum())
+            if p_j == 0:
+                continue
+            sub = num_df.loc[idx, num_df.columns[obs_mask]].to_numpy(dtype=float)
+            n_j = len(sub)
+            if n_j == 0:
+                continue
+            n_patterns += 1
+            total_obs_dims += p_j
+            y_bar_j = sub.mean(axis=0)
+            diff = y_bar_j - mu_hat[obs_mask]
+            cov_j = sigma_hat[np.ix_(obs_mask, obs_mask)]
+            cov_inv = np.linalg.pinv(cov_j)
+            chi2_stat += float(n_j * (diff @ cov_inv @ diff))
+
+        dof = total_obs_dims - p
+        if dof <= 0 or n_patterns <= 1:
+            return {
+                "status": "not_applicable",
+                "reason": "Insufficient distinct missingness patterns for Little's MCAR test.",
+                "statistic": round(chi2_stat, 6),
+                "df": int(max(0, dof)),
+                "p_value": None,
+                "is_mcar": None,
+            }
+
+        p_val = float(stats.chi2.sf(chi2_stat, df=dof))
+        return {
+            "status": "completed",
+            "statistic": round(chi2_stat, 6),
+            "df": int(dof),
+            "p_value": round(p_val, 6),
+            "alpha": float(alpha),
+            "is_mcar": bool(p_val >= alpha),
+            "n_patterns": int(n_patterns),
+        }
+

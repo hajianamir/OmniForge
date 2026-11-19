@@ -76,7 +76,7 @@ class CarbonReport(BaseModel):
     """Structured carbon and energy footprint telemetry for a compute operation."""
 
     operation_name: str
-    tracker_backend: str = "uap_hardware_estimator"
+    tracker_backend: str = "omniforge_hardware_estimator"
     duration_seconds: float = 0.0
     energy_kwh: float = 0.0
     emissions_kg_co2eq: float = 0.0
@@ -136,7 +136,7 @@ class ModelMetadata(BaseModel):
     model_family: str
     task_type: TaskType
     version: str = "1.0.0"
-    framework: str = "uap"
+    framework: str = "omniforge"
     hyperparameters: dict[str, Any] = Field(default_factory=dict)
     feature_names: list[str] = Field(default_factory=list)
     target_name: str | None = None

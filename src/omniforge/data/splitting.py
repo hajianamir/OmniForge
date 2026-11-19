@@ -154,7 +154,7 @@ class LeakageSafeSplitter:
                     "Group split requires a valid 'group_col' column in the dataset.",
                     suggestions=["Select a patient_id, customer_id, machine_id, or entity grouping column."],
                 )
-            groups = work[gcol].astype(str).fillna("__MISSING_GROUP__").to_numpy()
+            groups = work[gcol].fillna("__MISSING_GROUP__").astype(str).to_numpy()
             if len(np.unique(groups)) < 2:
                 raise DataValidationError(
                     f"Group column '{gcol}' has fewer than 2 unique groups; cannot perform Group split."
@@ -185,9 +185,14 @@ class LeakageSafeSplitter:
                     except Exception:
                         strat_vec = None
                 else:
-                    cand = t_ser.astype(str).fillna("__NA__").to_numpy()
+                    cand = t_ser.fillna("__NA__").astype(str).to_numpy()
                     if pd.Series(cand).value_counts().min() >= 2:
                         strat_vec = cand
+
+            if strat_vec is not None:
+                n_test_est = max(1, int(np.floor(n * self.config.test_size)))
+                if n_test_est < len(np.unique(strat_vec)):
+                    strat_vec = None
 
             tr_raw, te_raw = train_test_split(
                 all_pos,
@@ -200,7 +205,10 @@ class LeakageSafeSplitter:
             if self.config.val_size > 0.0 and len(train_idx) >= 6:
                 rel_val = min(0.45, self.config.val_size / max(1.0 - self.config.test_size, 0.2))
                 sub_strat = strat_vec[train_idx] if strat_vec is not None else None
-                if sub_strat is not None and pd.Series(sub_strat).value_counts().min() < 2:
+                if sub_strat is not None and (
+                    pd.Series(sub_strat).value_counts().min() < 2
+                    or int(np.floor(len(train_idx) * rel_val)) < len(np.unique(sub_strat))
+                ):
                     sub_strat = None
                 sub_tr, sub_va = train_test_split(
                     train_idx, test_size=rel_val, random_state=self.config.random_seed + 1, stratify=sub_strat
@@ -276,37 +284,51 @@ class LeakageSafeSplitter:
         ]
         warnings: list[str] = []
 
-        # Group isolation check
+        # Group isolation check across Train, Validation, and Test
         group_overlap = 0
         if self.config.group_col and self.config.group_col in df.columns:
-            tr_g = set(df.iloc[train_idx][self.config.group_col].astype(str))
-            te_g = set(df.iloc[test_idx][self.config.group_col].astype(str))
-            group_overlap = len(tr_g & te_g)
+            tr_g = set(df.iloc[train_idx][self.config.group_col].fillna("__MISSING_GROUP__").astype(str))
+            te_g = set(df.iloc[test_idx][self.config.group_col].fillna("__MISSING_GROUP__").astype(str))
+            va_g = (
+                set(df.iloc[val_idx][self.config.group_col].fillna("__MISSING_GROUP__").astype(str))
+                if val_idx is not None and len(val_idx) > 0
+                else set()
+            )
+            group_overlap = len(tr_g & te_g) + len(tr_g & va_g) + len(va_g & te_g)
             checks.append(
                 {
                     "check": f"Entity Group Isolation ('{self.config.group_col}')",
                     "passed": group_overlap == 0,
-                    "details": f"Shared groups across Train/Test: {group_overlap}",
+                    "details": f"Shared groups across Train/Val/Test: {group_overlap}",
                 }
             )
             if group_overlap > 0:
                 warnings.append(
-                    f"Group leakage detected: {group_overlap} entity group(s) in '{self.config.group_col}' appear in both Train and Test."
+                    f"Group leakage detected: {group_overlap} entity group(s) in '{self.config.group_col}' appear across split boundaries."
                 )
 
-        # Temporal non-inversion check
+        # Temporal non-inversion check across Train, Validation, and Test
         temporal_valid = True
         temporal_boundary = ""
         if self.config.time_col and self.config.time_col in df.columns:
             t_tr = pd.to_datetime(df.iloc[train_idx][self.config.time_col], errors="coerce", format="mixed").dropna()
             t_te = pd.to_datetime(df.iloc[test_idx][self.config.time_col], errors="coerce", format="mixed").dropna()
+            t_va = (
+                pd.to_datetime(df.iloc[val_idx][self.config.time_col], errors="coerce", format="mixed").dropna()
+                if val_idx is not None and len(val_idx) > 0
+                else pd.Series(dtype="datetime64[ns]")
+            )
             if not t_tr.empty and not t_te.empty:
                 max_tr, min_te = t_tr.max(), t_te.min()
-                temporal_valid = bool(max_tr <= min_te)
-                temporal_boundary = f"Train max={max_tr} | Test min={min_te}"
+                if not t_va.empty:
+                    temporal_valid = bool((max_tr <= t_va.min()) and (t_va.max() <= min_te))
+                    temporal_boundary = f"Train max={max_tr} | Val=[{t_va.min()}, {t_va.max()}] | Test min={min_te}"
+                else:
+                    temporal_valid = bool(max_tr <= min_te)
+                    temporal_boundary = f"Train max={max_tr} | Test min={min_te}"
                 checks.append(
                     {
-                        "check": f"Chronological Order ('{self.config.time_col}': max(Train) <= min(Test))",
+                        "check": f"Chronological Order ('{self.config.time_col}': max(Train) <= min(Val) <= min(Test))",
                         "passed": temporal_valid,
                         "details": temporal_boundary,
                     }
@@ -533,3 +555,73 @@ class LeakageSafePipelineBuilder:
             "overfit_gap": round(float(np.mean(raw_train) - np.mean(raw_test)) if is_clf else float(np.mean(raw_test) - np.mean(raw_train)), 6),
             "pipeline_template": pipe,
         }
+
+
+class CombinatorialPurgedKFold:
+    """Combinatorial Purged Cross-Validation (CPCV) for time-series with overlapping labels.
+
+    Generates all ``C(n_splits, n_test_splits)`` combinations of test folds,
+    applying a symmetric ``purge_gap`` around each test block and an ``embargo_pct``
+    buffer immediately following each test block to prevent temporal label leakage.
+    """
+
+    def __init__(
+        self,
+        n_splits: int = 6,
+        n_test_splits: int = 2,
+        purge_gap: int = 0,
+        embargo_pct: float = 0.0,
+    ) -> None:
+        if n_splits < 2:
+            raise ValueError("n_splits must be >= 2.")
+        if n_test_splits < 1 or n_test_splits >= n_splits:
+            raise ValueError("n_test_splits must satisfy 1 <= n_test_splits < n_splits.")
+        if purge_gap < 0:
+            raise ValueError("purge_gap must be >= 0.")
+        if not 0.0 <= embargo_pct < 1.0:
+            raise ValueError("embargo_pct must be in [0.0, 1.0).")
+        self.n_splits = n_splits
+        self.n_test_splits = n_test_splits
+        self.purge_gap = purge_gap
+        self.embargo_pct = embargo_pct
+
+    def get_n_splits(
+        self,
+        X: Any = None,
+        y: Any = None,
+        groups: Any = None,
+    ) -> int:
+        from math import comb
+
+        return comb(self.n_splits, self.n_test_splits)
+
+    def split(
+        self,
+        X: Any,
+        y: Any = None,
+        groups: Any = None,
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        from itertools import combinations
+
+        n_samples = len(X)
+        if n_samples < self.n_splits:
+            raise ValueError(f"Cannot have n_splits={self.n_splits} greater than n_samples={n_samples}.")
+
+        indices = np.arange(n_samples)
+        fold_bounds = np.array_split(indices, self.n_splits)
+        embargo = int(np.ceil(n_samples * self.embargo_pct))
+        splits: list[tuple[np.ndarray, np.ndarray]] = []
+
+        for test_fold_ids in combinations(range(self.n_splits), self.n_test_splits):
+            test_idx = np.concatenate([fold_bounds[i] for i in test_fold_ids])
+            excluded = np.zeros(n_samples, dtype=bool)
+            for fid in test_fold_ids:
+                block = fold_bounds[fid]
+                start, end = int(block[0]), int(block[-1]) + 1
+                purge_start = max(0, start - self.purge_gap)
+                purge_end = min(n_samples, end + self.purge_gap + embargo)
+                excluded[purge_start:purge_end] = True
+            train_idx = indices[~excluded]
+            splits.append((train_idx, test_idx))
+        return splits
+

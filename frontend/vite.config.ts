@@ -9,6 +9,23 @@ export default defineConfig({
     emptyOutDir: true,
     sourcemap: false,
     target: 'es2020',
+    chunkSizeWarningLimit: 600,
+    rollupOptions: {
+      output: {
+        // Isolate rarely-changing vendor code into long-lived cacheable chunks.
+        // Studios themselves are split further via React.lazy in App.tsx.
+        manualChunks(id: string): string | undefined {
+          if (!id.includes('node_modules')) return undefined;
+          if (id.includes('node_modules/react-dom') || id.includes('node_modules/react/')) {
+            return 'react-vendor';
+          }
+          if (id.includes('node_modules/lucide-react')) {
+            return 'icons-vendor';
+          }
+          return 'vendor';
+        },
+      },
+    },
   },
   server: {
     host: '0.0.0.0',

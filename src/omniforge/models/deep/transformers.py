@@ -16,7 +16,7 @@ from omniforge.models.deep.mlp import MLPModel
 def _layer_norm(x: np.ndarray, eps: float = 1e-5) -> np.ndarray:
     mean = np.mean(x, axis=-1, keepdims=True)
     var = np.var(x, axis=-1, keepdims=True)
-    return (x - mean) / np.sqrt(var + eps)
+    return np.asarray((x - mean) / np.sqrt(var + eps), dtype=float)
 
 
 class TabularTransformerModel(BaseOmniForgeModel):
@@ -117,7 +117,7 @@ class TabularTransformerModel(BaseOmniForgeModel):
             self._fit_torch(X_scaled, y, is_clf)
             return
 
-        self.framework = "uap_numpy_transformer"
+        self.framework = "omniforge_numpy_transformer"
         self.metadata_.framework = self.framework
         self._init_numpy_transformer(X_scaled.shape[1])
         encoded = self._encode_numpy(X_scaled)
@@ -133,9 +133,9 @@ class TabularTransformerModel(BaseOmniForgeModel):
         self.loss_history_: list[float] = list(self._head.loss_history_)
 
     def _fit_torch(self, X: np.ndarray, y: np.ndarray, is_clf: bool) -> None:
-        import torch  # type: ignore[import-not-found]
-        import torch.nn as nn  # type: ignore[import-not-found]
-        import torch.nn.functional as F  # type: ignore[import-not-found]
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
 
         self.framework = "pytorch_ft_transformer"
         self.metadata_.framework = self.framework
@@ -173,7 +173,8 @@ class TabularTransformerModel(BaseOmniForgeModel):
                 self.last_attn_weights = attn_w
                 x = x + attn_out
                 u, v = self.ffn_in(self.norm2(x)).chunk(2, dim=-1)
-                return x + self.ffn_out(self.ffn_drop(u * F.gelu(v)))
+                out: torch.Tensor = x + self.ffn_out(self.ffn_drop(u * F.gelu(v)))
+                return out
 
         class _FTTransformer(nn.Module):
             def __init__(self) -> None:
@@ -224,7 +225,8 @@ class TabularTransformerModel(BaseOmniForgeModel):
         with torch.no_grad():
             _ = net(X_t[: min(n, 256)])
             # Extract [CLS]-to-feature attention importance from final Transformer layer
-            w_last = net.blocks[-1].last_attn_weights
+            last_blk: Any = net.blocks[-1]
+            w_last: Any = last_blk.last_attn_weights
             if w_last is not None:
                 cls_to_feat = w_last[:, 0, 1:].mean(dim=0).cpu().numpy()
                 s_val = float(np.sum(cls_to_feat))
@@ -235,24 +237,24 @@ class TabularTransformerModel(BaseOmniForgeModel):
     def _predict(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
         X_scaled = self._scaler.transform(X)
         if self._torch_net is not None:
-            import torch  # type: ignore[import-not-found]
+            import torch
 
             with torch.no_grad():
                 out = self._torch_net(torch.tensor(X_scaled.astype(np.float32))).numpy()
             if self.task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
                 return np.array([self._idx_to_label[int(i)] for i in np.argmax(out, axis=1)])
-            return out.ravel()
+            return np.asarray(out.ravel(), dtype=float)
         assert self._head is not None
         return self._head.predict(self._encode_numpy(X_scaled))
 
     def _predict_proba(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
         X_scaled = self._scaler.transform(X)
         if self._torch_net is not None:
-            import torch  # type: ignore[import-not-found]
+            import torch
 
             with torch.no_grad():
                 logits = self._torch_net(torch.tensor(X_scaled.astype(np.float32)))
-                return torch.softmax(logits, dim=-1).numpy().astype(float)
+                return np.asarray(torch.softmax(logits, dim=-1).numpy(), dtype=float)
         assert self._head is not None
         return self._head.predict_proba(self._encode_numpy(X_scaled))
 

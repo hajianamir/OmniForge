@@ -1,18 +1,36 @@
 import React, { useEffect, useState } from 'react';
 import { AlertTriangle, CheckCircle2, Database, FileSpreadsheet, Play, ShieldAlert, TrendingDown, TrendingUp, Wrench } from 'lucide-react';
-import { apiDownload, apiGet, apiPost, apiUpload } from '../api';
+import { apiDownload, apiGet, apiPost, apiUpload, toErrorMessage } from '../api';
 import { BarChartSVG, DivergingDriverBarSVG, SPCControlSVG, SupervisoryTrendSVG } from '../components/Charts';
 import { SimpleTable } from '../components/DataGrid';
 import { StudioHelpButton } from '../components/HelpGuideModal';
 import { MathEquationCard } from '../components/MathEquation';
+import type {
+  ExcelSheetsResponse,
+  JsonRow,
+  EquationPayload,
+  RootCauseReport,
+  SQLInspectResponse,
+  StateEnvelope,
+  SupervisoryAlarm,
+  SupervisoryEvaluateResponse,
+  SupervisoryEvaluation,
+  SupervisoryModelInfo,
+  SupervisoryStatusResponse,
+  SupervisoryTrainResponse,
+  TableInfo,
+} from '../studioTypes';
 import { ProvenancePill, type StudioProps } from './StudiosPart1';
+
+/** Shape consumed by `SPCControlSVG` (Shewhart chart points). */
+type SPCControlPoint = { index: number; record_id?: string; residual: number; z_score?: number; severity?: string };
 
 /**
  * Studio 14 — Live Prediction, Actual-vs-Baseline Evaluation, Configurable Error Tolerance,
  * Multi-Source Connectors (XLSX, SQL, MS Access, Telemetry Sim, Single Probe) & Engineering Supervisory Dashboard.
  */
 export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioCache, setStudioResult, openHelp }) => {
-  const [models, setModels] = useState<any[]>([]);
+  const [models, setModels] = useState<SupervisoryModelInfo[]>([]);
   const [selectedModelId, setSelectedModelId] = useState('');
   const [selectedBaselineId, setSelectedBaselineId] = useState('');
   const [quickMethod, setQuickMethod] = useState('ridge');
@@ -37,13 +55,13 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
 
   // Source B: SQL Database
   const [sqlUrl, setSqlUrl] = useState('');
-  const [sqlTables, setSqlTables] = useState<any[]>([]);
+  const [sqlTables, setSqlTables] = useState<TableInfo[]>([]);
   const [sqlTable, setSqlTable] = useState('');
   const [sqlQuery, setSqlQuery] = useState('');
 
   // Source C: MS Access
   const [accessPath, setAccessPath] = useState('');
-  const [accessTables, setAccessTables] = useState<any[]>([]);
+  const [accessTables, setAccessTables] = useState<TableInfo[]>([]);
   const [accessTable, setAccessTable] = useState('');
 
   // Source D: Operational Telemetry Simulation
@@ -56,28 +74,28 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
   const [singleActual, setSingleActual] = useState('');
 
   // Results & History (hydrated immediately from studioCache + /s14/models)
-  const [localEvalRes, setLocalEvalRes] = useState<any>(null);
+  const [localEvalRes, setLocalEvalRes] = useState<SupervisoryEvaluation | null>(null);
   const evalRes = localEvalRes ?? studioCache.s14_supervisory ?? null;
-  const setEvalRes = (val: any) => {
+  const setEvalRes = (val: SupervisoryEvaluation) => {
     setLocalEvalRes(val);
     setStudioResult('s14_supervisory', val);
   };
-  const [history, setHistory] = useState<any[]>(studioCache.s14_supervisory?.history || []);
+  const [history, setHistory] = useState<JsonRow[]>(studioCache.s14_supervisory?.history || []);
   const [alarmFilter, setAlarmFilter] = useState<'ALL' | 'CRITICAL' | 'WARNING'>('ALL');
   const [selectedAlarmIdx, setSelectedAlarmIdx] = useState<number>(0);
-  const [previewChampEq, setPreviewChampEq] = useState<any>(null);
-  const [previewBaseEq, setPreviewBaseEq] = useState<any>(null);
+  const [previewChampEq, setPreviewChampEq] = useState<EquationPayload | null>(null);
+  const [previewBaseEq, setPreviewBaseEq] = useState<EquationPayload | null>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   const loadModels = async () => {
     try {
-      const r = await apiGet('/api/workbench/s14/models');
+      const r = await apiGet<SupervisoryStatusResponse>('/api/workbench/s14/models');
       const list = r.models || [];
       setModels(list);
       if (list.length && !selectedModelId) {
-        setSelectedModelId(list[0].model_id);
+        setSelectedModelId(list[0]?.model_id ?? '');
       }
       if (r.last_evaluation) setEvalRes(r.last_evaluation);
       if (r.history) setHistory(r.history);
@@ -97,7 +115,7 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
     const q = new URLSearchParams();
     q.set('model_id', mid);
     if (selectedBaselineId) q.set('baseline_model_id', selectedBaselineId);
-    apiGet(`/api/workbench/s14/equations?${q.toString()}`)
+    apiGet<SupervisoryStatusResponse>(`/api/workbench/s14/equations?${q.toString()}`)
       .then((r) => {
         if (r?.champion_equation) setPreviewChampEq(r.champion_equation);
         if (r?.baseline_equation) setPreviewBaseEq(r.baseline_equation);
@@ -127,13 +145,13 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
   const handleQuickTrain = async () => {
     setBusy(true); setErr(null); setMsg(null);
     try {
-      const res = await apiPost('/api/workbench/s14/quick-train', { method: quickMethod, epochs: 15 });
+      const res = await apiPost<SupervisoryTrainResponse>('/api/workbench/s14/quick-train', { method: quickMethod, epochs: 15 });
       setModels(res.models || []);
-      const newest = (res.models || []).find((m: any) => m.label.includes(res.trained_model)) || (res.models || [])[0];
+      const newest = (res.models || []).find((m) => m.label.includes(res.trained_model ?? '')) || (res.models || [])[0];
       if (newest) setSelectedModelId(newest.model_id);
       onSync(res.state);
       setMsg(`Trained '${res.trained_model}' (${res.metric}=${res.score}) and registered in Supervisory Monitor.`);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -146,10 +164,10 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
       try {
         const fd = new FormData();
         fd.append('file', file);
-        const info = await apiUpload('/api/workbench/s01/excel-sheets', fd);
+        const info = await apiUpload<ExcelSheetsResponse>('/api/workbench/s01/excel-sheets', fd);
         const sheets: string[] = info.sheets || [];
         setFileSheets(sheets);
-        if (sheets.length) setSelectedSheet(sheets[0]);
+        if (sheets.length) setSelectedSheet(sheets[0] ?? '');
       } catch {
         // Fallback single-sheet
       }
@@ -177,38 +195,38 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
       fd.append('warning_fraction', String(t.warning_fraction));
       fd.append('max_batch_breach_rate_pct', String(t.max_batch_breach_rate_pct));
       fd.append('min_classification_accuracy_pct', String(t.min_classification_accuracy_pct));
-      const res = await apiUpload('/api/workbench/s14/evaluate-file', fd);
+      const res = await apiUpload<SupervisoryEvaluateResponse>('/api/workbench/s14/evaluate-file', fd);
       onSync(res.state); setEvalRes(res); setHistory(res.history || []);
       setMsg(`Evaluated '${liveFile.name}' — Status: ${res.system_status} (${res.kpis?.breach_count ?? 0} tolerance breaches).`);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const connectDemoSQL = async () => {
     setBusy(true); setErr(null);
     try {
-      const info = await apiPost('/api/workbench/s01/sql/demo', {});
-      setSqlUrl(info.connection_url);
+      const info = await apiPost<SQLInspectResponse>('/api/workbench/s01/sql/demo', {});
+      setSqlUrl(info.connection_url ?? '');
       setSqlTables(info.tables || []);
-      const liveTbl = (info.tables || []).find((t: any) => t.name.includes('live')) || (info.tables || [])[0];
+      const liveTbl = (info.tables || []).find((t) => t.name.includes('live')) || (info.tables || [])[0];
       if (liveTbl) setSqlTable(liveTbl.name);
       setMsg('Connected to Demo Enterprise SQLite DB — ready to score live_turbine_monitoring_batch!');
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const inspectSQL = async () => {
     if (!sqlUrl.trim()) return;
     setBusy(true); setErr(null);
     try {
-      const info = await apiPost('/api/workbench/s01/sql/inspect', { connection_url: sqlUrl });
+      const info = await apiPost<SQLInspectResponse>('/api/workbench/s01/sql/inspect', { connection_url: sqlUrl });
       setSqlTables(info.tables || []);
-      if (info.tables?.length) setSqlTable(info.tables[0].name);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+      if (info.tables?.length) setSqlTable(info.tables[0]?.name ?? '');
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const evaluateSQL = async () => {
     setBusy(true); setErr(null); setMsg(null);
     try {
-      const res = await apiPost('/api/workbench/s14/evaluate-sql', {
+      const res = await apiPost<SupervisoryEvaluateResponse>('/api/workbench/s14/evaluate-sql', {
         ...tolPayload(),
         connection_url: sqlUrl,
         table_name: sqlQuery.trim() ? null : (sqlTable || null),
@@ -216,36 +234,36 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
       });
       onSync(res.state); setEvalRes(res); setHistory(res.history || []);
       setMsg(`SQL Live Evaluation complete — Status: ${res.system_status} (${res.kpis?.breach_count ?? 0} breaches).`);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const inspectAccess = async () => {
     if (!accessPath.trim()) return;
     setBusy(true); setErr(null);
     try {
-      const info = await apiPost('/api/workbench/s01/access/inspect', { file_path: accessPath });
+      const info = await apiPost<SQLInspectResponse>('/api/workbench/s01/access/inspect', { file_path: accessPath });
       setAccessTables(info.tables || []);
-      if (info.tables?.length) setAccessTable(info.tables[0].name);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+      if (info.tables?.length) setAccessTable(info.tables[0]?.name ?? '');
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const evaluateAccess = async () => {
     setBusy(true); setErr(null); setMsg(null);
     try {
-      const res = await apiPost('/api/workbench/s14/evaluate-access', {
+      const res = await apiPost<SupervisoryEvaluateResponse>('/api/workbench/s14/evaluate-access', {
         ...tolPayload(),
         file_path: accessPath,
         table_name: accessTable,
       });
       onSync(res.state); setEvalRes(res); setHistory(res.history || []);
       setMsg(`MS Access Live Evaluation complete — Status: ${res.system_status}.`);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const evaluateDemoBatch = async () => {
     setBusy(true); setErr(null); setMsg(null);
     try {
-      const res = await apiPost('/api/workbench/s14/evaluate-demo-batch', {
+      const res = await apiPost<SupervisoryEvaluateResponse>('/api/workbench/s14/evaluate-demo-batch', {
         ...tolPayload(),
         n_rows: simRows,
         inject_fault_pct: simFaultPct,
@@ -253,7 +271,7 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
       });
       onSync(res.state); setEvalRes(res); setHistory(res.history || []);
       setMsg(`Supervisory evaluation complete — Status: ${res.system_status} (${res.kpis?.breach_count ?? 0} breaches, ${res.kpis?.warning_count ?? 0} warnings).`);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const evaluateSingle = async () => {
@@ -261,19 +279,19 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
     try {
       const activeModelObj = models.find((m) => m.model_id === selectedModelId) || models[0];
       const fCols: string[] = activeModelObj?.feature_cols?.length ? activeModelObj.feature_cols : ws.numeric_columns.slice(0, 8);
-      const rec: Record<string, any> = {};
+      const rec: Record<string, string | number> = {};
       fCols.forEach((c) => {
         const rawV = singleInputs[c];
         rec[c] = rawV !== undefined && rawV !== '' ? (Number.isNaN(Number(rawV)) ? rawV : Number(rawV)) : 0;
       });
-      const res = await apiPost('/api/workbench/s14/evaluate-single', {
+      const res = await apiPost<SupervisoryEvaluateResponse>('/api/workbench/s14/evaluate-single', {
         ...tolPayload(),
         record: rec,
         actual_value: singleActual.trim() ? (Number.isNaN(Number(singleActual)) ? singleActual : Number(singleActual)) : null,
       });
       onSync(res.state); setEvalRes(res); setHistory(res.history || []);
       setMsg(`Single reading evaluated — Status: ${res.system_status}.`);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const activeModelMeta = models.find((m) => m.model_id === selectedModelId) || models[0];
@@ -286,14 +304,14 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
         ? 'warning'
         : 'normal';
 
-  const filteredAlarms = (evalRes?.alarms || []).filter((a: any) =>
+  const filteredAlarms = (evalRes?.alarms || []).filter((a) =>
     alarmFilter === 'ALL' ? true : String(a.severity || '').toUpperCase().includes(alarmFilter),
   );
   const activeChampEq = evalRes?.champion_equation || previewChampEq;
   const activeBaseEq = evalRes?.baseline_equation || previewBaseEq;
   const rootCause = evalRes?.root_cause_analysis || null;
   const gainVsBase = evalRes?.kpis?.model_vs_baseline_lift_pct ?? evalRes?.kpis?.mae_improvement_vs_baseline_pct;
-  const alarmDisplayRows = filteredAlarms.map((a: any) => ({
+  const alarmDisplayRows = filteredAlarms.map((a) => ({
     row_id: a.row_id,
     severity: a.severity,
     actual: a.actual,
@@ -405,6 +423,7 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
                 defaultOpenCode
                 eq={{
                   ...activeChampEq,
+                  model_name: activeChampEq.model_name || 'Monitoring Champion',
                   acceptance_status: 'ACTIVE MONITORING CHAMPION',
                 }}
               />
@@ -415,6 +434,7 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
               <MathEquationCard
                 eq={{
                   ...activeBaseEq,
+                  model_name: activeBaseEq.model_name || 'Reference Baseline',
                   acceptance_status: 'REFERENCE BASELINE EQUATION',
                 }}
               />
@@ -512,7 +532,7 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
                 <button className="btn" disabled={busy || !sqlUrl.trim()} onClick={inspectSQL}>Inspect Tables</button>
                 {sqlTables.length > 0 && (
                   <select value={sqlTable} onChange={(e) => setSqlTable(e.target.value)} style={{ flex: 1 }}>
-                    {sqlTables.map((t: any) => <option key={t.name} value={t.name}>{t.name} ({t.row_count ?? '?'} rows)</option>)}
+                    {sqlTables.map((t) => <option key={t.name} value={t.name}>{t.name} ({t.row_count ?? '?'} rows)</option>)}
                   </select>
                 )}
               </div>
@@ -536,7 +556,7 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
                 <button className="btn" disabled={busy || !accessPath.trim()} onClick={inspectAccess}>Inspect Tables</button>
                 {accessTables.length > 0 && (
                   <select value={accessTable} onChange={(e) => setAccessTable(e.target.value)} style={{ flex: 1 }}>
-                    {accessTables.map((t: any) => <option key={t.name} value={t.name}>{t.name}</option>)}
+                    {accessTables.map((t) => <option key={t.name} value={t.name}>{t.name}</option>)}
                   </select>
                 )}
               </div>
@@ -602,34 +622,34 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
                   {statusKey === 'critical' && <ShieldAlert size={18} color="#ef4444" />}
                   {statusKey === 'warning' && <AlertTriangle size={18} color="#f59e0b" />}
                   {statusKey === 'normal' && <CheckCircle2 size={18} color="#22c55e" />}
-                  SYSTEM STATUS: {evalRes.system_status}
+                  SYSTEM STATUS: {String(evalRes.system_status ?? 'N/A')}
                 </div>
                 <div style={{ fontSize: 12.2, color: 'var(--text-muted)' }}>
-                  Model: <strong>{evalRes.kpis?.model_label}</strong> vs Baseline: <strong>{evalRes.kpis?.baseline_label}</strong> · Source: {evalRes.source} · {evalRes.timestamp_utc}
+                  Model: <strong>{String(evalRes.kpis?.model_label ?? 'N/A')}</strong> vs Baseline: <strong>{String(evalRes.kpis?.baseline_label ?? 'N/A')}</strong> · Source: {evalRes.source} · {evalRes.timestamp_utc}
                 </div>
               </div>
             </div>
             <div className="row" style={{ gap: 8 }}>
               <span className="badge badge-green">Compliance: {Number(evalRes.kpis?.compliance_rate_pct ?? 100).toFixed(1)}%</span>
-              <span className="badge badge-red">Breaches: {evalRes.kpis?.breach_count ?? 0}</span>
-              <span className="badge badge-amber">Warnings: {evalRes.kpis?.warning_count ?? 0}</span>
+              <span className="badge badge-red">Breaches: {String(evalRes.kpis?.breach_count ?? 0)}</span>
+              <span className="badge badge-amber">Warnings: {String(evalRes.kpis?.warning_count ?? 0)}</span>
             </div>
           </div>
 
-          {evalRes.system_alerts?.length > 0 && (
+          {(evalRes.system_alerts?.length ?? 0) > 0 && (
             <div className="alert alert-error">
               <strong>Automated Supervisory Alerts Triggered:</strong>
               <ul style={{ margin: '6px 0 0', paddingLeft: 18 }}>
-                {evalRes.system_alerts.map((al: string, i: number) => <li key={i}>{al}</li>)}
+                {(evalRes.system_alerts ?? []).map((al, i) => <li key={i}>{String(al)}</li>)}
               </ul>
             </div>
           )}
 
           {/* Executive Engineering KPI Grid */}
           <div className="kpi-grid">
-            <div className="kpi-card"><div className="kpi-label">Records Evaluated</div><div className="kpi-value">{evalRes.kpis?.n_records ?? 0}</div></div>
-            <div className="kpi-card"><div className="kpi-label">Tolerance Compliance</div><div className="kpi-value" style={{ color: (evalRes.kpis?.compliance_rate_pct ?? 100) >= 95 ? 'var(--green)' : 'var(--red)' }}>{Number(evalRes.kpis?.compliance_rate_pct ?? 100).toFixed(1)}%</div></div>
-            <div className="kpi-card"><div className="kpi-label">Critical Breaches</div><div className="kpi-value" style={{ color: (evalRes.kpis?.breach_count ?? 0) > 0 ? 'var(--red)' : 'var(--green)' }}>{evalRes.kpis?.breach_count ?? 0}</div></div>
+            <div className="kpi-card"><div className="kpi-label">Records Evaluated</div><div className="kpi-value">{String(evalRes.kpis?.n_records ?? 0)}</div></div>
+            <div className="kpi-card"><div className="kpi-label">Tolerance Compliance</div><div className="kpi-value" style={{ color: Number(evalRes.kpis?.compliance_rate_pct ?? 100) >= 95 ? 'var(--green)' : 'var(--red)' }}>{Number(evalRes.kpis?.compliance_rate_pct ?? 100).toFixed(1)}%</div></div>
+            <div className="kpi-card"><div className="kpi-label">Critical Breaches</div><div className="kpi-value" style={{ color: Number(evalRes.kpis?.breach_count ?? 0) > 0 ? 'var(--red)' : 'var(--green)' }}>{String(evalRes.kpis?.breach_count ?? 0)}</div></div>
             <div className="kpi-card"><div className="kpi-label">Model MAE / MAPE</div><div className="kpi-value" style={{ fontSize: 16 }}>{evalRes.kpis?.mae !== undefined ? `${Number(evalRes.kpis.mae).toFixed(3)} (${Number(evalRes.kpis.mape_pct ?? 0).toFixed(2)}%)` : `${Number(evalRes.kpis?.accuracy_pct ?? 0).toFixed(1)}% Acc`}</div></div>
             <div className="kpi-card"><div className="kpi-label">Baseline MAE</div><div className="kpi-value" style={{ fontSize: 16 }}>{evalRes.kpis?.baseline_mae !== undefined ? Number(evalRes.kpis.baseline_mae).toFixed(3) : 'N/A'}</div></div>
             <div className="kpi-card"><div className="kpi-label">Gain vs Baseline</div><div className="kpi-value" style={{ color: (gainVsBase ?? 0) >= 0 ? 'var(--green)' : 'var(--amber)' }}>{gainVsBase !== undefined ? `${Number(gainVsBase) >= 0 ? '+' : ''}${Number(gainVsBase).toFixed(1)}%` : 'N/A'}</div></div>
@@ -697,12 +717,12 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
               </div>
 
               {/* Signed Diverging Waterfall / Tornado Attribution Chart */}
-              {rootCause.all_factor_attributions?.length > 0 && (
+              {(rootCause.all_factor_attributions?.length ?? 0) > 0 && (
                 <div style={{ marginBottom: 14 }}>
                   <DivergingDriverBarSVG
                     title="Signed Factor Attribution Tornado — Drivers of Increase (+Δ) vs. Decrease (−Δ) Relative to Baseline"
                     subtitle={rootCause.attribution_method}
-                    items={rootCause.all_factor_attributions}
+                    items={rootCause.all_factor_attributions ?? []}
                   />
                 </div>
               )}
@@ -716,14 +736,14 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
                     </span>
                     <span className="badge badge-red">{rootCause.increase_drivers?.length ?? 0}</span>
                   </div>
-                  {rootCause.increase_drivers?.length > 0 ? (
+                  {(rootCause.increase_drivers?.length ?? 0) > 0 ? (
                     <SimpleTable
                       title="Upward Deviation Drivers (+Δ)"
-                      rows={rootCause.increase_drivers.map((d: any) => ({
+                      rows={(rootCause.increase_drivers ?? []).map((d) => ({
                         Feature: d.feature,
                         'Live Mean': d.live_mean,
                         'Normal Ref': d.normal_reference,
-                        'Shift (σ)': `${d.z_shift >= 0 ? '+' : ''}${d.z_shift}σ`,
+                        'Shift (σ)': `${Number(d.z_shift ?? 0) >= 0 ? '+' : ''}${Number(d.z_shift ?? 0).toFixed(2)}σ`,
                         'Impact (+Δ)': `+${Number(d.signed_impact).toFixed(4)}`,
                         'Share %': `${d.impact_share_pct}%`,
                         'Healthy Band': d.healthy_band,
@@ -742,14 +762,14 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
                     </span>
                     <span className="badge badge-accent">{rootCause.decrease_drivers?.length ?? 0}</span>
                   </div>
-                  {rootCause.decrease_drivers?.length > 0 ? (
+                  {(rootCause.decrease_drivers?.length ?? 0) > 0 ? (
                     <SimpleTable
                       title="Downward Deviation Drivers (−Δ)"
-                      rows={rootCause.decrease_drivers.map((d: any) => ({
+                      rows={(rootCause.decrease_drivers ?? []).map((d) => ({
                         Feature: d.feature,
                         'Live Mean': d.live_mean,
                         'Normal Ref': d.normal_reference,
-                        'Shift (σ)': `${d.z_shift >= 0 ? '+' : ''}${d.z_shift}σ`,
+                        'Shift (σ)': `${Number(d.z_shift ?? 0) >= 0 ? '+' : ''}${Number(d.z_shift ?? 0).toFixed(2)}σ`,
                         'Impact (−Δ)': Number(d.signed_impact).toFixed(4),
                         'Share %': `${d.impact_share_pct}%`,
                         'Healthy Band': d.healthy_band,
@@ -763,11 +783,11 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
               </div>
 
               {/* Actionable Engineering Remediation Playbook */}
-              {rootCause.remediation_playbook?.length > 0 && (
+              {(rootCause.remediation_playbook?.length ?? 0) > 0 && (
                 <div>
                   <SimpleTable
                     title="Prioritized Corrective Engineering Playbook — How to Restore System to Baseline"
-                    rows={rootCause.remediation_playbook}
+                    rows={rootCause.remediation_playbook ?? []}
                     maxRows={10}
                   />
                 </div>
@@ -781,16 +801,16 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
               <SupervisoryTrendSVG points={evalRes.trend_series || []} />
             </div>
             <div className="card" style={{ marginBottom: 0 }}>
-              <SPCControlSVG points={evalRes.spc_points || []} limits={evalRes.spc_limits} />
+              <SPCControlSVG points={(evalRes.spc_points || []) as SPCControlPoint[]} limits={evalRes.spc_limits || undefined} />
             </div>
           </div>
 
-          {evalRes.error_histogram?.length > 0 && (
+          {(evalRes.error_histogram?.length ?? 0) > 0 && (
             <div className="card">
               <BarChartSVG
                 title="Live Prediction Error Distribution (% Error Histogram)"
-                items={evalRes.error_histogram.map((b: any) => ({
-                  label: b.label || b.bin || '',
+                items={(evalRes.error_histogram ?? []).map((b) => ({
+                  label: String(b.label ?? b.bin ?? ''),
                   value: Number(b.count || 0),
                   color: b.breach ? '#ef4444' : '#38bdf8',
                 }))}
@@ -814,7 +834,7 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
                 <SimpleTable title="Triggered Tolerance Alarms with Signed Baseline Root Causes & Recommended Fixes" rows={alarmDisplayRows} maxRows={100} />
 
                 {/* Interactive Single-Alarm Record Root-Cause Inspector */}
-                {inspectedAlarm && inspectedAlarm.factor_breakdown?.length > 0 && (
+                {inspectedAlarm && (inspectedAlarm.factor_breakdown?.length ?? 0) > 0 && (
                   <div style={{ marginTop: 14, padding: 12, borderRadius: 10, background: 'var(--bg-subtle)', border: '1px solid var(--border)' }}>
                     <div className="row" style={{ justifyContent: 'space-between', marginBottom: 10, gap: 10 }}>
                       <div>
@@ -826,11 +846,11 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
                         </div>
                       </div>
                       <select
-                        value={Math.min(selectedAlarmIdx, filteredAlarms.length - 1)}
+                        value={filteredAlarms.length ? Math.min(selectedAlarmIdx, filteredAlarms.length - 1) : 0}
                         onChange={(e) => setSelectedAlarmIdx(Number(e.target.value))}
                         style={{ minWidth: 240 }}
                       >
-                        {filteredAlarms.slice(0, 40).map((a: any, idx: number) => (
+                        {filteredAlarms.slice(0, 40).map((a, idx: number) => (
                           <option key={`${a.row_id}-${idx}`} value={idx}>
                             Record {a.row_id} · {a.deviation_direction || a.severity} (Δ={a.delta_vs_baseline ?? 'N/A'})
                           </option>
@@ -843,9 +863,9 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
                     <DivergingDriverBarSVG
                       title={`Record ${inspectedAlarm.row_id} — Signed Input Contribution to Baseline Deviation`}
                       subtitle={`Actual=${inspectedAlarm.actual ?? 'N/A'} | Champion=${inspectedAlarm.predicted} | Baseline=${inspectedAlarm.baseline_predicted} | Δ vs Baseline=${inspectedAlarm.delta_vs_baseline ?? 'N/A'}`}
-                      items={inspectedAlarm.factor_breakdown.map((fb: any) => ({
-                        feature: fb.feature,
-                        signed_impact: fb.signed_impact,
+                      items={(inspectedAlarm.factor_breakdown ?? []).map((fb) => ({
+                        feature: String(fb.feature),
+                        signed_impact: Number(fb.signed_impact),
                         z_shift: fb.z_shift,
                         live_mean: fb.live_value,
                         normal_reference: fb.normal_ref,

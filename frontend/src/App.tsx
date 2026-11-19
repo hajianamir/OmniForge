@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
@@ -27,12 +27,34 @@ import {
   X,
 } from 'lucide-react';
 import { apiDelete, apiDownload, apiGet, apiPost, apiUpload } from './api';
-import { HelpGuideModal, StudioHelpButton, type HandbookSectionId } from './components/HelpGuideModal';
-import { Studio01Data, Studio02Clustering, Studio03Diagnostics, Studio04EDA, Studio05Features } from './studios/StudiosPart1';
-import { Studio06Modeling, Studio07Responsible, Studio08Decision } from './studios/StudiosPart2';
-import { Studio09Specialized, Studio10DAG, Studio11MLOps, Studio12Reporting, Studio13Copilot } from './studios/StudiosPart3';
-import { Studio14Supervisory } from './studios/Studio14Supervisory';
+import type { HandbookSectionId } from './components/HelpGuideModal';
+import type { StudioCache, StudioPayload, StudioResultKey } from './studioTypes';
 import { STUDIOS, type StudioId, type WorkspaceState } from './types';
+
+// Code-split studios: each studio chunk downloads only on first visit, then
+// stays mounted (keep-alive via display:none) so tabs/forms/results survive.
+const Studio01Data = React.lazy(() => import('./studios/StudiosPart1').then((m) => ({ default: m.Studio01Data })));
+const Studio02Clustering = React.lazy(() => import('./studios/StudiosPart1').then((m) => ({ default: m.Studio02Clustering })));
+const Studio03Diagnostics = React.lazy(() => import('./studios/StudiosPart1').then((m) => ({ default: m.Studio03Diagnostics })));
+const Studio04EDA = React.lazy(() => import('./studios/StudiosPart1').then((m) => ({ default: m.Studio04EDA })));
+const Studio05Features = React.lazy(() => import('./studios/StudiosPart1').then((m) => ({ default: m.Studio05Features })));
+const Studio06Modeling = React.lazy(() => import('./studios/StudiosPart2').then((m) => ({ default: m.Studio06Modeling })));
+const Studio07Responsible = React.lazy(() => import('./studios/StudiosPart2').then((m) => ({ default: m.Studio07Responsible })));
+const Studio08Decision = React.lazy(() => import('./studios/StudiosPart2').then((m) => ({ default: m.Studio08Decision })));
+const Studio09Specialized = React.lazy(() => import('./studios/StudiosPart3').then((m) => ({ default: m.Studio09Specialized })));
+const Studio10DAG = React.lazy(() => import('./studios/StudiosPart3').then((m) => ({ default: m.Studio10DAG })));
+const Studio11MLOps = React.lazy(() => import('./studios/StudiosPart3').then((m) => ({ default: m.Studio11MLOps })));
+const Studio12Reporting = React.lazy(() => import('./studios/StudiosPart3').then((m) => ({ default: m.Studio12Reporting })));
+const Studio13Copilot = React.lazy(() => import('./studios/StudiosPart3').then((m) => ({ default: m.Studio13Copilot })));
+const Studio14Supervisory = React.lazy(() => import('./studios/Studio14Supervisory').then((m) => ({ default: m.Studio14Supervisory })));
+const HelpGuideModal = React.lazy(() => import('./components/HelpGuideModal').then((m) => ({ default: m.HelpGuideModal })));
+const StudioHelpButton = React.lazy(() => import('./components/HelpGuideModal').then((m) => ({ default: m.StudioHelpButton })));
+
+const StudioLoadingFallback: React.FC = () => (
+  <div style={{ padding: 24, color: 'var(--text-dim)', fontSize: 13 }}>
+    <span className="spinner" /> Loading studio chunk…
+  </div>
+);
 
 const ICONS: Record<StudioId, React.ReactNode> = {
   '01': <Database size={15} />,
@@ -97,7 +119,7 @@ export const App: React.FC = () => {
   const [helpOpen, setHelpOpen] = useState(false);
   const [helpSection, setHelpSection] = useState<HandbookSectionId>('workflow');
   const [toast, setToast] = useState<string | null>(null);
-  const [studioCache, setStudioCache] = useState<Record<string, any>>({});
+  const [studioCache, setStudioCache] = useState<StudioCache>({});
 
   const openHelp = useCallback((section: HandbookSectionId = 'workflow') => {
     setHelpSection(section);
@@ -124,23 +146,27 @@ export const App: React.FC = () => {
   const [projNotes, setProjNotes] = useState('');
 
   const fetchServerCache = useCallback(() => {
-    apiGet<{ results?: Record<string, any> }>('/api/workbench/results')
+    apiGet<{ results?: Partial<StudioCache> }>('/api/workbench/results')
       .then((res) => {
-        if (res && typeof res.results === 'object') {
-          setStudioCache((prev) => ({ ...prev, ...(res.results || {}) }));
+        const results = res?.results;
+        if (results && typeof results === 'object') {
+          // Server-side cache is trusted to match StudioCache (same backend that
+          // produced it); unknown extra keys are simply never read by studios.
+          setStudioCache((prev) => ({ ...prev, ...results }));
         }
       })
       .catch(() => {});
   }, []);
 
-  const setStudioResult = useCallback((key: string, val: any) => {
+  const setStudioResult = useCallback((key: StudioResultKey, val: StudioPayload) => {
     setStudioCache((prev) => {
+      const next: StudioCache = { ...prev };
       if (val === undefined || val === null) {
-        const next = { ...prev };
         delete next[key];
         return next;
       }
-      return { ...prev, [key]: val };
+      (next as Record<string, StudioPayload | undefined>)[key] = val;
+      return next;
     });
   }, []);
 
@@ -158,7 +184,7 @@ export const App: React.FC = () => {
         const allowed = new Set(next.cached_result_keys);
         let missingOnClient = false;
         setStudioCache((prev) => {
-          const filtered: Record<string, any> = {};
+          const filtered: Record<string, unknown> = {};
           for (const [k, v] of Object.entries(prev)) {
             if (allowed.has(k)) filtered[k] = v;
           }
@@ -188,66 +214,72 @@ export const App: React.FC = () => {
   useEffect(() => { syncState(); }, [syncState]);
 
   const bumpGrid = useCallback(() => setGridVersion((v) => v + 1), []);
-  const flash = (text: string) => {
+  const flash = useCallback((text: string) => {
     setToast(text);
-    setTimeout(() => setToast((cur) => (cur === text ? null : cur)), 4500);
-  };
+    window.setTimeout(() => setToast((cur) => (cur === text ? null : cur)), 4500);
+  }, []);
 
-  const toggleTheme = async () => {
+  const toggleTheme = useCallback(async () => {
     const nextTheme = ws.theme === 'light' ? 'dark' : 'light';
     document.documentElement.setAttribute('data-theme', nextTheme);
     setWs((prev) => ({ ...prev, theme: nextTheme }));
     try { await apiPost('/api/workbench/theme', { theme: nextTheme }); } catch {}
-  };
+  }, [ws.theme]);
 
-  const toggleTarget = async (col: string) => {
+  const toggleTarget = useCallback(async (col: string) => {
     const next = ws.targets.includes(col) ? ws.targets.filter((c) => c !== col) : [...ws.targets, col];
     if (!next.length) return;
-    const r = await apiPost('/api/workbench/targets', { targets: next });
+    const r = await apiPost<{ state: WorkspaceState }>('/api/workbench/targets', { targets: next });
     syncState(r.state); bumpGrid();
-  };
+  }, [ws.targets, syncState, bumpGrid]);
 
-  const toggleExclude = async (col: string) => {
+  const toggleExclude = useCallback(async (col: string) => {
     const next = ws.excluded_columns.includes(col)
       ? ws.excluded_columns.filter((c) => c !== col)
       : [...ws.excluded_columns, col];
-    const r = await apiPost('/api/workbench/exclusions', { excluded_columns: next });
+    const r = await apiPost<{ state: WorkspaceState }>('/api/workbench/exclusions', { excluded_columns: next });
     syncState(r.state); bumpGrid();
-  };
+  }, [ws.excluded_columns, syncState, bumpGrid]);
 
-  const handleSaveProject = async () => {
+  const handleSaveProject = useCallback(async () => {
     const fd = new FormData();
     fd.append('project_name', projName || ws.project_name);
     fd.append('notes', projNotes);
     await apiDownload('/api/workbench/workspace/save', `${projName || 'omniforge_project'}.omniforge`, 'POST', fd);
     flash('Saved portable .omniforge workspace project.');
     setModal('none');
-  };
+  }, [projName, projNotes, ws.project_name, flash]);
 
-  const handleLoadProject = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleLoadProject = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const fd = new FormData();
     fd.append('file', file);
-    const res = await apiUpload('/api/workbench/workspace/load', fd);
+    const res = await apiUpload<{ state: WorkspaceState }>('/api/workbench/workspace/load', fd);
     syncState(res.state);
     fetchServerCache();
     bumpGrid();
     flash(`Restored OmniForge project '${file.name}'.`);
     setModal('none');
     e.target.value = '';
-  };
+  }, [syncState, fetchServerCache, bumpGrid, flash]);
 
-  const commonProps = {
-    ws,
-    onSync: syncState,
-    gridVersion,
-    bumpGrid,
-    studioCache,
-    setStudioResult,
-    refreshCache: fetchServerCache,
-    openHelp,
-  };
+  // Memoized so keep-alive studios (display:none) do not re-render on every
+  // App-level state change (toast, modal, theme flash). Studios receive a
+  // stable props object unless workspace/cache data actually changes.
+  const commonProps = useMemo(
+    () => ({
+      ws,
+      onSync: syncState,
+      gridVersion,
+      bumpGrid,
+      studioCache,
+      setStudioResult,
+      refreshCache: fetchServerCache,
+      openHelp,
+    }),
+    [ws, syncState, gridVersion, bumpGrid, studioCache, setStudioResult, fetchServerCache, openHelp],
+  );
 
   return (
     <div className="app-shell">
@@ -366,23 +398,27 @@ export const App: React.FC = () => {
       {/* Main Studio Workspace — Keep visited studios mounted so returning NEVER resets tabs, forms, or results */}
       <main ref={mainPaneRef} className="main-pane">
         {toast && <div className="alert alert-success">{toast}</div>}
-        {visitedStudios.includes('01') && <div style={{ display: studio === '01' ? 'block' : 'none' }}><Studio01Data {...commonProps} /></div>}
-        {visitedStudios.includes('02') && <div style={{ display: studio === '02' ? 'block' : 'none' }}><Studio02Clustering {...commonProps} /></div>}
-        {visitedStudios.includes('03') && <div style={{ display: studio === '03' ? 'block' : 'none' }}><Studio03Diagnostics {...commonProps} /></div>}
-        {visitedStudios.includes('04') && <div style={{ display: studio === '04' ? 'block' : 'none' }}><Studio04EDA {...commonProps} /></div>}
-        {visitedStudios.includes('05') && <div style={{ display: studio === '05' ? 'block' : 'none' }}><Studio05Features {...commonProps} /></div>}
-        {visitedStudios.includes('06') && <div style={{ display: studio === '06' ? 'block' : 'none' }}><Studio06Modeling {...commonProps} /></div>}
-        {visitedStudios.includes('07') && <div style={{ display: studio === '07' ? 'block' : 'none' }}><Studio07Responsible {...commonProps} /></div>}
-        {visitedStudios.includes('08') && <div style={{ display: studio === '08' ? 'block' : 'none' }}><Studio08Decision {...commonProps} /></div>}
-        {visitedStudios.includes('09') && <div style={{ display: studio === '09' ? 'block' : 'none' }}><Studio09Specialized {...commonProps} /></div>}
-        {visitedStudios.includes('10') && <div style={{ display: studio === '10' ? 'block' : 'none' }}><Studio10DAG {...commonProps} /></div>}
-        {visitedStudios.includes('11') && <div style={{ display: studio === '11' ? 'block' : 'none' }}><Studio11MLOps {...commonProps} /></div>}
-        {visitedStudios.includes('12') && <div style={{ display: studio === '12' ? 'block' : 'none' }}><Studio12Reporting {...commonProps} /></div>}
-        {visitedStudios.includes('13') && <div style={{ display: studio === '13' ? 'block' : 'none' }}><Studio13Copilot {...commonProps} /></div>}
-        {visitedStudios.includes('14') && <div style={{ display: studio === '14' ? 'block' : 'none' }}><Studio14Supervisory {...commonProps} /></div>}
+        <React.Suspense fallback={<StudioLoadingFallback />}>
+          {visitedStudios.includes('01') && <div style={{ display: studio === '01' ? 'block' : 'none' }}><Studio01Data {...commonProps} /></div>}
+          {visitedStudios.includes('02') && <div style={{ display: studio === '02' ? 'block' : 'none' }}><Studio02Clustering {...commonProps} /></div>}
+          {visitedStudios.includes('03') && <div style={{ display: studio === '03' ? 'block' : 'none' }}><Studio03Diagnostics {...commonProps} /></div>}
+          {visitedStudios.includes('04') && <div style={{ display: studio === '04' ? 'block' : 'none' }}><Studio04EDA {...commonProps} /></div>}
+          {visitedStudios.includes('05') && <div style={{ display: studio === '05' ? 'block' : 'none' }}><Studio05Features {...commonProps} /></div>}
+          {visitedStudios.includes('06') && <div style={{ display: studio === '06' ? 'block' : 'none' }}><Studio06Modeling {...commonProps} /></div>}
+          {visitedStudios.includes('07') && <div style={{ display: studio === '07' ? 'block' : 'none' }}><Studio07Responsible {...commonProps} /></div>}
+          {visitedStudios.includes('08') && <div style={{ display: studio === '08' ? 'block' : 'none' }}><Studio08Decision {...commonProps} /></div>}
+          {visitedStudios.includes('09') && <div style={{ display: studio === '09' ? 'block' : 'none' }}><Studio09Specialized {...commonProps} /></div>}
+          {visitedStudios.includes('10') && <div style={{ display: studio === '10' ? 'block' : 'none' }}><Studio10DAG {...commonProps} /></div>}
+          {visitedStudios.includes('11') && <div style={{ display: studio === '11' ? 'block' : 'none' }}><Studio11MLOps {...commonProps} /></div>}
+          {visitedStudios.includes('12') && <div style={{ display: studio === '12' ? 'block' : 'none' }}><Studio12Reporting {...commonProps} /></div>}
+          {visitedStudios.includes('13') && <div style={{ display: studio === '13' ? 'block' : 'none' }}><Studio13Copilot {...commonProps} /></div>}
+          {visitedStudios.includes('14') && <div style={{ display: studio === '14' ? 'block' : 'none' }}><Studio14Supervisory {...commonProps} /></div>}
+        </React.Suspense>
       </main>
 
-      <HelpGuideModal open={helpOpen} initialSection={helpSection} onClose={() => setHelpOpen(false)} onJumpStudio={navigateStudio} />
+      <React.Suspense fallback={null}>
+        <HelpGuideModal open={helpOpen} initialSection={helpSection} onClose={() => setHelpOpen(false)} onJumpStudio={navigateStudio} />
+      </React.Suspense>
 
       {/* Always-Visible Floating Contextual '?' Quick-Help Launcher for the Current Studio */}
       {!helpOpen && (
@@ -411,18 +447,20 @@ export const App: React.FC = () => {
                 {modal === 'project' && 'Portable .omniforge Workspace Save & Restore'}
               </span>
               <div className="row" style={{ gap: 6 }}>
-                <StudioHelpButton
-                  section={modal === 'project' ? 'studio-12' : 'studio-01'}
-                  onOpenHelp={(sec) => { setModal('none'); openHelp(sec); }}
-                  title={
-                    modal === 'split'
-                      ? 'Read Split Lock vs Data Cleaning Anti-Leakage Guide'
-                      : modal === 'project'
-                        ? 'Read Portable .omniforge Workspace & Reporting Guide'
-                        : 'Read Target Selection, Column Exclusions & Data Provenance Guide'
-                  }
-                  compact
-                />
+                <React.Suspense fallback={null}>
+                  <StudioHelpButton
+                    section={modal === 'project' ? 'studio-12' : 'studio-01'}
+                    onOpenHelp={(sec) => { setModal('none'); openHelp(sec); }}
+                    title={
+                      modal === 'split'
+                        ? 'Read Split Lock vs Data Cleaning Anti-Leakage Guide'
+                        : modal === 'project'
+                          ? 'Read Portable .omniforge Workspace & Reporting Guide'
+                          : 'Read Target Selection, Column Exclusions & Data Provenance Guide'
+                    }
+                    compact
+                  />
+                </React.Suspense>
                 <button className="btn btn-sm" onClick={() => setModal('none')}><X size={14} /></button>
               </div>
             </div>
@@ -447,7 +485,7 @@ export const App: React.FC = () => {
                   ))}
                 </div>
                 {ws.excluded_columns.length > 0 && (
-                  <button className="btn btn-sm" onClick={async () => { const r = await apiPost('/api/workbench/exclusions', { excluded_columns: [] }); syncState(r.state); bumpGrid(); }}>
+                  <button className="btn btn-sm" onClick={async () => { const r = await apiPost<{ state: WorkspaceState }>('/api/workbench/exclusions', { excluded_columns: [] }); syncState(r.state); bumpGrid(); }}>
                     Restore All Excluded Columns
                   </button>
                 )}
@@ -475,12 +513,12 @@ export const App: React.FC = () => {
                 </div>
                 <div className="row">
                   <button className="btn btn-primary" onClick={async () => {
-                    const r = await apiPost('/api/workbench/split-lock', { strategy: splitStrat, test_size: splitTestSize, cv_folds: splitCvFolds });
+                    const r = await apiPost<{ state: WorkspaceState }>('/api/workbench/split-lock', { strategy: splitStrat, test_size: splitTestSize, cv_folds: splitCvFolds });
                     syncState(r.state); flash('Anti-Leakage Split Lock enabled.'); setModal('none');
                   }}>Lock Train/Test Split</button>
                   {ws.split_lock?.active && (
                     <button className="btn btn-danger" onClick={async () => {
-                      const r = await apiDelete('/api/workbench/split-lock');
+                      const r = await apiDelete<{ state: WorkspaceState }>('/api/workbench/split-lock');
                       syncState(r.state); flash('Split Lock unlocked.'); setModal('none');
                     }}>Unlock Split</button>
                   )}

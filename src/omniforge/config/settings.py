@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -112,9 +112,13 @@ class SecuritySettings(BaseModel):
     """Security, encryption, RBAC, and compliance settings."""
 
     enable_rbac: bool = True
-    jwt_secret_key: str = "uap-development-jwt-secret-key-do-not-use-in-prod-0123456789"
+    jwt_secret_key: str = ""
     jwt_algorithm: str = "HS256"
     jwt_expiration_minutes: int = 60
+    encryption_key: str = ""
+    artifact_signing_key: str = ""
+    api_key: str = ""
+    auto_bootstrap_local_ui: bool = True
     encrypt_artifacts_at_rest: bool = False
     pii_detection_enabled: bool = True
     compliance_profiles: list[str] = Field(default_factory=lambda: ["GDPR", "SOX"])
@@ -138,8 +142,27 @@ class APISettings(BaseModel):
 
     host: str = "0.0.0.0"
     port: int = 8000
-    cors_origins: list[str] = Field(default_factory=lambda: ["*"])
+    cors_origins: list[str] = Field(
+        default_factory=lambda: [
+            "http://localhost:8501",
+            "http://127.0.0.1:8501",
+            "http://localhost:8000",
+            "http://127.0.0.1:8000",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+        ]
+    )
+    cors_allow_credentials: bool = True
     rate_limit_per_minute: int = 300
+
+    @model_validator(mode="after")
+    def _prevent_wildcard_credentials(self) -> APISettings:
+        """Forbid wildcard CORS combined with ``allow_credentials=True`` (CWE-942)."""
+        cleaned = [o.strip() for o in self.cors_origins if o and o.strip()]
+        self.cors_origins = cleaned
+        if "*" in cleaned and self.cors_allow_credentials:
+            self.cors_allow_credentials = False
+        return self
 
 
 class UISettings(BaseModel):

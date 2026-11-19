@@ -69,6 +69,8 @@ class OptimizationEngine:
         *,
         A_ub: list[list[float]] | np.ndarray | None = None,
         b_ub: list[float] | np.ndarray | None = None,
+        A_eq: list[list[float]] | np.ndarray | None = None,
+        b_eq: list[float] | np.ndarray | None = None,
         lower_bounds: list[float] | np.ndarray | None = None,
         upper_bounds: list[float] | np.ndarray | None = None,
         maximize: bool = False,
@@ -77,14 +79,24 @@ class OptimizationEngine:
         c_vec = np.asarray(c, dtype=float)
         obj_c = -c_vec if maximize else c_vec
         integ = np.asarray(integrality, dtype=int)
+        if len(integ) != len(c_vec):
+            raise OptimizationError("integrality vector length must match objective vector c.")
         lb = np.zeros_like(c_vec) if lower_bounds is None else np.asarray(lower_bounds, dtype=float)
         ub = np.full_like(c_vec, np.inf) if upper_bounds is None else np.asarray(upper_bounds, dtype=float)
-        constraints = (
-            LinearConstraint(np.asarray(A_ub, dtype=float), -np.inf, np.asarray(b_ub, dtype=float))
-            if (A_ub is not None and b_ub is not None)
-            else None
+        constraint_list: list[LinearConstraint] = []
+        if A_ub is not None and b_ub is not None:
+            constraint_list.append(
+                LinearConstraint(np.asarray(A_ub, dtype=float), -np.inf, np.asarray(b_ub, dtype=float))
+            )
+        if A_eq is not None and b_eq is not None:
+            b_eq_arr = np.asarray(b_eq, dtype=float)
+            constraint_list.append(LinearConstraint(np.asarray(A_eq, dtype=float), b_eq_arr, b_eq_arr))
+        res = milp(
+            c=obj_c,
+            integrality=integ,
+            bounds=Bounds(lb, ub),
+            constraints=constraint_list if constraint_list else None,
         )
-        res = milp(c=obj_c, integrality=integ, bounds=Bounds(lb, ub), constraints=constraints)
         if not res.success or res.x is None:
             raise OptimizationError(f"MILP optimization failed: {res.message}")
         obj_val = float(-res.fun if maximize else res.fun)
@@ -118,8 +130,9 @@ class OptimizationEngine:
             maximize=True,
         )
         names = item_names or [f"item_{i}" for i in range(n)]
-        chosen = [names[i] for i, x in enumerate(res.solution) if isinstance(res.solution, list) and x > 0.5]
-        total_w = float(sum(weights[i] for i, x in enumerate(res.solution) if isinstance(res.solution, list) and x > 0.5))
+        sol_vec = res.solution if isinstance(res.solution, list) else []
+        chosen = [names[i] for i, x in enumerate(sol_vec) if float(x) > 0.5]
+        total_w = float(sum(float(weights[i]) for i, x in enumerate(sol_vec) if float(x) > 0.5))
         return OptimizationResult(
             problem_type="knapsack_allocation",
             status="optimal",
@@ -155,40 +168,62 @@ class OptimizationEngine:
         cov_matrix: list[list[float]] | np.ndarray,
         *,
         risk_aversion: float = 2.0,
+        risk_free_rate: float = 0.0,
         min_weight: float = 0.0,
         max_weight: float = 1.0,
         asset_names: list[str] | None = None,
     ) -> OptimizationResult:
-        """Solve Markowitz Mean-Variance portfolio optimization with long-only/box constraints."""
-        mu = np.asarray(expected_returns, dtype=float)
+        """Solve Markowitz Mean-Variance portfolio optimization with analytical gradients and box constraints."""
+        mu = np.asarray(expected_returns, dtype=float).ravel()
         cov = np.asarray(cov_matrix, dtype=float)
         n = len(mu)
-        if cov.shape != (n, n):
-            raise OptimizationError("Covariance matrix must be square and aligned with expected_returns.")
+        if n == 0 or cov.shape != (n, n):
+            raise OptimizationError("Covariance matrix must be non-empty, square, and aligned with expected_returns.")
+        if risk_aversion < 0.0:
+            raise OptimizationError("risk_aversion must be non-negative for convex mean-variance optimization.")
+        if min_weight > max_weight or n * min_weight > 1.0 + 1e-9 or n * max_weight < 1.0 - 1e-9:
+            raise OptimizationError(
+                f"Infeasible portfolio weight bounds [{min_weight}, {max_weight}] for {n} assets summing to 1."
+            )
+        cov_sym = 0.5 * (cov + cov.T)
 
         def objective(w: np.ndarray) -> float:
             port_ret = float(w @ mu)
-            port_var = float(w @ cov @ w)
+            port_var = float(w @ cov_sym @ w)
             return -(port_ret - 0.5 * risk_aversion * port_var)
 
-        w0 = np.full(n, 1.0 / n, dtype=float)
+        def gradient(w: np.ndarray) -> np.ndarray:
+            return np.asarray(-(mu - risk_aversion * (cov_sym @ w)), dtype=float)
+
+        w0 = np.clip(np.full(n, 1.0 / n, dtype=float), min_weight, max_weight)
+        w0 = w0 / max(float(w0.sum()), 1e-12)
         bounds = [(min_weight, max_weight) for _ in range(n)]
-        constraints = [{"type": "eq", "fun": lambda w: float(np.sum(w) - 1.0)}]
-        res = minimize(objective, w0, method="SLSQP", bounds=bounds, constraints=constraints)
+        constraints = [{"type": "eq", "fun": lambda w: float(np.sum(w) - 1.0), "jac": lambda w: np.ones(n, dtype=float)}]
+        res = minimize(
+            objective,
+            w0,
+            jac=gradient,
+            method="SLSQP",
+            bounds=bounds,
+            constraints=constraints,
+            options={"ftol": 1e-12, "maxiter": 500},
+        )
         if not res.success:
             raise OptimizationError(f"Portfolio optimization failed: {res.message}")
 
-        w_opt = res.x
+        w_opt = np.clip(np.asarray(res.x, dtype=float), min_weight, max_weight)
+        if abs(float(w_opt.sum()) - 1.0) > 1e-9 and float(w_opt.sum()) > 0.0:
+            w_opt = w_opt / float(w_opt.sum())
         port_ret = float(w_opt @ mu)
-        port_vol = float(np.sqrt(max(w_opt @ cov @ w_opt, 0.0)))
-        sharpe = port_ret / max(port_vol, 1e-12)
+        port_vol = float(np.sqrt(max(float(w_opt @ cov_sym @ w_opt), 0.0)))
+        sharpe = (port_ret - float(risk_free_rate)) / max(port_vol, 1e-12)
         names = asset_names or [f"asset_{i}" for i in range(n)]
         weights_map = {name: round(float(val), 6) for name, val in zip(names, w_opt, strict=False)}
         return OptimizationResult(
             problem_type="portfolio_mean_variance",
             status="optimal",
             optimal=True,
-            objective_value=round(float(-res.fun), 6),
+            objective_value=round(float(-objective(w_opt)), 6),
             solution=weights_map,
             solver="scipy_slsqp",
             iterations=int(res.nit),
@@ -236,6 +271,34 @@ class OptimizationEngine:
             solver="scipy_highs",
         )
 
+    @staticmethod
+    def _two_opt_route(route: list[int], dist: np.ndarray) -> list[int]:
+        """Improve a single depot-to-depot route [0, ..., 0] via exact 2-opt local search."""
+        best = list(route)
+        m = len(best)
+        if m <= 4:
+            return best
+
+        def _cost(seq: list[int]) -> float:
+            return sum(float(dist[seq[k], seq[k + 1]]) for k in range(len(seq) - 1))
+
+        best_cost = _cost(best)
+        improved = True
+        while improved:
+            improved = False
+            for a in range(1, m - 2):
+                for b in range(a + 1, m - 1):
+                    candidate = best[:a] + best[a : b + 1][::-1] + best[b + 1 :]
+                    cand_cost = _cost(candidate)
+                    if cand_cost + 1e-12 < best_cost:
+                        best = candidate
+                        best_cost = cand_cost
+                        improved = True
+                        break
+                if improved:
+                    break
+        return best
+
     def solve_vrp_savings(
         self,
         distance_matrix: list[list[float]] | np.ndarray,
@@ -245,8 +308,14 @@ class OptimizationEngine:
         """Solve Capacitated Vehicle Routing Problem (CVRP) via Clarke-Wright Savings + 2-opt."""
         dist = np.asarray(distance_matrix, dtype=float)
         n = dist.shape[0]
-        if n < 2 or len(demands) != n:
+        if dist.ndim != 2 or dist.shape[1] != n or n < 2 or len(demands) != n:
             raise OptimizationError("distance_matrix (NxN) and demands (length N, depot=0) required.")
+        if vehicle_capacity <= 0.0:
+            raise OptimizationError("vehicle_capacity must be positive.")
+        if any(float(d) > vehicle_capacity + 1e-12 for d in demands[1:]):
+            raise OptimizationError("At least one customer demand exceeds vehicle_capacity (infeasible CVRP).")
+
+        is_symmetric = bool(np.allclose(dist, dist.T, atol=1e-9))
 
         # Initial routes: depot -> customer -> depot
         routes: dict[int, list[int]] = {i: [i] for i in range(1, n)}
@@ -254,10 +323,20 @@ class OptimizationEngine:
         cust_to_route: dict[int, int] = {i: i for i in range(1, n)}
 
         savings: list[tuple[float, int, int]] = []
-        for i in range(1, n):
-            for j in range(i + 1, n):
-                sav = float(dist[0, i] + dist[0, j] - dist[i, j])
-                savings.append((sav, i, j))
+        if is_symmetric:
+            for i in range(1, n):
+                for j in range(i + 1, n):
+                    sav = float(dist[0, i] + dist[0, j] - dist[i, j])
+                    if sav > 1e-12:
+                        savings.append((sav, i, j))
+        else:
+            for i in range(1, n):
+                for j in range(1, n):
+                    if i == j:
+                        continue
+                    sav = float(dist[i, 0] + dist[0, j] - dist[i, j])
+                    if sav > 1e-12:
+                        savings.append((sav, i, j))
         savings.sort(key=lambda t: t[0], reverse=True)
 
         for _, i, j in savings:
@@ -265,12 +344,16 @@ class OptimizationEngine:
             if ri == rj:
                 continue
             route_i, route_j = routes[ri], routes[rj]
-            if route_load[ri] + route_load[rj] > vehicle_capacity:
+            if route_load[ri] + route_load[rj] > vehicle_capacity + 1e-12:
                 continue
             if route_i[-1] == i and route_j[0] == j:
                 merged = route_i + route_j
-            elif route_j[-1] == j and route_i[0] == i:
+            elif is_symmetric and route_j[-1] == j and route_i[0] == i:
                 merged = route_j + route_i
+            elif is_symmetric and route_i[-1] == i and route_j[-1] == j:
+                merged = route_i + route_j[::-1]
+            elif is_symmetric and route_i[0] == i and route_j[0] == j:
+                merged = route_i[::-1] + route_j
             else:
                 continue
             routes[ri] = merged
@@ -283,7 +366,7 @@ class OptimizationEngine:
         final_routes: list[list[int]] = []
         total_dist = 0.0
         for r in routes.values():
-            full = [0, *r, 0]
+            full = self._two_opt_route([0, *r, 0], dist)
             route_d = sum(float(dist[full[k], full[k + 1]]) for k in range(len(full) - 1))
             total_dist += route_d
             final_routes.append(full)
@@ -294,7 +377,7 @@ class OptimizationEngine:
             optimal=True,
             objective_value=round(total_dist, 4),
             solution={"routes": final_routes},
-            solver="clarke_wright_savings",
+            solver="clarke_wright_savings_2opt",
             details={"n_vehicles_used": len(final_routes)},
         )
 

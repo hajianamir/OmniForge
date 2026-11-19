@@ -153,8 +153,8 @@ class ModelServingEngine:
         estimator = getattr(model, "_estimator", None) or getattr(model, "_model", None)
         if estimator is not None:
             try:
-                from skl2onnx import convert_sklearn  # type: ignore[import-not-found]
-                from skl2onnx.common.data_types import FloatTensorType  # type: ignore[import-not-found]
+                from skl2onnx import convert_sklearn
+                from skl2onnx.common.data_types import FloatTensorType
 
                 onnx_model = convert_sklearn(
                     estimator, initial_types=[("float_input", FloatTensorType([None, n_features]))]
@@ -166,10 +166,10 @@ class ModelServingEngine:
                 logger.debug("skl2onnx_export_unavailable_falling_back", endpoint=endpoint_name, error=str(exc))
 
         # 2. Portable edge deployment package (joblib artifact + schema/metadata manifest)
-        model_bin = dest.with_suffix(".uap.joblib")
+        model_bin = dest.with_suffix(".omniforge.joblib")
         model.save(model_bin)
         manifest = {
-            "format": "uap_portable_edge_bundle",
+            "format": "omniforge_portable_edge_bundle",
             "onnx_note": "Install skl2onnx or torch to emit native .onnx protobuf graphs; portable OmniForge bundle written.",
             "endpoint": endpoint_name,
             "model_name": model.name,
@@ -184,7 +184,7 @@ class ModelServingEngine:
         logger.info("model_exported_portable_edge", endpoint=endpoint_name, path=str(manifest_path))
         return {
             "endpoint": endpoint_name,
-            "format": "uap_portable_edge_bundle",
+            "format": "omniforge_portable_edge_bundle",
             "path": str(manifest_path),
             "artifact_path": str(model_bin),
             "n_features": n_features,

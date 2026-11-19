@@ -17,6 +17,7 @@ from sklearn.feature_selection import (
     mutual_info_regression,
 )
 from sklearn.linear_model import LassoCV, LogisticRegression
+from sklearn.preprocessing import StandardScaler
 
 from omniforge.core.exceptions import FeatureEngineeringError
 from omniforge.core.logging import get_logger
@@ -111,14 +112,19 @@ class FeatureSelector:
                 raise FeatureEngineeringError("Target 'y' is required for f_test selection.")
             y_arr = np.asarray(y)
             fn = f_classif if self.task == "classification" else f_regression
-            f_vals, _ = fn(arr, y_arr)
-            f_vals = np.nan_to_num(f_vals, nan=0.0, posinf=0.0, neginf=0.0)
+            non_const = np.std(arr, axis=0) > 1e-12
+            f_vals = np.zeros(len(all_cols), dtype=float)
+            if np.any(non_const):
+                raw_f, _ = fn(arr[:, non_const], y_arr)
+                f_vals[non_const] = np.nan_to_num(raw_f, nan=0.0, posinf=0.0, neginf=0.0)
             scores = {c: float(s) for c, s in zip(all_cols, f_vals, strict=False)}
             selected = [c for c, _ in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:k]]
         elif self.method == "l1":
             if y is None:
                 raise FeatureEngineeringError("Target 'y' is required for L1 selection.")
             y_arr = np.asarray(y)
+            # Standardize features so L1 penalty is strictly scale-invariant across physical units
+            arr_scaled = StandardScaler().fit_transform(arr)
             if self.task == "classification":
                 try:
                     model = LogisticRegression(
@@ -128,11 +134,11 @@ class FeatureSelector:
                     model = LogisticRegression(
                         penalty="l1", solver="liblinear", C=0.5, random_state=self.random_seed, max_iter=500
                     )
-                model.fit(arr, y_arr)
+                model.fit(arr_scaled, y_arr)
                 weights = np.mean(np.abs(model.coef_), axis=0)
             else:
-                model = LassoCV(cv=min(5, max(2, len(arr) // 5)), random_state=self.random_seed)
-                model.fit(arr, y_arr)
+                model = LassoCV(cv=min(5, max(2, len(arr_scaled) // 5)), random_state=self.random_seed)
+                model.fit(arr_scaled, y_arr)
                 weights = np.abs(model.coef_)
             scores = {c: float(w) for c, w in zip(all_cols, weights, strict=False)}
             non_zero = [c for c, w in sorted(scores.items(), key=lambda kv: kv[1], reverse=True) if w > 1e-8]
@@ -155,19 +161,31 @@ class FeatureSelector:
                 raise FeatureEngineeringError("Target 'y' is required for boruta_shadow selection.")
             y_arr = np.asarray(y)
             rng = np.random.default_rng(self.random_seed)
-            shadow = np.column_stack([rng.permutation(arr[:, i]) for i in range(arr.shape[1])])
-            combined = np.hstack([arr, shadow])
-            est = (
-                RandomForestClassifier(n_estimators=80, random_state=self.random_seed, n_jobs=-1)
-                if self.task == "classification"
-                else RandomForestRegressor(n_estimators=80, random_state=self.random_seed, n_jobs=-1)
-            )
-            est.fit(combined, y_arr)
-            imps = est.feature_importances_
-            real_imps = imps[: len(all_cols)]
-            shadow_max = float(np.percentile(imps[len(all_cols) :], 90))
-            scores = {c: float(v) for c, v in zip(all_cols, real_imps, strict=False)}
-            selected = [c for c, v in zip(all_cols, real_imps, strict=False) if v >= shadow_max]
+            n_trials = 5
+            real_imp_trials = np.zeros((n_trials, len(all_cols)), dtype=float)
+            shadow_max_trials = np.zeros(n_trials, dtype=float)
+            for t in range(n_trials):
+                shadow = np.column_stack([rng.permutation(arr[:, i]) for i in range(arr.shape[1])])
+                combined = np.hstack([arr, shadow])
+                est = (
+                    RandomForestClassifier(n_estimators=50, random_state=self.random_seed + t, n_jobs=-1)
+                    if self.task == "classification"
+                    else RandomForestRegressor(n_estimators=50, random_state=self.random_seed + t, n_jobs=-1)
+                )
+                est.fit(combined, y_arr)
+                imps = est.feature_importances_
+                real_imp_trials[t] = imps[: len(all_cols)]
+                shadow_max_trials[t] = float(np.max(imps[len(all_cols) :]))
+            mean_real_imps = real_imp_trials.mean(axis=0)
+            shadow_threshold = float(np.median(shadow_max_trials))
+            scores = {c: float(v) for c, v in zip(all_cols, mean_real_imps, strict=False)}
+            # Feature confirmed if it beats shadow max in majority of trials (>= 3 of 5)
+            hits = np.sum(real_imp_trials > shadow_max_trials[:, None], axis=0)
+            selected = [
+                c
+                for c, h, v in zip(all_cols, hits, mean_real_imps, strict=False)
+                if h >= (n_trials // 2 + 1) or v >= shadow_threshold
+            ]
             if not selected:
                 selected = [c for c, _ in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:k]]
         else:
@@ -219,3 +237,128 @@ class FeatureSelector:
         """Leakage-free feature selection: fit strictly on ``X_train``/``y_train``, then filter both partitions."""
         self.fit(X_train, y_train)
         return self.transform(X_train), self.transform(X_test)
+
+    @staticmethod
+    def mrmr_select(
+        X: pd.DataFrame,
+        y: pd.Series | np.ndarray,
+        *,
+        k: int = 10,
+        task: str = "regression",
+        random_state: int = 42,
+    ) -> dict[str, Any]:
+        """Minimum Redundancy Maximum Relevance (mRMR, Peng et al. 2005) feature selection."""
+        from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
+
+        num_X = X.select_dtypes(include=[np.number]).fillna(0.0)
+        if num_X.empty:
+            raise FeatureEngineeringError("mRMR requires numeric features.")
+        k = min(max(1, k), num_X.shape[1])
+        y_arr = np.asarray(y)
+        if task == "classification":
+            rel = mutual_info_classif(num_X, y_arr, random_state=random_state)
+        else:
+            rel = mutual_info_regression(num_X, y_arr, random_state=random_state)
+        rel_s = pd.Series(rel, index=num_X.columns, dtype=float)
+        corr_mat = num_X.corr().abs().fillna(0.0)
+
+        selected: list[str] = []
+        remaining = list(num_X.columns)
+        scores: dict[str, float] = {}
+
+        first = str(rel_s.idxmax())
+        selected.append(first)
+        remaining.remove(first)
+        scores[first] = float(rel_s[first])
+
+        while len(selected) < k and remaining:
+            best_feat = remaining[0]
+            best_score = -np.inf
+            for feat in remaining:
+                redundancy = float(corr_mat.loc[feat, selected].mean())
+                mrmr_val = float(rel_s[feat]) - redundancy
+                if mrmr_val > best_score:
+                    best_score = mrmr_val
+                    best_feat = feat
+            selected.append(best_feat)
+            remaining.remove(best_feat)
+            scores[best_feat] = round(float(best_score), 6)
+
+        return {"selected_features": selected, "scores": scores}
+
+    @staticmethod
+    def boruta_select(
+        X: pd.DataFrame,
+        y: pd.Series | np.ndarray,
+        *,
+        task: str = "regression",
+        n_iter: int = 15,
+        alpha: float = 0.05,
+        random_state: int = 42,
+    ) -> dict[str, Any]:
+        """Boruta all-relevant feature selection using shadow features and binomial testing."""
+        from scipy.stats import binomtest
+
+        num_X = X.select_dtypes(include=[np.number]).fillna(0.0)
+        if num_X.shape[1] < 2:
+            raise FeatureEngineeringError("Boruta requires at least 2 numeric features.")
+        rng = np.random.default_rng(random_state)
+        y_arr = np.asarray(y)
+        hits = {str(c): 0 for c in num_X.columns}
+
+        for it in range(n_iter):
+            shadow = num_X.apply(lambda col: rng.permutation(col.to_numpy()))
+            shadow.columns = [f"_shadow_{c}" for c in num_X.columns]
+            comb = pd.concat([num_X, shadow], axis=1)
+            if task == "classification":
+                rf = RandomForestClassifier(n_estimators=50, random_state=random_state + it, n_jobs=-1)
+            else:
+                rf = RandomForestRegressor(n_estimators=50, random_state=random_state + it, n_jobs=-1)
+            rf.fit(comb, y_arr)
+            imps = pd.Series(rf.feature_importances_, index=comb.columns)
+            max_shadow = float(imps[[c for c in comb.columns if str(c).startswith("_shadow_")]].max())
+            for c in num_X.columns:
+                if float(imps[c]) > max_shadow:
+                    hits[str(c)] += 1
+
+        confirmed: list[str] = []
+        rejected: list[str] = []
+        tentative: list[str] = []
+        for c, h in hits.items():
+            p_val = float(binomtest(h, n=n_iter, p=0.5, alternative="greater").pvalue)
+            if p_val < alpha:
+                confirmed.append(c)
+            elif h < n_iter * 0.25:
+                rejected.append(c)
+            else:
+                tentative.append(c)
+        return {"confirmed": confirmed, "tentative": tentative, "rejected": rejected, "hits": hits}
+
+    @staticmethod
+    def stability_selection(
+        X: pd.DataFrame,
+        y: pd.Series | np.ndarray,
+        *,
+        method: str = "l1",
+        task: str = "regression",
+        max_features: int = 10,
+        n_bootstrap: int = 15,
+        threshold: float = 0.6,
+        random_state: int = 42,
+    ) -> dict[str, Any]:
+        """Bootstrap stability selection reporting selection frequency per feature."""
+        rng = np.random.default_rng(random_state)
+        n = len(X)
+        counts = {str(c): 0 for c in X.columns}
+        y_arr = np.asarray(y)
+        for _b in range(n_bootstrap):
+            idx = rng.choice(n, size=n, replace=True)
+            sel = FeatureSelector(method=method, task=task, max_features=max_features)
+            sel.fit(X.iloc[idx], y_arr[idx])
+            for f in sel.selected_features_:
+                if f in counts:
+                    counts[f] += 1
+        freqs = {c: round(cnt / n_bootstrap, 4) for c, cnt in counts.items()}
+        stable = [c for c, f in freqs.items() if f >= threshold]
+        return {"stable_features": stable, "selection_frequencies": freqs, "threshold": threshold}
+

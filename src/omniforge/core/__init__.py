@@ -63,6 +63,7 @@ from omniforge.core.performance import (
 )
 from omniforge.core.security import (
     AccessController,
+    ArtifactSigner,
     AuditLogger,
     ComplianceValidator,
     EncryptionManager,
@@ -105,6 +106,7 @@ from omniforge.core.workspace_session import (
 
 __all__ = [
     "AccessController",
+    "ArtifactSigner",
     "AuditEvent",
     "AuditLogger",
     "AuthorizationError",

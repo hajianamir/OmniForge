@@ -90,7 +90,7 @@ class AnomalyDetector(BaseOmniForgeModel):
                 self._detectors[m] = "mad"
             elif m == "zscore":
                 self._means = np.mean(X_s, axis=0)
-                self._stds = np.maximum(np.std(X_s, axis=0, ddof=0), 1e-6)
+                self._stds = np.maximum(np.std(X_s, axis=0, ddof=1 if len(X_s) > 1 else 0), 1e-6)
                 self._detectors[m] = "zscore"
 
         # Cache sorted training score empirical CDFs for strictly inductive, zero-leakage rank calibration
@@ -108,13 +108,13 @@ class AnomalyDetector(BaseOmniForgeModel):
             return -np.asarray(det.score_samples(X_s), dtype=float)
         if m == "pca_recon" and self._pca is not None:
             recon = self._pca.inverse_transform(self._pca.transform(X_s))
-            return np.mean((X_s - recon) ** 2, axis=1)
+            return np.asarray(np.mean((X_s - recon) ** 2, axis=1), dtype=float)
         if m == "mad" and self._medians is not None and self._mads is not None:
             z = np.abs(X_s - self._medians) / (1.4826 * self._mads)
-            return np.max(z, axis=1)
+            return np.asarray(np.max(z, axis=1), dtype=float)
         if m == "zscore" and self._means is not None and self._stds is not None:
             z = np.abs(X_s - self._means) / self._stds
-            return np.max(z, axis=1)
+            return np.asarray(np.max(z, axis=1), dtype=float)
         return np.zeros(len(X_s), dtype=float)
 
     def anomaly_scores(self, X: pd.DataFrame | np.ndarray) -> np.ndarray:
@@ -207,16 +207,15 @@ class AnomalyDetector(BaseOmniForgeModel):
         win = max(6, int(window or (span * 2)))
         min_p = min(4, max(2, len(s) // 5))
         past_resid = resid.shift(1)
+        def _window_mad(w: np.ndarray) -> float:
+            med = float(np.median(w))
+            return float(np.median(np.abs(w - med)))
+
         roll_med = past_resid.rolling(window=win, min_periods=min_p, center=False).median()
-        roll_mad = (
-            (past_resid - roll_med)
-            .abs()
-            .rolling(window=win, min_periods=min_p, center=False)
-            .median()
-        )
+        roll_mad = past_resid.rolling(window=win, min_periods=min_p, center=False).apply(_window_mad, raw=True)
         # Warm-up fallback using strictly expanding past residuals (never future!)
         exp_med = past_resid.expanding(min_periods=1).median().fillna(0.0)
-        exp_mad = (past_resid - exp_med).abs().expanding(min_periods=1).median()
+        exp_mad = past_resid.expanding(min_periods=1).apply(_window_mad, raw=True)
         med_series = roll_med.fillna(exp_med).fillna(0.0)
         mad_series = roll_mad.fillna(exp_mad).fillna(1e-6).clip(lower=1e-6)
 

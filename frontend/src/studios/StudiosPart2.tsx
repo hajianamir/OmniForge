@@ -1,10 +1,25 @@
 import React, { useEffect, useState } from 'react';
-import { apiGet, apiPost, apiUpload } from '../api';
+import { apiGet, apiPost, apiUpload, toErrorMessage } from '../api';
 import { BarChartSVG, ForecastFanSVG } from '../components/Charts';
 import { SimpleTable } from '../components/DataGrid';
 import { StudioHelpButton } from '../components/HelpGuideModal';
 import { MathEquationCard } from '../components/MathEquation';
 import { ModeBar, type ExecutionMode } from '../components/ModeBar';
+import type {
+  AutoMLResponse,
+  BackendInfo,
+  BackendsResponse,
+  BatchPredictionResponse,
+  CausalResponse,
+  DeepLearningResponse,
+  ExplainResponse,
+  FairnessResponse,
+  ForecastResponse,
+  NonParametricResponse,
+  OptimizeResponse,
+  SimulateResponse,
+  SinglePredictionResponse,
+} from '../studioTypes';
 import { ProvenancePill, type StudioProps } from './StudiosPart1';
 
 // ============================================================================
@@ -12,7 +27,7 @@ import { ProvenancePill, type StudioProps } from './StudiosPart1';
 // ============================================================================
 export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCache, setStudioResult, openHelp }) => {
   const [tab, setTab] = useState<'automl' | 'nonparametric' | 'deep' | 'predict'>('automl');
-  const [backends, setBackends] = useState<any[]>([]);
+  const [backends, setBackends] = useState<BackendInfo[]>([]);
   const [selectedBackend, setSelectedBackend] = useState('native_stacking');
   const [budget, setBudget] = useState(25);
   const [cvFolds, setCvFolds] = useState(3);
@@ -39,7 +54,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
-    apiGet('/api/workbench/s06/backends')
+    apiGet<BackendsResponse>('/api/workbench/s06/backends')
       .then((res) => setBackends(res.automl_backends || []))
       .catch(() => {});
   }, []);
@@ -47,14 +62,14 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
   const runAutoML = async () => {
     setBusy(true); setErr(null);
     try {
-      const res = await apiPost('/api/workbench/s06/automl', {
+      const res = await apiPost<AutoMLResponse>('/api/workbench/s06/automl', {
         backend: selectedBackend,
         time_budget_seconds: budget,
         cv_folds: cvFolds,
       });
       onSync(res.state);
       setStudioResult('s06_automl', res);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const toggleNpModel = (m: string) => {
@@ -66,7 +81,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
     try {
       const allModels = ['gam_spline', 'nadaraya_watson', 'kernel_ridge_rbf', 'weighted_knn', 'isotonic'];
       const chosen = npMode === 'custom' ? npModels : npMode === 'auto' ? ['gam_spline', 'nadaraya_watson', 'kernel_ridge_rbf', 'weighted_knn'] : allModels;
-      const res = await apiPost('/api/workbench/s06/nonparametric', {
+      const res = await apiPost<NonParametricResponse>('/api/workbench/s06/nonparametric', {
         models: chosen.length ? chosen : allModels,
         n_knots: npKnots,
         spline_degree: npDegree,
@@ -77,7 +92,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
       });
       onSync(res.state);
       setStudioResult('s06_nonparametric', res);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const toggleArch = (a: string) => {
@@ -87,10 +102,10 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
   const runDeep = async () => {
     setBusy(true); setErr(null);
     try {
-      const res = await apiPost('/api/workbench/s06/deep-learning', { architectures: dlArchs, epochs: dlEpochs });
+      const res = await apiPost<DeepLearningResponse>('/api/workbench/s06/deep-learning', { architectures: dlArchs, epochs: dlEpochs });
       onSync(res.state);
       setStudioResult('s06_dl', res);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const runSinglePred = async () => {
@@ -98,9 +113,9 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
     try {
       const numRec: Record<string, number> = {};
       for (const c of ws.active_feature_cols) numRec[c] = Number(singleRec[c] || 0);
-      const res = await apiPost('/api/workbench/s06/predict-single', { record: numRec });
+      const res = await apiPost<SinglePredictionResponse>('/api/workbench/s06/predict-single', { record: numRec });
       setStudioResult('s06_predict_single', res);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const runBatchPred = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -110,9 +125,9 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
     try {
       const fd = new FormData();
       fd.append('file', file);
-      const res = await apiUpload('/api/workbench/s06/predict-batch', fd);
+      const res = await apiUpload<BatchPredictionResponse>('/api/workbench/s06/predict-batch', fd);
       setStudioResult('s06_predict_batch', res);
-    } catch (er: any) { setErr(er.message); } finally { setBusy(false); e.target.value = ''; }
+    } catch (er: unknown) { setErr(toErrorMessage(er)); } finally { setBusy(false); e.target.value = ''; }
   };
 
   return (
@@ -183,8 +198,8 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
           {automlRes && (
             <div className="card">
               <div className="card-title">
-                <span>Champion Model Leaderboard ({automlRes.backend_used})</span>
-                <span className="badge badge-green">Lift vs Baseline: {automlRes.lift_over_baseline >= 0 ? '+' : ''}{Number(automlRes.lift_over_baseline).toFixed(4)}</span>
+                <span>Champion Model Leaderboard ({automlRes.backend_used ?? 'native'})</span>
+                <span className="badge badge-green">Lift vs Baseline: {Number(automlRes.lift_over_baseline ?? 0) >= 0 ? '+' : ''}{Number(automlRes.lift_over_baseline ?? 0).toFixed(4)}</span>
               </div>
               {automlRes.fallback_reason && <div className="alert alert-warn">{automlRes.fallback_reason}</div>}
               <div className="kpi-grid">
@@ -200,18 +215,18 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
                     defaultOpenCode
                     eq={{
                       ...automlRes.equation,
-                      model_name: automlRes.equation.model_name || automlRes.best_model_name,
+                      model_name: automlRes.equation.model_name || automlRes.best_model_name || '',
                       formula_plain: automlRes.equation.formula_plain || automlRes.equation.equation_text,
                       rank: 1,
                       primary_metric: automlRes.primary_metric,
                       primary_score: automlRes.best_score,
                       naive_floor_score: automlRes.baseline_score,
                       lift_over_naive: automlRes.lift_over_baseline,
-                      selection_criterion: `Max CV ${automlRes.primary_metric} + Positive Lift over Strong Baseline (${Number(automlRes.baseline_score).toFixed(4)})`,
-                      acceptance_status: automlRes.lift_over_baseline >= 0 ? 'ACCEPTED — AUTOML CHAMPION' : 'ACCEPTED — BEST AVAILABLE',
+                      selection_criterion: `Max CV ${automlRes.primary_metric ?? ''} + Positive Lift over Strong Baseline (${Number(automlRes.baseline_score).toFixed(4)})`,
+                      acceptance_status: Number(automlRes.lift_over_baseline ?? 0) >= 0 ? 'ACCEPTED — AUTOML CHAMPION' : 'ACCEPTED — BEST AVAILABLE',
                       acceptance_reasons: [
                         `Ranked #1 across ${(automlRes.leaderboard || []).length} candidate pipelines in ${automlRes.elapsed_seconds}s using ${automlRes.backend_used}.`,
-                        `Achieved ${automlRes.primary_metric}=${Number(automlRes.best_score).toFixed(4)} vs strong baseline ${Number(automlRes.baseline_score).toFixed(4)} (lift ${automlRes.lift_over_baseline >= 0 ? '+' : ''}${Number(automlRes.lift_over_baseline).toFixed(4)}).`,
+                        `Achieved ${automlRes.primary_metric ?? ''}=${Number(automlRes.best_score).toFixed(4)} vs strong baseline ${Number(automlRes.baseline_score).toFixed(4)} (lift ${Number(automlRes.lift_over_baseline ?? 0) >= 0 ? '+' : ''}${Number(automlRes.lift_over_baseline ?? 0).toFixed(4)}).`,
                       ],
                     }}
                   />
@@ -303,24 +318,24 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
                 <SimpleTable title="Non-Parametric Analytical Leaderboard" rows={npRes.leaderboard || []} />
               </div>
 
-              {npRes.spline_components?.length > 0 && (
+              {(npRes.spline_components?.length ?? 0) > 0 && (
                 <div className="card">
                   <div className="card-title">
                     <span>Additive Penalized B-Spline GAM Component Decomposition</span>
                     <span className="badge badge-green">Per-Feature Smooth fⱼ(xⱼ) Effects</span>
                   </div>
-                  <SimpleTable title="GAM Smooth Component Contributions" rows={npRes.spline_components} />
+                  <SimpleTable title="GAM Smooth Component Contributions" rows={npRes.spline_components || []} />
                 </div>
               )}
 
-              {npRes.equations?.length > 0 && (
+              {(npRes.equations?.length ?? 0) > 0 && (
                 <div className="card">
                   <div className="card-title">
                     <span>Exact Non-Parametric Analytical Mathematical Equations</span>
-                    <span className="badge badge-accent">{npRes.equations.length} Models · Closed-Form + LaTeX + Python</span>
+                    <span className="badge badge-accent">{(npRes.equations ?? []).length} Models · Closed-Form + LaTeX + Python</span>
                   </div>
-                  {npRes.equations.map((eq: any, idx: number) => (
-                    <MathEquationCard key={`np-eq-${eq.model_name || idx}`} eq={{ ...eq, target_name: eq.target_name || npRes.target }} />
+                  {(npRes.equations ?? []).map((eq, idx) => (
+                    <MathEquationCard key={`np-eq-${eq.model_name || idx}`} eq={{ ...eq, model_name: eq.model_name || `NP Model ${idx + 1}`, target_name: eq.target_name || npRes.target || '' }} />
                   ))}
                 </div>
               )}
@@ -356,13 +371,13 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
           </div>
           {dlRes && (
             <>
-              <SimpleTable rows={(dlRes.results || []).map(({ loss_curve: _, ...rest }: any) => rest)} />
+              <SimpleTable rows={(dlRes.results || []).map(({ loss_curve: _lossCurve, ...rest }) => rest)} />
               {dlRes.feature_importances && Object.keys(dlRes.feature_importances).length > 0 && (
                 <div className="grid-2" style={{ marginTop: 16 }}>
-                  {Object.entries(dlRes.feature_importances).map(([mName, list]: any) => (
+                  {Object.entries(dlRes.feature_importances).map(([mName, list]) => (
                     <div className="card" key={mName} style={{ marginBottom: 0 }}>
                       <div className="card-title">{mName} — Attention / Sparsemax Feature Masks</div>
-                      <BarChartSVG horizontal items={list.map((x: any) => ({ label: x.feature, value: x.importance }))} />
+                      <BarChartSVG horizontal items={(list || []).map((x) => ({ label: x.feature, value: x.importance }))} />
                     </div>
                   ))}
                 </div>
@@ -420,17 +435,17 @@ export const Studio07Responsible: React.FC<StudioProps> = ({ ws, studioCache, se
   const runExplain = async () => {
     setBusy(true); setErr(null);
     try {
-      const res = await apiPost('/api/workbench/s07/explain', { row_index: rowIdx });
+      const res = await apiPost<ExplainResponse>('/api/workbench/s07/explain', { row_index: rowIdx });
       setStudioResult('s07_explain', res);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   const runFair = async () => {
     setBusy(true); setErr(null);
     try {
-      const res = await apiPost('/api/workbench/s07/fairness', { sensitive_col: sensCol || ws.columns[0] });
+      const res = await apiPost<FairnessResponse>('/api/workbench/s07/fairness', { sensitive_col: sensCol || ws.columns[0] });
       setStudioResult('s07_fairness', res);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   return (
@@ -456,7 +471,7 @@ export const Studio07Responsible: React.FC<StudioProps> = ({ ws, studioCache, se
             <button className="btn btn-primary" disabled={busy || !ws.active_model_name} onClick={runExplain}>Run Explainability</button>
           </div>
           {expRes?.global_importance && (
-            <BarChartSVG horizontal items={Object.entries(expRes.global_importance).map(([k, v]: any) => ({ label: k, value: Number(v) }))} />
+            <BarChartSVG horizontal items={Object.entries(expRes.global_importance).map(([k, v]) => ({ label: k, value: Number(v) }))} />
           )}
         </div>
         <div className="card">
@@ -503,10 +518,10 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
   const runForecast = async () => {
     setBusy(true); setErr(null);
     try {
-      const res = await apiPost('/api/workbench/s08/forecast', { target_col: targetCol || ws.numeric_columns[0], horizon, deep_arch: deepArch, epochs: 25 });
+      const res = await apiPost<ForecastResponse>('/api/workbench/s08/forecast', { target_col: targetCol || ws.numeric_columns[0], horizon, deep_arch: deepArch, epochs: 25 });
       onSync(res.state);
       setStudioResult('s08_forecast', res);
-    } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   return (
@@ -577,10 +592,10 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
             <button className="btn btn-primary" disabled={busy || !ws.has_dataset} onClick={async () => {
               setBusy(true); setErr(null);
               try {
-                const r = await apiPost('/api/workbench/s08/causal', { treatment_col: treatCol || ws.columns[0], outcome_col: outCol || ws.numeric_columns[0] });
+                const r = await apiPost<CausalResponse>('/api/workbench/s08/causal', { treatment_col: treatCol || ws.columns[0], outcome_col: outCol || ws.numeric_columns[0] });
                 if (r.state) onSync(r.state);
                 setStudioResult('s08_causal', r);
-              } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+              } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
             }}>Estimate Causal ATE</button>
           </div>
           {causalRes && <pre className="code-block">{JSON.stringify(causalRes, null, 2)}</pre>}
@@ -592,9 +607,9 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
           <button className="btn btn-primary" disabled={busy || !ws.has_dataset} onClick={async () => {
             setBusy(true); setErr(null);
             try {
-              const r = await apiPost('/api/workbench/s08/optimize', {});
+              const r = await apiPost<OptimizeResponse>('/api/workbench/s08/optimize', {});
               setStudioResult('s08_optimize', r);
-            } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+            } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
           }}>Run Markowitz Mean-Variance Portfolio Optimizer</button>
           {optRes && <pre className="code-block" style={{ marginTop: 12 }}>{JSON.stringify(optRes, null, 2)}</pre>}
         </div>
@@ -609,9 +624,9 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
             <button className="btn btn-primary" disabled={busy || !ws.has_dataset} onClick={async () => {
               setBusy(true); setErr(null);
               try {
-                const r = await apiPost('/api/workbench/s08/simulate', { target_col: targetCol || ws.numeric_columns[0], n_simulations: 3000 });
+                const r = await apiPost<SimulateResponse>('/api/workbench/s08/simulate', { target_col: targetCol || ws.numeric_columns[0], n_simulations: 3000 });
                 setStudioResult('s08_simulate', r);
-              } catch (e: any) { setErr(e.message); } finally { setBusy(false); }
+              } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
             }}>Run 3,000-Trial Monte Carlo</button>
           </div>
           {simRes && <pre className="code-block">{JSON.stringify(simRes, null, 2).slice(0, 2600)}</pre>}

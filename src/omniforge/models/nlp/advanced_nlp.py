@@ -85,7 +85,7 @@ class AdvancedNLPSuite(NLPEngine):
 
         if self.use_pretrained and is_package_available("transformers"):
             try:
-                from transformers import pipeline  # type: ignore[import-not-found]
+                from transformers import pipeline
 
                 if "zs" not in self._hf_pipelines:
                     self._hf_pipelines["zs"] = pipeline("zero-shot-classification")
@@ -143,7 +143,7 @@ class AdvancedNLPSuite(NLPEngine):
 
         if self.use_pretrained and is_package_available("transformers"):
             try:
-                from transformers import pipeline  # type: ignore[import-not-found]
+                from transformers import pipeline
 
                 if "qa" not in self._hf_pipelines:
                     self._hf_pipelines["qa"] = pipeline("question-answering")
@@ -208,7 +208,7 @@ class AdvancedNLPSuite(NLPEngine):
         cleaned = [self.preprocess(t) for t in texts]
         if self.use_pretrained and is_package_available("sentence_transformers"):
             try:
-                from sentence_transformers import SentenceTransformer  # type: ignore[import-not-found]
+                from sentence_transformers import SentenceTransformer
 
                 if "st" not in self._hf_pipelines:
                     self._hf_pipelines["st"] = SentenceTransformer("all-MiniLM-L6-v2")
@@ -385,11 +385,11 @@ class AdvancedNLPSuite(NLPEngine):
 
         if self.use_pretrained and is_package_available("transformers"):
             try:
-                from transformers import pipeline  # type: ignore[import-not-found]
+                from transformers import pipeline
 
-                if "summarizer" not in self._cached_pipelines:
-                    self._cached_pipelines["summarizer"] = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
-                res = self._cached_pipelines["summarizer"](clean[:3000], max_length=130, min_length=25, do_sample=False)
+                if "summarizer" not in self._hf_pipelines:
+                    self._hf_pipelines["summarizer"] = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
+                res = self._hf_pipelines["summarizer"](clean[:3000], max_length=130, min_length=25, do_sample=False)
                 if res:
                     return {"backend": "transformers:distilbart-cnn-12-6", "summary": str(res[0].get("summary_text", "")), "sentences_selected": max_sentences}
             except Exception:

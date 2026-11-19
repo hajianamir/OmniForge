@@ -8,8 +8,33 @@ import numpy as np
 import pandas as pd
 
 from omniforge.core.exceptions import EvaluationError
+from omniforge.core.logging import get_logger
 from omniforge.core.types import TaskType
 from omniforge.models.base import BaseOmniForgeModel
+
+logger = get_logger(__name__)
+
+
+def split_conformal_quantile(scores: np.ndarray, alpha: float) -> tuple[float, bool]:
+    """Compute the exact finite-sample split conformal quantile (Angelopoulos & Bates 2021, Thm. D.1).
+
+    Computes the ``k``-th smallest order statistic ``s_(k)`` where
+    ``k = ceil((n + 1) * (1 - alpha))``, matching the empirical inverted-CDF quantile
+    ``Quantile(s_1, ..., s_n; k / n)`` without NumPy's ``method='higher'`` +1 shift
+    or floating-point rounding drift. Returns ``(q_hat, finite_sample_valid)`` where
+    ``finite_sample_valid`` is ``True`` iff ``k <= n`` (guaranteeing coverage in
+    ``[1 - alpha, 1 - alpha + 1/(n+1)]`` under exchangeability).
+    """
+    arr = np.asarray(scores, dtype=float).ravel()
+    arr = arr[np.isfinite(arr)]
+    n = len(arr)
+    if n == 0:
+        raise EvaluationError("Cannot compute conformal quantile on empty nonconformity scores.")
+    a = float(np.clip(alpha, 1e-6, 0.999999))
+    k = int(np.ceil((n + 1) * (1.0 - a)))
+    finite_sample_valid = k <= n
+    idx = min(max(k, 1), n) - 1
+    return float(np.partition(arr, idx)[idx]), finite_sample_valid
 
 
 class ConformalPredictor:
@@ -19,6 +44,8 @@ class ConformalPredictor:
         self.model = model
         self.alpha = float(np.clip(alpha, 0.001, 0.5))
         self.quantile_: float = 0.0
+        self.n_calibration_: int = 0
+        self.finite_sample_valid_: bool = False
         self.is_calibrated_: bool = False
 
     def calibrate(self, X_cal: pd.DataFrame | np.ndarray, y_cal: pd.Series | np.ndarray) -> ConformalPredictor:
@@ -32,13 +59,23 @@ class ConformalPredictor:
             proba = self.model.predict_proba(X_cal)
             classes = list(self.model.classes_) if self.model.classes_ is not None else list(range(proba.shape[1]))
             cls_to_idx = {c: i for i, c in enumerate(classes)}
-            scores = np.array([1.0 - proba[i, cls_to_idx[y_arr[i]]] for i in range(n)], dtype=float)
+            scores = np.array(
+                [1.0 - float(proba[i, cls_to_idx[y_arr[i]]]) if y_arr[i] in cls_to_idx else 1.0 for i in range(n)],
+                dtype=float,
+            )
         else:
             preds = self.model.predict(X_cal).astype(float)
             scores = np.abs(y_arr.astype(float) - preds)
 
-        q_level = min(1.0, float(np.ceil((n + 1) * (1.0 - self.alpha)) / n))
-        self.quantile_ = float(np.quantile(scores, q_level, method="higher"))
+        self.quantile_, self.finite_sample_valid_ = split_conformal_quantile(scores, self.alpha)
+        self.n_calibration_ = n
+        if not self.finite_sample_valid_:
+            logger.warning(
+                "conformal_calibration_sample_small",
+                n_cal=n,
+                alpha=self.alpha,
+                min_required=int(np.ceil((1.0 - self.alpha) / self.alpha)),
+            )
         self.is_calibrated_ = True
         return self
 
@@ -123,3 +160,54 @@ class RobustnessTester:
             "worst_score_drop": round(worst_drop, 6),
             "robustness_index_0_100": robustness_index,
         }
+
+
+def adaptive_conformal_intervals(
+    y_true: np.ndarray | list[float],
+    y_pred: np.ndarray | list[float],
+    *,
+    alpha: float = 0.10,
+    gamma: float = 0.05,
+    window: int = 30,
+) -> dict[str, Any]:
+    """Adaptive Conformal Inference (ACI, Gibbs & Candes 2021) for non-exchangeable time series."""
+    yt = np.asarray(y_true, dtype=float).ravel()
+    yp = np.asarray(y_pred, dtype=float).ravel()
+    if len(yt) != len(yp) or len(yt) < 5:
+        raise ValueError("y_true and y_pred must have identical length >= 5.")
+    if not (0.0 < alpha < 1.0) or gamma <= 0.0:
+        raise ValueError("alpha must be in (0, 1) and gamma > 0.")
+
+    residuals = np.abs(yt - yp)
+    n = len(yt)
+    lower = np.empty(n, dtype=float)
+    upper = np.empty(n, dtype=float)
+    alpha_t = float(alpha)
+    covered = np.zeros(n, dtype=bool)
+
+    for t in range(n):
+        if t == 0:
+            q_t = 0.0
+        else:
+            start = max(0, t - max(2, window))
+            cal_res = residuals[start:t]
+            q_level = float(np.clip(1.0 - alpha_t, 0.0, 1.0))
+            q_t = float(np.quantile(cal_res, q_level))
+        lower[t] = yp[t] - q_t
+        upper[t] = yp[t] + q_t
+        err_t = 0.0 if (lower[t] <= yt[t] <= upper[t]) else 1.0
+        covered[t] = err_t == 0.0
+        alpha_t = float(np.clip(alpha_t + gamma * (alpha - err_t), 0.001, 0.999))
+
+    eval_start = min(5, n - 1)
+    emp_cov = float(np.mean(covered[eval_start:]))
+    avg_width = float(np.mean(upper[eval_start:] - lower[eval_start:]))
+    return {
+        "lower": lower,
+        "upper": upper,
+        "empirical_coverage": round(emp_cov, 6),
+        "target_coverage": round(1.0 - alpha, 6),
+        "avg_width": round(avg_width, 6),
+        "final_alpha_t": round(alpha_t, 6),
+    }
+

@@ -15,25 +15,32 @@ from omniforge.models.base import BaseOmniForgeModel
 def _softmax(logits: np.ndarray) -> np.ndarray:
     shifted = logits - np.max(logits, axis=1, keepdims=True)
     exps = np.exp(shifted)
-    return exps / np.maximum(np.sum(exps, axis=1, keepdims=True), 1e-12)
+    return np.asarray(exps / np.maximum(np.sum(exps, axis=1, keepdims=True), 1e-12), dtype=np.float64)
 
 
 def _activate(z: np.ndarray, kind: str) -> np.ndarray:
     if kind == "tanh":
-        return np.tanh(z)
+        return np.asarray(np.tanh(z), dtype=np.float64)
     if kind == "gelu":
-        return 0.5 * z * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (z + 0.044715 * (z**3))))
-    return np.maximum(0.0, z)
+        zc = np.clip(z, -1e3, 1e3)
+        u = np.sqrt(2.0 / np.pi) * (zc + 0.044715 * (zc**3))
+        return np.asarray(0.5 * z * (1.0 + np.tanh(u)), dtype=np.float64)
+    return np.asarray(np.maximum(0.0, z), dtype=np.float64)
 
 
 def _activate_grad(z: np.ndarray, kind: str) -> np.ndarray:
     if kind == "tanh":
         t = np.tanh(z)
-        return 1.0 - t * t
+        return np.asarray(1.0 - t * t, dtype=np.float64)
     if kind == "gelu":
-        # Smooth GELU derivative approximation
-        s = 1.0 / (1.0 + np.exp(-1.702 * z))
-        return s + z * 1.702 * s * (1.0 - s)
+        # Exact analytical derivative of tanh-GELU (Hendrycks & Gimpel 2016), overflow-safe for |z| >> 1
+        zc = np.clip(z, -1e3, 1e3)
+        c = np.sqrt(2.0 / np.pi)
+        u = c * (zc + 0.044715 * (zc**3))
+        th = np.tanh(u)
+        sech2 = 1.0 - th * th
+        du_dz = c * (1.0 + 3.0 * 0.044715 * (zc**2))
+        return np.asarray(0.5 * (1.0 + th) + 0.5 * zc * sech2 * du_dz, dtype=np.float64)
     return (z > 0.0).astype(np.float64)
 
 
@@ -102,13 +109,13 @@ class MLPModel(BaseOmniForgeModel):
             self._fit_torch(X_scaled, y_idx, out_dim, is_clf)
             return
 
-        self.framework = "uap_numpy_autograd"
+        self.framework = "omniforge_numpy_autograd"
         self.metadata_.framework = self.framework
         self._fit_numpy(X_scaled, y_idx, out_dim, is_clf)
 
     def _fit_torch(self, X: np.ndarray, y: np.ndarray, out_dim: int, is_clf: bool) -> None:
-        import torch  # type: ignore[import-not-found]
-        import torch.nn as nn  # type: ignore[import-not-found]
+        import torch
+        import torch.nn as nn
 
         self.framework = "pytorch"
         self.metadata_.framework = self.framework
@@ -252,14 +259,17 @@ class MLPModel(BaseOmniForgeModel):
     def _forward_logits(self, X: np.ndarray) -> np.ndarray:
         X_scaled = self._scaler.transform(X).astype(np.float64)
         if self._torch_net is not None:
-            import torch  # type: ignore[import-not-found]
+            import torch
 
             with torch.no_grad():
-                return self._torch_net(torch.tensor(X_scaled, dtype=torch.float32)).numpy().astype(np.float64)
+                return np.asarray(
+                    self._torch_net(torch.tensor(X_scaled, dtype=torch.float32)).numpy(),
+                    dtype=np.float64,
+                )
         h = X_scaled
         for li in range(len(self._weights) - 1):
             h = _activate(h @ self._weights[li] + self._biases[li], self.activation)
-        return h @ self._weights[-1] + self._biases[-1]
+        return np.asarray(h @ self._weights[-1] + self._biases[-1], dtype=np.float64)
 
     def _predict_proba(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
         return _softmax(self._forward_logits(X))

@@ -36,6 +36,8 @@ class GraphAnalyticsEngine:
             graph.add_edge(row[source_col], row[target_col], weight=w)
         return graph
 
+    build_graph_from_edges = build_graph
+
     @staticmethod
     def compute_centralities(graph: nx.Graph) -> pd.DataFrame:
         """Compute PageRank, Degree, Betweenness, Closeness, and Clustering centralities per node."""
@@ -106,21 +108,28 @@ class GraphAnalyticsEngine:
     def compute_node_embeddings(
         self, graph: nx.Graph, *, embedding_dim: int = 16, walk_steps: int = 3
     ) -> dict[Any, np.ndarray]:
-        """Compute NetMF / random-walk PMI spectral node embeddings via TruncatedSVD."""
+        """Compute NetMF (Qiu et al., WSDM 2018) closed-form random-walk PMI spectral node embeddings."""
         nodes = list(graph.nodes())
         n = len(nodes)
         if n == 0:
             return {}
         adj = nx.to_numpy_array(graph, nodelist=nodes, dtype=float)
-        deg = adj.sum(axis=1, keepdims=True)
-        P = np.divide(adj, np.where(deg > 0, deg, 1.0))
-        # Multi-step transition matrix sum approximating DeepWalk/Node2Vec co-occurrence
+        deg = adj.sum(axis=1)
+        vol = float(np.sum(deg))
+        if vol <= 0.0:
+            k = max(1, min(embedding_dim, n - 1)) if n > 1 else 1
+            return {node: np.zeros(k, dtype=np.float32) for node in nodes}
+        P = np.divide(adj, np.where(deg[:, None] > 0.0, deg[:, None], 1.0))
+        # Multi-step transition matrix sum: M = (vol(G) / T) * (sum_{r=1}^T P^r) D^{-1}
         accum = np.zeros_like(P)
         power = P.copy()
-        for _ in range(max(1, walk_steps)):
+        T = max(1, int(walk_steps))
+        for _ in range(T):
             accum += power
             power = power @ P
-        pmi = np.log(np.maximum(accum * n / max(walk_steps, 1), 1.0))
+        inv_deg = np.where(deg > 0.0, 1.0 / deg, 0.0)
+        pmi_ratio = (vol / float(T)) * (accum * inv_deg[None, :])
+        pmi = np.log(np.maximum(pmi_ratio, 1.0))
         k = max(1, min(embedding_dim, n - 1)) if n > 1 else 1
         if n > 2 and k < n:
             emb = TruncatedSVD(n_components=k, random_state=self.random_seed).fit_transform(pmi)
@@ -130,14 +139,14 @@ class GraphAnalyticsEngine:
 
     @staticmethod
     def detect_anomalous_nodes(graph: nx.Graph, z_threshold: float = 2.5) -> pd.DataFrame:
-        """Identify structurally anomalous nodes via z-scores on degree, PageRank, and ego density."""
+        """Identify structurally anomalous nodes via z-scores on degree, PageRank, and betweenness."""
         df = GraphAnalyticsEngine.compute_centralities(graph)
         if len(df) < 3:
             df["anomaly_score"] = 0.0
             df["is_anomaly"] = 0
             return df
         feats = df[["degree", "pagerank", "betweenness"]].to_numpy(dtype=float)
-        stds = np.maximum(feats.std(axis=0), 1e-9)
+        stds = np.maximum(feats.std(axis=0, ddof=1), 1e-9)
         z = np.abs((feats - feats.mean(axis=0)) / stds)
         df["anomaly_score"] = np.round(z.max(axis=1), 4)
         df["is_anomaly"] = (df["anomaly_score"] > z_threshold).astype(int)

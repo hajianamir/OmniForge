@@ -110,9 +110,9 @@ export interface WorkspaceState {
   format_audit_issues: number;
   intake_audit?: IntakeAuditSummary | null;
   s02_cluster_committed?: boolean;
-  s02_cluster_summary?: Record<string, any> | null;
+  s02_cluster_summary?: Record<string, unknown> | null;
   s02_anomaly_committed?: boolean;
-  s02_anomaly_summary?: Record<string, any> | null;
+  s02_anomaly_summary?: Record<string, unknown> | null;
   active_model_name: string | null;
   active_model_metrics: Record<string, number> | null;
   active_feature_cols: string[];

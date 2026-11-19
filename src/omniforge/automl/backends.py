@@ -240,7 +240,8 @@ class _WrappedSklearnModel(BaseOmniForgeModel):
             return np.asarray(self._estimator.predict(X))
         return np.asarray(self._estimator.predict(X))
 
-    def predict_proba(self, X: pd.DataFrame | np.ndarray) -> np.ndarray:
+    def predict_proba(self, X: pd.DataFrame | np.ndarray, **kwargs: Any) -> np.ndarray:
+        _ = kwargs
         if hasattr(self._estimator, "predict_proba"):
             return np.asarray(self._estimator.predict_proba(X), dtype=float)
         raise AutoMLError(f"Model '{self.name}' does not support probability predictions.")
@@ -301,9 +302,10 @@ class _CaruanaStackPredictor:
         if self.is_clf:
             probs = self.predict_proba(X)
             idx = np.argmax(probs, axis=1)
-            if self.classes_ is not None:
-                return self.classes_[idx]
-            return idx
+            # ``np.asarray`` keeps the label dtype (int/bool/str): an object cast would break
+            # sklearn metrics with "mix of binary and unknown targets".
+            labels: np.ndarray = np.asarray(self.classes_) if self.classes_ is not None else np.asarray(idx)
+            return np.asarray(labels[idx]) if self.classes_ is not None else labels
         _, l1_preds, X_l2 = self._transform_and_l1(X)
         all_preds = dict(l1_preds)
         for mname, est in self.l2_models.items():
@@ -1003,7 +1005,7 @@ class AutoMLBackendHub:
         X_va, y_va = va_df.drop(columns=[target_col]), va_df[target_col]
 
         if backend == "autogluon" and is_package_available("autogluon.tabular"):
-            from autogluon.tabular import TabularPredictor  # type: ignore[import-not-found]
+            from autogluon.tabular import TabularPredictor
 
             predictor = TabularPredictor(label=target_col, eval_metric="f1_macro" if is_clf else "root_mean_squared_error").fit(
                 tr_df, time_limit=max(10, int(time_budget)), verbosity=0
@@ -1021,7 +1023,7 @@ class AutoMLBackendHub:
             }
 
         if backend == "tpot" and is_package_available("tpot"):
-            from tpot import TPOTClassifier, TPOTRegressor  # type: ignore[import-not-found]
+            from tpot import TPOTClassifier, TPOTRegressor
 
             pre = _build_preprocessor(X_tr)
             est = (
@@ -1043,7 +1045,7 @@ class AutoMLBackendHub:
             }
 
         if backend == "flaml" and is_package_available("flaml"):
-            from flaml import AutoML as FLAMLAutoML  # type: ignore[import-not-found]
+            from flaml import AutoML as FLAMLAutoML
 
             pre = _build_preprocessor(X_tr)
             X_tr_m = pre.fit_transform(X_tr)
@@ -1063,8 +1065,8 @@ class AutoMLBackendHub:
             }
 
         if backend == "h2o" and is_package_available("h2o") and shutil.which("java") is not None:
-            import h2o  # type: ignore[import-not-found]
-            from h2o.automl import H2OAutoML  # type: ignore[import-not-found]
+            import h2o
+            from h2o.automl import H2OAutoML
 
             h2o.init(verbose=False)
             h_tr = h2o.H2OFrame(tr_df)
@@ -1081,7 +1083,8 @@ class AutoMLBackendHub:
 
             class _H2OWrapper:
                 def predict(self, X_in: pd.DataFrame) -> np.ndarray:
-                    return aml.leader.predict(h2o.H2OFrame(X_in)).as_data_frame()["predict"].to_numpy()
+                    frame = aml.leader.predict(h2o.H2OFrame(X_in)).as_data_frame()["predict"]
+                    return np.asarray(frame.to_numpy(), dtype=float)
 
             return {
                 "best_model": _WrappedSklearnModel(f"H2O({aml.leader.model_id})", _H2OWrapper(), task_type, random_seed=random_seed),
@@ -1094,9 +1097,9 @@ class AutoMLBackendHub:
 
         if backend == "autosklearn" and is_package_available("autosklearn"):
             if is_clf:
-                from autosklearn.classification import AutoSklearnClassifier as ASKEst  # type: ignore[import-not-found]
+                from autosklearn.classification import AutoSklearnClassifier as ASKEst
             else:
-                from autosklearn.regression import AutoSklearnRegressor as ASKEst  # type: ignore[import-not-found]
+                from autosklearn.regression import AutoSklearnRegressor as ASKEst
             pre = _build_preprocessor(X_tr)
             pipe = Pipeline([("pre", pre), ("ask", ASKEst(time_left_for_this_task=max(30, int(time_budget)), seed=random_seed))])
             pipe.fit(X_tr, y_tr)

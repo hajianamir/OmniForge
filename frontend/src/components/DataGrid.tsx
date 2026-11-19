@@ -1,7 +1,10 @@
-import React, { useEffect, useState } from 'react';
-import { apiGet } from '../api';
+import React, { useEffect, useRef, useState } from 'react';
+import { ApiError, apiGet } from '../api';
 import type { GridResponse } from '../types';
 import { InspectableBox } from './InspectModal';
+
+/** Debounce delay (ms) before a search keystroke triggers a server round-trip. */
+const SEARCH_DEBOUNCE_MS = 300;
 
 export const PaginatedDataGrid: React.FC<{
   refreshKey: number;
@@ -14,10 +17,21 @@ export const PaginatedDataGrid: React.FC<{
   const [sortCol, setSortCol] = useState<string | null>(null);
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
   const [search, setSearch] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   const [loading, setLoading] = useState(false);
+  const abortRef = useRef<AbortController | null>(null);
+
+  // Debounce the search box: the input stays instant, the server is hit only
+  // after the user pauses typing (avoids one request per keystroke).
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedSearch(search), SEARCH_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [search]);
 
   useEffect(() => {
-    let active = true;
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
     setLoading(true);
     const params = new URLSearchParams({
       page: String(page),
@@ -26,13 +40,15 @@ export const PaginatedDataGrid: React.FC<{
       sort_dir: sortDir,
     });
     if (sortCol) params.set('sort_col', sortCol);
-    if (search.trim()) params.set('search', search.trim());
-    apiGet<GridResponse>(`/api/workbench/s01/grid?${params.toString()}`)
-      .then((res) => { if (active) setData(res); })
-      .catch(() => {})
-      .finally(() => { if (active) setLoading(false); });
-    return () => { active = false; };
-  }, [page, pageSize, sortCol, sortDir, search, viewMode, refreshKey]);
+    if (debouncedSearch.trim()) params.set('search', debouncedSearch.trim());
+    apiGet<GridResponse>(`/api/workbench/s01/grid?${params.toString()}`, { signal: controller.signal })
+      .then((res) => { if (!controller.signal.aborted) setData(res); })
+      .catch((err: unknown) => {
+        if (err instanceof ApiError && err.code === 'ABORTED') return;
+      })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    return () => controller.abort();
+  }, [page, pageSize, sortCol, sortDir, debouncedSearch, viewMode, refreshKey]);
 
   const toggleSort = (col: string) => {
     if (sortCol === col) {
@@ -107,15 +123,25 @@ export const PaginatedDataGrid: React.FC<{
       </div>
     </InspectableBox>
   );
-};
+}
 
-export const SimpleTable: React.FC<{
-  rows: Record<string, unknown>[];
+/**
+ * Compact, inspectable table for arbitrary record arrays.
+ * Generic over the row type so typed API payloads (interfaces) can be passed
+ * directly: interfaces are not assignable to `Record<string, unknown>`, but any
+ * object shape renders fine here.
+ */
+export function SimpleTable<T extends object>({
+  rows,
+  maxRows = 60,
+  title = 'Data Table',
+}: {
+  rows: T[];
   maxRows?: number;
   title?: string;
-}> = ({ rows, maxRows = 60, title = 'Data Table' }) => {
+}) {
   if (!rows || !rows.length) return <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>No records available.</div>;
-  const cols = Object.keys(rows[0]);
+  const cols = Object.keys(rows[0] as Record<string, unknown>);
   return (
     <InspectableBox title={title} subtitle={`${rows.length.toLocaleString()} rows × ${cols.length} cols`} compact>
       <div className="table-wrap">
@@ -127,7 +153,7 @@ export const SimpleTable: React.FC<{
             {rows.slice(0, maxRows).map((r, i) => (
               <tr key={i}>
                 {cols.map((c) => {
-                  const v = r[c];
+                  const v = (r as Record<string, unknown>)[c];
                   const text =
                     v === null || v === undefined
                       ? '—'
@@ -145,4 +171,4 @@ export const SimpleTable: React.FC<{
       </div>
     </InspectableBox>
   );
-};
+}

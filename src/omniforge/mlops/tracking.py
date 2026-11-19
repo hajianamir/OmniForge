@@ -21,6 +21,22 @@ from omniforge.core.utils import safe_json_default
 logger = get_logger(__name__)
 
 
+@contextmanager
+def _sqlite_conn(db_path: str | Path, **kwargs: Any) -> Iterator[sqlite3.Connection]:
+    """Yield a SQLite connection that is always committed/rolled back **and closed**.
+
+    ``with sqlite3.connect(...)`` only wraps a transaction; the underlying handle
+    stays open until garbage collection, which leaks file descriptors and emits
+    ``ResourceWarning: unclosed database``.
+    """
+    conn = sqlite3.connect(db_path, **kwargs)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
 class RunRecord(BaseModel):
     """Structured record of a tracked experiment run."""
 
@@ -52,7 +68,7 @@ class ExperimentTracker:
         self._init_db()
 
     def _init_db(self) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with _sqlite_conn(self.db_path) as conn:
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS experiments (
@@ -86,7 +102,7 @@ class ExperimentTracker:
 
     def create_experiment(self, name: str, description: str = "") -> str:
         """Create an experiment if it does not already exist."""
-        with sqlite3.connect(self.db_path) as conn:
+        with _sqlite_conn(self.db_path) as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO experiments (name, description, created_at) VALUES (?, ?, ?)",
                 (name, description, datetime.now(UTC).isoformat()),
@@ -106,7 +122,7 @@ class ExperimentTracker:
         run_id = f"exp_{uuid4().hex[:12]}"
         r_name = run_name or run_id
         now = datetime.now(UTC).isoformat()
-        with sqlite3.connect(self.db_path) as conn:
+        with _sqlite_conn(self.db_path) as conn:
             conn.execute(
                 """
                 INSERT INTO runs (run_id, experiment_name, run_name, status, started_at, ended_at, params_json, metrics_json, tags_json, artifacts_json)
@@ -131,7 +147,7 @@ class ExperimentTracker:
         rid = self._resolve_run(run_id)
         rec = self.get_run(rid)
         merged = {**rec.params, **{str(k): v for k, v in params.items()}}
-        with sqlite3.connect(self.db_path) as conn:
+        with _sqlite_conn(self.db_path) as conn:
             conn.execute(
                 "UPDATE runs SET params_json = ? WHERE run_id = ?",
                 (json.dumps(merged, default=safe_json_default), rid),
@@ -144,7 +160,7 @@ class ExperimentTracker:
         rec = self.get_run(rid)
         merged = dict(rec.metrics)
         now = datetime.now(UTC).isoformat()
-        with sqlite3.connect(self.db_path) as conn:
+        with _sqlite_conn(self.db_path) as conn:
             for k, v in metrics.items():
                 if isinstance(v, (int, float)):
                     merged[str(k)] = float(v)
@@ -167,14 +183,14 @@ class ExperimentTracker:
         shutil.copy2(src, dest)
         rec = self.get_run(rid)
         arts = list(dict.fromkeys([*rec.artifacts, str(dest.resolve())]))
-        with sqlite3.connect(self.db_path) as conn:
+        with _sqlite_conn(self.db_path) as conn:
             conn.execute("UPDATE runs SET artifacts_json = ? WHERE run_id = ?", (json.dumps(arts), rid))
             conn.commit()
         return dest
 
     def end_run(self, run_id: str, status: str = "FINISHED") -> None:
         """Finalize run status and end timestamp."""
-        with sqlite3.connect(self.db_path) as conn:
+        with _sqlite_conn(self.db_path) as conn:
             conn.execute(
                 "UPDATE runs SET status = ?, ended_at = ? WHERE run_id = ?",
                 (status, datetime.now(UTC).isoformat(), run_id),
@@ -183,7 +199,7 @@ class ExperimentTracker:
 
     def get_run(self, run_id: str) -> RunRecord:
         """Fetch a tracked run record by ID."""
-        with sqlite3.connect(self.db_path) as conn:
+        with _sqlite_conn(self.db_path) as conn:
             row = conn.execute(
                 "SELECT run_id, experiment_name, run_name, status, started_at, ended_at, params_json, metrics_json, tags_json, artifacts_json FROM runs WHERE run_id = ?",
                 (run_id,),
@@ -205,7 +221,7 @@ class ExperimentTracker:
 
     def list_runs(self, experiment_name: str | None = None, limit: int = 50) -> list[RunRecord]:
         """List recent experiment runs, optionally filtered by experiment name."""
-        with sqlite3.connect(self.db_path) as conn:
+        with _sqlite_conn(self.db_path) as conn:
             if experiment_name:
                 rows = conn.execute(
                     "SELECT run_id FROM runs WHERE experiment_name = ? ORDER BY started_at DESC LIMIT ?",

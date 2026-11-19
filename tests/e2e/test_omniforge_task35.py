@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from omniforge.api.auth import get_api_key
 from omniforge.api.main import create_app
 
 
 def _client_and_headers() -> tuple[TestClient, dict[str, str]]:
     app = create_app()
-    client = TestClient(app)
+    client = TestClient(app, headers={"X-API-Key": get_api_key()})
     headers = {"X-Session-ID": "task35_e2e_session"}
     return client, headers
 

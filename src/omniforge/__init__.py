@@ -1,4 +1,4 @@
-"""OmniForge v2.0.0 — Enterprise Analytics & AI Workbench (uap SDK).
+"""OmniForge v2.0.0 — Enterprise Analytics & AI Workbench (OmniForge SDK).
 
 Unified end-to-end Python SDK for multi-source data ingestion, automatic format auditing,
 cleaning with deleted-row provenance, quality profiling, automated EDA, feature engineering,

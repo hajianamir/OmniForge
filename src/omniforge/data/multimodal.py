@@ -121,7 +121,7 @@ class MultimodalProcessor:
         }
         if is_package_available("librosa") and len(y) >= 512:
             try:
-                import librosa  # type: ignore[import-not-found]
+                import librosa
 
                 mfccs = librosa.feature.mfcc(y=y.astype(np.float32), sr=sample_rate, n_mfcc=8)
                 for i in range(mfccs.shape[0]):
@@ -134,7 +134,7 @@ class MultimodalProcessor:
     def extract_video_features(video_path: str | Path, max_frames: int = 16) -> dict[str, float]:
         """Sample frames from a video file using OpenCV and aggregate frame statistics & motion."""
         try:
-            import cv2  # type: ignore[import-not-found]
+            import cv2
         except ImportError as exc:
             raise DataError(
                 "OpenCV ('opencv-python') is required for video frame extraction. "

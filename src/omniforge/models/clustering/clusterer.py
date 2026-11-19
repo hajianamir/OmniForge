@@ -127,6 +127,8 @@ class ClusteringEngine(BaseOmniForgeModel):
         self._labels_: np.ndarray = np.array([], dtype=int)
         self._X_scaled_: np.ndarray = np.empty((0, 0), dtype=float)
         self._encoded_cols_: list[str] = []
+        self._col_medians_: dict[str, float] = {}
+        self._array_medians_: np.ndarray | None = None
 
     def _make_scaler(self) -> Any:
         if self.scaler_type == "standard":
@@ -145,7 +147,11 @@ class ClusteringEngine(BaseOmniForgeModel):
             cat_cols = [c for c in work.columns if c not in num_cols]
             for c in num_cols:
                 col_vals = pd.to_numeric(work[c], errors="coerce")
-                med = float(col_vals.median()) if col_vals.notna().any() else 0.0
+                if fit_scaler:
+                    med = float(col_vals.median()) if col_vals.notna().any() else 0.0
+                    self._col_medians_[str(c)] = med
+                else:
+                    med = self._col_medians_.get(str(c), float(col_vals.median()) if col_vals.notna().any() else 0.0)
                 work[c] = col_vals.fillna(med)
             if cat_cols:
                 for c in cat_cols:
@@ -163,18 +169,30 @@ class ClusteringEngine(BaseOmniForgeModel):
             arr = np.asarray(X, dtype=float)
             if arr.ndim == 1:
                 arr = arr.reshape(-1, 1)
+            if fit_scaler:
+                with np.errstate(all="ignore"):
+                    col_med = np.nanmedian(arr, axis=0)
+                col_med = np.where(np.isnan(col_med), 0.0, col_med).astype(float)
+                self._array_medians_ = col_med
+                if self.feature_names_ and len(self.feature_names_) == len(col_med):
+                    self._col_medians_ = {str(name): float(val) for name, val in zip(self.feature_names_, col_med, strict=False)}
+            else:
+                if self._array_medians_ is not None and len(self._array_medians_) == arr.shape[1]:
+                    col_med = self._array_medians_
+                else:
+                    with np.errstate(all="ignore"):
+                        col_med = np.nanmedian(arr, axis=0)
+                    col_med = np.where(np.isnan(col_med), 0.0, col_med).astype(float)
             if np.isnan(arr).any():
-                col_med = np.nanmedian(arr, axis=0)
-                col_med = np.where(np.isnan(col_med), 0.0, col_med)
                 inds = np.where(np.isnan(arr))
                 arr = arr.copy()
                 arr[inds] = np.take(col_med, inds[1])
 
-        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+        arr = np.asarray(np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0), dtype=float)
         if fit_scaler:
             self._scaler = self._make_scaler()
-            return self._scaler.fit_transform(arr) if self._scaler is not None else arr
-        return self._scaler.transform(arr) if self._scaler is not None else arr
+            return np.asarray(self._scaler.fit_transform(arr), dtype=float) if self._scaler is not None else arr
+        return np.asarray(self._scaler.transform(arr), dtype=float) if self._scaler is not None else arr
 
     def _estimate_dbscan_eps(self, X_s: np.ndarray) -> float:
         """Heuristic k-distance elbow estimate for DBSCAN eps (sampled on >15k rows for O(N) speed)."""

@@ -7,6 +7,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
+from omniforge.api.auth import get_api_key
 from omniforge.api.main import create_app
 from omniforge.cli.main import cli
 
@@ -19,15 +20,24 @@ def test_fastapi_e2e_lifecycle() -> None:
     r_health = client.get("/health")
     assert r_health.status_code == 200 and r_health.json()["status"] == "healthy"
 
-    # Auth Token
-    r_tok = client.post("/api/v1/auth/token", json={"username": "lead_ds", "role": "admin", "tenant_id": "ent"})
+    # Unauthenticated calls MUST be rejected (HTTP 401)
+    assert client.post("/api/v1/auth/token", json={"username": "anon", "role": "admin"}).status_code == 401
+    assert client.get("/api/workbench/state").status_code == 401
+    assert client.post("/api/v1/data/quality", json={"records": [{"x": 1}]}).status_code == 401
+
+    # Auth Token (requires valid X-API-Key)
+    r_tok = client.post(
+        "/api/v1/auth/token",
+        json={"username": "lead_ds", "role": "admin", "tenant_id": "ent"},
+        headers={"X-API-Key": get_api_key()},
+    )
     assert r_tok.status_code == 200
     headers = {"Authorization": f"Bearer {r_tok.json()['access_token']}"}
 
-    # Domains list & sample
-    r_dom = client.get("/api/v1/domains")
+    # Domains list & sample (authenticated)
+    r_dom = client.get("/api/v1/domains", headers=headers)
     assert r_dom.status_code == 200 and len(r_dom.json()["domains"]) == 18
-    r_samp = client.get("/api/v1/domains/finance/sample?n_samples=60")
+    r_samp = client.get("/api/v1/domains/finance/sample?n_samples=60", headers=headers)
     assert r_samp.status_code == 200
     records = r_samp.json()["preview"]
 
@@ -61,13 +71,14 @@ def test_fastapi_e2e_lifecycle() -> None:
     assert r_pred.status_code == 200 and r_pred.json()["n_records"] == 3
 
     # Copilot REST endpoint
-    r_cop = client.post("/api/v1/copilot/chat", json={"message": "list industry domains"})
+    r_cop = client.post("/api/v1/copilot/chat", json={"message": "list industry domains"}, headers=headers)
     assert r_cop.status_code == 200 and "18" in r_cop.json()["reply"]
 
     # Portfolio Optimization REST endpoint
     r_opt = client.post(
         "/api/v1/optimization/portfolio",
         json={"expected_returns": [0.08, 0.13], "covariance_matrix": [[0.04, 0.01], [0.01, 0.09]]},
+        headers=headers,
     )
     assert r_opt.status_code == 200 and r_opt.json()["status"] == "optimal"
 

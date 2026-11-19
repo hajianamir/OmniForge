@@ -60,7 +60,7 @@ class DatasetVersionManager:
         tag: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> DatasetVersion:
-        """Persist a versioned immutable Parquet/Pickle snapshot of ``df``."""
+        """Persist a versioned immutable Parquet/JSON snapshot of ``df``."""
         manifest = self._load_manifest()
         history: list[dict[str, Any]] = manifest["datasets"].setdefault(dataset_name, [])
         checksum = compute_dataframe_checksum(df)
@@ -74,8 +74,8 @@ class DatasetVersionManager:
             artifact_path = ds_dir / f"{version_id}.parquet"
             df.to_parquet(artifact_path, index=False)
         except Exception:
-            artifact_path = ds_dir / f"{version_id}.pkl"
-            df.to_pickle(artifact_path)
+            artifact_path = ds_dir / f"{version_id}.json"
+            df.to_json(artifact_path, orient="table")
 
         version = DatasetVersion(
             dataset_name=dataset_name,
@@ -116,7 +116,15 @@ class DatasetVersionManager:
                 f"Version or tag '{version_or_tag}' not found for dataset '{dataset_name}'."
             )
         path = Path(selected.storage_path)
-        df = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_pickle(path)
+        if path.suffix == ".parquet":
+            df = pd.read_parquet(path)
+        elif path.suffix == ".json":
+            df = pd.read_json(path, orient="table")
+        else:
+            raise DataError(
+                f"Refusing to load unsafe legacy dataset snapshot format '{path.suffix}' (CWE-502 protection). "
+                "Re-commit the dataset version in Parquet or JSON format."
+            )
         return df, selected
 
     def list_versions(self, dataset_name: str) -> list[DatasetVersion]:

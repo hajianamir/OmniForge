@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useCallback, useEffect, useRef } from 'react';
 import type { ScatterPayload } from '../types';
 import { InspectableBox } from './InspectModal';
 
@@ -12,17 +12,19 @@ export const CanvasScatter: React.FC<{
   title?: string;
 }> = ({ data, xLabel = 'Component 1', yLabel = 'Component 2', height = 340, title = '2D Scatter Projection' }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const rafRef = useRef<number>(0);
 
-  useEffect(() => {
+  const draw = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas || !data.x?.length) return;
     const dpr = window.devicePixelRatio || 1;
     const width = canvas.clientWidth || 640;
-    canvas.width = width * dpr;
-    canvas.height = height * dpr;
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    ctx.scale(dpr, dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, width, height);
 
     const pad = { l: 48, r: 18, t: 16, b: 36 };
@@ -82,6 +84,27 @@ export const CanvasScatter: React.FC<{
     ctx.restore();
   }, [data, xLabel, yLabel, height]);
 
+  useEffect(() => {
+    draw();
+  }, [draw]);
+
+  // Redraw crisply when the container resizes (sidebar collapse, window drag,
+  // monitor change). Coalesced through requestAnimationFrame so a drag does
+  // not queue a redraw per ResizeObserver notification.
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = requestAnimationFrame(() => draw());
+    });
+    observer.observe(container);
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(rafRef.current);
+    };
+  }, [draw]);
+
   const uniqGroups = Array.from(new Set((data.groups || []).map(String))).slice(0, 12);
 
   return (
@@ -90,7 +113,7 @@ export const CanvasScatter: React.FC<{
       subtitle={`${xLabel} vs ${yLabel} · ${data.rendered_points.toLocaleString()} / ${data.total_points.toLocaleString()} pts`}
       compact
     >
-      <div>
+      <div ref={containerRef}>
         <canvas ref={canvasRef} style={{ width: '100%', height, display: 'block', borderRadius: 10, background: 'var(--bg)' }} />
         <div className="row" style={{ marginTop: 8, justifyContent: 'space-between' }}>
           <div className="row" style={{ gap: 6 }}>
@@ -317,10 +340,13 @@ export const NetworkGraphSVG: React.FC<{
  */
 export const SupervisoryTrendSVG: React.FC<{
   points: {
-    index: number;
+    index?: number;
+    label?: string;
     record_id?: string;
     actual?: number | null;
-    model_pred: number;
+    predicted?: number | null;
+    model_pred?: number;
+    baseline?: number | null;
     baseline_pred?: number | null;
     tol_upper?: number | null;
     tol_lower?: number | null;
@@ -333,7 +359,7 @@ export const SupervisoryTrendSVG: React.FC<{
 
   const vals: number[] = [];
   points.forEach((p) => {
-    [p.actual, p.model_pred, p.baseline_pred, p.tol_upper, p.tol_lower].forEach((v) => {
+    [p.actual, p.model_pred ?? p.predicted, p.baseline_pred ?? p.baseline, p.tol_upper, p.tol_lower].forEach((v) => {
       if (typeof v === 'number' && Number.isFinite(v)) vals.push(v);
     });
   });
@@ -381,8 +407,8 @@ export const SupervisoryTrendSVG: React.FC<{
     .filter(Boolean);
   const corridor = upperPts.length === points.length && lowerPts.length === points.length ? [...upperPts, ...lowerPts].join(' ') : '';
 
-  const modelPath = buildPath((p) => p.model_pred);
-  const basePath = buildPath((p) => p.baseline_pred);
+  const modelPath = buildPath((p) => p.model_pred ?? p.predicted);
+  const basePath = buildPath((p) => p.baseline_pred ?? p.baseline);
   const actualPath = buildPath((p) => p.actual);
 
   return (
@@ -405,13 +431,15 @@ export const SupervisoryTrendSVG: React.FC<{
         {actualPath && <path d={actualPath} fill="none" stroke="#f8fafc" strokeWidth={1.8} opacity={0.92} />}
 
         {points.map((p, i) => {
-          const yVal = typeof p.actual === 'number' && Number.isFinite(p.actual) ? p.actual : p.model_pred;
+          const modelVal = p.model_pred ?? p.predicted;
+          const yVal = typeof p.actual === 'number' && Number.isFinite(p.actual) ? p.actual : modelVal;
+          if (typeof yVal !== 'number' || !Number.isFinite(yVal)) return null;
           const sev = (p.severity || '').toUpperCase();
           if (sev === 'CRITICAL' || sev === 'BREACH') {
             return (
               <g key={i}>
                 <circle cx={sx(i)} cy={sy(yVal)} r={5.2} fill="#ef4444" stroke="#ffffff" strokeWidth={1.4}>
-                  <title>{`ALARM [${p.record_id ?? i}]: Actual=${p.actual ?? 'N/A'}, Model=${p.model_pred}, Baseline=${p.baseline_pred ?? 'N/A'}`}</title>
+                  <title>{`ALARM [${p.record_id ?? p.label ?? i}]: Actual=${p.actual ?? 'N/A'}, Model=${p.model_pred ?? p.predicted ?? 'N/A'}, Baseline=${p.baseline_pred ?? p.baseline ?? 'N/A'}`}</title>
                 </circle>
               </g>
             );
@@ -419,7 +447,7 @@ export const SupervisoryTrendSVG: React.FC<{
           if (sev === 'WARNING') {
             return (
               <circle key={i} cx={sx(i)} cy={sy(yVal)} r={4.2} fill="#fbbf24" stroke="#0f172a" strokeWidth={1}>
-                <title>{`WARNING [${p.record_id ?? i}]: Actual=${p.actual ?? 'N/A'}, Model=${p.model_pred}`}</title>
+                <title>{`WARNING [${p.record_id ?? p.label ?? i}]: Actual=${p.actual ?? 'N/A'}, Model=${p.model_pred ?? p.predicted ?? 'N/A'}`}</title>
               </circle>
             );
           }
@@ -447,7 +475,7 @@ export const SupervisoryTrendSVG: React.FC<{
  * Shewhart Statistical Process Control (SPC) Residual / Z-Score Chart with UCL / LCL & Warning Zones.
  */
 export const SPCControlSVG: React.FC<{
-  points: { index: number; record_id?: string; residual: number; z_score?: number; severity?: string }[];
+  points: { index?: number; label?: string; record_id?: string; residual: number; ucl?: number | null; lcl?: number | null; z_score?: number; status?: string; severity?: string }[];
   limits?: { center_line?: number; ucl?: number; lcl?: number; uwl?: number; lwl?: number };
   height?: number;
   title?: string;
@@ -499,12 +527,12 @@ export const SPCControlSVG: React.FC<{
 
         <path d={path} fill="none" stroke="#38bdf8" strokeWidth={1.8} />
         {points.map((p, i) => {
-          const sev = (p.severity || '').toUpperCase();
+          const sev = (p.severity || p.status || '').toUpperCase();
           const col = sev === 'CRITICAL' || sev === 'BREACH' ? '#ef4444' : sev === 'WARNING' ? '#fbbf24' : '#38bdf8';
           const r = sev === 'CRITICAL' || sev === 'BREACH' ? 4.8 : sev === 'WARNING' ? 3.8 : 2.5;
           return (
             <circle key={i} cx={sx(i)} cy={sy(p.residual)} r={r} fill={col}>
-              <title>{`[${p.record_id ?? i}] Residual=${p.residual.toFixed(3)}, Z=${p.z_score?.toFixed(2) ?? 'N/A'} (${sev || 'OK'})`}</title>
+              <title>{`[${p.record_id ?? p.label ?? i}] Residual=${Number.isFinite(p.residual) ? p.residual.toFixed(3) : 'N/A'}, Z=${typeof p.z_score === 'number' ? p.z_score.toFixed(2) : 'N/A'} (${sev || 'OK'})`}</title>
             </circle>
           );
         })}

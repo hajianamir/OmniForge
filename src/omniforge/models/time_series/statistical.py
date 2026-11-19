@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize_scalar
 from sklearn.linear_model import Ridge
 
 from omniforge.core.exceptions import ForecastingError
@@ -49,7 +50,7 @@ class StatisticalForecaster:
         self._history = arr
 
         if self.method == "prophet" and is_package_available("prophet"):
-            from prophet import Prophet  # type: ignore[import-not-found]
+            from prophet import Prophet
 
             df_p = pd.DataFrame({"ds": pd.date_range("2020-01-01", periods=len(arr), freq="D"), "y": arr})
             m = Prophet(interval_width=self.confidence_level)
@@ -102,10 +103,27 @@ class StatisticalForecaster:
             )
         elif self.method == "theta":
             n = len(self._history)
-            t_future = np.arange(n, n + h, dtype=float)
-            drift = self._theta_params["slope"] * 0.5
+            h_idx = np.arange(1, h + 1, dtype=float)
+            slope = self._theta_params["slope"]
             level = self._theta_params["ses_level"]
-            yhat = level + drift * (t_future - (n - 1) + (1.0 / max(self._theta_params["alpha"], 0.05) - 1.0))
+            alpha = self._theta_params["alpha"]
+            # Exact Hyndman & Billah (2003, Int. J. Forecasting 19:287-290) Eq. 5 finite-sample Theta drift:
+            # X_hat_{T+h|T} = ell_T + 0.5 * b_0 * [ (h - 1) + (1 - (1 - alpha)^T) / alpha ]
+            if alpha <= 1e-8:
+                drift_offset = float(n)
+            else:
+                drift_offset = (1.0 - (1.0 - alpha) ** n) / alpha
+            yhat = level + 0.5 * slope * ((h_idx - 1.0) + drift_offset)
+            # Exact SES-with-drift h-step-ahead forecast error std: sigma * sqrt(1 + (h - 1) * alpha^2)
+            theta_half_w = z * self._residual_std * np.sqrt(1.0 + (h_idx - 1.0) * (alpha**2))
+            return pd.DataFrame(
+                {
+                    "step": np.arange(1, h + 1),
+                    "yhat": yhat,
+                    "yhat_lower": yhat - theta_half_w,
+                    "yhat_upper": yhat + theta_half_w,
+                }
+            )
         elif self.method == "croston":
             yhat = np.full(h, self._croston_rate, dtype=float)
         else:
@@ -137,7 +155,8 @@ class StatisticalForecaster:
             )
             res = model.fit(optimized=True)
             self._fitted_model = res
-            self._residual_std = float(np.std(res.resid)) or float(np.std(np.diff(arr)))
+            ddof = 1 if len(res.resid) > 1 else 0
+            self._residual_std = float(np.std(res.resid, ddof=ddof)) or float(np.std(np.diff(arr), ddof=1 if len(arr) > 2 else 0))
         except Exception as exc:
             logger.warning("ets_fallback_to_fourier", reason=str(exc))
             self.method = "fourier_prophet"
@@ -155,26 +174,51 @@ class StatisticalForecaster:
             )
             res = model.fit(disp=False)
             self._fitted_model = res
-            self._residual_std = float(np.std(res.resid)) or 1.0
+            # Drop diffuse Kalman state-space burn-in residuals (p + d / loglikelihood_burn)
+            p_ord, d_ord, _ = self.arima_order
+            burn = max(int(p_ord) + int(d_ord), int(getattr(res, "loglikelihood_burn", int(p_ord) + int(d_ord))))
+            burn = min(max(0, burn), max(0, len(res.resid) - 2))
+            eff_resid = np.asarray(res.resid[burn:], dtype=float)
+            ddof = 1 if len(eff_resid) > 1 else 0
+            self._residual_std = float(np.std(eff_resid, ddof=ddof)) or 1.0
         except Exception as exc:
             logger.warning("arima_fallback_to_fourier", reason=str(exc))
             self.method = "fourier_prophet"
             self._fit_fourier_trend(arr)
 
     def _fit_theta(self, arr: np.ndarray) -> None:
-        t = np.arange(len(arr), dtype=float)
+        """Fit Hyndman & Billah (2003) Theta method (theta=2) with SSE-optimal SES alpha."""
+        n = len(arr)
+        t = np.arange(n, dtype=float)
         slope, _ = np.polyfit(t, arr, 1)
-        alpha = 0.25
-        level = arr[0]
-        fitted = np.empty_like(arr)
-        for i, val in enumerate(arr):
-            fitted[i] = level
-            level = alpha * val + (1.0 - alpha) * level
+
+        def _ses_sse(alpha_val: float) -> float:
+            lvl = float(arr[0])
+            sse = 0.0
+            for i in range(1, n):
+                err = float(arr[i]) - lvl
+                sse += err * err
+                lvl = alpha_val * float(arr[i]) + (1.0 - alpha_val) * lvl
+            return sse
+
+        opt = minimize_scalar(_ses_sse, bounds=(1e-4, 1.0), method="bounded")
+        alpha = float(np.clip(opt.x, 1e-4, 1.0))
+
+        level = float(arr[0])
+        one_step_errors = np.empty(max(n - 1, 1), dtype=float)
+        for i in range(n):
+            if i > 0:
+                one_step_errors[i - 1] = float(arr[i]) - level
+            level = alpha * float(arr[i]) + (1.0 - alpha) * level
+
         self._theta_params = {"slope": float(slope), "ses_level": float(level), "alpha": alpha}
-        self._residual_std = float(np.std(arr - fitted)) or 1.0
+        # Unbiased 1-step-ahead innovation std (excluding trivial t=0 initialization error)
+        dof = max(len(one_step_errors) - 1, 1)
+        sigma = float(np.sqrt(np.sum(one_step_errors**2) / float(dof)))
+        self._residual_std = sigma if sigma > 1e-12 else (float(np.std(np.diff(arr), ddof=1 if n > 2 else 0)) or 1.0)
 
     def _fit_croston(self, arr: np.ndarray, alpha: float = 0.2) -> None:
-        """Croston's method for intermittent demand forecasting."""
+        """Syntetos-Boylan Approximation (SBA) bias-corrected Croston method for intermittent demand."""
         non_zero_idx = np.where(arr > 0)[0]
         if len(non_zero_idx) == 0:
             self._croston_rate = 0.0
@@ -188,8 +232,9 @@ class StatisticalForecaster:
             z_est = alpha * float(arr[idx]) + (1.0 - alpha) * z_est
             p_est = alpha * q + (1.0 - alpha) * p_est
             last_idx = int(idx)
-        self._croston_rate = z_est / max(p_est, 1e-6)
-        self._residual_std = float(np.std(arr - self._croston_rate))
+        # Syntetos & Boylan (2005) bias correction factor (1 - alpha / 2) eliminates Croston positive bias
+        self._croston_rate = (1.0 - 0.5 * alpha) * (z_est / max(p_est, 1e-6))
+        self._residual_std = float(np.std(arr - self._croston_rate, ddof=1 if len(arr) > 1 else 0))
 
     def _build_fourier_matrix(self, t: np.ndarray) -> np.ndarray:
         cols: list[np.ndarray] = [t / max(len(self._history), 1)]
