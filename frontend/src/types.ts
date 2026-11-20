@@ -1,4 +1,5 @@
 export type StudioId =
+  | '00'
   | '01'
   | '02'
   | '03'
@@ -21,7 +22,8 @@ export interface StudioDef {
 }
 
 export const STUDIOS: StudioDef[] = [
-  { id: '01', title: 'Data Ingestion, Quality & Cleaning', short: 'Data & Quality' },
+  { id: '00', title: 'Data Ingestion & Split Lock', short: 'Ingestion' },
+  { id: '01', title: 'Data Preparation & Cleaning', short: 'Cleaning' },
   { id: '02', title: 'Clustering, Anomaly & Data Mining', short: 'Cluster · Mining' },
   { id: '03', title: 'Universal Diagnostics, Baselines & Risk', short: 'Diagnostics & Risk' },
   { id: '04', title: 'Automated EDA & Hypothesis Lab', short: 'EDA & Hypothesis' },

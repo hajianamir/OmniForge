@@ -211,3 +211,81 @@ def adaptive_conformal_intervals(
         "final_alpha_t": round(alpha_t, 6),
     }
 
+
+def knn_shapley_valuation(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    *,
+    k: int = 5,
+) -> dict[str, Any]:
+    """Exact O(N log N) KNN-Shapley training data valuation (Jia et al., 2019) for mislabel/noise detection."""
+    X_tr = np.asarray(X_train, dtype=float)
+    y_tr = np.asarray(y_train)
+    X_va = np.asarray(X_val, dtype=float)
+    y_va = np.asarray(y_val)
+    n_tr = len(X_tr)
+    n_va = len(X_va)
+    if n_tr < 2 or n_va < 1:
+        return {"evaluable": False, "values": [], "negative_value_count": 0, "worst_indices": []}
+    k_eff = max(1, min(k, n_tr))
+    shapley = np.zeros(n_tr, dtype=float)
+
+    for j in range(n_va):
+        dists = np.linalg.norm(X_tr - X_va[j], axis=1)
+        order = np.argsort(dists)
+        s = np.zeros(n_tr, dtype=float)
+        match_last = 1.0 if y_tr[order[-1]] == y_va[j] else 0.0
+        s[n_tr - 1] = match_last / n_tr
+        for i in range(n_tr - 2, -1, -1):
+            m_curr = 1.0 if y_tr[order[i]] == y_va[j] else 0.0
+            m_next = 1.0 if y_tr[order[i + 1]] == y_va[j] else 0.0
+            rank = i + 1
+            s[i] = s[i + 1] + ((m_curr - m_next) / k_eff) * (min(k_eff, rank) / rank)
+        shapley[order] += s / n_va
+
+    neg_mask = shapley < 0.0
+    worst_idx = np.argsort(shapley)[: min(20, n_tr)].tolist()
+    return {
+        "evaluable": True,
+        "n_train": int(n_tr),
+        "n_val": int(n_va),
+        "k": int(k_eff),
+        "values": [round(float(v), 6) for v in shapley],
+        "negative_value_count": int(neg_mask.sum()),
+        "worst_indices": [int(i) for i in worst_idx],
+    }
+
+
+def venn_abers_calibrate(
+    cal_scores: np.ndarray,
+    cal_y: np.ndarray,
+    test_scores: np.ndarray,
+) -> dict[str, list[float]]:
+    """Inductive Venn-ABERS Predictor (IVAP, Vovk et al.) returning calibrated probability intervals [p0, p1]."""
+    from sklearn.isotonic import IsotonicRegression
+
+    cs = np.asarray(cal_scores, dtype=float)
+    cy = np.asarray(cal_y, dtype=int)
+    ts = np.asarray(test_scores, dtype=float)
+
+    p0_list: list[float] = []
+    p1_list: list[float] = []
+    p_cal_list: list[float] = []
+
+    for x_t in ts:
+        x_aug = np.append(cs, x_t)
+        iso0 = IsotonicRegression(out_of_bounds="clip").fit(x_aug, np.append(cy, 0))
+        iso1 = IsotonicRegression(out_of_bounds="clip").fit(x_aug, np.append(cy, 1))
+        p0 = float(np.clip(iso0.predict([x_t])[0], 0.0, 1.0))
+        p1 = float(np.clip(iso1.predict([x_t])[0], 0.0, 1.0))
+        denom = 1.0 - p0 + p1
+        p_cal = float(p1 / denom) if denom > 1e-12 else 0.5
+        p0_list.append(round(p0, 6))
+        p1_list.append(round(p1, 6))
+        p_cal_list.append(round(p_cal, 6))
+
+    return {"p0": p0_list, "p1": p1_list, "p_calibrated": p_cal_list}
+
+

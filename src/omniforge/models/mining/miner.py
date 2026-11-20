@@ -176,6 +176,75 @@ class AssociationRuleMiner:
         )
 
 
+    @staticmethod
+    def mine_transactions(
+        df: pd.DataFrame,
+        transaction_col: str,
+        item_col: str,
+        *,
+        min_support: float = 0.05,
+        min_confidence: float = 0.4,
+        min_lift: float = 1.0,
+        max_rules: int = 50,
+    ) -> dict[str, Any]:
+        """Transaction-ID-aware association rule mining with full item keys (no truncation)."""
+        from collections import Counter
+        from itertools import combinations
+
+        if transaction_col not in df.columns or item_col not in df.columns:
+            raise ValueError(f"Columns '{transaction_col}' and '{item_col}' must exist in DataFrame.")
+        grouped = (
+            df[[transaction_col, item_col]]
+            .dropna()
+            .groupby(transaction_col)[item_col]
+            .apply(lambda s: frozenset(str(v) for v in s))
+        )
+        n_tx = len(grouped)
+        if n_tx == 0:
+            return {"n_transactions": 0, "rules": [], "n_rules": 0}
+
+        item_counts: Counter[str] = Counter()
+        for basket in grouped:
+            for it in basket:
+                item_counts[it] += 1
+
+        freq_1 = {it: cnt / n_tx for it, cnt in item_counts.items() if (cnt / n_tx) >= min_support}
+        freq_items = sorted(freq_1.keys())
+        pair_counts: Counter[tuple[str, str]] = Counter()
+        for basket in grouped:
+            present = sorted(it for it in basket if it in freq_1)
+            for a, b in combinations(present, 2):
+                pair_counts[(a, b)] += 1
+
+        rules: list[dict[str, Any]] = []
+        for (a, b), cnt in pair_counts.items():
+            sup_ab = cnt / n_tx
+            if sup_ab < min_support:
+                continue
+            sup_a, sup_b = freq_1[a], freq_1[b]
+            for ant, con, s_ant, s_con in ((a, b, sup_a, sup_b), (b, a, sup_b, sup_a)):
+                conf = sup_ab / max(s_ant, 1e-12)
+                lift = conf / max(s_con, 1e-12)
+                if conf >= min_confidence and lift >= min_lift:
+                    rules.append(
+                        {
+                            "antecedent": [ant],
+                            "consequent": [con],
+                            "support": round(sup_ab, 6),
+                            "confidence": round(conf, 6),
+                            "lift": round(lift, 6),
+                            "count": int(cnt),
+                        }
+                    )
+        rules.sort(key=lambda r: (r["lift"], r["confidence"], r["support"]), reverse=True)
+        return {
+            "n_transactions": int(n_tx),
+            "n_frequent_1_itemsets": int(len(freq_items)),
+            "rules": rules[:max_rules],
+            "n_rules": int(len(rules)),
+        }
+
+
 class SubgroupDiscoveryMiner:
     """Statistically validated Subgroup Discovery identifying feature cohorts with highest target lift."""
 
@@ -234,7 +303,7 @@ class SubgroupDiscoveryMiner:
                 out_vals = y[~mask]
                 sub_mean = float(np.mean(in_vals))
                 diff = sub_mean - global_mean
-                lift = sub_mean / global_mean if abs(global_mean) > 1e-9 else 1.0
+                lift: float | None = (sub_mean / global_mean) if abs(global_mean) > 1e-9 else None
                 try:
                     _, p_val = stats.ttest_ind(in_vals, out_vals, equal_var=False)
                     p_val = float(p_val)
@@ -252,7 +321,7 @@ class SubgroupDiscoveryMiner:
                         "subgroup_value": round(sub_mean, 4),
                         "global_value": round(global_mean, 4),
                         "delta": round(diff, 4),
-                        "lift": round(lift, 3),
+                        "lift": round(lift, 3) if lift is not None else None,
                         "wracc": round(wracc, 5),
                         "p_value": round(p_val, 6),
                         "significant": "Yes (p<0.05)" if p_val < 0.05 else "No",
@@ -292,15 +361,17 @@ class ManifoldProjector:
         *,
         method: str = "pca",
         color_col: str | None = None,
+        exclude_cols: list[str] | None = None,
         max_points: int = 2500,
     ) -> dict[str, Any]:
         """Project numeric feature space into 2D coordinates with loadings/variance diagnostics."""
         m = method.lower()
         if m not in self.SUPPORTED_METHODS:
             m = "pca"
-        num_cols = list(df.select_dtypes(include=[np.number]).columns)
+        excl = set(exclude_cols or []) | ({color_col} if color_col else set())
+        num_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c not in excl]
         if len(num_cols) < 2:
-            raise ValueError("Manifold projection requires at least 2 numeric columns.")
+            raise ValueError("Manifold projection requires at least 2 numeric feature columns.")
 
         # Non-linear manifold embeddings scale O(N^2), cap sample cleanly for interactive speed
         cap = max_points if m in ("pca", "svd") else min(max_points, 700)
@@ -353,6 +424,16 @@ class ManifoldProjector:
                 except Exception:
                     groups = None
 
+        trust: float | None = None
+        if len(emb) >= 10:
+            try:
+                from sklearn.manifold import trustworthiness as _tw
+
+                k_nb = min(5, max(1, len(emb) // 3))
+                trust = round(float(_tw(X_s, emb, n_neighbors=k_nb)), 4)
+            except Exception:
+                trust = None
+
         scatter = compact_scatter_payload(emb[:, 0], emb[:, 1], groups=groups, max_points=cap)
         return dict(
             to_json_safe(
@@ -360,6 +441,7 @@ class ManifoldProjector:
                     "method": m.upper(),
                     "n_points": len(emb),
                     "was_sampled": was_sampled,
+                    "trustworthiness": trust,
                     "explained_variance_pct": explained,
                     "total_explained_pct": round(sum(explained), 2) if explained else None,
                     "loadings": loadings[:20],
@@ -369,3 +451,260 @@ class ManifoldProjector:
                 }
             )
         )
+
+
+class _FPNode:
+    """Node in an FP-Tree."""
+
+    __slots__ = ("item", "count", "parent", "children", "link")
+
+    def __init__(self, item: str | None, count: int, parent: _FPNode | None) -> None:
+        self.item = item
+        self.count = count
+        self.parent = parent
+        self.children: dict[str, _FPNode] = {}
+        self.link: _FPNode | None = None
+
+
+def fp_growth_mine(
+    transactions: list[list[str]],
+    *,
+    min_support: float = 0.05,
+    min_confidence: float = 0.3,
+    min_lift: float = 1.0,
+    max_rules: int = 50,
+) -> dict[str, Any]:
+    """Mine frequent itemsets and association rules using the FP-Growth algorithm."""
+    n_tx = len(transactions)
+    if n_tx == 0:
+        return {"n_transactions": 0, "frequent_itemsets": [], "rules": []}
+    min_count = max(1, int(np.ceil(min_support * n_tx)))
+
+    def _build_tree(
+        txs: list[tuple[list[str], int]],
+    ) -> tuple[_FPNode, dict[str, tuple[int, _FPNode | None]]]:
+        counts: dict[str, int] = {}
+        for items, mult in txs:
+            for it in set(items):
+                counts[it] = counts.get(it, 0) + mult
+        freq = {k: v for k, v in counts.items() if v >= min_count}
+        header: dict[str, tuple[int, _FPNode | None]] = {k: (v, None) for k, v in freq.items()}
+        root = _FPNode(None, 0, None)
+        for items, mult in txs:
+            ordered = sorted([it for it in set(items) if it in freq], key=lambda x: (-freq[x], x))
+            curr = root
+            for it in ordered:
+                if it in curr.children:
+                    curr.children[it].count += mult
+                else:
+                    node = _FPNode(it, mult, curr)
+                    curr.children[it] = node
+                    cnt_h, head_node = header[it]
+                    if head_node is None:
+                        header[it] = (cnt_h, node)
+                    else:
+                        p = head_node
+                        while p.link is not None:
+                            p = p.link
+                        p.link = node
+                curr = curr.children[it]
+        return root, header
+
+    freq_itemsets: dict[frozenset[str], int] = {}
+
+    def _mine(header: dict[str, tuple[int, _FPNode | None]], prefix: frozenset[str]) -> None:
+        sorted_items = sorted(header.items(), key=lambda kv: (kv[1][0], kv[0]))
+        for item, (sup, node) in sorted_items:
+            new_set = prefix | {item}
+            freq_itemsets[new_set] = sup
+            cond_txs: list[tuple[list[str], int]] = []
+            curr = node
+            while curr is not None:
+                path: list[str] = []
+                parent = curr.parent
+                while parent is not None and parent.item is not None:
+                    path.append(parent.item)
+                    parent = parent.parent
+                if path:
+                    cond_txs.append((path, curr.count))
+                curr = curr.link
+            if cond_txs:
+                _, cond_header = _build_tree(cond_txs)
+                if cond_header:
+                    _mine(cond_header, new_set)
+
+    _, root_header = _build_tree([(tx, 1) for tx in transactions])
+    _mine(root_header, frozenset())
+
+    rules: list[dict[str, Any]] = []
+    for iset, sup_ab in freq_itemsets.items():
+        if len(iset) < 2:
+            continue
+        for item in iset:
+            ant = iset - {item}
+            con = frozenset({item})
+            sup_a = freq_itemsets.get(ant, 0)
+            sup_b = freq_itemsets.get(con, 0)
+            if sup_a == 0 or sup_b == 0:
+                continue
+            conf = sup_ab / sup_a
+            s_ab = sup_ab / n_tx
+            s_b = sup_b / n_tx
+            lift = conf / max(s_b, 1e-12)
+            if conf >= min_confidence and lift >= min_lift:
+                rules.append(
+                    {
+                        "antecedent": sorted(ant),
+                        "consequent": [item],
+                        "support": round(s_ab, 6),
+                        "confidence": round(conf, 6),
+                        "lift": round(lift, 6),
+                    }
+                )
+    rules.sort(key=lambda r: (r["lift"], r["confidence"], r["support"]), reverse=True)
+    return {
+        "n_transactions": n_tx,
+        "frequent_itemsets": [
+            {"items": sorted(k), "support": round(v / n_tx, 6)}
+            for k, v in sorted(freq_itemsets.items(), key=lambda kv: (-kv[1], sorted(kv[0])))
+        ],
+        "rules": rules[:max_rules],
+    }
+
+
+class SequentialPatternMiner:
+    """Sequential pattern mining via PrefixSpan."""
+
+    @staticmethod
+    def prefix_span(
+        sequences: list[list[str]],
+        *,
+        min_support: float = 0.2,
+        max_len: int = 4,
+    ) -> list[dict[str, Any]]:
+        """Discover frequent sequential patterns using PrefixSpan projected databases."""
+        n_seq = len(sequences)
+        if n_seq == 0:
+            return []
+        min_count = max(1, int(np.ceil(min_support * n_seq)))
+        results: list[dict[str, Any]] = []
+
+        def _project(prefix: list[str], db: list[list[str]]) -> None:
+            if len(prefix) >= max_len:
+                return
+            item_counts: dict[str, int] = {}
+            for seq in db:
+                for it in set(seq):
+                    item_counts[it] = item_counts.get(it, 0) + 1
+            for it, cnt in sorted(item_counts.items(), key=lambda kv: (-kv[1], kv[0])):
+                if cnt < min_count:
+                    continue
+                new_prefix = [*prefix, it]
+                results.append(
+                    {
+                        "pattern": new_prefix,
+                        "count": cnt,
+                        "support": round(cnt / n_seq, 6),
+                    }
+                )
+                proj_db: list[list[str]] = []
+                for seq in db:
+                    try:
+                        idx = seq.index(it)
+                        if idx + 1 < len(seq):
+                            proj_db.append(seq[idx + 1 :])
+                    except ValueError:
+                        continue
+                if proj_db:
+                    _project(new_prefix, proj_db)
+
+        _project([], sequences)
+        results.sort(key=lambda r: (-r["support"], -len(r["pattern"]), r["pattern"]))
+        return results
+
+
+def subgroup_beam_search(
+    df: pd.DataFrame,
+    target_col: str,
+    *,
+    beam_width: int = 5,
+    max_depth: int = 2,
+    min_support: int = 10,
+) -> list[dict[str, Any]]:
+    """Multi-condition subgroup discovery using Beam Search."""
+    if target_col not in df.columns or len(df) < max(20, min_support):
+        return []
+    y = pd.to_numeric(df[target_col], errors="coerce")
+    valid = y.notna()
+    work = df.loc[valid].copy()
+    y_vals = y.loc[valid].to_numpy(dtype=float)
+    if len(y_vals) < min_support:
+        return []
+    global_mean = float(np.mean(y_vals))
+
+    # Build atomic selectors
+    selectors: list[tuple[str, np.ndarray]] = []
+    for col in work.columns:
+        if col == target_col:
+            continue
+        ser = work[col]
+        if pd.api.types.is_numeric_dtype(ser):
+            med = float(pd.to_numeric(ser, errors="coerce").median())
+            m_hi = (pd.to_numeric(ser, errors="coerce") > med).to_numpy()
+            if int(m_hi.sum()) >= min_support:
+                selectors.append((f"{col} > {med:.3g}", m_hi))
+        else:
+            for val in ser.astype(str).value_counts().head(4).index:
+                m_eq = (ser.astype(str) == str(val)).to_numpy()
+                if int(m_eq.sum()) >= min_support:
+                    selectors.append((f"{col} == '{val}'", m_eq))
+
+    def _score(mask: np.ndarray) -> tuple[float, float, float | None]:
+        sub_y = y_vals[mask]
+        sub_mean = float(np.mean(sub_y))
+        lift = (sub_mean / global_mean) if abs(global_mean) > 1e-9 else None
+        score = abs(sub_mean - global_mean) * float(np.sqrt(len(sub_y)))
+        return score, sub_mean, lift
+
+    beam: list[tuple[tuple[str, ...], np.ndarray, float, float, float | None]] = []
+    for name, mask in selectors:
+        sc, sm, lf = _score(mask)
+        beam.append(((name,), mask, sc, sm, lf))
+    beam.sort(key=lambda x: x[2], reverse=True)
+    beam = beam[:beam_width]
+
+    all_found = list(beam)
+    for _depth in range(2, max_depth + 1):
+        candidates: list[tuple[tuple[str, ...], np.ndarray, float, float, float | None]] = []
+        seen: set[tuple[str, ...]] = set()
+        for conds, mask, _, _, _ in beam:
+            for name, s_mask in selectors:
+                if name in conds:
+                    continue
+                new_conds = tuple(sorted([*conds, name]))
+                if new_conds in seen:
+                    continue
+                seen.add(new_conds)
+                comb = mask & s_mask
+                if int(comb.sum()) < min_support:
+                    continue
+                sc, sm, lf = _score(comb)
+                candidates.append((new_conds, comb, sc, sm, lf))
+        if not candidates:
+            break
+        candidates.sort(key=lambda x: x[2], reverse=True)
+        beam = candidates[:beam_width]
+        all_found.extend(beam)
+
+    all_found.sort(key=lambda x: x[2], reverse=True)
+    return [
+        {
+            "conditions": list(conds),
+            "support": int(mask.sum()),
+            "subgroup_mean": round(sm, 6),
+            "lift": round(lf, 3) if lf is not None else None,
+            "score": round(sc, 4),
+        }
+        for conds, mask, sc, sm, lf in all_found[: beam_width * max_depth]
+    ]
+

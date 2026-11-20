@@ -33,6 +33,7 @@ import { STUDIOS, type StudioId, type WorkspaceState } from './types';
 
 // Code-split studios: each studio chunk downloads only on first visit, then
 // stays mounted (keep-alive via display:none) so tabs/forms/results survive.
+const Studio00Ingestion = React.lazy(() => import('./studios/StudiosPart1').then((m) => ({ default: m.Studio00Ingestion })));
 const Studio01Data = React.lazy(() => import('./studios/StudiosPart1').then((m) => ({ default: m.Studio01Data })));
 const Studio02Clustering = React.lazy(() => import('./studios/StudiosPart1').then((m) => ({ default: m.Studio02Clustering })));
 const Studio03Diagnostics = React.lazy(() => import('./studios/StudiosPart1').then((m) => ({ default: m.Studio03Diagnostics })));
@@ -57,6 +58,7 @@ const StudioLoadingFallback: React.FC = () => (
 );
 
 const ICONS: Record<StudioId, React.ReactNode> = {
+  '00': <Database size={15} />,
   '01': <Database size={15} />,
   '02': <ScatterChart size={15} />,
   '03': <Activity size={15} />,
@@ -112,8 +114,8 @@ const EMPTY_WS: WorkspaceState = {
 
 export const App: React.FC = () => {
   const [ws, setWs] = useState<WorkspaceState>(EMPTY_WS);
-  const [studio, setStudio] = useState<StudioId>('01');
-  const [visitedStudios, setVisitedStudios] = useState<StudioId[]>(['01']);
+  const [studio, setStudio] = useState<StudioId>('00');
+  const [visitedStudios, setVisitedStudios] = useState<StudioId[]>(['00']);
   const [gridVersion, setGridVersion] = useState(0);
   const [modal, setModal] = useState<'none' | 'targets' | 'exclusions' | 'split' | 'project'>('none');
   const [helpOpen, setHelpOpen] = useState(false);
@@ -399,6 +401,7 @@ export const App: React.FC = () => {
       <main ref={mainPaneRef} className="main-pane">
         {toast && <div className="alert alert-success">{toast}</div>}
         <React.Suspense fallback={<StudioLoadingFallback />}>
+          {visitedStudios.includes('00') && <div style={{ display: studio === '00' ? 'block' : 'none' }}><Studio00Ingestion {...commonProps} /></div>}
           {visitedStudios.includes('01') && <div style={{ display: studio === '01' ? 'block' : 'none' }}><Studio01Data {...commonProps} /></div>}
           {visitedStudios.includes('02') && <div style={{ display: studio === '02' ? 'block' : 'none' }}><Studio02Clustering {...commonProps} /></div>}
           {visitedStudios.includes('03') && <div style={{ display: studio === '03' ? 'block' : 'none' }}><Studio03Diagnostics {...commonProps} /></div>}

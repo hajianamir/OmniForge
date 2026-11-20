@@ -194,14 +194,22 @@ def test_p0_3_and_p0_4_auth_rbac_csrf_cors_health_and_500_hygiene() -> None:
             resp = anon.request(method, url, json={} if method in ("POST", "PUT", "PATCH") else None)
             assert resp.status_code == 401, (method, route.path, resp.status_code)
 
-    # 2. Local SPA cookie + CSRF double-submit enforcement
-    browser = TestClient(app)
-    assert browser.get("/").status_code == 200
-    assert WORKBENCH_AUTH_COOKIE in browser.cookies and WORKBENCH_CSRF_COOKIE in browser.cookies
-    assert browser.get("/api/workbench/state").status_code == 200
-    assert browser.post("/api/workbench/theme", json={"theme": "light"}).status_code == 403
-    csrf = browser.cookies[WORKBENCH_CSRF_COOKIE]
-    assert browser.post("/api/workbench/theme", json={"theme": "light"}, headers={"X-CSRF-Token": csrf}).status_code == 200
+    # 2. Local SPA cookie + CSRF double-submit enforcement (requires explicit opt-in)
+    from omniforge.config.settings import get_settings
+
+    sec = get_settings().security
+    prev_opt_in = sec.auto_bootstrap_local_ui
+    sec.auto_bootstrap_local_ui = True
+    try:
+        browser = TestClient(app)
+        assert browser.get("/").status_code == 200
+        assert WORKBENCH_AUTH_COOKIE in browser.cookies and WORKBENCH_CSRF_COOKIE in browser.cookies
+        assert browser.get("/api/workbench/state").status_code == 200
+        assert browser.post("/api/workbench/theme", json={"theme": "light"}).status_code == 403
+        csrf = browser.cookies[WORKBENCH_CSRF_COOKIE]
+        assert browser.post("/api/workbench/theme", json={"theme": "light"}, headers={"X-CSRF-Token": csrf}).status_code == 200
+    finally:
+        sec.auto_bootstrap_local_ui = prev_opt_in
 
     # 3. CORS forbids wildcard+credentials and rejects untrusted origins
     assert APISettings(cors_origins=["*"], cors_allow_credentials=True).cors_allow_credentials is False

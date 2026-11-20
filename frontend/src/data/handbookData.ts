@@ -8,6 +8,7 @@ import type { StudioChapter, StudioDeepSupplement } from './handbookTypes';
 export * from './handbookTypes';
 
 const ALL_SUPPLEMENTS: Record<StudioId, StudioDeepSupplement> = {
+  '00': DEEP_SUPPLEMENTS_PART_1['01'],
   ...DEEP_SUPPLEMENTS_PART_1,
   ...DEEP_SUPPLEMENTS_PART_2,
 };

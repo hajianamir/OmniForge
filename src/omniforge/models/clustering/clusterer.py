@@ -554,3 +554,141 @@ class ClusteringEngine(BaseOmniForgeModel):
             k_selection_curve=k_curve,
             probabilities=probs,
         )
+
+    @staticmethod
+    def k_prototypes_fit(
+        df: pd.DataFrame,
+        *,
+        n_clusters: int = 3,
+        gamma: float = 0.5,
+        max_iter: int = 30,
+        random_state: int = 42,
+    ) -> dict[str, Any]:
+        """K-Prototypes (Huang, 1998) clustering for mixed numeric + categorical data."""
+        num_cols = list(df.select_dtypes(include=[np.number]).columns)
+        cat_cols = [c for c in df.columns if c not in num_cols]
+        if not num_cols and not cat_cols:
+            raise ValueError("k_prototypes_fit requires at least one column.")
+        n = len(df)
+        if n < n_clusters or n_clusters < 2:
+            raise ValueError("n_clusters must be >= 2 and <= number of rows.")
+
+        rng = np.random.default_rng(random_state)
+        if num_cols:
+            num_raw = df[num_cols].fillna(df[num_cols].median()).to_numpy(dtype=float)
+            mu = num_raw.mean(axis=0)
+            sd = np.where(num_raw.std(axis=0) > 1e-12, num_raw.std(axis=0), 1.0)
+            X_num = (num_raw - mu) / sd
+        else:
+            X_num = np.zeros((n, 0), dtype=float)
+
+        X_cat = df[cat_cols].fillna("MISSING").astype(str).to_numpy() if cat_cols else np.empty((n, 0), dtype=object)
+
+        init_idx = rng.choice(n, size=n_clusters, replace=False)
+        num_centers = X_num[init_idx].copy()
+        cat_centers = X_cat[init_idx].copy()
+        labels = np.zeros(n, dtype=int)
+
+        for _ in range(max_iter):
+            new_labels = np.empty(n, dtype=int)
+            for i in range(n):
+                best_k = 0
+                best_dist = np.inf
+                for k in range(n_clusters):
+                    d_num = float(np.sum((X_num[i] - num_centers[k]) ** 2)) if X_num.shape[1] > 0 else 0.0
+                    d_cat = float(np.sum(X_cat[i] != cat_centers[k])) if X_cat.shape[1] > 0 else 0.0
+                    dist = d_num + gamma * d_cat
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_k = k
+                new_labels[i] = best_k
+
+            if np.array_equal(new_labels, labels):
+                break
+            labels = new_labels
+
+            for k in range(n_clusters):
+                mask = labels == k
+                if not mask.any():
+                    continue
+                if X_num.shape[1] > 0:
+                    num_centers[k] = X_num[mask].mean(axis=0)
+                if X_cat.shape[1] > 0:
+                    for j in range(X_cat.shape[1]):
+                        vals, cnts = np.unique(X_cat[mask, j], return_counts=True)
+                        cat_centers[k, j] = vals[int(np.argmax(cnts))]
+
+        return {
+            "n_clusters": int(n_clusters),
+            "labels": labels.tolist(),
+            "numeric_columns": num_cols,
+            "categorical_columns": cat_cols,
+        }
+
+    @staticmethod
+    def bootstrap_stability_ari(
+        df: pd.DataFrame,
+        *,
+        n_clusters: int = 3,
+        n_bootstraps: int = 20,
+        random_state: int = 42,
+    ) -> dict[str, Any]:
+        """Evaluate clustering stability via bootstrap resampling and Adjusted Rand Index (ARI) on shared points."""
+        from sklearn.cluster import KMeans
+        from sklearn.metrics import adjusted_rand_score
+        from sklearn.preprocessing import StandardScaler
+
+        num = df.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan).dropna()
+        n = len(num)
+        if n < max(15, n_clusters * 3) or num.shape[1] < 1:
+            return {"evaluable": False, "mean_ari": 0.0, "std_ari": 0.0, "n_bootstraps": 0}
+        X = StandardScaler().fit_transform(num.to_numpy(dtype=float))
+        ref_labels = KMeans(n_clusters=n_clusters, random_state=random_state, n_init="auto").fit_predict(X)
+        rng = np.random.default_rng(random_state)
+        aris: list[float] = []
+        for b in range(n_bootstraps):
+            idx = rng.integers(0, n, size=n)
+            uniq_idx, first_pos = np.unique(idx, return_index=True)
+            if len(uniq_idx) < n_clusters * 2:
+                continue
+            b_labels = KMeans(n_clusters=n_clusters, random_state=random_state + b + 1, n_init="auto").fit_predict(X[idx])
+            ari = float(adjusted_rand_score(ref_labels[uniq_idx], b_labels[first_pos]))
+            aris.append(ari)
+        return {
+            "evaluable": True,
+            "n_clusters": int(n_clusters),
+            "n_bootstraps": len(aris),
+            "mean_ari": round(float(np.mean(aris)), 4) if aris else 0.0,
+            "std_ari": round(float(np.std(aris)), 4) if aris else 0.0,
+        }
+
+    @staticmethod
+    def hopkins_statistic(df: pd.DataFrame, *, sample_size: int = 50, random_state: int = 42) -> dict[str, Any]:
+        """Compute Hopkins Statistic (H in [0, 1]) to assess clustering tendency vs uniform randomness."""
+        from sklearn.neighbors import NearestNeighbors
+        from sklearn.preprocessing import StandardScaler
+
+        num = df.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan).dropna()
+        n, d = num.shape
+        if n < 20 or d < 1:
+            return {"evaluable": False, "hopkins": 0.5, "tendency": "insufficient_data"}
+        m = min(sample_size, max(5, n // 5))
+        X = StandardScaler().fit_transform(num.to_numpy(dtype=float))
+        rng = np.random.default_rng(random_state)
+        sample_idx = rng.choice(n, size=m, replace=False)
+        X_sample = X[sample_idx]
+        mins = X.min(axis=0)
+        maxs = X.max(axis=0)
+        U = rng.uniform(mins, maxs, size=(m, d))
+
+        nbrs = NearestNeighbors(n_neighbors=2).fit(X)
+        u_dist, _ = nbrs.kneighbors(U, n_neighbors=1)
+        w_dist, _ = nbrs.kneighbors(X_sample, n_neighbors=2)
+        u_sum = float(np.sum(u_dist[:, 0]))
+        w_sum = float(np.sum(w_dist[:, 1]))
+        h = u_sum / (u_sum + w_sum) if (u_sum + w_sum) > 1e-12 else 0.5
+        tendency = "strong_clusters" if h >= 0.75 else ("moderate_clusters" if h >= 0.6 else "uniform_or_random")
+        return {"evaluable": True, "hopkins": round(float(h), 4), "tendency": tendency, "sample_size": int(m)}
+
+
+

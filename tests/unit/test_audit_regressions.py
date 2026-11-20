@@ -9,12 +9,15 @@ import pytest
 from omniforge.core.contracts import AnalysisSpec, LeakageGuard, ResultBundle
 from omniforge.data.cleaning import CleaningConfig, DataCleaner
 from omniforge.data.quality import DataQualityProfiler
-from omniforge.data.splitting import CombinatorialPurgedKFold
+from omniforge.data.splitting import CombinatorialPurgedKFold, LeakageSafeSplitter
 from omniforge.data.validation import ColumnContract, DataContract
 from omniforge.eda.statistics import StatisticalAnalyzer
 from omniforge.evaluation.robustness import adaptive_conformal_intervals
 from omniforge.features.selection import FeatureSelector
 from omniforge.mlops.drift import DriftDetector
+from omniforge.models.clustering.clusterer import ClusteringEngine
+from omniforge.models.mining.miner import AssociationRuleMiner
+from omniforge.reporting.exporters import sanitize_spreadsheet_value
 
 
 def test_cleaner_transform_before_fit_raises_runtime_error() -> None:
@@ -247,6 +250,364 @@ def test_data_contract_and_missforest_config() -> None:
     cleaner = DataCleaner(CleaningConfig(numeric_imputation="missforest"))
     cleaned, _ = cleaner.fit_transform(df_ok)
     assert int(cleaned["temp"].isna().sum()) == 0
+
+
+def test_root_does_not_auto_issue_admin_cookie_by_default() -> None:
+    """Visiting / must not issue admin auth cookies when auto_bootstrap_local_ui is False."""
+    from fastapi.testclient import TestClient
+
+    from omniforge.api.main import app
+    from omniforge.config.settings import get_settings
+
+    sec = get_settings().security
+    prev = sec.auto_bootstrap_local_ui
+    sec.auto_bootstrap_local_ui = False
+    try:
+        client = TestClient(app)
+        resp = client.get("/")
+        assert resp.status_code == 200
+        assert "omniforge_wb_auth" not in resp.cookies
+    finally:
+        sec.auto_bootstrap_local_ui = prev
+
+
+def test_transaction_mining_and_k_prototypes() -> None:
+    """Verify transaction-ID-aware association rules and K-Prototypes mixed clustering."""
+    tx_df = pd.DataFrame(
+        {
+            "invoice_id": ["T1", "T1", "T2", "T2", "T3", "T3", "T4", "T4"],
+            "item": ["A", "B", "A", "B", "A", "C", "B", "D"],
+        }
+    )
+    res_tx = AssociationRuleMiner.mine_transactions(
+        tx_df, "invoice_id", "item", min_support=0.25, min_confidence=0.5, min_lift=1.0
+    )
+    assert res_tx["n_transactions"] == 4
+    assert res_tx["n_rules"] >= 1
+
+    mix_df = pd.DataFrame(
+        {
+            "x": [1.0, 1.2, 0.9, 10.0, 10.5, 9.8],
+            "cat": ["red", "red", "red", "blue", "blue", "blue"],
+        }
+    )
+    kp = ClusteringEngine.k_prototypes_fit(mix_df, n_clusters=2, gamma=0.5, random_state=42)
+    assert len(kp["labels"]) == 6
+    assert len(set(kp["labels"])) == 2
+
+
+def test_group_cv_without_groups_raises_and_spreadsheet_sanitization() -> None:
+    """Group CV without groups must raise DataValidationError; formula prefixes must be neutralized."""
+    from omniforge.core.exceptions import DataValidationError
+    from omniforge.data.splitting import SplitConfig
+
+    splitter = LeakageSafeSplitter(SplitConfig(strategy="group"))
+    df = pd.DataFrame({"x": np.arange(20), "y": np.arange(20) % 2})
+    with pytest.raises(DataValidationError, match="groups=None"):
+        splitter.build_cv_splitter(df, y=df["y"], groups=None, is_classification=True)
+
+    assert sanitize_spreadsheet_value("=1+1") == "'=1+1"
+    assert sanitize_spreadsheet_value("  +cmd|'/C calc'!A0") == "'  +cmd|'/C calc'!A0"
+    assert sanitize_spreadsheet_value("@SUM(A1:A2)") == "'@SUM(A1:A2)"
+    assert sanitize_spreadsheet_value("safe_text") == "safe_text"
+    assert sanitize_spreadsheet_value(42) == 42
+
+
+def test_drift_unknown_on_no_shared_columns() -> None:
+    """DriftDetector must return DriftStatus.UNKNOWN when no shared columns or valid samples exist."""
+    from omniforge.core.types import DriftStatus
+
+    det = DriftDetector()
+    ref = pd.DataFrame({"a": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]})
+    cur = pd.DataFrame({"b": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]})
+    rep = det.detect(ref, cur)
+    assert rep.overall_status == DriftStatus.UNKNOWN
+    assert rep.total_features == 0
+
+
+def test_session_state_tenant_isolation() -> None:
+    """Two tenants using the same X-Session-ID must receive completely isolated workspace states."""
+    from omniforge.ui.state import get_session_state
+
+    s_a = get_session_state("shared-sid", tenant_id="tenant-alpha")
+    s_b = get_session_state("shared-sid", tenant_id="tenant-beta")
+    s_a["secret_marker"] = "alpha-only"
+    assert "secret_marker" not in s_b
+
+
+def test_split_lock_row_id_and_fail_closed() -> None:
+    """get_active_split_frames must match by row_id when present and fail-closed on invalid lock."""
+    from omniforge.ui.state import get_active_split_frames
+
+    df = pd.DataFrame(
+        {
+            "__row_id__": [f"r_{i}" for i in range(10)],
+            "x": np.arange(10, dtype=float),
+        },
+        index=[100 + i for i in range(10)],
+    )
+    state = {
+        "uap_split_lock": {
+            "active": True,
+            "row_id_col": "__row_id__",
+            "train_row_ids": [f"r_{i}" for i in range(7)],
+            "test_row_ids": [f"r_{i}" for i in range(7, 10)],
+        }
+    }
+    tr, te, _ = get_active_split_frames(state, df)
+    assert len(tr) == 7
+    assert te is not None and len(te) == 3
+
+    bad_state = {"uap_split_lock": {"active": True, "train_indices": [0, 1], "test_indices": [2]}}
+    with pytest.raises(ValueError, match="Active Split Lock is invalid"):
+        get_active_split_frames(bad_state, df)
+
+
+def test_manifold_projector_excludes_color_col_and_targets() -> None:
+    """Changing color_col or passing exclude_cols must not alter PCA coordinates."""
+    from omniforge.models.mining.miner import ManifoldProjector
+
+    rng = np.random.default_rng(42)
+    df1 = pd.DataFrame({"x1": rng.normal(0, 1, 30), "x2": rng.normal(0, 1, 30), "target": rng.integers(0, 2, 30)})
+    df2 = df1.copy()
+    df2["target"] = 1 - df2["target"]  # Flip target/color_col only
+
+    proj = ManifoldProjector()
+    r1 = proj.project(df1, method="pca", color_col="target")
+    r2 = proj.project(df2, method="pca", color_col="target")
+    assert r1["loadings"] == r2["loadings"]
+    assert r1["explained_variance_pct"] == r2["explained_variance_pct"]
+
+
+def test_fp_growth_prefixspan_beam_search_and_raw_view() -> None:
+    """Verify FP-Growth, PrefixSpan, Subgroup Beam Search, and raw audit/anomaly view separation."""
+    from omniforge.models.mining.miner import SequentialPatternMiner, fp_growth_mine, subgroup_beam_search
+    from omniforge.ui.state import get_audit_anomaly_dataframe
+
+    # 1. FP-Growth
+    txs = [["A", "B", "C"], ["A", "B"], ["A", "C"], ["B", "C"], ["A", "B"], ["D"]]
+    fp = fp_growth_mine(txs, min_support=0.3, min_confidence=0.5, min_lift=1.0)
+    assert fp["n_transactions"] == 6
+    assert len(fp["frequent_itemsets"]) >= 3
+    assert len(fp["rules"]) >= 1
+
+    # 2. PrefixSpan
+    seqs = [["login", "view", "buy"], ["login", "buy"], ["view", "buy"], ["login", "view", "logout"]]
+    sp = SequentialPatternMiner.prefix_span(seqs, min_support=0.5, max_len=3)
+    patterns = [r["pattern"] for r in sp]
+    assert ["login", "buy"] in patterns
+
+    # 3. Subgroup Beam Search (2-condition)
+    rng = np.random.default_rng(7)
+    df_sg = pd.DataFrame(
+        {
+            "age": np.concatenate([np.full(20, 60.0), rng.normal(30, 5, 40)]),
+            "plan": ["gold"] * 20 + ["basic"] * 40,
+            "spend": np.concatenate([np.full(20, 100.0), rng.normal(10, 2, 40)]),
+        }
+    )
+    bs = subgroup_beam_search(df_sg, "spend", beam_width=4, max_depth=2, min_support=10)
+    assert any(len(r["conditions"]) == 2 for r in bs)
+
+    # 4. Raw audit/anomaly view separation
+    raw_df = pd.DataFrame({"x": [1.0, 2.0, 999.0]})
+    clipped_df = pd.DataFrame({"x": [1.0, 2.0, 10.0]})
+    state = {"uap_raw_df": raw_df, "uap_df": clipped_df}
+    out_raw = get_audit_anomaly_dataframe(state)
+    assert float(out_raw["x"].max()) == 999.0
+
+
+def test_benford_and_robust_mahalanobis_cleaning() -> None:
+    """Verify Benford's Law audit test and MCD Robust Mahalanobis multivariate outlier detection."""
+    from omniforge.data.cleaning import benford_digit_test, robust_mahalanobis_outliers
+
+    # Benford-conforming exponential-like data
+    rng = np.random.default_rng(123)
+    benford_series = pd.Series(10.0 ** rng.uniform(0.0, 4.0, 300))
+    b_res = benford_digit_test(benford_series)
+    assert b_res["evaluable"] is True
+    assert b_res["conforms_benford"] is True
+
+    # Multivariate MCD Mahalanobis outlier detection
+    X_in = rng.normal(0.0, 1.0, size=(80, 3))
+    X_out = np.array([[15.0, -15.0, 12.0], [20.0, 20.0, -18.0]])
+    df_mcd = pd.DataFrame(np.vstack([X_in, X_out]), columns=["a", "b", "c"])
+    m_res = robust_mahalanobis_outliers(df_mcd, alpha=0.01)
+    assert m_res["evaluable"] is True
+    assert 80 in m_res["outlier_indices"]
+    assert 81 in m_res["outlier_indices"]
+
+
+def test_distance_correlation_and_cluster_stability_ari() -> None:
+    """Verify nonlinear Distance Correlation (dCor) and Bootstrap ARI cluster stability."""
+    from omniforge.eda.statistics import distance_correlation
+
+    rng = np.random.default_rng(42)
+    x = rng.uniform(-2.0, 2.0, 120)
+    y_quad = x**2  # Zero linear Pearson correlation, strong nonlinear dependence
+    res_dc = distance_correlation(x, y_quad)
+    assert res_dc["dcor"] > 0.35
+
+    # Well-separated clusters should achieve high bootstrap ARI
+    c1 = rng.normal(0.0, 0.3, size=(30, 2))
+    c2 = rng.normal(6.0, 0.3, size=(30, 2))
+    df_c = pd.DataFrame(np.vstack([c1, c2]), columns=["f1", "f2"])
+    stab = ClusteringEngine.bootstrap_stability_ari(df_c, n_clusters=2, n_bootstraps=10, random_state=42)
+    assert stab["evaluable"] is True
+    assert stab["mean_ari"] > 0.85
+
+
+def test_cleaning_distortion_and_manifold_trustworthiness() -> None:
+    """Verify cleaning_distortion_audit (KS/Wasserstein) and ManifoldProjector trustworthiness."""
+    from omniforge.data.cleaning import cleaning_distortion_audit
+    from omniforge.models.mining.miner import ManifoldProjector
+
+    rng = np.random.default_rng(11)
+    raw = pd.DataFrame({"v": rng.normal(0.0, 1.0, 100)})
+    distorted = pd.DataFrame({"v": rng.normal(5.0, 1.0, 100)})
+    audit = cleaning_distortion_audit(raw, distorted)
+    assert audit["columns_audited"] == 1
+    assert "v" in audit["high_distortion_columns"]
+    assert audit["per_column"]["v"]["wasserstein"] > 4.0
+
+    df_m = pd.DataFrame({"x1": rng.normal(0, 1, 40), "x2": rng.normal(0, 1, 40), "x3": rng.normal(0, 1, 40)})
+    res = ManifoldProjector().project(df_m, method="pca")
+    assert res["trustworthiness"] is not None
+    assert 0.0 <= res["trustworthiness"] <= 1.0
+
+
+def test_adbench_anomaly_metrics() -> None:
+    """Verify ADBench (NeurIPS 2022) anomaly evaluation metrics: AUC-ROC, AUC-PR, Precision@K."""
+    from omniforge.evaluation.metrics import evaluate_anomaly_adbench
+
+    yt = np.array([0] * 90 + [1] * 10)
+    sc = np.concatenate([np.linspace(0.0, 0.4, 90), np.linspace(0.8, 1.0, 10)])
+    rep = evaluate_anomaly_adbench(yt, sc, k=10)
+    assert rep["auc_roc"] == 1.0
+    assert rep["auc_pr"] == 1.0
+    assert rep["precision_at_k"] == 1.0
+
+
+def test_friedman_nemenyi_demsar_test() -> None:
+    """Verify Demšar (2006) Friedman + Nemenyi Critical Difference multi-model comparison."""
+    from omniforge.eda.statistics import friedman_nemenyi_test
+
+    # 6 datasets/folds x 3 models where Model 0 consistently outperforms Model 1 and Model 2
+    scores = np.array(
+        [
+            [0.95, 0.85, 0.70],
+            [0.94, 0.84, 0.72],
+            [0.96, 0.86, 0.68],
+            [0.93, 0.82, 0.71],
+            [0.97, 0.83, 0.69],
+            [0.92, 0.80, 0.65],
+        ]
+    )
+    res = friedman_nemenyi_test(scores, alpha=0.05)
+    assert res["evaluable"] is True
+    assert res["significant"] is True
+    assert res["avg_ranks"][0] == 1.0
+    assert res["critical_difference"] > 0.0
+
+
+def test_advanced_audit_and_mining_endpoints() -> None:
+    """Verify /api/workbench/s01/advanced_audit and /s02/advanced_mining endpoints."""
+    from fastapi.testclient import TestClient
+
+    from omniforge.api.main import app
+    from omniforge.config.settings import get_settings
+    from omniforge.ui.state import get_session_state
+
+    rng = np.random.default_rng(7)
+    df = pd.DataFrame(
+        {
+            "amount": 10.0 ** rng.uniform(0.0, 3.0, 60),
+            "age": rng.normal(40.0, 10.0, 60),
+            "target": rng.normal(10.0, 2.0, 60),
+        }
+    )
+    state = get_session_state("adv-ep-test")
+    state["uap_df"] = df
+    state["uap_raw_df"] = df.copy()
+    state["uap_target_col"] = "target"
+
+    sec = get_settings().security
+    prev = sec.auto_bootstrap_local_ui
+    sec.auto_bootstrap_local_ui = True
+    try:
+        client = TestClient(app)
+        client.get("/")
+        csrf = client.cookies.get("omniforge_csrf", "")
+        headers = {"X-Session-ID": "adv-ep-test", "X-CSRF-Token": csrf}
+        r1 = client.post("/api/workbench/s01/advanced_audit", headers=headers)
+        assert r1.status_code == 200
+        d1 = r1.json()
+        assert "benford_tests" in d1 and "robust_mahalanobis" in d1 and "cleaning_distortion" in d1
+
+        r2 = client.post("/api/workbench/s02/advanced_mining", headers=headers)
+        assert r2.status_code == 200
+        d2 = r2.json()
+        assert "beam_subgroups" in d2 and "cluster_stability_ari" in d2 and "distance_correlation" in d2
+        assert "hopkins_clustering_tendency" in d2 and d2["hopkins_clustering_tendency"]["evaluable"] is True
+    finally:
+        sec.auto_bootstrap_local_ui = prev
+
+
+def test_association_rules_exact_hand_calculated_metrics() -> None:
+    """Verify exact support=0.20, confidence=0.50, lift=1.6667 on 100 transactions."""
+    from omniforge.models.mining.miner import fp_growth_mine
+
+    txs: list[list[str]] = []
+    txs.extend([["A", "B"]] * 20)
+    txs.extend([["A"]] * 20)
+    txs.extend([["B"]] * 10)
+    txs.extend([["C"]] * 50)
+    res = fp_growth_mine(txs, min_support=0.1, min_confidence=0.4, min_lift=1.0)
+    rule_ab = [r for r in res["rules"] if r["antecedent"] == ["A"] and r["consequent"] == ["B"]]
+    assert len(rule_ab) == 1
+    assert abs(rule_ab[0]["support"] - 0.20) < 1e-4
+    assert abs(rule_ab[0]["confidence"] - 0.50) < 1e-4
+    assert abs(rule_ab[0]["lift"] - 1.6667) < 1e-3
+
+
+def test_knn_shapley_and_venn_abers() -> None:
+    """Verify exact KNN-Shapley data valuation (detecting mislabeled points) and Venn-ABERS calibration."""
+    from omniforge.evaluation.robustness import knn_shapley_valuation, venn_abers_calibrate
+
+    rng = np.random.default_rng(42)
+    X_tr = np.vstack([rng.normal(0.0, 0.4, (20, 2)), rng.normal(3.0, 0.4, (20, 2))])
+    y_tr = np.array([0] * 20 + [1] * 20)
+    # Flip label of index 0 to simulate a mislabeled training point
+    y_tr[0] = 1
+    X_va = np.vstack([rng.normal(0.0, 0.4, (10, 2)), rng.normal(3.0, 0.4, (10, 2))])
+    y_va = np.array([0] * 10 + [1] * 10)
+
+    val_res = knn_shapley_valuation(X_tr, y_tr, X_va, y_va, k=5)
+    assert val_res["evaluable"] is True
+    assert val_res["values"][0] < 0.0
+    assert 0 in val_res["worst_indices"][:5]
+
+    cal_scores = np.linspace(0.05, 0.95, 40)
+    cal_y = (cal_scores > 0.5).astype(int)
+    va = venn_abers_calibrate(cal_scores, cal_y, np.array([0.1, 0.9]))
+    assert va["p0"][0] <= va["p_calibrated"][0] <= va["p1"][0]
+    assert va["p_calibrated"][1] > va["p_calibrated"][0]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

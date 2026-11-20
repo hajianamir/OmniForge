@@ -860,6 +860,19 @@ export const HelpGuideModal: React.FC<{
                         <strong style={{ color: '#fbbf24' }}>Critical Anti-Leakage Rule — Split Lock BEFORE Data Cleaning:</strong>{' '}
                         Whenever your workflow includes predictive modeling (Studios 03, 05, 06, 07, 11, or 14), enable <strong>Split Lock</strong> right after loading data and picking Targets — <em>before</em> running Studio 01 Data Cleaning or Studio 02 Clustering. With Split Lock active, OmniForge fits all imputers, outlier fences, scalers, and clusters strictly on Train (<code>fit_transform_split</code>) and applies them to Test with zero data leakage.
                       </div>
+                      <div
+                        style={{
+                          marginTop: 10,
+                          padding: '10px 12px',
+                          borderRadius: 6,
+                          background: 'rgba(56,189,248,0.10)',
+                          border: '1px solid rgba(56,189,248,0.35)',
+                          fontSize: 12.5,
+                        }}
+                      >
+                        <strong style={{ color: '#38bdf8' }}>Latest Architecture &amp; Capabilities:</strong>{' '}
+                        <strong>Studio 00</strong> now handles Data Ingestion, Intake Defect Audit, Split Lock, and the <strong>Data Relationships Chart &amp; Table</strong> (Pearson, Spearman &amp; Distance Correlation). <strong>Studio 01</strong> is dedicated to Data Preparation &amp; Cleaning with a transparent <strong>Step-by-Step Pipeline Log</strong> (<code>steps_applied</code>), unclipped raw view preservation (<code>uap_raw_df</code>), <strong>Benford&apos;s Law</strong>, <strong>MCD Robust Mahalanobis</strong>, and <strong>Cleaning Distortion Audit</strong> (<code>/s01/advanced_audit</code>). <strong>Studio 02</strong> includes <strong>FP-Growth</strong>, <strong>PrefixSpan</strong>, <strong>Subgroup Beam Search</strong>, <strong>Hopkins Tendency</strong>, <strong>Bootstrap ARI</strong>, and <strong>Distance Correlation</strong> (<code>/s02/advanced_mining</code>). Local browser UI sessions automatically bootstrap authentication on localhost.
+                      </div>
                     </div>
 
                     {WORKFLOW_ROADMAP.map((w) => (

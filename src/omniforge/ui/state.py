@@ -271,9 +271,11 @@ class ServerSessionRegistry:
 SESSION_STORE = ServerSessionRegistry()
 
 
-def get_session_state(session_id: str | None) -> dict[str, Any]:
-    """Retrieve the active server-side workspace dict for ``session_id``."""
-    return SESSION_STORE.get(session_id)
+def get_session_state(session_id: str | None, *, tenant_id: str | None = None) -> dict[str, Any]:
+    """Retrieve the active server-side workspace dict scoped by ``tenant_id`` and ``session_id``."""
+    raw_sid = (session_id or "default").strip() or "default"
+    scoped_sid = f"{tenant_id}::{raw_sid}" if tenant_id else raw_sid
+    return SESSION_STORE.get(scoped_sid)
 
 
 def _reset_downstream_state(state: dict[str, Any], *, keep_keys: set[str] | None = None) -> None:
@@ -395,6 +397,14 @@ def get_excluded_columns(state: dict[str, Any], df: pd.DataFrame | None = None) 
         valid = valid[: max(0, len(active_df.columns) - 1)]
     state["uap_excluded_columns"] = valid
     return valid
+
+
+def get_audit_anomaly_dataframe(state: dict[str, Any], df: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Return the unclipped raw audit/anomaly view when available, falling back to the active analysis view."""
+    raw = state.get("uap_raw_df")
+    if isinstance(raw, pd.DataFrame) and not raw.empty:
+        return get_analysis_dataframe(state, raw)
+    return get_analysis_dataframe(state, df)
 
 
 def get_analysis_dataframe(state: dict[str, Any], df: pd.DataFrame | None = None) -> pd.DataFrame:
@@ -1028,10 +1038,19 @@ def get_active_split_frames(state: dict[str, Any], df: pd.DataFrame | None = Non
     lock = state.get("uap_split_lock")
     if not isinstance(lock, dict) or not lock.get("active"):
         return active_df, None, None
+    row_id_col = lock.get("row_id_col")
+    if isinstance(row_id_col, str) and row_id_col in active_df.columns and lock.get("train_row_ids") is not None:
+        tr_set = set(lock.get("train_row_ids") or [])
+        te_set = set(lock.get("test_row_ids") or [])
+        tr_mask = active_df[row_id_col].isin(tr_set)
+        te_mask = active_df[row_id_col].isin(te_set)
+        if int(tr_mask.sum()) < 5 or int(te_mask.sum()) < 2:
+            raise ValueError("Active Split Lock is invalid or corrupted (insufficient train/test row_ids).")
+        return active_df.loc[tr_mask].copy(), active_df.loc[te_mask].copy(), lock
     tr_idx = [i for i in (lock.get("train_indices") or []) if i in active_df.index]
     te_idx = [i for i in (lock.get("test_indices") or []) if i in active_df.index]
     if len(tr_idx) < 5 or len(te_idx) < 2:
-        return active_df, None, None
+        raise ValueError("Active Split Lock is invalid or corrupted (insufficient train/test indices).")
     return active_df.loc[tr_idx].copy(), active_df.loc[te_idx].copy(), lock
 
 

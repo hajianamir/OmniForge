@@ -112,7 +112,7 @@ class MetricsEvaluator:
         mae = float(mean_absolute_error(yt, yp))
         r2 = float(r2_score(yt, yp))
         non_zero = np.abs(yt) > 1e-12
-        mape = float(np.mean(np.abs((yt[non_zero] - yp[non_zero]) / yt[non_zero])) * 100.0) if np.any(non_zero) else 0.0
+        mape = float(np.mean(np.abs((yt[non_zero] - yp[non_zero]) / yt[non_zero])) * 100.0) if np.any(non_zero) else float("nan")
         smape_denom = (np.abs(yt) + np.abs(yp)) / 2.0
         smape_terms = np.where(smape_denom > 0.0, np.abs(yt - yp) / np.where(smape_denom > 0.0, smape_denom, 1.0), 0.0)
         smape = float(np.mean(smape_terms) * 100.0) if len(yt) > 0 else 0.0
@@ -241,3 +241,31 @@ class MetricsEvaluator:
             "sortino_ratio": round(float(sortino), 4) if np.isfinite(sortino) else float(sortino),
             "max_drawdown": round(max_dd, 6),
         }
+
+
+def evaluate_anomaly_adbench(
+    y_true: np.ndarray,
+    anomaly_scores: np.ndarray,
+    *,
+    k: int = 50,
+) -> dict[str, float]:
+    """Evaluate anomaly detection using ADBench (NeurIPS 2022) standard: AUC-ROC, AUC-PR, and Precision@K."""
+    from sklearn.metrics import average_precision_score, roc_auc_score
+
+    yt = np.asarray(y_true, dtype=int)
+    sc = np.asarray(anomaly_scores, dtype=float)
+    mask = np.isfinite(sc)
+    yt = yt[mask]
+    sc = sc[mask]
+    if len(yt) == 0 or len(np.unique(yt)) < 2:
+        return {"auc_roc": float("nan"), "auc_pr": float("nan"), "precision_at_k": float("nan"), "k": float(k)}
+    k_eff = max(1, min(k, len(yt)))
+    top_k_idx = np.argsort(sc)[::-1][:k_eff]
+    p_at_k = float(np.mean(yt[top_k_idx] == 1))
+    return {
+        "auc_roc": round(float(roc_auc_score(yt, sc)), 6),
+        "auc_pr": round(float(average_precision_score(yt, sc)), 6),
+        "precision_at_k": round(p_at_k, 6),
+        "k": float(k_eff),
+    }
+

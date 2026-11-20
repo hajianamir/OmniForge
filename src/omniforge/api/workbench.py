@@ -99,6 +99,7 @@ from omniforge.ui.state import (
     get_active_split_frames,
     get_all_deleted_records_df,
     get_analysis_dataframe,
+    get_audit_anomaly_dataframe,
     get_dataset_processing_status,
     get_excluded_columns,
     get_selected_targets,
@@ -286,12 +287,19 @@ def _infer_task(y: pd.Series) -> TaskType:
     return TaskType.REGRESSION
 
 
-def _prepare_xy(df: pd.DataFrame, target: str) -> tuple[pd.DataFrame, pd.Series, TaskType]:
+def _prepare_xy(df: pd.DataFrame, target: str, *, raw_features: bool = False) -> tuple[pd.DataFrame, pd.Series, TaskType]:
     work = df.dropna(subset=[target]).copy()
     if len(work) < 10:
         raise HTTPException(status_code=400, detail=f"Target '{target}' has fewer than 10 non-null observations.")
     y = work[target]
     X_raw = work.drop(columns=[target])
+    if raw_features:
+        if X_raw.shape[1] == 0:
+            raise HTTPException(status_code=400, detail="No usable predictor columns remain after excluding target.")
+        X_out = X_raw.copy()
+        for dt_col in X_out.select_dtypes(include=["datetime", "datetimetz"]).columns:
+            X_out[dt_col] = X_out[dt_col].astype("int64").astype(float) / 1e9
+        return X_out.replace([np.inf, -np.inf], np.nan), y, _infer_task(y)
     num_df = X_raw.select_dtypes(include=[np.number]).copy()
     cat_cols = [c for c in X_raw.columns if c not in num_df.columns]
     for c in cat_cols[:12]:
@@ -484,7 +492,7 @@ class FeatureSelReq(BaseModel):
 class AutoMLRunReq(BaseModel):
     target: str | None = None
     backend: str = "omniforge_native"
-    time_budget_seconds: float = Field(default=30.0, ge=5.0, le=300.0)
+    time_budget_seconds: float = Field(default=30.0, ge=5.0, le=3600.0)
     cv_folds: int = Field(default=3, ge=2, le=10)
     async_job: bool = False
 
@@ -1072,7 +1080,7 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
             outlier_method=str(preset.get("outlier_method", "iqr")),
             outlier_action=str(preset.get("outlier_action", "clip")),
             outlier_threshold=float(preset.get("outlier_threshold", 1.5)),
-            exclude_columns=get_excluded_columns(state, df),
+            exclude_columns=list(dict.fromkeys([*get_excluded_columns(state, df), *get_selected_targets(state, df)])),
         )
         drop_const = bool(preset.get("drop_constant_columns", True))
         std_col_names = False
@@ -1092,7 +1100,7 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
             outlier_method="iqr",
             outlier_action="clip",
             outlier_threshold=1.5,
-            exclude_columns=get_excluded_columns(state, df),
+            exclude_columns=list(dict.fromkeys([*get_excluded_columns(state, df), *get_selected_targets(state, df)])),
         )
         drop_const = True
         std_col_names = False
@@ -1120,7 +1128,7 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
             contamination=req.contamination,
             causal_time_series=has_time_lock,
             time_column=lock_cfg.get("time_col") if has_time_lock else None,
-            exclude_columns=get_excluded_columns(state, df),
+            exclude_columns=list(dict.fromkeys([*get_excluded_columns(state, df), *get_selected_targets(state, df)])),
         )
         drop_const = req.drop_constant_columns
         std_col_names = req.standardize_column_names
@@ -1154,8 +1162,13 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
     dropped_const_cols: list[str] = []
     if drop_const:
         excl_set = set(get_excluded_columns(state, cleaned)) | set(get_selected_targets(state, cleaned))
+        const_source = (
+            cleaned_tr
+            if (rep_dict.get("split_lock_leakage_safe") and isinstance(cleaned_tr, pd.DataFrame) and not cleaned_tr.empty)
+            else cleaned
+        )
         for col in list(cleaned.columns):
-            if col not in excl_set and int(cleaned[col].nunique(dropna=True)) <= 1 and len(cleaned) > 1:
+            if col in const_source.columns and col not in excl_set and int(const_source[col].nunique(dropna=True)) <= 1 and len(const_source) > 1:
                 dropped_const_cols.append(str(col))
         if dropped_const_cols and len(dropped_const_cols) < cleaned.shape[1]:
             cleaned = cleaned.drop(columns=dropped_const_cols)
@@ -1632,8 +1645,8 @@ def s02_commit_clustering(req: ClusterCommitReq, x_session_id: str | None = Head
 def s02_run_anomaly(req: AnomalyReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _sid(x_session_id)
     state = get_session_state(sid)
-    df = get_analysis_dataframe(state, _require_df(state))
-    helper_cols = {"cluster_id", "is_anomaly", "anomaly_score"}
+    df = get_audit_anomaly_dataframe(state, _require_df(state))
+    helper_cols = {"cluster_id", "is_anomaly", "anomaly_score"} | set(get_selected_targets(state, df))
     num_cols = req.features or [
         c for c in df.select_dtypes(include=[np.number]).columns if c not in helper_cols
     ]
@@ -1641,8 +1654,13 @@ def s02_run_anomaly(req: AnomalyReq, x_session_id: str | None = Header(default="
     if not num_cols:
         raise HTTPException(status_code=400, detail="Anomaly detection requires numeric columns.")
 
-    X_num = df[num_cols].replace([np.inf, -np.inf], np.nan)
-    X_num = X_num.fillna(X_num.median(numeric_only=True).fillna(0.0))
+    train_df, _test_df, _lock = get_active_split_frames(state, df)
+    fit_source = train_df if isinstance(train_df, pd.DataFrame) and not train_df.empty else df
+    X_fit_raw = fit_source[num_cols].replace([np.inf, -np.inf], np.nan)
+    fit_medians = X_fit_raw.median(numeric_only=True).fillna(0.0)
+    X_fit = X_fit_raw.fillna(fit_medians)
+
+    X_num = df[num_cols].replace([np.inf, -np.inf], np.nan).fillna(fit_medians)
 
     mode = req.mode.lower()
     if mode == "complete":
@@ -1660,7 +1678,7 @@ def s02_run_anomaly(req: AnomalyReq, x_session_id: str | None = Header(default="
     for m_name in det_methods:
         try:
             det = AnomalyDetector(method=m_name, contamination=req.contamination)
-            det.fit(X_num)
+            det.fit(X_fit)
             flags = det.predict(X_num)
             scores = det.score_samples(X_num)
             is_anom = (flags == -1) if np.any(flags == -1) else (flags == 1)
@@ -2219,7 +2237,7 @@ def s05_engineer_features(req: FeatureEngReq, x_session_id: str | None = Header(
             extract_datetime_features=req.add_datetime_features,
         )
     fe = FeatureEngineeringPipeline(cfg)
-    train_df = state.get("active_train_df")
+    train_df, _test_df, _lock = get_active_split_frames(state, df)
     if isinstance(train_df, pd.DataFrame) and not train_df.empty and all(c in train_df.columns for c in feat_cols):
         fe.fit(train_df[feat_cols])
         transformed = fe.transform(df[feat_cols])
@@ -2250,7 +2268,7 @@ def s05_select_features(req: FeatureSelReq, x_session_id: str | None = Header(de
     if not target:
         raise HTTPException(status_code=400, detail="Select a target column before running Feature Selection.")
     X, y, task = _prepare_xy(df, target)
-    train_df = state.get("active_train_df")
+    train_df, _test_df, _lock = get_active_split_frames(state, df)
     if isinstance(train_df, pd.DataFrame) and not train_df.empty and target in train_df.columns:
         X_fit, y_fit, _ = _prepare_xy(train_df, target)
     else:
@@ -2344,7 +2362,7 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
         raise HTTPException(status_code=400, detail="Select a target column first.")
 
     def _execute() -> dict[str, Any]:
-        X, y, task = _prepare_xy(df, target)
+        X, y, task = _prepare_xy(df, target, raw_features=True)
         work_df = X.copy()
         work_df[target] = y.to_numpy()
         res = AutoMLBackendHub.run(
@@ -3965,3 +3983,116 @@ def s14_export_results(fmt: str, x_session_id: str | None = Header(default="defa
         media_type="text/csv",
         headers={"Content-Disposition": 'attachment; filename="omniforge_supervisory_evaluation.csv"'},
     )
+
+
+@router.post("/s01/advanced_audit")
+def s01_advanced_audit(x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
+    """Run Benford's Law, MCD Robust Mahalanobis outliers, and Cleaning Distortion Audit."""
+    from omniforge.data.cleaning import benford_digit_test, cleaning_distortion_audit, robust_mahalanobis_outliers
+
+    state = get_session_state(_sid(x_session_id))
+    df = get_analysis_dataframe(state, _require_df(state))
+    raw_df = state.get("uap_raw_df")
+    audit_df = raw_df if isinstance(raw_df, pd.DataFrame) and not raw_df.empty else df
+
+    num_cols = list(audit_df.select_dtypes(include=[np.number]).columns)[:6]
+    benford_results = {col: benford_digit_test(audit_df[col]) for col in num_cols}
+    mcd_res = robust_mahalanobis_outliers(audit_df)
+    distortion = (
+        cleaning_distortion_audit(raw_df, df)
+        if isinstance(raw_df, pd.DataFrame) and not raw_df.empty
+        else {"columns_audited": 0, "per_column": {}, "high_distortion_columns": []}
+    )
+    return {
+        "benford_tests": benford_results,
+        "robust_mahalanobis": mcd_res,
+        "cleaning_distortion": distortion,
+    }
+
+
+@router.post("/s02/advanced_mining")
+def s02_advanced_mining(
+    target_col: str | None = None,
+    n_clusters: int = 3,
+    x_session_id: str | None = Header(default="default"),
+) -> dict[str, Any]:
+    """Run Subgroup Beam Search, Bootstrap ARI Cluster Stability, and Distance Correlation."""
+    from omniforge.eda.statistics import distance_correlation
+    from omniforge.models.clustering.clusterer import ClusteringEngine
+    from omniforge.models.mining.miner import subgroup_beam_search
+
+    state = get_session_state(_sid(x_session_id))
+    df = get_analysis_dataframe(state, _require_df(state))
+    targets = get_selected_targets(state, df)
+    tgt = target_col or (targets[0] if targets else None)
+
+    subgroups = subgroup_beam_search(df, tgt, beam_width=5, max_depth=2, min_support=10) if tgt and tgt in df.columns else []
+    stability = ClusteringEngine.bootstrap_stability_ari(df, n_clusters=max(2, n_clusters), n_bootstraps=15)
+    hopkins = ClusteringEngine.hopkins_statistic(df)
+
+    dcor_results: dict[str, Any] = {}
+    if tgt and tgt in df.columns and pd.api.types.is_numeric_dtype(df[tgt]):
+        num_feats = [c for c in df.select_dtypes(include=[np.number]).columns if c != tgt][:6]
+        for col in num_feats:
+            dcor_results[col] = distance_correlation(df[col], df[tgt])
+
+    return {
+        "target": tgt,
+        "beam_subgroups": subgroups,
+        "cluster_stability_ari": stability,
+        "hopkins_clustering_tendency": hopkins,
+        "distance_correlation": dcor_results,
+    }
+
+
+@router.get("/s00/data_relationships")
+def s00_data_relationships(x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
+    """Compute pairwise linear (Pearson), monotonic (Spearman), and nonlinear (dCor) relationships for Studio 00."""
+    from omniforge.eda.statistics import distance_correlation
+
+    state = get_session_state(_sid(x_session_id))
+    df = _require_df(state)
+    num_cols = list(df.select_dtypes(include=[np.number]).columns)[:10]
+    pairs: list[dict[str, Any]] = []
+    sub = df[num_cols].replace([np.inf, -np.inf], np.nan)
+    for i in range(len(num_cols)):
+        for j in range(i + 1, len(num_cols)):
+            c1, c2 = num_cols[i], num_cols[j]
+            pair_df = sub[[c1, c2]].dropna()
+            if len(pair_df) < 5:
+                continue
+            x = pair_df[c1].to_numpy(dtype=float)
+            y = pair_df[c2].to_numpy(dtype=float)
+            pear = float(np.corrcoef(x, y)[0, 1]) if np.std(x) > 1e-12 and np.std(y) > 1e-12 else 0.0
+            spear = float(pair_df[c1].corr(pair_df[c2], method="spearman") or 0.0)
+            dcor = float(distance_correlation(x[:400], y[:400])["dcor"])
+            abs_p = abs(pear)
+            if abs_p >= 0.7:
+                rel_type = "Strong Linear"
+            elif dcor >= 0.35 and abs_p < 0.3:
+                rel_type = "Nonlinear Dependence"
+            elif abs(spear) >= 0.5 and abs_p < 0.45:
+                rel_type = "Monotonic Nonlinear"
+            elif abs_p >= 0.35 or dcor >= 0.3:
+                rel_type = "Moderate Association"
+            else:
+                rel_type = "Weak / Independent"
+            pairs.append(
+                {
+                    "feature_a": c1,
+                    "feature_b": c2,
+                    "pearson": round(pear, 4),
+                    "spearman": round(spear, 4),
+                    "dcor": round(dcor, 4),
+                    "relationship_type": rel_type,
+                }
+            )
+    pairs.sort(key=lambda r: max(abs(r["pearson"]), r["dcor"]), reverse=True)
+    return {
+        "n_rows": int(len(df)),
+        "n_cols": int(df.shape[1]),
+        "numeric_cols": num_cols,
+        "pairs": pairs[:30],
+    }
+
+

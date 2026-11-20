@@ -324,6 +324,11 @@ class FeatureEngineeringPipeline:
         # Time-series lag, rolling, and Fourier features
         ts_target = self.config.time_series_target
         if ts_target and ts_target in X.columns:
+            for lag in self.config.lags:
+                if lag <= 0:
+                    raise ValueError(
+                        f"Causal time-series lag must be > 0 to prevent future data leakage (got lag={lag})."
+                    )
             series = pd.to_numeric(X[ts_target], errors="coerce")
             grp_col = self.config.time_series_group_col
             if grp_col and grp_col in X.columns:

@@ -987,3 +987,58 @@ class StatisticalAnalyzer:
         }
 
 
+def distance_correlation(x: np.ndarray | pd.Series, y: np.ndarray | pd.Series) -> dict[str, float]:
+    """Compute Székely-Rizzo-Bakirov (2007) distance correlation (dCor) for linear & nonlinear dependence."""
+    xa = np.asarray(x, dtype=float)
+    ya = np.asarray(y, dtype=float)
+    mask = np.isfinite(xa) & np.isfinite(ya)
+    xa = xa[mask]
+    ya = ya[mask]
+    n = len(xa)
+    if n < 4:
+        return {"dcor": 0.0, "dcov": 0.0, "n": float(n)}
+    a = np.abs(xa[:, None] - xa[None, :])
+    b = np.abs(ya[:, None] - ya[None, :])
+    a_cent = a - a.mean(axis=0, keepdims=True) - a.mean(axis=1, keepdims=True) + a.mean()
+    b_cent = b - b.mean(axis=0, keepdims=True) - b.mean(axis=1, keepdims=True) + b.mean()
+    dcov2_xy = float(np.mean(a_cent * b_cent))
+    dcov2_xx = float(np.mean(a_cent * a_cent))
+    dcov2_yy = float(np.mean(b_cent * b_cent))
+    denom = float(np.sqrt(max(dcov2_xx, 0.0) * max(dcov2_yy, 0.0)))
+    dcor = float(np.sqrt(max(dcov2_xy, 0.0)) / denom) if denom > 1e-12 else 0.0
+    return {
+        "dcor": round(dcor, 6),
+        "dcov": round(float(np.sqrt(max(dcov2_xy, 0.0))), 6),
+        "n": float(n),
+    }
+
+
+def friedman_nemenyi_test(score_matrix: np.ndarray | pd.DataFrame, *, alpha: float = 0.05) -> dict[str, Any]:
+    """Demšar (2006) Friedman test with Nemenyi post-hoc Critical Difference (CD) for multi-model comparison."""
+    from scipy import stats
+
+    mat = np.asarray(score_matrix, dtype=float)
+    if mat.ndim != 2 or mat.shape[0] < 3 or mat.shape[1] < 2:
+        return {"evaluable": False, "reason": "Requires >= 3 datasets/folds and >= 2 models."}
+    n_datasets, k_models = mat.shape
+    stat, p_val = stats.friedmanchisquare(*[mat[:, j] for j in range(k_models)])
+    # Average ranks (higher score = rank 1)
+    ranks = np.array([stats.rankdata(-row) for row in mat])
+    avg_ranks = np.mean(ranks, axis=0)
+    # Approximate Nemenyi q_alpha via studentized range / normal critical value
+    q_alpha = float(stats.norm.ppf(1.0 - alpha / (k_models * (k_models - 1)))) if k_models > 2 else 1.96
+    cd = float(q_alpha * np.sqrt(k_models * (k_models + 1) / (6.0 * n_datasets)))
+    return {
+        "evaluable": True,
+        "n_datasets": int(n_datasets),
+        "k_models": int(k_models),
+        "friedman_stat": round(float(stat), 6),
+        "p_value": round(float(p_val), 6),
+        "significant": bool(p_val < alpha),
+        "avg_ranks": [round(float(r), 4) for r in avg_ranks],
+        "critical_difference": round(cd, 4),
+    }
+
+
+
+

@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from pydantic import BaseModel, Field, model_validator
+from sklearn.covariance import EllipticEnvelope
 from sklearn.ensemble import IsolationForest
 from sklearn.experimental import enable_iterative_imputer  # noqa: F401
 from sklearn.impute import IterativeImputer, KNNImputer
@@ -41,7 +42,7 @@ class CleaningConfig(BaseModel):
     infer_types: bool = True
     drop_high_missing_cols: bool = True
     missing_col_threshold: float = Field(default=0.95, ge=0.0, le=1.0)
-    numeric_imputation: str = "median"  # mean, median, constant, knn, iterative, ffill, bfill, interpolate, none
+    numeric_imputation: str = "median"  # mean, median, constant, knn, iterative, missforest, ffill, bfill, interpolate, none
     categorical_imputation: str = "most_frequent"  # most_frequent, mode, constant, none
     constant_fill_numeric: float = 0.0
     constant_fill_categorical: str = "MISSING"
@@ -49,9 +50,12 @@ class CleaningConfig(BaseModel):
     drop_exact_duplicates: bool = True
     fuzzy_dedup_column: str | None = None
     fuzzy_dedup_threshold: float = Field(default=0.97, ge=0.5, le=1.0)
-    outlier_method: str = "iqr"  # iqr, zscore, mad, isolation_forest, lof, none
+    outlier_method: str = "iqr"  # iqr, zscore, mad, percentile, isolation_forest, lof, elliptic, none
     outlier_action: str = "clip"  # clip, remove, drop, nan, flag, none
     outlier_threshold: float = 1.5
+    lower_percentile: float = Field(default=0.01, ge=0.0, le=0.49)
+    upper_percentile: float = Field(default=0.99, ge=0.51, le=1.0)
+    rare_category_threshold: float = Field(default=0.0, ge=0.0, le=0.5)
     contamination: float = Field(default=0.05, gt=0.0, lt=0.5)
     causal_time_series: bool = True
     time_column: str | None = None
@@ -119,10 +123,12 @@ class _FittedCleanerState:
     numeric_fill_values: dict[str, float] = field(default_factory=dict)
     causal_last_values: dict[str, float] = field(default_factory=dict)
     categorical_fill_values: dict[str, Any] = field(default_factory=dict)
+    frequent_categories: dict[str, set[str]] = field(default_factory=dict)
     knn_imputer: KNNImputer | None = None
     knn_columns: list[str] = field(default_factory=list)
     iterative_imputer: IterativeImputer | None = None
     iterative_columns: list[str] = field(default_factory=list)
+    missforest_models: dict[str, tuple[Any, list[str]]] = field(default_factory=dict)
     missing_indicator_cols: list[str] = field(default_factory=list)
     outlier_bounds: dict[str, tuple[float, float]] = field(default_factory=dict)
     multivariate_detector: Any | None = None
@@ -194,14 +200,21 @@ class DataCleaner:
         self._state = _FittedCleanerState()
         excluded = set(self.config.exclude_columns)
 
-        if self.config.standardize_missing_tokens:
-            work = self._standardize_missing(work, excluded)
         if self.config.clean_strings:
             work, _ = self._clean_strings(work, excluded)
+        if self.config.standardize_missing_tokens:
+            work = self._standardize_missing(work, excluded)
         if self.config.infer_types:
             work, _ = self._infer_and_cast_types(work, excluded, fit_mode=True)
+        for col in work.select_dtypes(include=[np.number]).columns:
+            if col not in excluded:
+                arr_vals = work[col].to_numpy(dtype=float, na_value=np.nan)
+                if np.isinf(arr_vals).any():
+                    work[col] = work[col].replace([np.inf, -np.inf], np.nan)
         if self.config.domain_bounds:
             work, _ = self.apply_domain_bounds(work, self.config.domain_bounds)
+        if self.config.drop_exact_duplicates and len(work) > 0:
+            work = work.drop_duplicates()
 
         if self.config.drop_high_missing_cols and len(work) > 0:
             for col in work.columns:
@@ -255,6 +268,28 @@ class DataCleaner:
                 iter_imp.fit(work[usable])
                 self._state.iterative_imputer = iter_imp
                 self._state.iterative_columns = usable
+        elif self.config.numeric_imputation == "missforest" and num_cols and len(work) >= 5:
+            from sklearn.ensemble import RandomForestRegressor
+
+            usable = [c for c in num_cols if not work[c].isna().all()]
+            if len(usable) >= 2:
+                mf_work = work[usable].copy()
+                for c in usable:
+                    mf_work[c] = mf_work[c].fillna(self._state.numeric_fill_values.get(c, 0.0))
+                for c in usable:
+                    obs_mask = work[c].notna().to_numpy()
+                    if obs_mask.sum() < 3:
+                        continue
+                    pred_cols = [oc for oc in usable if oc != c]
+                    rf = RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=-1)
+                    rf.fit(mf_work.loc[obs_mask, pred_cols], work.loc[obs_mask, c].to_numpy(dtype=float))
+                    self._state.missforest_models[c] = (rf, pred_cols)
+        elif self.config.numeric_imputation in ("knn", "iterative", "missforest") and len(work) < 5:
+            logger.warning(
+                "imputation_fallback_to_median",
+                requested=self.config.numeric_imputation,
+                rows=len(work),
+            )
 
         for col in cat_cols:
             non_null = work[col].dropna()
@@ -322,6 +357,11 @@ class DataCleaner:
                     random_state=42,
                     n_estimators=120,
                     n_jobs=parallel_n_jobs(),
+                ).fit(arr)
+            elif self.config.outlier_method in ("elliptic", "elliptic_envelope"):
+                det = EllipticEnvelope(
+                    contamination=self.config.contamination,
+                    random_state=42,
                 ).fit(arr)
             else:
                 n_neighbors = min(20, max(2, len(work) - 1))
@@ -723,14 +763,17 @@ class DataCleaner:
                 for c, cnt in before_nulls.items():
                     if cnt > 0:
                         imputed[c] = cnt
-        elif self.config.numeric_imputation == "missforest":
+        elif self.config.numeric_imputation == "missforest" and self._state.missforest_models:
             num_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c not in excluded]
-            before_nulls = {c: int(df[c].isna().sum()) for c in num_cols}
-            if any(v > 0 for v in before_nulls.values()):
-                df = self.missforest_impute(df)
-                for c, cnt in before_nulls.items():
-                    if cnt > 0:
-                        imputed[c] = cnt
+            mf_in = df[num_cols].copy()
+            for c in num_cols:
+                mf_in[c] = mf_in[c].fillna(self._state.numeric_fill_values.get(c, 0.0))
+            for c, (rf, pred_cols) in self._state.missforest_models.items():
+                if c in df.columns and c not in excluded and all(pc in mf_in.columns for pc in pred_cols):
+                    na_mask = df[c].isna().to_numpy()
+                    if na_mask.any():
+                        df.loc[na_mask, c] = rf.predict(mf_in.loc[na_mask, pred_cols])
+                        imputed[c] = int(na_mask.sum())
         elif self.config.numeric_imputation in ("ffill", "bfill", "interpolate"):
             # Sort chronologically if time_column provided, restore index ordering afterwards
             orig_index = df.index
@@ -831,6 +874,29 @@ class DataCleaner:
         return {"m": int(m), "pooled_estimates": pooled, "imputed_datasets": imputed_datasets}
 
     @staticmethod
+    def pool_rubin_estimates(
+        estimates: list[np.ndarray],
+        variances: list[np.ndarray],
+    ) -> dict[str, np.ndarray]:
+        """Generic Rubin's Rules pooling for any downstream estimator (e.g. regression coefficients)."""
+        m = len(estimates)
+        if m < 2 or len(variances) != m:
+            raise ValueError("pool_rubin_estimates requires m >= 2 estimates and matching variances.")
+        q_mat = np.vstack([np.asarray(e, dtype=float) for e in estimates])
+        u_mat = np.vstack([np.asarray(v, dtype=float) for v in variances])
+        q_bar = q_mat.mean(axis=0)
+        u_bar = u_mat.mean(axis=0)
+        b_var = q_mat.var(axis=0, ddof=1)
+        total_var = u_bar + (1.0 + 1.0 / m) * b_var
+        return {
+            "pooled_estimate": q_bar,
+            "within_variance": u_bar,
+            "between_variance": b_var,
+            "total_variance": total_var,
+            "pooled_se": np.sqrt(np.maximum(0.0, total_var)),
+        }
+
+    @staticmethod
     def missforest_impute(
         df: pd.DataFrame,
         max_iter: int = 5,
@@ -889,4 +955,96 @@ class DataCleaner:
                     rf_c.fit(X_obs, y_obs.astype(str))
                     work.loc[mask, c] = rf_c.predict(X_mis)
         return work
+
+
+def benford_digit_test(series: pd.Series) -> dict[str, Any]:
+    """First-digit Benford's Law conformity test (Chi-square) for financial/audit data screening."""
+    from scipy import stats
+
+    vals = pd.to_numeric(series, errors="coerce").dropna().abs()
+    vals = vals[vals > 0]
+    if len(vals) < 30:
+        return {"evaluable": False, "reason": "Requires >= 30 positive observations.", "n": int(len(vals))}
+    first_digits = vals.astype(str).str.lstrip("0.").str[0]
+    digits = first_digits[first_digits.isin([str(d) for d in range(1, 10)])].astype(int)
+    n = len(digits)
+    if n < 30:
+        return {"evaluable": False, "reason": "Insufficient valid leading digits.", "n": int(n)}
+    obs = np.array([int((digits == d).sum()) for d in range(1, 10)], dtype=float)
+    exp = np.array([n * np.log10(1.0 + 1.0 / d) for d in range(1, 10)], dtype=float)
+    chi2_stat, p_val = stats.chisquare(obs, f_exp=exp)
+    return {
+        "evaluable": True,
+        "n": int(n),
+        "chi2": round(float(chi2_stat), 4),
+        "p_value": round(float(p_val), 6),
+        "conforms_benford": bool(p_val >= 0.05),
+    }
+
+
+def robust_mahalanobis_outliers(
+    df: pd.DataFrame,
+    *,
+    alpha: float = 0.01,
+    random_state: int = 42,
+) -> dict[str, Any]:
+    """Multivariate outlier detection using Minimum Covariance Determinant (MCD) Mahalanobis distance."""
+    from scipy import stats
+    from sklearn.covariance import MinCovDet
+
+    num = df.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan).dropna()
+    p = num.shape[1]
+    if p < 2 or len(num) < max(20, p + 5):
+        return {"evaluable": False, "reason": "Requires >= 2 numeric columns and sufficient complete rows."}
+    X = num.to_numpy(dtype=float)
+    try:
+        mcd = MinCovDet(random_state=random_state).fit(X)
+        dist_sq = mcd.mahalanobis(X)
+    except Exception:
+        cov = np.cov(X, rowvar=False) + np.eye(p) * 1e-6
+        inv_cov = np.linalg.pinv(cov)
+        diff = X - np.mean(X, axis=0)
+        dist_sq = np.einsum("ij,jk,ik->i", diff, inv_cov, diff)
+    cutoff = float(stats.chi2.ppf(1.0 - alpha, df=p))
+    flags = dist_sq > cutoff
+    return {
+        "evaluable": True,
+        "n_rows": int(len(num)),
+        "n_features": int(p),
+        "chi2_cutoff": round(cutoff, 4),
+        "n_outliers": int(flags.sum()),
+        "outlier_indices": num.index[flags].tolist(),
+    }
+
+
+def cleaning_distortion_audit(raw_df: pd.DataFrame, cleaned_df: pd.DataFrame) -> dict[str, Any]:
+    """Quantify statistical distortion introduced by data cleaning (KS, Wasserstein, median shift)."""
+    from scipy import stats
+
+    shared_num = [
+        c
+        for c in raw_df.select_dtypes(include=[np.number]).columns
+        if c in cleaned_df.columns and pd.api.types.is_numeric_dtype(cleaned_df[c])
+    ]
+    per_col: dict[str, dict[str, float]] = {}
+    for col in shared_num:
+        r = pd.to_numeric(raw_df[col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna().to_numpy(dtype=float)
+        c = pd.to_numeric(cleaned_df[col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna().to_numpy(dtype=float)
+        if len(r) < 5 or len(c) < 5:
+            continue
+        ks = stats.ks_2samp(r, c)
+        w_dist = float(stats.wasserstein_distance(r, c))
+        per_col[col] = {
+            "ks_stat": round(float(ks.statistic), 6),
+            "ks_pvalue": round(float(ks.pvalue), 6),
+            "wasserstein": round(w_dist, 6),
+            "median_shift": round(float(np.median(c) - np.median(r)), 6),
+        }
+    return {
+        "columns_audited": len(per_col),
+        "per_column": per_col,
+        "high_distortion_columns": [k for k, v in per_col.items() if v["ks_pvalue"] < 0.01],
+    }
+
+
 

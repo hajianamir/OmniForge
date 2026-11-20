@@ -64,7 +64,94 @@ export const ProvenancePill: React.FC<{ ws: WorkspaceState }> = ({ ws }) => {
 // ============================================================================
 // Studio 01 — Multi-Source Data Ingestion, Auto Defect Audit & Full Cleaning
 // ============================================================================
-export const Studio01Data: React.FC<StudioProps> = ({ ws, onSync, gridVersion, bumpGrid, studioCache, setStudioResult, refreshCache, openHelp }) => {
+export const Studio00Ingestion: React.FC<StudioProps> = (props) => {
+  const [relData, setRelData] = useState<{
+    n_rows: number;
+    n_cols: number;
+    pairs: Array<{ feature_a: string; feature_b: string; pearson: number; spearman: number; dcor: number; relationship_type: string }>;
+  } | null>(null);
+  const [relBusy, setRelBusy] = useState(false);
+
+  const loadRelationships = async () => {
+    setRelBusy(true);
+    try {
+      const res = await apiGet<typeof relData>('/api/workbench/s00/data_relationships');
+      setRelData(res);
+    } catch {
+      setRelData(null);
+    } finally {
+      setRelBusy(false);
+    }
+  };
+
+  return (
+    <div>
+      <Studio01Data {...props} sectionMode="ingestion" />
+      {props.ws.has_dataset && (
+        <div className="card" style={{ marginTop: 14 }}>
+          <div className="card-title">
+            <span>Data Relationships &amp; Dependency Types (Studio 00)</span>
+            <button className="btn btn-secondary" disabled={relBusy} onClick={loadRelationships}>
+              {relBusy ? 'Analyzing…' : 'Analyze Data Relationships (Chart & Table)'}
+            </button>
+          </div>
+          {relData && relData.pairs.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {relData.pairs.slice(0, 8).map((p, idx) => (
+                  <div key={idx} style={{ fontSize: 12 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 2 }}>
+                      <span><strong>{p.feature_a}</strong> ↔ <strong>{p.feature_b}</strong></span>
+                      <span className="badge">{p.relationship_type}</span>
+                    </div>
+                    <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                      <span style={{ width: 70, color: '#94a3b8' }}>|r|={Math.abs(p.pearson).toFixed(2)}</span>
+                      <div style={{ flex: 1, height: 8, background: 'rgba(148,163,184,0.2)', borderRadius: 4, overflow: 'hidden' }}>
+                        <div style={{ width: `${Math.min(100, Math.abs(p.pearson) * 100)}%`, height: '100%', background: '#38bdf8' }} />
+                      </div>
+                      <span style={{ width: 75, color: '#94a3b8' }}>dCor={p.dcor.toFixed(2)}</span>
+                      <div style={{ flex: 1, height: 8, background: 'rgba(148,163,184,0.2)', borderRadius: 4, overflow: 'hidden' }}>
+                        <div style={{ width: `${Math.min(100, p.dcor * 100)}%`, height: '100%', background: '#34d399' }} />
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div style={{ overflowX: 'auto' }}>
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Feature A</th>
+                      <th>Feature B</th>
+                      <th>Pearson r</th>
+                      <th>Spearman ρ</th>
+                      <th>Distance Corr (dCor)</th>
+                      <th>Relationship Type</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {relData.pairs.map((p, idx) => (
+                      <tr key={idx}>
+                        <td>{p.feature_a}</td>
+                        <td>{p.feature_b}</td>
+                        <td>{p.pearson}</td>
+                        <td>{p.spearman}</td>
+                        <td>{p.dcor}</td>
+                        <td>{p.relationship_type}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+export const Studio01Data: React.FC<StudioProps & { sectionMode?: 'ingestion' | 'cleaning' }> = ({ ws, onSync, gridVersion, bumpGrid, studioCache, setStudioResult, refreshCache, openHelp, sectionMode = 'cleaning' }) => {
   const [ingestTab, setIngestTab] = useState<'file' | 'sql' | 'access' | 'samples'>('file');
   const [catalog, setCatalog] = useState<{ benchmarks: SampleCatalogItem[]; domains: SampleCatalogItem[] }>({ benchmarks: [], domains: [] });
   const [viewMode, setViewMode] = useState<'active' | 'raw'>('active');
@@ -277,7 +364,7 @@ export const Studio01Data: React.FC<StudioProps> = ({ ws, onSync, gridVersion, b
       <div className="studio-hero">
         <div>
           <div className="row" style={{ gap: 8, alignItems: 'center' }}>
-            <h1>01 · Data Ingestion, Automatic Defect Audit &amp; Cleaning</h1>
+            <h1>{sectionMode === 'ingestion' ? '00 · Data Ingestion, Intake Audit & Split Lock' : '01 · Data Preparation & Cleaning'}</h1>
             <StudioHelpButton section="studio-01" onOpenHelp={openHelp} title="Open Chapter 01: Ingestion, Split Lock, Imputation & Outlier Formulas" />
           </div>
           <p>Ingest CSV, Multi-Sheet Excel (.xlsx), Parquet, SQL Databases, or MS Access (.accdb/.mdb) — instant automatic statistical &amp; defect auditing plus full Auto / Complete / Custom data cleaning.</p>
@@ -298,6 +385,7 @@ export const Studio01Data: React.FC<StudioProps> = ({ ws, onSync, gridVersion, b
       {err && <div className="alert alert-error">{err}</div>}
 
       {/* Multi-Source Ingestion Hub */}
+      {sectionMode === 'ingestion' && (
       <div className="card">
         <div className="tabs" style={{ marginBottom: 12 }}>
           <button className={`tab-btn ${ingestTab === 'file' ? 'active' : ''}`} onClick={() => setIngestTab('file')}>Upload File (CSV / XLSX / Parquet / JSON)</button>
@@ -402,9 +490,10 @@ export const Studio01Data: React.FC<StudioProps> = ({ ws, onSync, gridVersion, b
           </div>
         )}
       </div>
+      )}
 
       {/* AUTOMATIC POST-INGESTION DEFECT & STATISTICAL PRE-SCREEN AUDIT */}
-      {ws.has_dataset && ia && (
+      {sectionMode === 'ingestion' && ws.has_dataset && ia && (
         <div className="card" style={{ borderColor: ia.defect_counts.critical > 0 ? 'var(--red)' : ia.defect_counts.high > 0 ? 'var(--amber)' : 'var(--green)' }}>
           <div className="card-title">
             <span>Automatic Post-Ingestion Defect Audit &amp; Statistical Pre-Screening — {ia.overall_health}</span>
@@ -451,7 +540,7 @@ export const Studio01Data: React.FC<StudioProps> = ({ ws, onSync, gridVersion, b
       )}
 
       {/* RESTORED & EXPANDED DATA CLEANING STUDIO (Auto / Complete / Custom) */}
-      {ws.has_dataset && (
+      {sectionMode === 'cleaning' && ws.has_dataset && (
         <div className="card">
           <div className="card-title">
             <span>Data Cleaning &amp; Remediation Studio (Restored + Expanded)</span>
@@ -551,6 +640,16 @@ export const Studio01Data: React.FC<StudioProps> = ({ ws, onSync, gridVersion, b
               <div className="kpi-card"><div className="kpi-label">Mode</div><div className="kpi-value" style={{ fontSize: 16 }}>{String(cleanPreview.cleaning_report.mode_used || cleanMode).toUpperCase()}</div></div>
               <div className="kpi-card"><div className="kpi-label">Rows</div><div className="kpi-value" style={{ fontSize: 16 }}>{cleanPreview.cleaning_report.rows_before} → {cleanPreview.cleaning_report.rows_after}</div></div>
               <div className="kpi-card"><div className="kpi-label">Columns</div><div className="kpi-value" style={{ fontSize: 16 }}>{cleanPreview.cleaning_report.cols_before} → {cleanPreview.cleaning_report.cols_after}</div></div>
+              {Array.isArray((cleanPreview.cleaning_report as Record<string, unknown>).steps_applied) && (
+                <div style={{ gridColumn: '1 / -1', marginTop: 8, padding: '10px 12px', borderRadius: 6, background: 'rgba(16,185,129,0.08)', border: '1px solid rgba(16,185,129,0.3)', fontSize: 12.5 }}>
+                  <strong style={{ color: '#34d399' }}>Ordered Cleaning Pipeline Executed (Step-by-Step):</strong>
+                  <ol style={{ margin: '6px 0 0 18px', padding: 0 }}>
+                    {((cleanPreview.cleaning_report as Record<string, unknown>).steps_applied as string[]).map((step, idx) => (
+                      <li key={idx} style={{ marginBottom: 2 }}>{step}</li>
+                    ))}
+                  </ol>
+                </div>
+              )}
               <div className="kpi-card"><div className="kpi-label">Missing Cells</div><div className="kpi-value" style={{ fontSize: 16 }}>{cleanPreview.cleaning_report.missing_before} → {cleanPreview.cleaning_report.missing_after}</div></div>
             </div>
           )}
@@ -711,6 +810,21 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
 
   const toggleMineTask = (t: string) => {
     setMineTasks((prev) => (prev.includes(t) ? prev.filter((x) => x !== t) : [...prev, t]));
+  };
+
+  const [advMineRes, setAdvMineRes] = useState<Record<string, unknown> | null>(null);
+
+  const runAdvancedMining = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const res = await apiPost<Record<string, unknown>>('/api/workbench/s02/advanced_mining', {});
+      setAdvMineRes(res);
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : 'Advanced mining failed');
+    } finally {
+      setBusy(false);
+    }
   };
 
   const runMining = async () => {
@@ -953,9 +1067,20 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
                 <input type="number" step={0.1} min={0.5} max={10.0} value={minLift} onChange={(e) => setMinLift(Number(e.target.value))} />
               </label>
             </div>
-            <button className="btn btn-primary" disabled={busy || !ws.has_dataset} onClick={runMining}>
-              {busy ? <span className="spinner" /> : null} Execute Data Mining Suite ({mineMode.toUpperCase()})
-            </button>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+              <button className="btn btn-primary" disabled={busy || !ws.has_dataset} onClick={runMining}>
+                {busy ? <span className="spinner" /> : null} Execute Data Mining Suite ({mineMode.toUpperCase()})
+              </button>
+              <button className="btn btn-secondary" disabled={busy || !ws.has_dataset} onClick={runAdvancedMining}>
+                Run Advanced Mining (Beam + ARI + dCor)
+              </button>
+            </div>
+            {advMineRes && (
+              <div className="card" style={{ marginTop: 10 }}>
+                <div className="card-title"><span>Advanced Mining Diagnostics (Beam Search, Bootstrap ARI, dCor)</span></div>
+                <pre style={{ fontSize: 12, maxHeight: 220, overflow: 'auto', margin: 0 }}>{JSON.stringify(advMineRes, null, 2)}</pre>
+              </div>
+            )}
           </div>
 
           {mineRes && (

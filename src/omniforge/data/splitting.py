@@ -398,7 +398,9 @@ class LeakageSafeSplitter:
             gap = min(self.config.gap, max(0, (n // (n_splits + 1)) - 2))
             return TimeSeriesSplit(n_splits=n_splits, gap=gap), None
 
-        if strategy == "group" and groups is not None:
+        if strategy == "group":
+            if groups is None:
+                raise DataValidationError("Group cross-validation requested (strategy='group') but groups=None.")
             uniq_g = len(np.unique(groups))
             n_splits = max(2, min(self.config.cv_folds, uniq_g))
             return GroupKFold(n_splits=n_splits), groups

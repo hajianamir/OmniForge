@@ -2,6 +2,31 @@ import type { StudioChapter } from './handbookTypes';
 
 export const HANDBOOK_CHAPTERS_PART1: StudioChapter[] = [
   // =========================================================================
+  // CHAPTER 0 — STUDIO 00
+  // =========================================================================
+  {
+    studioId: '00',
+    chapterNum: 'Chapter 00',
+    title: 'Data Ingestion, Intake Audit, Split Lock & Data Relationships',
+    subtitle: 'Multi-source data loading, immutable raw view preservation, zero-leakage Split Lock, and linear/nonlinear relationship diagnostics.',
+    overview:
+      'Studio 00 is the entry point of OmniForge. It handles multi-source ingestion (CSV, Excel, Parquet, JSON, SQL, MS Access, and Benchmark datasets), preserves an immutable raw copy (uap_raw_df), executes InitialIntakeAuditor, enforces Split Lock before any cleaning or modeling, and visualizes pairwise variable relationships (Pearson r, Spearman rho, and Distance Correlation dCor) via interactive charts and tables.',
+    realWorldApplications: [
+      'Onboarding raw enterprise datasets while preserving an unclipped audit copy.',
+      'Detecting linear, monotonic, and nonlinear dependencies (dCor) immediately after ingestion.',
+      'Locking Train/Test partitions with stable row_id identity before Studio 01 Data Cleaning.',
+    ],
+    stepByStep: [
+      '1. Ingest Data Source: Upload CSV/XLSX/Parquet/JSON or connect to SQL/Access or load a benchmark dataset.',
+      '2. Inspect Intake Audit & Data Relationships: Review structural defects and click Analyze Data Relationships (Chart & Table) to inspect Pearson, Spearman, and dCor.',
+      '3. Enable Split Lock Before Studio 01: Select target/excluded columns and lock Train/Test partitions before proceeding to Studio 01 Data Cleaning.',
+    ],
+    provenanceRule: 'Immutable raw view (uap_raw_df) and Split Lock row_id partitions are established in Studio 00 before any cleaning or modeling.',
+    methods: [],
+    thresholdTables: [],
+    decisionMatrix: { title: 'Studio 00 Ingestion & Split Lock Matrix', rows: [] },
+  },
+  // =========================================================================
   // CHAPTER 1 — STUDIO 01
   // =========================================================================
   {

@@ -24,6 +24,17 @@ from omniforge.core.utils import safe_json_default
 
 logger = get_logger(__name__)
 
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def sanitize_spreadsheet_value(val: Any) -> Any:
+    """Neutralize spreadsheet formula injection (CWE-1236) in CSV/XLSX string cells."""
+    if isinstance(val, str):
+        stripped = val.lstrip(" \t\r\n")
+        if stripped.startswith(_FORMULA_PREFIXES):
+            return f"'{val}"
+    return val
+
 # Logical mapping from table names to report section IDs for contextual placement
 _TABLE_SECTION_MAP: dict[str, str] = {
     "Analyses_Performed_Audit_Log": "analyses_performed",

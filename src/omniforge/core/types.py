@@ -70,6 +70,7 @@ class DriftStatus(StrEnum):
     HEALTHY = "healthy"
     WARNING = "warning"
     CRITICAL = "critical"
+    UNKNOWN = "unknown"
 
 
 class CarbonReport(BaseModel):

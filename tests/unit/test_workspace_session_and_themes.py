@@ -192,8 +192,8 @@ def test_workspace_local_project_save_list_and_delete(tmp_path: Path) -> None:
 
 def test_light_and_dark_theme_react_spa_tokens_and_compiled_bundle() -> None:
     """Verify compiled React/Vite SPA bundle exists and includes native Dark & Light theme tokens."""
-    assert len(STUDIOS) == 13
-    assert STUDIOS[0][0] == "01" and STUDIOS[-1][0] == "13"
+    assert len(STUDIOS) == 14
+    assert STUDIOS[0][0] == "01" and STUDIOS[-1][0] == "14"
 
     static_dir = get_static_app_dir()
     assert (static_dir / "index.html").is_file()

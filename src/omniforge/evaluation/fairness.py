@@ -18,7 +18,7 @@ class FairnessReport(BaseModel):
     disparate_impact_ratio: float
     equalized_odds_diff: float
     equal_opportunity_diff: float
-    group_metrics: dict[str, dict[str, float]] = Field(default_factory=dict)
+    group_metrics: dict[str, dict[str, float | None]] = Field(default_factory=dict)
     violations: list[str] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
 
@@ -52,7 +52,7 @@ class FairnessAuditor:
         sf = np.asarray(sensitive_features).astype(str)
 
         groups = sorted(np.unique(sf).tolist())
-        group_metrics: dict[str, dict[str, float]] = {}
+        group_metrics: dict[str, dict[str, float | None]] = {}
         sel_rates: list[float] = []
         tprs: list[float] = []
         fprs: list[float] = []
@@ -64,24 +64,24 @@ class FairnessAuditor:
             sel_rate = float(np.mean(g_yp)) if len(g_yp) > 0 else 0.0
             pos_mask = g_yt == 1
             neg_mask = g_yt == 0
-            tpr = float(np.mean(g_yp[pos_mask])) if np.any(pos_mask) else 0.0
-            fpr = float(np.mean(g_yp[neg_mask])) if np.any(neg_mask) else 0.0
+            tpr_val: float | None = float(np.mean(g_yp[pos_mask])) if np.any(pos_mask) else None
+            fpr_val: float | None = float(np.mean(g_yp[neg_mask])) if np.any(neg_mask) else None
             acc = float(np.mean(g_yp == g_yt)) if len(g_yt) > 0 else 0.0
             prec = float(np.mean(g_yt[g_yp == 1])) if np.any(g_yp == 1) else 0.0
 
             group_metrics[grp] = {
                 "count": float(int(np.sum(mask))),
                 "selection_rate": round(sel_rate, 6),
-                "tpr": round(tpr, 6),
-                "fpr": round(fpr, 6),
+                "tpr": round(tpr_val, 6) if tpr_val is not None else None,
+                "fpr": round(fpr_val, 6) if fpr_val is not None else None,
                 "accuracy": round(acc, 6),
                 "precision": round(prec, 6),
             }
             sel_rates.append(sel_rate)
-            if np.any(pos_mask):
-                tprs.append(tpr)
-            if np.any(neg_mask):
-                fprs.append(fpr)
+            if tpr_val is not None:
+                tprs.append(tpr_val)
+            if fpr_val is not None:
+                fprs.append(fpr_val)
 
         dp_diff = float(max(sel_rates) - min(sel_rates)) if sel_rates else 0.0
         if sel_rates:

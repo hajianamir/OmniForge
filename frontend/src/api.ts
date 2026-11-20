@@ -4,7 +4,7 @@ const CSRF_COOKIE_NAME = 'omniforge_csrf';
 /** Default per-verb timeouts (ms). Long-running modeling jobs pass an explicit override. */
 export const DEFAULT_TIMEOUTS = {
   get: 30_000,
-  post: 60_000,
+  post: 300_000,
   delete: 30_000,
   upload: 120_000,
   download: 120_000,

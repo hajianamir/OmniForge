@@ -86,10 +86,11 @@ class ModelServingEngine:
         if len(ep["latencies_ms"]) > 1000:
             ep["latencies_ms"] = ep["latencies_ms"][-1000:]
 
+        routed_version = (ep.get("canary_version") or ep["primary_version"]) if use_canary else ep["primary_version"]
         return {
             "endpoint": endpoint_name,
             "variant": routed_variant,
-            "model_version": ep["primary_version"],
+            "model_version": routed_version,
             "n_records": len(preds),
             "predictions": preds.tolist(),
             "probabilities": probas,

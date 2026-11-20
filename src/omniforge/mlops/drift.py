@@ -140,7 +140,9 @@ class DriftDetector:
         total = max(len(feature_results), 1)
         ratio = len(drifted) / total
 
-        if critical or ratio >= 0.4:
+        if len(feature_results) == 0:
+            overall = DriftStatus.UNKNOWN
+        elif critical or ratio >= 0.4:
             overall = DriftStatus.CRITICAL
         elif drifted:
             overall = DriftStatus.WARNING
@@ -148,7 +150,9 @@ class DriftDetector:
             overall = DriftStatus.HEALTHY
 
         recs: list[str] = []
-        if overall == DriftStatus.CRITICAL:
+        if overall == DriftStatus.UNKNOWN:
+            recs.append("Insufficient shared columns or valid samples (>= 5) to evaluate drift.")
+        elif overall == DriftStatus.CRITICAL:
             recs.append(
                 f"Critical drift detected in {[f.column for f in critical] or [f.column for f in drifted[:5]]}. Trigger continuous retraining."
             )

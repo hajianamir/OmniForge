@@ -156,7 +156,10 @@ def get_current_principal(
 
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Authentication required. Provide a valid Bearer JWT token or X-API-Key header.",
+        detail=(
+            "Authentication required. Provide a valid Bearer JWT token or X-API-Key header "
+            "(for local browser UI sessions, set OMNIFORGE_SECURITY__AUTO_BOOTSTRAP_LOCAL_UI=true)."
+        ),
         headers={"WWW-Authenticate": "Bearer"},
     )
 

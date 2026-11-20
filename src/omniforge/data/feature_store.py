@@ -177,7 +177,7 @@ class LocalFeatureStore:
         rows_to_upsert: list[tuple[str, str, str, str, str]] = [
             (
                 view_name,
-                "|".join(arr[idx] for arr in join_arrs),
+                json.dumps([arr[idx] for arr in join_arrs], ensure_ascii=False),
                 ts_arr[idx] if ts_arr is not None else now_iso,
                 json.dumps(feat_records[idx], default=safe_json_default),
                 now_iso,
@@ -238,6 +238,7 @@ class LocalFeatureStore:
                 view_sub[spec.timestamp_column] = pd.to_datetime(view_sub[spec.timestamp_column])
                 left = left.sort_values(entity_timestamp_col)
                 view_sub = view_sub.sort_values(spec.timestamp_column)
+                tol = pd.Timedelta(seconds=float(spec.ttl_seconds)) if getattr(spec, "ttl_seconds", 0) and spec.ttl_seconds > 0 else None
                 merged = pd.merge_asof(
                     left,
                     view_sub,
@@ -245,6 +246,7 @@ class LocalFeatureStore:
                     right_on=spec.timestamp_column,
                     by=spec.join_keys,
                     direction="backward",
+                    tolerance=tol,
                     suffixes=("", f"__{view_name}"),
                 )
                 result = merged.sort_values("_uap_orig_order").drop(columns=["_uap_orig_order"]).reset_index(drop=True)
@@ -265,7 +267,7 @@ class LocalFeatureStore:
         output: list[dict[str, Any]] = []
         with _sqlite_conn(self._online_db) as conn:
             for row in entity_rows:
-                key_str = "|".join(str(row[k]) for k in spec.join_keys)
+                key_str = json.dumps([str(row[k]) for k in spec.join_keys], ensure_ascii=False)
                 cur = conn.execute(
                     "SELECT features_json FROM online_features WHERE view_name = ? AND entity_key = ?",
                     (view_name, key_str),
