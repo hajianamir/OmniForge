@@ -44,3 +44,7 @@ dist/omniforge-bootstrap/
 .cache/bootstrap/
 # Lock generator scratch inputs (regenerated on demand)
 locks/.requirements.*.txt
+
+# Local audit scratch (py3.11 validation copy) & venv
+.audit/
+.venv-audit/

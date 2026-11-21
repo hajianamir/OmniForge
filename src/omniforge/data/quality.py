@@ -211,7 +211,6 @@ class DataQualityProfiler:
             "validity": round(validity, 2),
             "consistency": round(consistency, 2),
             "accuracy": round(accuracy, 2),
-            "proxy_accuracy": round(accuracy, 2),
             "timeliness": round(timeliness, 2) if timeliness is not None else None,
         }
         evaluable_weights = {

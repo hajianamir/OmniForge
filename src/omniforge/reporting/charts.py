@@ -259,6 +259,9 @@ class ReportChartBuilder:
         if not dims:
             return None
 
+        dims = {k: v for k, v in dims.items() if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v}
+        if not dims:
+            return None
         names = [str(k).replace("_", " ").title() for k in dims]
         scores = [float(v) for v in dims.values()]
         bar_colors = [_EMERALD if s >= 90 else (_BLUE if s >= 80 else (_AMBER if s >= 70 else _RED)) for s in scores]

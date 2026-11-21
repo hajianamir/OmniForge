@@ -26,4 +26,4 @@ jobs:
       - name: Mypy type check
         run: mypy src/omniforge
       - name: Run pytest with coverage
-        run: pytest -q tests/unit/test_audit_regressions.py tests/unit/test_anti_leakage_and_pipeline.py --cov=omniforge --cov-report=term-missing
+        run: pytest -q tests --cov=omniforge --cov-report=term-missing

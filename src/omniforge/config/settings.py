@@ -154,6 +154,10 @@ class APISettings(BaseModel):
     )
     cors_allow_credentials: bool = True
     rate_limit_per_minute: int = 300
+    # Whole-request body cap (bytes). Enforced by RequestBodySizeLimitMiddleware before any
+    # byte is read (Content-Length) and while streaming (chunked uploads). 256 MB default is
+    # generous for local data-science workloads while still bounding memory exhaustion.
+    max_request_body_bytes: int = 268_435_456
 
     @model_validator(mode="after")
     def _prevent_wildcard_credentials(self) -> APISettings:

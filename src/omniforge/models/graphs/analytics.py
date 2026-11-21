@@ -127,7 +127,7 @@ class GraphAnalyticsEngine:
         for _ in range(T):
             accum += power
             power = power @ P
-        inv_deg = np.where(deg > 0.0, 1.0 / deg, 0.0)
+        inv_deg = np.divide(1.0, deg, out=np.zeros_like(deg), where=deg > 0.0)
         pmi_ratio = (vol / float(T)) * (accum * inv_deg[None, :])
         pmi = np.log(np.maximum(pmi_ratio, 1.0))
         k = max(1, min(embedding_dim, n - 1)) if n > 1 else 1

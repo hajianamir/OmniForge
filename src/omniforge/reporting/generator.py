@@ -256,10 +256,13 @@ class ReportGenerator:
             if "quality_diagnostics" in enabled and quality_report:
                 dims = quality_report.get("dimensions") or {}
                 if isinstance(dims, dict) and dims:
-                    assembled_tables["Data_Quality_6D_Breakdown"] = [
+                    dq_rows = [
                         {"Dimension": str(k).replace("_", " ").title(), "Score (0-100)": round(float(v), 2)}
                         for k, v in dims.items()
+                        if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v
                     ]
+                    if dq_rows:
+                        assembled_tables["Data_Quality_6D_Breakdown"] = dq_rows
 
             # 4. Top Correlations from live DataFrame if EDA enabled
             if "eda_hypothesis" in enabled and df is not None and not df.empty:

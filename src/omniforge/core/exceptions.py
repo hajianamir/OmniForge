@@ -8,12 +8,13 @@ remediation suggestions, trace identifier, timestamp, and contextual payload.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
+from omniforge.core.types import SerializableStrEnum
 
-class ErrorSeverity(StrEnum):
+
+class ErrorSeverity(SerializableStrEnum):
     """Severity classification for structured platform errors."""
 
     LOW = "low"

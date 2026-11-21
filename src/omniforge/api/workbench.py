@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import math
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -22,7 +24,7 @@ from omniforge.core.logging import get_logger
 from omniforge.core.performance import (
     compact_scatter_payload,
 )
-from omniforge.core.types import TaskType
+from omniforge.core.types import Principal, TaskType
 from omniforge.core.utils import to_json_object, to_json_safe
 from omniforge.data.cleaning import CleaningConfig, DataCleaner
 from omniforge.data.connectors import (
@@ -90,8 +92,43 @@ _SHARED_TRACKER = ExperimentTracker()
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _sid(x_session_id: str | None) -> str:
-    return (x_session_id or "default").strip() or "default"
+# Session-key namespacing (OWASP API1: Broken Object Level Authorization).
+# The raw X-Session-ID supplied by a client is never trusted as a global key: it is scoped to
+# the authenticated (tenant, subject) pair, so two callers presenting the same header value
+# always land in isolated session stores (each gets an empty, private session).
+_SESSION_KEY_RE = re.compile(r"^ws:[0-9a-f]{16}:(.*)$")
+
+
+def _display_session_id(sid: str) -> str:
+    """Return the client-facing session id (strip the internal ``ws:<owner_tag>:`` prefix).
+
+    The namespaced key is an internal storage detail; echoing it back would leak the
+    ownership-tag scheme and confuse clients that round-trip the value.
+    """
+    m = _SESSION_KEY_RE.match(sid or "")
+    return m.group(1) if m else (sid or "default")
+
+
+def _owner_tag(tenant: str, subject: str) -> str:
+    digest = hashlib.sha256(f"{tenant}\x00{subject}".encode("utf-8", errors="replace")).hexdigest()
+    return digest[:16]
+
+
+def _sid(x_session_id: str | None, principal: Principal | None = None) -> str:
+    raw = (x_session_id or "default").strip() or "default"
+    if principal is None:
+        # Fall back to the request-scoped principal stashed by the auth dependency.
+        try:
+            from omniforge.api.auth import get_request_principal
+
+            principal = get_request_principal()
+        except Exception:
+            principal = None
+    if principal is None or not getattr(principal, "subject", None):
+        # No authenticated context available (unit tests / internal tooling): legacy behavior.
+        return raw
+    tenant = str(getattr(principal, "tenant_id", "") or "default-tenant")
+    return f"ws:{_owner_tag(tenant, str(principal.subject))}:{raw}"
 
 
 def _require_df(state: dict[str, Any]) -> pd.DataFrame:
@@ -168,7 +205,7 @@ def _state_summary(state: dict[str, Any], session_id: str) -> dict[str, Any]:
 
     return to_json_object(
         {
-            "session_id": session_id,
+            "session_id": _display_session_id(session_id),
             "platform": get_version_info(),
             "has_dataset": has_df,
             "dataset_name": state.get("uap_dataset_name"),

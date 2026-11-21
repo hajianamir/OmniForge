@@ -7,10 +7,10 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Header, HTTPException
 
-from omniforge.eda import AutomatedEDA, StatisticalAnalyzer
 from omniforge.core.performance import smart_sample_df
+from omniforge.eda import AutomatedEDA, StatisticalAnalyzer
 
 router = APIRouter(tags=["workbench-s04"])
 

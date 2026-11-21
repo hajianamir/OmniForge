@@ -15,8 +15,8 @@ import pandas as pd
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import StreamingResponse
 
-from omniforge.reporting import REPORT_PRESETS, REPORT_SECTIONS_CATALOG, ReportGenerator
 from omniforge.core.performance import downsample_table_for_plot
+from omniforge.reporting import REPORT_PRESETS, REPORT_SECTIONS_CATALOG, ReportGenerator
 
 router = APIRouter(tags=["workbench-s12"])
 
