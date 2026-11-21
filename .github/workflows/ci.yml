@@ -26,4 +26,18 @@ jobs:
       - name: Mypy type check
         run: mypy src/omniforge
       - name: Run pytest with coverage
-        run: pytest -q tests --cov=omniforge --cov-report=term-missing
+        run: |
+          set +e
+          pytest -q tests --cov=omniforge --cov-report=term-missing --tb=short > /tmp/pytest-output.log 2>&1
+          status=$?
+          set -e
+          {
+            echo '## pytest output (exit code' "$status" ')'
+            echo '<details><summary>full log</summary>'
+            echo '```'
+            tail -c 60000 /tmp/pytest-output.log
+            echo '```'
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/pytest-output.log
+          exit "$status"
