@@ -10,6 +10,7 @@ jobs:
   quality-and-tests:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.12", "3.13"]
     steps:
@@ -40,4 +41,11 @@ jobs:
             echo '</details>'
           } >> "$GITHUB_STEP_SUMMARY"
           cat /tmp/pytest-output.log
+          if [ "$status" -ne 0 ]; then
+            grep -E "^(FAILED|ERROR)|failed, .*passed|error" /tmp/pytest-output.log | tail -40 | while IFS= read -r line; do
+              clean=$(printf '%s' "$line" | tr -d '\r' | cut -c1-500)
+              echo "::error title=pytest::$clean"
+            done
+            tail -c 3000 /tmp/pytest-output.log | tr '\n' ' ' | sed 's/%/%25/g' | cut -c1-2800 | while IFS= read -r line; do echo "::error title=pytest-tail::$line"; done
+          fi
           exit "$status"
