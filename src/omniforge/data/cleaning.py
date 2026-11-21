@@ -927,7 +927,10 @@ class DataCleaner:
         for c in cat_cols:
             if work[c].isna().any():
                 mode_s = work[c].mode(dropna=True)
-                work[c] = work[c].fillna("MISSING" if mode_s.empty else mode_s.iloc[0])
+                _fv = "MISSING" if mode_s.empty else mode_s.iloc[0]
+                if isinstance(work[c].dtype, pd.CategoricalDtype) and _fv not in work[c].cat.categories:
+                    work[c] = work[c].cat.add_categories([_fv])
+                work[c] = work[c].fillna(_fv)
 
         # Encode categoricals numerically for predictor matrix
         for _ in range(max_iter):

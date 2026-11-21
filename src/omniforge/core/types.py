@@ -10,7 +10,22 @@ from uuid import uuid4
 from pydantic import BaseModel, Field
 
 
-class TaskType(StrEnum):
+class SerializableStrEnum(StrEnum):
+    """``StrEnum`` that always pickles by value (``(cls, (value,))``).
+
+    CPython <= 3.11 reduces enums to ``(builtins.getattr, (EnumClass, member_name))``
+    (see CPython issue history; 3.12+ changed to by-value). The restricted unpickler in
+    :mod:`omniforge.core.security` deliberately refuses ``builtins.getattr``, which made
+    OmniForge artifacts unloadable on older interpreters (audit finding SEC-001).
+    Reducing by value matches CPython >= 3.12 behavior on every supported version, keeps
+    artifacts interoperable across interpreters, and never requires ``getattr``.
+    """
+
+    def __reduce_ex__(self, protocol: int) -> tuple[type[SerializableStrEnum], tuple[str]]:  # type: ignore[override]
+        return (self.__class__, (self._value_,))
+
+
+class TaskType(SerializableStrEnum):
     """Canonical analytics and machine learning task taxonomy."""
 
     BINARY_CLASSIFICATION = "binary_classification"
@@ -30,7 +45,7 @@ class TaskType(StrEnum):
     MULTIMODAL = "multimodal"
 
 
-class DataModality(StrEnum):
+class DataModality(SerializableStrEnum):
     """Supported data modalities across the platform."""
 
     TABULAR = "tabular"
@@ -46,7 +61,7 @@ class DataModality(StrEnum):
     MULTIMODAL = "multimodal"
 
 
-class ModelStage(StrEnum):
+class ModelStage(SerializableStrEnum):
     """Lifecycle stages for registered models in the MLOps Model Registry."""
 
     NONE = "None"
@@ -55,7 +70,7 @@ class ModelStage(StrEnum):
     ARCHIVED = "Archived"
 
 
-class ValidationSeverity(StrEnum):
+class ValidationSeverity(SerializableStrEnum):
     """Severity levels for data validation expectations and compliance checks."""
 
     INFO = "info"
@@ -64,7 +79,7 @@ class ValidationSeverity(StrEnum):
     CRITICAL = "critical"
 
 
-class DriftStatus(StrEnum):
+class DriftStatus(SerializableStrEnum):
     """Drift assessment classification."""
 
     HEALTHY = "healthy"
@@ -172,6 +187,9 @@ class AuditEvent(BaseModel):
     details: dict[str, Any] = Field(default_factory=dict)
     previous_hash: str = ""
     event_hash: str = ""
+    # v2 tamper-evidence: HMAC-SHA256 over ``event_hash`` in the dedicated
+    # ``omniforge-audit-event-v2`` domain (see AuditLogger in core/security.py).
+    chain_mac: str = ""
 
 
 class Principal(BaseModel):

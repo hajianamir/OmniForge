@@ -101,7 +101,10 @@ class FeatureEngineeringPipeline:
         # Categorical encodings (with out-of-fold target encoding cached for leak-free training transform)
         oof_target_enc: dict[str, np.ndarray] = {}
         for col in self._state.categorical_cols:
-            s = X[col].fillna("MISSING").astype(str)
+            _s_raw = X[col]
+            if isinstance(_s_raw.dtype, pd.CategoricalDtype) and "MISSING" not in _s_raw.cat.categories:
+                _s_raw = _s_raw.cat.add_categories(["MISSING"])
+            s = _s_raw.fillna("MISSING").astype(str)
             n_uniq = int(s.nunique())
             enc_mode = self.config.categorical_encoding
             if enc_mode == "onehot" or (enc_mode == "auto" and n_uniq <= self.config.max_onehot_cardinality):
@@ -280,7 +283,10 @@ class FeatureEngineeringPipeline:
         for col in self._state.categorical_cols:
             if col not in X.columns:
                 continue
-            s = X[col].fillna("MISSING").astype(str)
+            _s_raw = X[col]
+            if isinstance(_s_raw.dtype, pd.CategoricalDtype) and "MISSING" not in _s_raw.cat.categories:
+                _s_raw = _s_raw.cat.add_categories(["MISSING"])
+            s = _s_raw.fillna("MISSING").astype(str)
             if col in self._state.onehot_categories:
                 for cat in self._state.onehot_categories[col]:
                     safe_cat = "".join(ch if ch.isalnum() else "_" for ch in str(cat))[:32]

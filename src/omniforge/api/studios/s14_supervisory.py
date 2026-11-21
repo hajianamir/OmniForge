@@ -7,12 +7,24 @@ import io
 import math
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 import pandas as pd
 from fastapi import APIRouter, File, Form, Header, HTTPException, Response, UploadFile
 
+# Request models are imported at RUNTIME (not under TYPE_CHECKING) because this module uses
+# `from __future__ import annotations`: FastAPI resolves route annotations against module globals
+# when registering routes. Models imported only under TYPE_CHECKING are missing at runtime, which
+# made every s14 POST endpoint treat its body as a required query parameter (all calls -> 422)
+# and crashed /openapi.json with PydanticUserError. See docs/AUDIT_REPORT.md §5.1.
+from omniforge.api.workbench import (  # noqa: F401 - re-exported for FastAPI annotation resolution
+    SupervisoryAccessReq,
+    SupervisoryDemoReq,
+    SupervisoryQuickTrainReq,
+    SupervisorySingleReq,
+    SupervisorySQLReq,
+)
 from omniforge.core.types import TaskType
 from omniforge.core.utils import to_json_object
 from omniforge.data.ingestion import DataIngestionEngine
@@ -21,16 +33,7 @@ from omniforge.models.deep import FTTransformerModel, MLPModel, ResNetTabularMod
 from omniforge.models.nonparametric import NadarayaWatsonKernelModel, PenalizedSplineGAMModel
 from omniforge.ui.state import get_analysis_dataframe, get_selected_targets, get_session_state, record_lineage
 
-if TYPE_CHECKING:
-    from omniforge.api.workbench import (
-        SupervisoryAccessReq,
-        SupervisoryDemoReq,
-        SupervisoryQuickTrainReq,
-        SupervisorySingleReq,
-        SupervisorySQLReq,
-    )
-
-router = APIRouter(tags=["workbench-s14"])
+router: APIRouter = APIRouter(tags=["workbench-s14"])
 
 
 def _wb() -> Any:

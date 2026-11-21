@@ -16,6 +16,7 @@ from fastapi import APIRouter, File, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
 from omniforge.automl.backends import AutoMLBackendHub, probe_automl_backends
+from omniforge.evaluation.equations import ModelEquationExtractor
 from omniforge.models.baselines import BaselineBenchmarkSuite
 from omniforge.models.deep import (
     CNN1DModel,
@@ -25,7 +26,6 @@ from omniforge.models.deep import (
     ResNetTabularModel,
     TabNetModel,
 )
-from omniforge.evaluation.equations import ModelEquationExtractor
 from omniforge.models.nonparametric import NonParametricAnalyticalSuite
 
 router = APIRouter(tags=["workbench-s06"])

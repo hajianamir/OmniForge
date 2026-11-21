@@ -9,9 +9,9 @@ import numpy as np
 import pandas as pd
 from fastapi import APIRouter, Header, HTTPException
 
-from omniforge.evaluation.interpretability import InterpretabilityEngine
 from omniforge.core.types import ModelMetadata
 from omniforge.evaluation.fairness import FairnessAuditor
+from omniforge.evaluation.interpretability import InterpretabilityEngine
 from omniforge.evaluation.model_cards import ModelCardGenerator
 
 router = APIRouter(tags=["workbench-s07"])
@@ -53,7 +53,10 @@ def s07_fairness(req: _wb().FairnessReq, x_session_id: str | None = Header(defau
     sens_source = df if req.sensitive_col in df.columns else full_df
     if model is None or X_te is None or req.sensitive_col not in sens_source.columns:
         raise HTTPException(status_code=400, detail="Train a model and select a valid sensitive attribute column.")
-    sens = sens_source[req.sensitive_col].reindex(X_te.index).fillna("Missing").astype(str).to_numpy()
+    _sens = sens_source[req.sensitive_col].reindex(X_te.index)
+    if isinstance(_sens.dtype, pd.CategoricalDtype) and "Missing" not in _sens.cat.categories:
+        _sens = _sens.cat.add_categories(["Missing"])
+    sens = _sens.fillna("Missing").astype(str).to_numpy()
     preds = np.asarray(model.predict(X_te))
     y_arr = np.asarray(y_te)
     if np.issubdtype(y_arr.dtype, np.number) and len(np.unique(y_arr)) > 2:

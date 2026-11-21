@@ -9,12 +9,11 @@ import numpy as np
 import pandas as pd
 from fastapi import APIRouter, Header, HTTPException
 
-from omniforge.simulation import MonteCarloSimulator
-
 from omniforge.causal import CausalInferenceEngine
 from omniforge.forecasting.engine import ForecastingEngine
 from omniforge.models.time_series.deep_forecast import DeepForecaster
 from omniforge.optimization import OptimizationEngine
+from omniforge.simulation import MonteCarloSimulator
 
 router = APIRouter(tags=["workbench-s08"])
 

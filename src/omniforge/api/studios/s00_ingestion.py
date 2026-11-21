@@ -11,6 +11,12 @@ from fastapi import APIRouter, Header, HTTPException
 from omniforge.eda.statistics import distance_correlation
 from omniforge.ui.state import get_session_state
 
+
+def _wb() -> Any:
+    from omniforge.api import workbench as wb
+
+    return wb
+
 router = APIRouter(tags=["workbench-s00"])
 
 
@@ -51,7 +57,7 @@ def _classify_rel(pear: float, spear: float, dcor: float, both_numeric: bool) ->
 @router.get("/s00/data_relationships")
 def s00_data_relationships(x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     """Compute pairwise relationships across all active (non-excluded) variables and vs. target."""
-    sid = (x_session_id or "default").strip() or "default"
+    sid = _wb()._sid(x_session_id)
     state = get_session_state(sid)
     df = state.get("uap_df")
     if df is None or len(df) == 0:

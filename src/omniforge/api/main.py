@@ -42,6 +42,7 @@ from omniforge.copilot.agent import OmniForgeCopilotAgent
 from omniforge.core.constants import RBAC_ROLE_PERMISSIONS
 from omniforge.core.exceptions import OmniForgeError, SecurityError
 from omniforge.core.logging import get_logger
+from omniforge.core.security import RequestBodySizeLimitMiddleware, SlidingWindowRateLimitMiddleware
 from omniforge.core.types import ModelStage, Principal
 from omniforge.core.utils import to_json_object, to_json_safe
 from omniforge.data.cleaning import DataCleaner
@@ -89,6 +90,14 @@ def create_app() -> FastAPI:
         ],
     )
     app.add_middleware(GZipMiddleware, minimum_size=500)
+    # Hard request-body cap (413) — prevents memory-exhaustion via huge uploads.
+    app.add_middleware(RequestBodySizeLimitMiddleware, max_body_bytes=settings.api.max_request_body_bytes)
+    # Enforce the declared `api.rate_limit_per_minute` policy (429 + Retry-After).
+    # 0 disables (used by the test-suite to avoid cross-test throttling).
+    app.add_middleware(
+        SlidingWindowRateLimitMiddleware,
+        max_requests_per_minute=settings.api.rate_limit_per_minute,
+    )
 
     @app.middleware("http")
     async def security_headers_middleware(request: Request, call_next: Any) -> Any:

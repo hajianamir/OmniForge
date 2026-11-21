@@ -10,6 +10,8 @@ import os
 import re
 import secrets
 import stat
+import time
+from collections import deque
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -758,13 +760,255 @@ class PIIRedactor:
         return result
 
 
+# ---------------------------------------------------------------------------
+# Pure-ASGI hardening middleware: request body size limit + sliding-window rate limit
+# ---------------------------------------------------------------------------
+Scope = dict[str, Any]
+Receive = Any
+Send = Any
+ASGIApp = Any
+
+
+class _PayloadTooLarge(BaseException):
+    """Internal signal used to abort an in-flight oversized request body.
+
+    Deliberately derives from ``BaseException`` (not ``Exception``) so Starlette's
+    exception handlers and application-level ``except Exception`` blocks do not
+    swallow it and turn a 413 into a 500.
+    """
+
+
+async def _send_simple_json(send: Send, status: int, payload: dict[str, Any], extra_headers: list[tuple[bytes, bytes]] | None = None) -> None:
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    headers = [
+        (b"content-type", b"application/json"),
+        (b"content-length", str(len(body)).encode("ascii")),
+    ]
+    if extra_headers:
+        headers.extend(extra_headers)
+    await send({"type": "http.response.start", "status": status, "headers": headers})
+    await send({"type": "http.response.body", "body": body})
+
+
+class RequestBodySizeLimitMiddleware:
+    """Reject HTTP requests whose body exceeds ``max_body_bytes`` with HTTP 413.
+
+    Two layers of enforcement:
+      1. A ``Content-Length`` pre-check rejects oversized requests before any byte
+         of the body is consumed (covers the common case, zero-copy rejection).
+      2. Streaming enforcement counts bytes across ``http.request`` messages, so
+         chunked-transfer bodies without ``Content-Length`` are bounded as well.
+    """
+
+    def __init__(self, app: ASGIApp, max_body_bytes: int = 268_435_456) -> None:
+        self.app = app
+        self.max_body_bytes = int(max_body_bytes)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        limit = self.max_body_bytes
+        for name, value in scope.get("headers", []):
+            if name.lower() == b"content-length":
+                try:
+                    declared = int(value)
+                except ValueError:
+                    declared = -1
+                if declared > limit:
+                    await _send_simple_json(
+                        send,
+                        413,
+                        {
+                            "detail": f"Request body exceeds the {limit // (1024 * 1024)} MB limit.",
+                            "error_type": "PayloadTooLarge",
+                        },
+                    )
+                    return
+        received = 0
+
+        async def limited_receive() -> dict[str, Any]:
+            nonlocal received
+            message: dict[str, Any] = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    raise _PayloadTooLarge()
+            return message
+
+        response_started = False
+
+        async def wrapped_send(message: dict[str, Any]) -> None:
+            nonlocal response_started
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, wrapped_send)
+        except _PayloadTooLarge:
+            if not response_started:
+                await _send_simple_json(
+                    send,
+                    413,
+                    {
+                        "detail": f"Request body exceeds the {limit // (1024 * 1024)} MB limit.",
+                        "error_type": "PayloadTooLarge",
+                    },
+                )
+            # else: the downstream app already started responding; there is nothing
+            # safe left to send — the connection is torn down with the client informed
+            # via the truncated response.
+
+
+class SlidingWindowRateLimitMiddleware:
+    """Per-client-IP sliding-window rate limiter (HTTP 429 + ``Retry-After``).
+
+    Implements the ``api.rate_limit_per_minute`` policy declared in configuration.
+    Keyed by the ASGI client host (NOT ``X-Forwarded-For``, which is spoofable);
+    deployments sitting behind a single trusted proxy share one bucket unless the
+    limit is raised via ``OMNIFORGE_API__RATE_LIMIT_PER_MINUTE`` (0 disables).
+    Health probe paths are exempt so load balancers are never throttled.
+    """
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        max_requests_per_minute: int = 300,
+        window_seconds: float = 60.0,
+        exclude_paths: frozenset[str] = frozenset({"/health", "/api/v1/health"}),
+        clock: Any = None,
+    ) -> None:
+        self.app = app
+        self.max_rpm = int(max_requests_per_minute)
+        self.window_seconds = float(window_seconds)
+        self.exclude_paths = frozenset(exclude_paths)
+        self._clock = clock or time.monotonic
+        self._hits: dict[str, deque[float]] = {}
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") != "http" or self.max_rpm <= 0:
+            await self.app(scope, receive, send)
+            return
+        if scope.get("path", "") in self.exclude_paths:
+            await self.app(scope, receive, send)
+            return
+        client = scope.get("client") or ("unknown", 0)
+        key = str(client[0])
+        now = self._clock()
+        hits = self._hits.get(key)
+        if hits is None:
+            hits = self._hits[key] = deque()
+        cutoff = now - self.window_seconds
+        while hits and hits[0] < cutoff:
+            hits.popleft()
+        if len(hits) >= self.max_rpm:
+            retry_after = int(self.window_seconds - (now - hits[0])) + 1
+            await _send_simple_json(
+                send,
+                429,
+                {
+                    "detail": "Rate limit exceeded. Slow down and retry shortly.",
+                    "error_type": "TooManyRequests",
+                },
+                extra_headers=[(b"retry-after", str(retry_after).encode("ascii"))],
+            )
+            return
+        hits.append(now)
+        if len(self._hits) > 10000:  # unbounded-growth guard for many distinct client keys
+            self._sweep(cutoff)
+        await self.app(scope, receive, send)
+
+    def _sweep(self, cutoff: float) -> None:
+        for stale in [k for k, dq in self._hits.items() if not dq or dq[-1] < cutoff]:
+            del self._hits[stale]
+
+
+_AUDIT_HMAC_CONTEXT = b"omniforge-audit-event-v2"
+
+
 class AuditLogger:
-    """Hash-chained, tamper-evident enterprise audit trail persisted as JSONL."""
+    """Hash-chained, HMAC-signed, tamper-evident enterprise audit trail persisted as JSONL.
+
+    v2 design: every forensic-relevant field (including ``role``, ``trace_id`` and
+    ``details``) is covered by the SHA-256 hash payload, and each record carries a
+    domain-separated HMAC-SHA256 MAC (``chain_mac``) over the hash. Verification
+    requires both the hash and the MAC; editing any covered field in the stored log
+    invalidates the chain. There is intentionally NO unsigned legacy verification
+    path — an unauthenticated (subset) hash would let a log-file attacker forge or
+    strip records without the MAC key.
+    Note: for full tamper-evidence across host compromise, anchor checkpoints
+    externally (RFC 9162-style); this implementation covers in-band integrity only.
+    """
 
     def __init__(self, log_path: str | Path = "./.omniforge_workspace/audit.jsonl") -> None:
         self._path = Path(log_path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._audit_signer: ArtifactSigner | None = None
         self._last_hash = self._load_last_hash()
+
+    def _signer(self) -> ArtifactSigner:
+        if self._audit_signer is None:
+            self._audit_signer = ArtifactSigner()
+        return self._audit_signer
+
+    @staticmethod
+    def _canonical_payload(fields: dict[str, Any]) -> bytes:
+        """Canonical JSON encoding used both for hashing and MAC verification."""
+        return json.dumps(fields, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+
+    @staticmethod
+    def _event_fields(source: AuditEvent | dict[str, Any]) -> dict[str, Any]:
+        """Full v2 payload: EVERY forensic-relevant field is covered by the hash chain."""
+        if isinstance(source, AuditEvent):
+            return {
+                "event_id": source.event_id,
+                "timestamp": source.timestamp,
+                "tenant_id": source.tenant_id,
+                "actor": source.actor,
+                "role": source.role,
+                "action": source.action,
+                "resource_type": source.resource_type,
+                "resource_id": source.resource_id,
+                "status": source.status,
+                "trace_id": source.trace_id,
+                "details": source.details,
+                "previous_hash": source.previous_hash,
+            }
+        return {
+            "event_id": source.get("event_id"),
+            "timestamp": source.get("timestamp"),
+            "tenant_id": source.get("tenant_id"),
+            "actor": source.get("actor"),
+            "role": source.get("role"),
+            "action": source.get("action"),
+            "resource_type": source.get("resource_type"),
+            "resource_id": source.get("resource_id"),
+            "status": source.get("status"),
+            "trace_id": source.get("trace_id"),
+            "details": source.get("details") or {},
+            "previous_hash": source.get("previous_hash"),
+        }
+
+    @staticmethod
+    def _verify_record(record: dict[str, Any], signer: ArtifactSigner) -> bool:
+        """v2 verification: full-payload hash + domain-separated HMAC-SHA256 MAC.
+
+        There is deliberately NO legacy/bypass path: a log record must carry both a
+        correct full-payload SHA-256 ``event_hash`` and a valid ``chain_mac``.
+        """
+        event_hash = str(record.get("event_hash") or "")
+        chain_mac = str(record.get("chain_mac") or "")
+        if not event_hash or not chain_mac:
+            return False
+        try:
+            recomputed = hashlib.sha256(AuditLogger._canonical_payload(AuditLogger._event_fields(record))).hexdigest()
+            if not hmac.compare_digest(recomputed, event_hash):
+                return False
+            return signer.verify_bytes(bytes.fromhex(recomputed), chain_mac, context=_AUDIT_HMAC_CONTEXT)
+        except (ValueError, TypeError):
+            return False
 
     def _load_last_hash(self) -> str:
         if not self._path.exists() or self._path.stat().st_size == 0:
@@ -777,9 +1021,20 @@ class AuditLogger:
         if not last_line:
             return "0" * 64
         try:
-            return str(json.loads(last_line).get("event_hash", "0" * 64))
+            record = json.loads(last_line)
         except json.JSONDecodeError:
-            return "0" * 64
+            raise SecurityError(
+                "Audit log's last record is not valid JSON; refusing to extend an unverifiable chain.",
+                suggestions=["Restore the audit log from a trusted backup or archive it before continuing."],
+            ) from None
+        if not AuditLogger._verify_record(record, self._signer()):
+            raise SecurityError(
+                "Audit log's last record fails integrity verification (hash/MAC mismatch).",
+                suggestions=[
+                    "Treat the audit log as tampered. Investigate, then restore from an external checkpoint/backup."
+                ],
+            )
+        return str(record.get("event_hash", "0" * 64))
 
     def log_event(
         self,
@@ -793,7 +1048,7 @@ class AuditLogger:
         status: str = "success",
         details: dict[str, Any] | None = None,
     ) -> AuditEvent:
-        """Append a cryptographically chained audit event to the audit log."""
+        """Append a cryptographically chained, HMAC-signed audit event to the audit log."""
         event = AuditEvent(
             tenant_id=tenant_id,
             actor=actor,
@@ -806,65 +1061,51 @@ class AuditLogger:
             details=details or {},
             previous_hash=self._last_hash,
         )
-        hash_payload = json.dumps(
-            {
-                "event_id": event.event_id,
-                "timestamp": event.timestamp,
-                "tenant_id": event.tenant_id,
-                "actor": event.actor,
-                "action": event.action,
-                "resource_type": event.resource_type,
-                "resource_id": event.resource_id,
-                "status": event.status,
-                "previous_hash": event.previous_hash,
-            },
-            sort_keys=True,
-        ).encode("utf-8")
-        event.event_hash = hashlib.sha256(hash_payload).hexdigest()
+        event.event_hash = hashlib.sha256(self._canonical_payload(self._event_fields(event))).hexdigest()
+        event.chain_mac = self._signer().sign_bytes(bytes.fromhex(event.event_hash), context=_AUDIT_HMAC_CONTEXT)
         self._last_hash = event.event_hash
 
         with self._path.open("a", encoding="utf-8") as handle:
             handle.write(event.model_dump_json() + "\n")
         return event
 
-    def verify_chain(self) -> tuple[bool, int]:
-        """Verify cryptographic continuity of the entire audit log.
+    @classmethod
+    def verify_file(cls, log_path: str | Path) -> tuple[bool, int]:
+        """Verify a JSONL audit log without constructing a logger (for SIEM/ops tooling).
 
-        Returns:
-            Tuple of ``(is_valid, total_events_checked)``.
+        Same semantics as :meth:`verify_chain` but never raises on a corrupt last record.
         """
-        if not self._path.exists():
+        path = Path(log_path)
+        if not path.exists():
             return True, 0
+        records: list[dict[str, Any]] = []
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.strip():
+                        records.append(json.loads(line))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return False, 0
+        signer = ArtifactSigner()
         expected_prev = "0" * 64
         count = 0
-        with self._path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                if not line.strip():
-                    continue
-                record = json.loads(line)
-                if record.get("previous_hash") != expected_prev:
-                    return False, count
-                recomputed = hashlib.sha256(
-                    json.dumps(
-                        {
-                            "event_id": record["event_id"],
-                            "timestamp": record["timestamp"],
-                            "tenant_id": record["tenant_id"],
-                            "actor": record["actor"],
-                            "action": record["action"],
-                            "resource_type": record["resource_type"],
-                            "resource_id": record["resource_id"],
-                            "status": record["status"],
-                            "previous_hash": record["previous_hash"],
-                        },
-                        sort_keys=True,
-                    ).encode("utf-8")
-                ).hexdigest()
-                if record.get("event_hash") != recomputed:
-                    return False, count
-                expected_prev = recomputed
-                count += 1
+        for record in records:
+            if record.get("previous_hash") != expected_prev:
+                return False, count
+            if not AuditLogger._verify_record(record, signer):
+                return False, count
+            expected_prev = str(record.get("event_hash") or "")
+            count += 1
         return True, count
+
+    def verify_chain(self) -> tuple[bool, int]:
+        """Verify cryptographic continuity and integrity of the entire audit log.
+
+        Every record is validated with a full-payload SHA-256 hash plus a domain-separated
+        HMAC-SHA256 MAC. Returns:
+            Tuple of ``(is_valid, total_events_checked)``.
+        """
+        return AuditLogger.verify_file(self._path)
 
     def read_events(self, limit: int = 100) -> list[AuditEvent]:
         """Read the most recent ``limit`` audit events."""
