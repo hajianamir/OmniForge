@@ -68,6 +68,9 @@ export const Studio00Ingestion: React.FC<StudioProps> = (props) => {
   const [relData, setRelData] = useState<{
     n_rows: number;
     n_cols: number;
+    target?: string | null;
+    targets?: string[];
+    target_relationships?: Array<{ feature: string; target: string; pearson: number; spearman: number; dcor: number; relationship_type: string }>;
     pairs: Array<{ feature_a: string; feature_b: string; pearson: number; spearman: number; dcor: number; relationship_type: string }>;
   } | null>(null);
   const [relBusy, setRelBusy] = useState(false);
@@ -84,6 +87,14 @@ export const Studio00Ingestion: React.FC<StudioProps> = (props) => {
     }
   };
 
+  useEffect(() => {
+    if (props.ws.has_dataset) {
+      void loadRelationships();
+    } else {
+      setRelData(null);
+    }
+  }, [props.ws.has_dataset, props.ws.targets.join(','), props.ws.excluded_columns.join(',')]);
+
   return (
     <div>
       <Studio01Data {...props} sectionMode="ingestion" />
@@ -95,6 +106,37 @@ export const Studio00Ingestion: React.FC<StudioProps> = (props) => {
               {relBusy ? 'Analyzing…' : 'Analyze Data Relationships (Chart & Table)'}
             </button>
           </div>
+          {relData && relData.target_relationships && relData.target_relationships.length > 0 && (
+            <div style={{ marginBottom: 14, overflowX: 'auto' }}>
+              <div style={{ fontWeight: 700, fontSize: 12.5, marginBottom: 6, color: '#38bdf8' }}>
+                Variable Relationships with Target{(relData.targets?.length ?? 0) > 1 ? 's' : ''} ({(relData.targets && relData.targets.length > 0 ? relData.targets.join(', ') : relData.target)}) — {relData.target_relationships.length} pairs
+              </div>
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Feature</th>
+                    <th>Target</th>
+                    <th>Pearson r</th>
+                    <th>Spearman ρ</th>
+                    <th>dCor</th>
+                    <th>Relationship Type</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {relData.target_relationships.map((tr, idx) => (
+                    <tr key={idx}>
+                      <td><strong>{tr.feature}</strong></td>
+                      <td>{tr.target}</td>
+                      <td>{tr.pearson.toFixed(4)}</td>
+                      <td>{tr.spearman.toFixed(4)}</td>
+                      <td>{tr.dcor.toFixed(4)}</td>
+                      <td><span className="badge">{tr.relationship_type}</span></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
           {relData && relData.pairs.length > 0 && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -501,11 +543,6 @@ export const Studio01Data: React.FC<StudioProps & { sectionMode?: 'ingestion' | 
               <span className={`badge ${ia.quality_score >= 85 ? 'badge-green' : ia.quality_score >= 65 ? 'badge-amber' : 'badge-red'}`}>
                 Score {ia.quality_score}/100 (Grade {ia.quality_grade})
               </span>
-              {ia.defect_counts.total > 0 && (
-                <button className="btn btn-primary btn-sm" disabled={busy} onClick={() => runClean(false, 'auto')}>
-                  1-Click Apply Auto-Fix Cleaning
-                </button>
-              )}
             </div>
           </div>
 
@@ -648,6 +685,32 @@ export const Studio01Data: React.FC<StudioProps & { sectionMode?: 'ingestion' | 
                       <li key={idx} style={{ marginBottom: 2 }}>{step}</li>
                     ))}
                   </ol>
+                </div>
+              )}
+              {Array.isArray((cleanPreview.cleaning_report as Record<string, unknown>).deleted_records) &&
+                ((cleanPreview.cleaning_report as Record<string, unknown>).deleted_records as Array<Record<string, unknown>>).length > 0 && (
+                <div style={{ gridColumn: '1 / -1', marginTop: 8, padding: '10px 12px', borderRadius: 6, background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.3)', fontSize: 12.5 }}>
+                  <strong style={{ color: '#f87171' }}>Deleted Rows &amp; Removal Reasons (Why Each Row Was Removed):</strong>
+                  <div className="table-wrap" style={{ marginTop: 6, maxHeight: 220, overflowY: 'auto' }}>
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Row Index</th>
+                          <th>Stage</th>
+                          <th>Reason for Removal</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {((cleanPreview.cleaning_report as Record<string, unknown>).deleted_records as Array<Record<string, unknown>>).slice(0, 50).map((rec, idx) => (
+                          <tr key={idx}>
+                            <td>{String(rec.row_index ?? rec.index ?? idx)}</td>
+                            <td>{String(rec.stage ?? 'cleaning')}</td>
+                            <td>{String(rec.reason ?? 'Policy threshold exceeded')}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
               )}
               <div className="kpi-card"><div className="kpi-label">Missing Cells</div><div className="kpi-value" style={{ fontSize: 16 }}>{cleanPreview.cleaning_report.missing_before} → {cleanPreview.cleaning_report.missing_after}</div></div>

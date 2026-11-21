@@ -34,7 +34,7 @@ class DataQualityReport(BaseModel):
 
     overall_score: float = Field(ge=0.0, le=100.0)
     grade: str
-    dimensions: dict[str, float]
+    dimensions: dict[str, float | None]
     row_count: int
     column_count: int
     duplicate_row_ratio: float
@@ -205,15 +205,23 @@ class DataQualityProfiler:
         accuracy = float(np.mean(accuracy_parts)) if accuracy_parts else 100.0
         timeliness = self._compute_timeliness(df, timestamp_column, max_freshness_days)
 
-        dimensions = {
+        dimensions: dict[str, Any] = {
             "completeness": round(completeness, 2),
             "uniqueness": round(uniqueness, 2),
             "validity": round(validity, 2),
             "consistency": round(consistency, 2),
             "accuracy": round(accuracy, 2),
-            "timeliness": round(timeliness, 2),
+            "proxy_accuracy": round(accuracy, 2),
+            "timeliness": round(timeliness, 2) if timeliness is not None else None,
         }
-        overall = round(sum(dimensions[k] * w for k, w in self.weights.items()), 2)
+        evaluable_weights = {
+            k: w for k, w in self.weights.items() if dimensions.get(k) is not None
+        }
+        total_w = sum(evaluable_weights.values()) or 1.0
+        overall = round(
+            sum(float(dimensions[k]) * (w / total_w) for k, w in evaluable_weights.items()),
+            2,
+        )
         grade = self._score_to_grade(overall)
 
         if completeness < 95.0:
@@ -232,7 +240,7 @@ class DataQualityProfiler:
             recommendations.append(
                 "Elevated extreme outlier density or range violations detected. Apply IQR/IsolationForest handling."
             )
-        if timeliness < 85.0:
+        if timeliness is not None and timeliness < 85.0:
             recommendations.append(
                 "Dataset freshness is below threshold. Schedule incremental ingestion or check pipeline SLA."
             )
@@ -257,16 +265,16 @@ class DataQualityProfiler:
     @staticmethod
     def _compute_timeliness(
         df: pd.DataFrame, timestamp_column: str | None, max_freshness_days: float
-    ) -> float:
+    ) -> float | None:
         ts_col = timestamp_column
         if ts_col is None:
             dt_cols = df.select_dtypes(include=["datetime", "datetimetz"]).columns.tolist()
             ts_col = str(dt_cols[0]) if dt_cols else None
         if ts_col is None or ts_col not in df.columns:
-            return 100.0
+            return None
         ts = pd.to_datetime(df[ts_col], errors="coerce", utc=True).dropna()
         if len(ts) == 0:
-            return 50.0
+            return None
         latest = pd.Timestamp(ts.max()).to_pydatetime()
         now = datetime.now(UTC)
         age_days = max(0.0, (now - latest).total_seconds() / 86400.0)

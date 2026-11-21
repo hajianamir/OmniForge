@@ -10,6 +10,27 @@ from omniforge.models.deep.rnn_lstm import RecurrentSequenceModel
 from omniforge.models.deep.tabnet import TabNetModel
 from omniforge.models.deep.transformers import FTTransformerModel, TabularTransformerModel
 
+
+def probe_foundation_backends() -> dict[str, dict[str, str | bool]]:
+    """Report availability and transparent fallback for Foundation TS (Chronos/TimesFM) and TabPFN."""
+    import importlib.util
+
+    specs = {
+        "chronos": ("chronos", "RecurrentSequenceModel"),
+        "timesfm": ("timesfm", "RecurrentSequenceModel"),
+        "tabpfn": ("tabpfn", "FTTransformerModel"),
+    }
+    out: dict[str, dict[str, str | bool]] = {}
+    for name, (pkg, fallback) in specs.items():
+        avail = importlib.util.find_spec(pkg) is not None
+        out[name] = {
+            "available": avail,
+            "active_backend": name if avail else fallback,
+            "mode": "native" if avail else "transparent_fallback",
+        }
+    return out
+
+
 __all__ = [
     "AutoencoderModel",
     "CNN1DModel",
@@ -22,4 +43,5 @@ __all__ = [
     "ResNetTabularModel",
     "TabNetModel",
     "TabularTransformerModel",
+    "probe_foundation_backends",
 ]

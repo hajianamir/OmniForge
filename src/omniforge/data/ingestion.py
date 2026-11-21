@@ -820,3 +820,38 @@ class DataIngestionEngine:
 def path_or_hint(path_str: str) -> str:
     """Return a concise representation of a path for error reporting."""
     return path_str if len(path_str) <= 120 else f"...{path_str[-117:]}"
+
+
+def fast_read_tabular(path: str | Path, *, backend: str = "auto") -> tuple[pd.DataFrame, str]:
+    """Read CSV or Parquet using Polars/DuckDB when available, with transparent pandas fallback."""
+    p = Path(path)
+    ext = p.suffix.lower()
+    use_polars = backend == "polars" or (backend == "auto" and is_package_available("polars"))
+    use_duckdb = backend == "duckdb" or (backend == "auto" and not use_polars and is_package_available("duckdb"))
+
+    if use_polars:
+        import polars as pl
+
+        if ext == ".parquet":
+            return pl.read_parquet(p).to_pandas(), "polars"
+        if ext in (".csv", ".tsv"):
+            sep = "\t" if ext == ".tsv" else ","
+            return pl.read_csv(p, separator=sep).to_pandas(), "polars"
+
+    if use_duckdb:
+        import duckdb
+
+        if ext == ".parquet":
+            rel = duckdb.query(f"SELECT * FROM read_parquet('{p.as_posix()}')")
+            if rel is not None:
+                return rel.df(), "duckdb"
+        if ext in (".csv", ".tsv"):
+            rel = duckdb.query(f"SELECT * FROM read_csv_auto('{p.as_posix()}')")
+            if rel is not None:
+                return rel.df(), "duckdb"
+
+    if ext == ".parquet":
+        return pd.read_parquet(p), "pandas"
+    sep = "\t" if ext == ".tsv" else ","
+    return pd.read_csv(p, sep=sep), "pandas"
+

@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from sklearn.dummy import DummyClassifier, DummyRegressor
-from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.linear_model import LassoCV, LogisticRegression
 from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, root_mean_squared_error
 from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
@@ -60,7 +60,7 @@ class LogisticBaseline(BaseOmniForgeModel):
             **kwargs,
         )
         self._scaler = StandardScaler()
-        self._model = LogisticRegression(C=C, max_iter=1000, random_state=self.random_seed)
+        self._model = LogisticRegression(C=C, penalty="l1", solver="liblinear", max_iter=1000, random_state=self.random_seed)
 
     def _fit(self, X: np.ndarray, y: np.ndarray | None, **kwargs: Any) -> None:
         assert y is not None
@@ -134,7 +134,7 @@ class RidgeLinearBaseline(BaseOmniForgeModel):
             **kwargs,
         )
         self._scaler = StandardScaler()
-        self._model = Ridge(alpha=alpha, random_state=self.random_seed)
+        self._model = LassoCV(cv=3, max_iter=2000, random_state=self.random_seed)
 
     def _fit(self, X: np.ndarray, y: np.ndarray | None, **kwargs: Any) -> None:
         assert y is not None

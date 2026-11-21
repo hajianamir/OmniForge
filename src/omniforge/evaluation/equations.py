@@ -134,8 +134,8 @@ def _build_external_deployment_formulas(
         if isinstance(v, (int, float)) and math.isfinite(float(v)) and abs(float(v)) > 1e-12
     ]
     terms.sort(key=lambda kv: abs(kv[1]), reverse=True)
-    # Limit external inline expressions to top 40 terms so Excel/SQL remain readable & valid
-    used_terms = terms[:40]
+    # Keep all statistically non-zero / impactful terms without an arbitrary hard cap
+    used_terms = [kv for kv in terms if abs(float(kv[1])) > 1e-12]
     safe_tgt = _safe_identifier(target_name)
 
     if not used_terms and intercept is None:

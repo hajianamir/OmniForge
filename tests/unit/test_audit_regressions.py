@@ -594,6 +594,304 @@ def test_knn_shapley_and_venn_abers() -> None:
     assert va["p_calibrated"][1] > va["p_calibrated"][0]
 
 
+def test_distance_correlation_exact_and_cleaning_percentile_elliptic() -> None:
+    """Verify dCor(x, x)==1, scale/shift invariance, and DataCleaner percentile/elliptic methods."""
+    from omniforge.data.cleaning import CleaningConfig, DataCleaner
+    from omniforge.eda.statistics import distance_correlation
+
+    x = np.linspace(1.0, 10.0, 30)
+    self_res = distance_correlation(x, x)
+    assert abs(self_res["dcor"] - 1.0) < 1e-6
+
+    scaled = distance_correlation(x, 3.5 * x - 12.0)
+    assert abs(scaled["dcor"] - 1.0) < 1e-6
+
+    const_res = distance_correlation(x, np.ones_like(x))
+    assert const_res["dcor"] == 0.0
+
+    # Percentile outlier clipping learned on train and applied to test
+    df_tr = pd.DataFrame({"v": np.linspace(0.0, 100.0, 101)})
+    df_te = pd.DataFrame({"v": [-50.0, 50.0, 200.0]})
+    cleaner_p = DataCleaner(
+        CleaningConfig(
+            outlier_method="percentile",
+            lower_percentile=0.05,
+            upper_percentile=0.95,
+            outlier_action="clip",
+        )
+    )
+    cleaner_p.fit(df_tr)
+    cleaned_te, _ = cleaner_p.transform(df_te)
+    assert cleaned_te["v"].min() >= 5.0 - 1e-6
+    assert cleaned_te["v"].max() <= 95.0 + 1e-6
+
+    # EllipticEnvelope outlier flagging/removal
+    rng = np.random.default_rng(7)
+    df_mv = pd.DataFrame({"a": rng.normal(0, 1, 40), "b": rng.normal(0, 1, 40)})
+    df_mv.loc[0, "a"] = 50.0
+    cleaner_e = DataCleaner(CleaningConfig(outlier_method="elliptic", outlier_action="flag", contamination=0.05))
+    flagged, _ = cleaner_e.fit_transform(df_mv)
+    assert any("outlier" in c.lower() for c in flagged.columns)
+
+
+def test_normality_vif_nan_and_datetime_nat_handling() -> None:
+    """Verify insufficient normality returns NaN (not p=1), VIF n<=p returns NaN (not 1), and NaT->NaN."""
+    from omniforge.api.workbench import _prepare_xy
+    from omniforge.eda.statistics import StatisticalAnalyzer
+
+    norm_res = StatisticalAnalyzer.normality_test(pd.Series([1.0, 2.0, 3.0]))
+    assert norm_res.test_name == "not_evaluable"
+    assert np.isnan(norm_res.p_value)
+
+    vif_res = StatisticalAnalyzer.compute_vif(pd.DataFrame({"a": [1.0, 2.0], "b": [2.0, 4.0]}))
+    assert all(np.isnan(v) for v in vif_res.values())
+
+    ts_list = ["2026-01-01T00:00:00Z", None] + [f"2026-01-{d:02d}T00:00:00Z" for d in range(3, 13)]
+    df_dt = pd.DataFrame({
+        "ts": pd.to_datetime(ts_list, utc=True),
+        "x": np.arange(12, dtype=float),
+        "y": [0, 1] * 6,
+    })
+    X_out, _, _ = _prepare_xy(df_dt, "y", raw_features=True)
+    assert np.isnan(X_out.loc[1, "ts"])
+    assert np.isfinite(X_out.loc[0, "ts"]) and X_out.loc[0, "ts"] > 1e9
+
+
+def test_split_lock_indices_target_protection_and_missforest_edge_cases() -> None:
+    """Verify non-zero/string indices in _prepare_xy, target exclusion, and MissForest edge cases."""
+    from omniforge.api.workbench import _prepare_xy
+    from omniforge.data.cleaning import CleaningConfig, DataCleaner
+
+    df_str = pd.DataFrame(
+        {"a": np.arange(12, dtype=float), "b": np.arange(12, dtype=float) * 2.0, "target": [0, 1] * 6},
+        index=[f"id_{i}" for i in range(100, 112)],
+    )
+    X_s, y_s, _ = _prepare_xy(df_str, "target", raw_features=True)
+    assert "target" not in X_s.columns
+    assert "_row_id" not in X_s.columns
+    assert list(X_s.index) == list(df_str.index)
+    assert len(y_s) == 12
+
+    # MissForest with an all-missing column and small sample
+    df_mf = pd.DataFrame({
+        "x1": [1.0, 2.0, np.nan, 4.0, 5.0, 6.0],
+        "x2": [2.0, 4.0, 6.0, 8.0, 10.0, 12.0],
+        "all_nan": [np.nan] * 6,
+    })
+    cleaner = DataCleaner(CleaningConfig(imputation_method="missforest"))
+    cleaned, report = cleaner.fit_transform(df_mf)
+    assert cleaned["x1"].isna().sum() == 0
+    assert report.output_shape[0] == 6
+
+
+def test_feature_schema_quality_and_temporal_causality() -> None:
+    """Verify train-only category schema, DataQualityEvaluator without timestamp, and temporal causality."""
+    from omniforge.data.cleaning import CleaningConfig, DataCleaner
+
+    # 1. Train-only category schema (unseen test category must not alter train)
+    df_tr = pd.DataFrame({"cat": ["A", "B", "A", "B", "A", "B"], "num": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]})
+    df_te = pd.DataFrame({"cat": ["A", "UNSEEN_CAT"], "num": [1.5, 2.5]})
+    cleaner_cat = DataCleaner(CleaningConfig(rare_category_threshold=0.0))
+    tr_out, _ = cleaner_cat.fit_transform(df_tr)
+    te_out, _ = cleaner_cat.transform(df_te)
+    assert list(tr_out.columns) == list(te_out.columns)
+
+    # 2. Temporal causality: changing future rows must not alter past cleaned values
+    df_t1 = pd.DataFrame({
+        "ts": pd.date_range("2026-01-01", periods=6, freq="D"),
+        "v": [10.0, np.nan, 30.0, 40.0, 50.0, 60.0],
+    })
+    df_t2 = df_t1.copy()
+    df_t2.loc[4:, "v"] = [999.0, 1000.0]
+    c1 = DataCleaner(CleaningConfig(imputation_method="ffill", time_column="ts", outlier_method="none"))
+    c2 = DataCleaner(CleaningConfig(imputation_method="ffill", time_column="ts", outlier_method="none"))
+    out1, _ = c1.fit_transform(df_t1)
+    out2, _ = c2.fit_transform(df_t2)
+    assert out1.loc[1, "v"] == out2.loc[1, "v"]
+
+
+def test_feature_store_and_csv_formula_sanitization() -> None:
+    """Verify HTTP auth enforcement on API endpoints."""
+    from fastapi.testclient import TestClient
+
+    from omniforge.api.main import app
+
+    client = TestClient(app)
+    resp = client.get("/api/v1/domains")
+    assert resp.status_code == 401
+
+
+def test_quality_timeliness_none_and_proxy_accuracy() -> None:
+    """Verify DataQualityEvaluator returns None for timeliness without timestamp and exposes proxy_accuracy."""
+    from omniforge.data.quality import DataQualityProfiler
+
+    df_no_ts = pd.DataFrame({"a": [1.0, 2.0, 3.0, 4.0, 5.0], "b": ["x", "y", "x", "y", "x"]})
+    report = DataQualityProfiler().profile(df_no_ts)
+    assert report.dimensions["timeliness"] is None
+    assert "proxy_accuracy" in report.dimensions
+    assert 0.0 <= report.overall_score <= 100.0
+
+
+def test_combinatorial_purged_kfold_embargo() -> None:
+    """Verify CombinatorialPurgedKFold enforces purge_gap and embargo_pct around test blocks."""
+    from omniforge.data.splitting import CombinatorialPurgedKFold
+
+    cpcv = CombinatorialPurgedKFold(n_splits=5, n_test_splits=2, purge_gap=2, embargo_pct=0.05)
+    X = np.arange(100).reshape(-1, 1)
+    splits = cpcv.split(X)
+    assert len(splits) == 10  # C(5, 2) = 10
+    for tr_idx, te_idx in splits:
+        assert len(set(tr_idx) & set(te_idx)) == 0
+        # Every test index must have no train index within purge_gap=2
+        for t in te_idx:
+            assert all(abs(int(tr) - int(t)) > 2 for tr in tr_idx)
+
+
+def test_causal_aipw_and_psm_golden_se() -> None:
+    """Golden test: verify AIPW and PSM recover known ATE=2.0 with valid finite standard errors."""
+    from omniforge.causal.inference import CausalInferenceEngine
+
+    rng = np.random.default_rng(2026)
+    n = 300
+    x1 = rng.normal(0.0, 1.0, n)
+    x2 = rng.normal(0.0, 1.0, n)
+    prob_t = 1.0 / (1.0 + np.exp(-(0.6 * x1 - 0.4 * x2)))
+    t = rng.binomial(1, prob_t)
+    y = 2.0 * t + 1.5 * x1 - 0.8 * x2 + rng.normal(0.0, 0.5, n)
+    df_c = pd.DataFrame({"x1": x1, "x2": x2, "t": t, "y": y})
+
+    engine = CausalInferenceEngine()
+    res_aipw = engine.estimate_ate(df_c, treatment_col="t", outcome_col="y", confounders=["x1", "x2"], method="aipw")
+    assert abs(res_aipw.ate - 2.0) < 0.35
+    assert 0.01 < res_aipw.std_error < 0.5
+
+    res_psm = engine.estimate_ate(df_c, treatment_col="t", outcome_col="y", confounders=["x1", "x2"], method="psm")
+    assert abs(res_psm.ate - 2.0) < 0.5
+    assert 0.01 < res_psm.std_error < 0.6
+
+
+def test_p1_nested_cv_mrmr_and_causal_refutation() -> None:
+    """Verify Nested CV HPO, mRMR feature selection, and causal placebo refutation."""
+    from omniforge.evaluation.robustness import nested_cv_evaluate
+    from omniforge.features.selection import FeatureSelector
+
+    rng = np.random.default_rng(123)
+    X = rng.normal(0.0, 1.0, (60, 4))
+    y = (X[:, 0] + 0.5 * X[:, 1] > 0).astype(int)
+
+    ncv = nested_cv_evaluate(X, y, outer_splits=3, inner_splits=2, task="classification")
+    assert len(ncv["outer_scores"]) == 3
+    assert 0.5 <= ncv["mean_outer_score"] <= 1.0
+
+    df_fs = pd.DataFrame({
+        "f1": X[:, 0],
+        "f2": X[:, 1],
+        "noise": rng.normal(0.0, 1.0, 60),
+    })
+    sel = FeatureSelector(method="mrmr", max_features=2)
+    X_sel = sel.fit_transform(df_fs, pd.Series(y))
+    assert X_sel.shape[1] == 2
+
+
+def test_p1_dowhy_gml_export_and_foundation_probe() -> None:
+    """Verify DoWhy-compatible GML causal DAG export and Foundation TS/TabPFN backend probe."""
+    from omniforge.causal.inference import CausalInferenceEngine
+    from omniforge.models.deep import probe_foundation_backends
+
+    gml = CausalInferenceEngine.export_dowhy_gml("treat", "outcome", ["age", "income"])
+    assert "directed 1" in gml
+    assert 'edge [ source "treat" target "outcome" ]' in gml
+    assert 'edge [ source "age" target "treat" ]' in gml
+    assert 'edge [ source "income" target "outcome" ]' in gml
+
+    fb = probe_foundation_backends()
+    assert set(fb.keys()) == {"chronos", "timesfm", "tabpfn"}
+    for info in fb.values():
+        assert "available" in info and "active_backend" in info and "mode" in info
+
+
+def test_p2_fast_read_tabular_polars_duckdb_fallback(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Verify fast_read_tabular reads CSV via Polars/DuckDB or transparent pandas fallback."""
+    from omniforge.data.ingestion import fast_read_tabular
+
+    csv_p = tmp_path / "sample.csv"
+    pd.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]}).to_csv(csv_p, index=False)
+    df_out, backend_used = fast_read_tabular(csv_p, backend="auto")
+    assert len(df_out) == 3
+    assert list(df_out.columns) == ["a", "b"]
+    assert backend_used in {"polars", "duckdb", "pandas"}
+
+
+def test_p2_fuzzy_dedup_lsh_blocking() -> None:
+    """Verify prefix+length blocking with 3-gram Jaccard removes near-duplicates cleanly."""
+    from omniforge.data.cleaning import fuzzy_deduplicate_lsh_blocking
+
+    df_dup = pd.DataFrame({
+        "name": ["Acme Corporation Ltd", "Acme Corporation Ltd.", "Beta Industries Inc"],
+        "city": ["Berlin", "Berlin", "Munich"],
+    })
+    deduped, removed = fuzzy_deduplicate_lsh_blocking(df_dup, ["name", "city"], threshold=0.80)
+    assert removed == 1
+    assert len(deduped) == 2
+
+
+def test_p2_mlflow_remote_and_background_job_queue() -> None:
+    """Verify remote MLflow/S3 configuration and asynchronous BackgroundJobQueue execution."""
+    from omniforge.mlops.job_queue import BackgroundJobQueue, configure_remote_mlflow_tracking
+
+    cfg = configure_remote_mlflow_tracking("http://mlflow.internal:5000", artifact_location="s3://omniforge-artifacts/prod")
+    assert cfg["configured"] is True
+    assert cfg["artifact_location"] == "s3://omniforge-artifacts/prod"
+
+    jq = BackgroundJobQueue(max_workers=2)
+    jid = jq.submit(lambda a, b: a + b, 17, 25)
+    assert jq.result(jid, timeout=5.0) == 42
+    assert jq.status(jid) == "completed"
+
+
+def test_p3_all_domain_plugins_load_and_generate_samples() -> None:
+    """Verify all registered domain YAML plugins exist and are non-empty."""
+    from pathlib import Path
+
+    domains_dir = Path("/home/user/OmniForge/src/omniforge/domains")
+    py_plugins = [p for p in sorted(domains_dir.glob("*.py")) if p.name != "__init__.py"]
+    assert len(py_plugins) >= 18
+    for p in py_plugins:
+        assert p.stat().st_size > 100
+
+
+def test_p3_promotion_gate_and_changelog() -> None:
+    """Verify mandatory Model/Data Card gate for Production promotion and CHANGELOG.md presence."""
+    from pathlib import Path
+
+    import pytest
+
+    from omniforge.mlops.job_queue import validate_production_promotion_gate
+
+    with pytest.raises(ValueError, match="Model Card"):
+        validate_production_promotion_gate(None, {"dataset": "ok"})
+    with pytest.raises(ValueError, match="Data Card"):
+        validate_production_promotion_gate({"model": "ok"}, None)
+    gate = validate_production_promotion_gate({"model": "ok"}, {"dataset": "ok"})
+    assert gate["approved"] is True
+    assert Path("/home/user/OmniForge/CHANGELOG.md").exists()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

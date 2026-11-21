@@ -330,6 +330,10 @@ class DataCleaner:
                         med - self.config.outlier_threshold * scaled,
                         med + self.config.outlier_threshold * scaled,
                     )
+            elif self.config.outlier_method == "percentile":
+                lo_q = float(vals.quantile(self.config.lower_percentile))
+                hi_q = float(vals.quantile(self.config.upper_percentile))
+                self._state.outlier_bounds[str(col)] = (lo_q, hi_q)
 
         # Fit leakage-safe multivariate outlier detector strictly on training data
         # Also record last valid chronological Train observation per numeric column for causal ffill continuity
@@ -343,7 +347,7 @@ class DataCleaner:
             if len(valid_c) > 0:
                 self._state.causal_last_values[str(c)] = float(valid_c.iloc[-1])
 
-        if self.config.outlier_method in ("isolation_forest", "lof") and num_cols and len(work) >= 10:
+        if self.config.outlier_method in ("isolation_forest", "lof", "elliptic", "elliptic_envelope") and num_cols and len(work) >= 10:
             mat = work[num_cols].copy()
             mv_meds: dict[str, float] = {}
             for c in num_cols:
@@ -661,7 +665,7 @@ class DataCleaner:
         method = self.config.outlier_method
         action = self.config.outlier_action
 
-        if method in ("iqr", "zscore", "mad"):
+        if method in ("iqr", "zscore", "mad", "percentile"):
             rows_to_drop = pd.Series(False, index=df.index)
             per_row_cols: dict[int, list[str]] = {}
             for col, (low, high) in self._state.outlier_bounds.items():
@@ -699,7 +703,7 @@ class DataCleaner:
 
         # Multivariate outlier detection (Isolation Forest / LOF novelty=True) using Train-fitted detector
         if (
-            method in ("isolation_forest", "lof")
+            method in ("isolation_forest", "lof", "elliptic", "elliptic_envelope")
             and self._state.multivariate_detector is not None
             and self._state.multivariate_columns
         ):
@@ -1045,6 +1049,56 @@ def cleaning_distortion_audit(raw_df: pd.DataFrame, cleaned_df: pd.DataFrame) ->
         "per_column": per_col,
         "high_distortion_columns": [k for k, v in per_col.items() if v["ks_pvalue"] < 0.01],
     }
+
+
+def fuzzy_deduplicate_lsh_blocking(
+    df: pd.DataFrame,
+    cols: list[str],
+    *,
+    threshold: float = 0.85,
+) -> tuple[pd.DataFrame, int]:
+    """Near-linear fuzzy deduplication using prefix+length blocking and 3-gram Jaccard similarity."""
+    if df.empty or not cols:
+        return df.copy(), 0
+    valid_cols = [c for c in cols if c in df.columns]
+    if not valid_cols:
+        return df.copy(), 0
+
+    def _shingles(text: str) -> set[str]:
+        s = " ".join(text.lower().split())
+        if len(s) < 3:
+            return {s} if s else set()
+        return {s[i : i + 3] for i in range(len(s) - 2)}
+
+    blocks: dict[tuple[str, int], list[int]] = {}
+    keys: list[str] = []
+    for idx_pos, row_vals in enumerate(df[valid_cols].astype(str).itertuples(index=False, name=None)):
+        txt = " | ".join(row_vals).strip().lower()
+        keys.append(txt)
+        b_key = (txt[:3], len(txt) // 4)
+        blocks.setdefault(b_key, []).append(idx_pos)
+
+    keep_mask = np.ones(len(df), dtype=bool)
+    for idxs in blocks.values():
+        if len(idxs) < 2:
+            continue
+        kept_shingles: list[set[str]] = []
+        for pos in idxs:
+            sh = _shingles(keys[pos])
+            is_dup = False
+            for ref in kept_shingles:
+                union = len(sh | ref)
+                if union > 0 and (len(sh & ref) / union) >= threshold:
+                    is_dup = True
+                    break
+            if is_dup:
+                keep_mask[pos] = False
+            else:
+                kept_shingles.append(sh)
+
+    removed = int((~keep_mask).sum())
+    return df.iloc[keep_mask].copy(), removed
+
 
 
 

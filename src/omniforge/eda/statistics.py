@@ -67,12 +67,12 @@ class StatisticalAnalyzer:
         vals = pd.to_numeric(series, errors="coerce").dropna().to_numpy(dtype=float)
         if len(vals) < 8:
             return HypothesisTestResult(
-                test_name="shapiro_wilk",
-                statistic=0.0,
-                p_value=1.0,
+                test_name="not_evaluable",
+                statistic=float("nan"),
+                p_value=float("nan"),
                 alpha=alpha,
                 reject_null=False,
-                interpretation="Insufficient observations (<8) for normality testing.",
+                interpretation="Not evaluable: insufficient observations (<8) for normality testing.",
             )
 
         std = float(np.std(vals, ddof=1))
@@ -630,14 +630,14 @@ class StatisticalAnalyzer:
         num_df = df.select_dtypes(include=[np.number]).dropna()
         cols = list(num_df.columns)
         if len(cols) < 2 or len(num_df) <= len(cols):
-            return {str(c): 1.0 for c in cols}
+            return {str(c): float("nan") for c in cols}
 
         X = num_df.to_numpy(dtype=float)
         stds = X.std(axis=0)
         valid_mask = stds > 1e-12
         valid_cols = [cols[i] for i in range(len(cols)) if valid_mask[i]]
         if len(valid_cols) < 2:
-            return {str(c): 1.0 for c in cols}
+            return {str(c): float("nan") for c in cols}
 
         # Standardize valid predictors (zero mean, unit std -> no intercept needed after centering)
         Z = (X[:, valid_mask] - X[:, valid_mask].mean(axis=0)) / stds[valid_mask]
@@ -1004,8 +1004,11 @@ def distance_correlation(x: np.ndarray | pd.Series, y: np.ndarray | pd.Series) -
     dcov2_xy = float(np.mean(a_cent * b_cent))
     dcov2_xx = float(np.mean(a_cent * a_cent))
     dcov2_yy = float(np.mean(b_cent * b_cent))
-    denom = float(np.sqrt(max(dcov2_xx, 0.0) * max(dcov2_yy, 0.0)))
-    dcor = float(np.sqrt(max(dcov2_xy, 0.0)) / denom) if denom > 1e-12 else 0.0
+    denom_sq = float(np.sqrt(max(dcov2_xx, 0.0) * max(dcov2_yy, 0.0)))
+    if denom_sq <= 1e-12:
+        return {"dcor": 0.0, "dcov": 0.0, "n": float(n)}
+    dcor = float(np.sqrt(max(dcov2_xy, 0.0) / denom_sq))
+    dcor = float(np.clip(dcor, 0.0, 1.0))
     return {
         "dcor": round(dcor, 6),
         "dcov": round(float(np.sqrt(max(dcov2_xy, 0.0))), 6),

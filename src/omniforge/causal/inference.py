@@ -479,3 +479,18 @@ class CausalInferenceEngine:
                 "passed": abs(sub_ate - original_ate) < max(abs(original_ate) * 0.25, 0.5),
             },
         }
+
+    @staticmethod
+    def export_dowhy_gml(treatment_col: str, outcome_col: str, confounders: list[str]) -> str:
+        """Export a DoWhy-compatible GML causal DAG string for external graph/refutation tooling."""
+        nodes = [treatment_col, outcome_col, *confounders]
+        lines = ["graph [", "  directed 1"]
+        for n in nodes:
+            lines.append(f'  node [ id "{n}" label "{n}" ]')
+        lines.append(f'  edge [ source "{treatment_col}" target "{outcome_col}" ]')
+        for c in confounders:
+            lines.append(f'  edge [ source "{c}" target "{treatment_col}" ]')
+            lines.append(f'  edge [ source "{c}" target "{outcome_col}" ]')
+        lines.append("]")
+        return "\n".join(lines)
+

@@ -289,3 +289,67 @@ def venn_abers_calibrate(
     return {"p0": p0_list, "p1": p1_list, "p_calibrated": p_cal_list}
 
 
+def nested_cv_evaluate(
+    X: np.ndarray | pd.DataFrame,
+    y: np.ndarray | pd.Series,
+    *,
+    param_grid: list[dict[str, Any]] | None = None,
+    outer_splits: int = 3,
+    inner_splits: int = 2,
+    task: str = "classification",
+) -> dict[str, Any]:
+    """Leakage-free Nested Cross-Validation (outer evaluation + inner HPO selection)."""
+    from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+    from sklearn.metrics import accuracy_score, r2_score
+    from sklearn.model_selection import KFold, StratifiedKFold
+
+    X_arr = np.asarray(X, dtype=float)
+    y_arr = np.asarray(y)
+    grid = param_grid or [{"max_depth": 3}, {"max_depth": 6}, {"max_depth": None}]
+    is_clf = task == "classification"
+    outer_cv = (
+        StratifiedKFold(n_splits=outer_splits, shuffle=True, random_state=42)
+        if is_clf
+        else KFold(n_splits=outer_splits, shuffle=True, random_state=42)
+    )
+    outer_scores: list[float] = []
+    chosen_params: list[dict[str, Any]] = []
+
+    for tr_idx, te_idx in outer_cv.split(X_arr, y_arr):
+        X_tr, X_te = X_arr[tr_idx], X_arr[te_idx]
+        y_tr, y_te = y_arr[tr_idx], y_arr[te_idx]
+        inner_cv = (
+            StratifiedKFold(n_splits=inner_splits, shuffle=True, random_state=42)
+            if is_clf
+            else KFold(n_splits=inner_splits, shuffle=True, random_state=42)
+        )
+        best_p = grid[0]
+        best_inner = -float("inf")
+        for params in grid:
+            in_scores: list[float] = []
+            for itr, iva in inner_cv.split(X_tr, y_tr):
+                cls = RandomForestClassifier if is_clf else RandomForestRegressor
+                m = cls(n_estimators=20, random_state=42, **params).fit(X_tr[itr], y_tr[itr])
+                preds = m.predict(X_tr[iva])
+                sc = float(accuracy_score(y_tr[iva], preds) if is_clf else r2_score(y_tr[iva], preds))
+                in_scores.append(sc)
+            mean_in = float(np.mean(in_scores))
+            if mean_in > best_inner:
+                best_inner = mean_in
+                best_p = params
+        cls = RandomForestClassifier if is_clf else RandomForestRegressor
+        final_m = cls(n_estimators=20, random_state=42, **best_p).fit(X_tr, y_tr)
+        out_preds = final_m.predict(X_te)
+        out_sc = float(accuracy_score(y_te, out_preds) if is_clf else r2_score(y_te, out_preds))
+        outer_scores.append(round(out_sc, 6))
+        chosen_params.append(best_p)
+
+    return {
+        "outer_scores": outer_scores,
+        "mean_outer_score": round(float(np.mean(outer_scores)), 6),
+        "std_outer_score": round(float(np.std(outer_scores)), 6),
+        "chosen_params_per_fold": chosen_params,
+    }
+
+
+
