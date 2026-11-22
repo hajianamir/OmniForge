@@ -9,6 +9,7 @@ import pandas as pd
 from sklearn.linear_model import Ridge
 
 from omniforge.core.types import TaskType
+from omniforge.evaluation.robustness import ConformalPredictor, split_conformal_quantile
 from omniforge.models.base import BaseOmniForgeModel
 
 
@@ -304,4 +305,188 @@ class InterpretabilityEngine:
             "distance_metric": "wachter_l1_mad",
             "sparsity_changed_features": len(changes),
             "changes": changes,
+        }
+
+    def _local_linear_attributions(
+        self,
+        model: BaseOmniForgeModel,
+        X_background: pd.DataFrame,
+        instance: pd.DataFrame | pd.Series,
+        *,
+        n_perturbations: int = 200,
+        ridge_alpha: float = 1.0,
+    ) -> tuple[dict[str, float], float]:
+        """Local linear surrogate (Ridge in standardized z-space) attributions + scalar prediction.
+
+        Mirrors :meth:`explain_lime_local` but returns raw (unrounded) weights so
+        :meth:`explain_diff` can compute precise shift statistics.
+        """
+        rng = np.random.default_rng(self.random_seed)
+        x_row = instance.to_frame().T if isinstance(instance, pd.Series) else instance.iloc[[0]].copy()
+        num_cols = list(X_background.select_dtypes(include=[np.number]).columns)
+        pred_x0 = float(self._predict_scalar(model, x_row)[0])
+        if not num_cols:
+            return {}, pred_x0
+        p = len(num_cols)
+        n_pts = max(10, int(n_perturbations))
+        stds = X_background[num_cols].std(ddof=1).replace(0.0, 1.0).fillna(1.0)
+        std_vec = stds.to_numpy(dtype=float)
+        z_local = rng.normal(0.0, 0.35, size=(n_pts, p))
+        z_local[0, :] = 0.0
+        perturbed = pd.concat([x_row] * n_pts, ignore_index=True)
+        for idx, col in enumerate(num_cols):
+            perturbed[col] = float(x_row[col].iloc[0]) + z_local[:, idx] * float(std_vec[idx])
+        preds = self._predict_scalar(model, perturbed)
+        kw = 0.75 * float(np.sqrt(p))
+        distances = np.linalg.norm(z_local, axis=1)
+        kernel_w = np.sqrt(np.exp(-(distances**2) / max(kw * kw, 1e-12)))
+        surrogate = Ridge(alpha=max(1e-6, float(ridge_alpha)))
+        surrogate.fit(z_local, preds, sample_weight=kernel_w)
+        weights = {
+            str(col): float(coef)
+            for col, coef in zip(num_cols, surrogate.coef_, strict=False)
+        }
+        return weights, pred_x0
+
+    def explain_diff(
+        self,
+        model_a: BaseOmniForgeModel,
+        model_b: BaseOmniForgeModel,
+        X_background: pd.DataFrame,
+        instance: pd.DataFrame | pd.Series,
+        *,
+        n_perturbations: int = 200,
+        n_permutations: int = 500,
+        alpha: float = 0.05,
+    ) -> dict[str, Any]:
+        """Shift detection between two models' local explanations (e.g. Ridge vs GBDT).
+
+        Fits local linear surrogates for both models around ``instance``,
+        compares per-feature attributions, and runs a paired sign-flip
+        permutation test on the global signed shift statistic to decide whether
+        the difference is statistically significant at level ``alpha``.
+
+        Returns per-feature attribution shift (a - b), the prediction difference,
+        the global shift statistic, the permutation p-value, and the top-shifted
+        features ranked by absolute shift.
+        """
+        rng = np.random.default_rng(self.random_seed)
+        x_row = instance.to_frame().T if isinstance(instance, pd.Series) else instance.iloc[[0]].copy()
+        attrs_a, pred_a = self._local_linear_attributions(
+            model_a, X_background, x_row, n_perturbations=n_perturbations
+        )
+        attrs_b, pred_b = self._local_linear_attributions(
+            model_b, X_background, x_row, n_perturbations=n_perturbations
+        )
+
+        common_feats = sorted(set(attrs_a) | set(attrs_b))
+        per_feature: dict[str, dict[str, float]] = {}
+        shifts: list[float] = []
+        for f in common_feats:
+            a = float(attrs_a.get(f, 0.0))
+            b = float(attrs_b.get(f, 0.0))
+            shift = a - b
+            per_feature[f] = {
+                "attribution_a": round(a, 6),
+                "attribution_b": round(b, 6),
+                "shift": round(shift, 6),
+                "abs_shift": round(abs(shift), 6),
+            }
+            shifts.append(shift)
+
+        shifts_arr = np.asarray(shifts, dtype=float)
+        global_shift = float(np.mean(shifts_arr)) if shifts_arr.size else 0.0
+        mean_abs_shift = float(np.mean(np.abs(shifts_arr))) if shifts_arr.size else 0.0
+        prediction_diff = float(pred_a - pred_b)
+
+        # Paired sign-flip permutation test (null: model_a/model_b exchangeable per feature).
+        n_perm = max(1, int(n_permutations))
+        perm_stats = np.zeros(n_perm, dtype=float)
+        signs = rng.choice([-1.0, 1.0], size=(n_perm, max(len(shifts_arr), 1)))
+        if shifts_arr.size:
+            perm_stats = signs @ shifts_arr / shifts_arr.size
+        abs_obs = abs(global_shift)
+        p_value = float(np.mean(np.abs(perm_stats) >= abs_obs)) if n_perm else 1.0
+
+        top_shifted = sorted(
+            per_feature.items(), key=lambda kv: kv[1]["abs_shift"], reverse=True
+        )
+        return {
+            "method": "explain_diff_local_shift",
+            "prediction_a": round(pred_a, 6),
+            "prediction_b": round(pred_b, 6),
+            "prediction_diff": round(prediction_diff, 6),
+            "global_shift": round(global_shift, 6),
+            "mean_abs_shift": round(mean_abs_shift, 6),
+            "p_value": round(p_value, 6),
+            "significant": bool(p_value < float(alpha)),
+            "alpha": float(alpha),
+            "per_feature": per_feature,
+            "top_shifted_features": [
+                {"feature": f, "shift": round(v["shift"], 6), "abs_shift": round(v["abs_shift"], 6)}
+                for f, v in top_shifted[:10]
+            ],
+        }
+
+    def conformal_explain(
+        self,
+        model: BaseOmniForgeModel,
+        X_calib: pd.DataFrame,
+        y_calib: pd.Series | np.ndarray,
+        instance: pd.DataFrame | pd.Series,
+        *,
+        alpha: float = 0.1,
+    ) -> dict[str, Any]:
+        """Split-conformal local explanation: point prediction + distribution-free interval/set.
+
+        For regression: uses LAC (absolute residual) nonconformity scores on the
+        exchangeable calibration holdout, computes the exact finite-sample
+        split-conformal quantile (Angelopoulos & Bates 2021, Thm. D.1), and
+        returns ``[pred - q, pred + q]`` with guaranteed marginal coverage
+        ``>= 1 - alpha``.
+
+        For classification: wraps :class:`~omniforge.evaluation.robustness.ConformalPredictor`
+        (APS) to return a prediction set with coverage ``>= 1 - alpha``.
+        """
+        a = float(np.clip(alpha, 1e-6, 0.999999))
+        x_row = instance.to_frame().T if isinstance(instance, pd.Series) else instance.iloc[[0]].copy()
+        y_arr = np.asarray(y_calib).ravel()
+        pred = float(self._predict_scalar(model, x_row)[0])
+
+        is_clf = model.task_type in (
+            TaskType.BINARY_CLASSIFICATION,
+            TaskType.MULTICLASS_CLASSIFICATION,
+        )
+        if is_clf:
+            cp = ConformalPredictor(model, alpha=a, score_method="aps", random_seed=self.random_seed)
+            cp.calibrate(X_calib, y_arr)
+            pred_sets = cp.predict_sets(x_row)
+            pred_set = pred_sets[0] if pred_sets else []
+            return {
+                "method": "conformal_aps_prediction_set",
+                "task_type": str(model.task_type),
+                "alpha": a,
+                "coverage_guarantee": round(1.0 - a, 6),
+                "finite_sample_valid": bool(cp.finite_sample_valid_),
+                "prediction": round(pred, 6),
+                "prediction_set": sorted(int(v) for v in pred_set),
+                "n_calibration": int(cp.n_calibration_),
+            }
+
+        # Regression: LAC split conformal interval.
+        calib_preds = np.asarray(model.predict(X_calib), dtype=float).ravel()
+        scores = np.abs(calib_preds - y_arr)
+        q_hat, finite_sample_valid = split_conformal_quantile(scores, a)
+        lower = round(float(pred - q_hat), 6)
+        upper = round(float(pred + q_hat), 6)
+        return {
+            "method": "conformal_lac_interval",
+            "task_type": str(model.task_type),
+            "alpha": a,
+            "coverage_guarantee": round(1.0 - a, 6),
+            "finite_sample_valid": bool(finite_sample_valid),
+            "prediction": round(pred, 6),
+            "interval": [lower, upper],
+            "half_width": round(float(q_hat), 6),
+            "n_calibration": int(len(scores)),
         }

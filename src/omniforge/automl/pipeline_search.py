@@ -61,6 +61,10 @@ class AutoMLResult:
     leakage_audit: LeakageAuditReport | None = None
     cv_summary: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # C3 Green-AI: budget constraints & Pareto frontier.
+    max_carbon_grams_co2e: float | None = None
+    max_inference_latency_ms: float | None = None
+    pareto_frontier: list[dict[str, Any]] = field(default_factory=list)
 
 
 class AutoMLPipelineSearch:
@@ -83,6 +87,8 @@ class AutoMLPipelineSearch:
         use_cv_pipeline: bool = True,
         select_k_features: int | None = None,
         random_seed: int = 42,
+        max_carbon_grams_co2e: float | None = None,
+        max_inference_latency_ms: float | None = None,
     ) -> None:
         self.task_type = task_type
         self.time_budget_seconds = float(time_budget_seconds)
@@ -98,6 +104,13 @@ class AutoMLPipelineSearch:
         self.use_cv_pipeline = use_cv_pipeline
         self.select_k_features = select_k_features
         self.random_seed = random_seed
+        # Green-AI budgets (C3): None means unconstrained.
+        self.max_carbon_grams_co2e = (
+            None if max_carbon_grams_co2e is None else float(max_carbon_grams_co2e)
+        )
+        self.max_inference_latency_ms = (
+            None if max_inference_latency_ms is None else float(max_inference_latency_ms)
+        )
 
     @staticmethod
     def infer_task_type(y: pd.Series | np.ndarray) -> TaskType:
@@ -108,6 +121,83 @@ class AutoMLPipelineSearch:
         if s.nunique() <= 10 and np.all(np.isclose(s, np.round(s))):
             return TaskType.BINARY_CLASSIFICATION if s.nunique() <= 2 else TaskType.MULTICLASS_CLASSIFICATION
         return TaskType.REGRESSION
+
+    @staticmethod
+    def pareto_frontier(
+        rows: list[dict[str, Any]],
+        primary_metric: str,
+        *,
+        higher_is_better: bool,
+    ) -> list[dict[str, Any]]:
+        """Compute the non-dominated 3D Pareto frontier (metric × latency × carbon).
+
+        A row dominates another when it is at least as good on all three objectives and
+        strictly better on at least one. Metric is maximized when ``higher_is_better``;
+        latency (ms per 1k) and carbon (grams CO2eq) are always minimized.
+        Rows missing latency/carbon are treated as unconstrained (infinite objective)
+        and never dominate fully-measured rows unless they also tie on the available axes.
+        """
+        if not rows:
+            return []
+
+        def objective(r: dict[str, Any]) -> tuple[float, float, float]:
+            metric = float(r.get(primary_metric, float("-inf")))
+            if not higher_is_better:
+                metric = -metric
+            latency = float(r.get("inference_latency_ms_per_1k", float("inf")))
+            carbon = float(r.get("carbon_gco2e", float("inf")))
+            return (metric, -latency, -carbon)  # negate so all-maximize = non-dominated sort
+
+        # Sort descending by primary objective for efficient sweep; then filter dominated.
+        ordered = sorted(rows, key=objective, reverse=True)
+        frontier: list[dict[str, Any]] = []
+        best_latency = float("inf")
+        best_carbon = float("inf")
+        # Non-dominated in 3D: track the Pareto-optimal set via pairwise comparison.
+        for r in ordered:
+            m, l, c = objective(r)
+            dominated = False
+            for f in frontier:
+                fm, fl, fc = objective(f)
+                if fm >= m and fl >= l and fc >= c and (fm > m or fl > l or fc > c):
+                    dominated = True
+                    break
+            if not dominated:
+                frontier.append(r)
+        # Stable, deterministic order by metric desc.
+        frontier.sort(key=objective, reverse=True)
+        return frontier
+
+    def _fit_measured(self, model: BaseOmniForgeModel, X_tr: pd.DataFrame, y_tr: pd.Series | np.ndarray) -> float:
+        """Fit ``model`` under a CarbonTracker and return emissions in grams CO2eq."""
+        tracker = CarbonTracker(f"automl_candidate_{getattr(model, 'name', 'candidate')}", enabled=True)
+        with tracker:
+            model.fit(X_tr, y_tr)
+        return float(tracker.report.emissions_g_co2eq) if tracker.report is not None else 0.0
+
+    def _inference_latency_ms_per_1k(self, model: BaseOmniForgeModel, X_va: pd.DataFrame | np.ndarray) -> float:
+        """Measure predict latency on up to 1k validation rows, scaled to ms per 1k rows."""
+        bench = X_va[:1000] if hasattr(X_va, "__getitem__") else X_va
+        n = max(1, len(bench))
+        t0 = time.perf_counter()
+        model.predict(bench)
+        elapsed_s = time.perf_counter() - t0
+        return (elapsed_s / n) * 1000.0
+
+    def _budget_rejected(self, reason: str, carbon_g: float, latency_ms: float) -> bool:
+        if self.max_carbon_grams_co2e is not None and carbon_g > self.max_carbon_grams_co2e:
+            logger.warning(
+                "automl_budget_rejected", reason=reason, budget="carbon",
+                carbon_g=round(carbon_g, 4), limit=self.max_carbon_grams_co2e,
+            )
+            return True
+        if self.max_inference_latency_ms is not None and latency_ms > self.max_inference_latency_ms:
+            logger.warning(
+                "automl_budget_rejected", reason=reason, budget="inference_latency",
+                latency_ms=round(latency_ms, 2), limit=self.max_inference_latency_ms,
+            )
+            return True
+        return False
 
     def _sklearn_estimator_for_cv(
         self,
@@ -286,14 +376,20 @@ class AutoMLPipelineSearch:
                 try:
                     m = ClassicalMLModel(alg, task_type=task, random_seed=self.random_seed, track_carbon=False)
                     ts = time.perf_counter()
-                    m.fit(X_tr, y_tr)
+                    carbon_g = self._fit_measured(m, X_tr, y_tr)
+                    latency_ms = self._inference_latency_ms_per_1k(m, X_va)
                     sc = _score_model(m)
+                    # C3: enforce Green-AI budgets (carbon / inference latency) before accepting candidate.
+                    if self._budget_rejected(alg, carbon_g, latency_ms):
+                        continue
                     row_entry: dict[str, Any] = {
                         "model": alg,
                         "family": "classical_ml",
                         primary_metric: round(sc, 6),
                         "split_strategy": split_res.strategy_used,
                         "fit_time_s": round(time.perf_counter() - ts, 4),
+                        "inference_latency_ms_per_1k": round(latency_ms, 4),
+                        "carbon_gco2e": round(carbon_g, 6),
                     }
                     # Fold-isolated Pipeline + ColumnTransformer CV (StratifiedKFold / GroupKFold / TimeSeriesSplit)
                     if (
@@ -560,6 +656,13 @@ class AutoMLPipelineSearch:
             leaderboard.sort(key=lambda row: row[primary_metric], reverse=is_clf)
             lift = (best_val_score - best_bl_score) if is_clf else (best_bl_score - best_val_score)
 
+        # C3 Green-AI: Pareto frontier over accepted candidates (metric × latency × carbon).
+        pareto_rows = self.pareto_frontier(
+            leaderboard,
+            primary_metric,
+            higher_is_better=is_clf,
+        )
+
         elapsed = round(time.perf_counter() - t0, 4)
         logger.info(
             "automl_completed",
@@ -582,6 +685,9 @@ class AutoMLPipelineSearch:
             elapsed_seconds=elapsed,
             leakage_audit=split_res.audit_report,
             cv_summary=cv_summary,
+            max_carbon_grams_co2e=self.max_carbon_grams_co2e,
+            max_inference_latency_ms=self.max_inference_latency_ms,
+            pareto_frontier=pareto_rows,
             metadata={
                 "fitted_models": all_fitted_models,
                 "equations": equations_map,

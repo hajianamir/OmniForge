@@ -835,6 +835,8 @@ class AutoMLBackendHub:
         split_strategy: SplitStrategyType = "auto",
         fallback_to_native: bool = True,
         random_seed: int = 42,
+        max_carbon_grams_co2e: float | None = None,
+        max_inference_latency_ms: float | None = None,
     ) -> MultiBackendAutoMLResult:
         """Run any selected AutoML engine with baseline comparison and optional native fallback."""
         if target_col not in df.columns:
@@ -980,6 +982,8 @@ class AutoMLBackendHub:
             cv_folds=cv_folds,
             split_strategy=split_strategy,
             random_seed=random_seed,
+            max_carbon_grams_co2e=max_carbon_grams_co2e,
+            max_inference_latency_ms=max_inference_latency_ms,
         ).fit(X_all, y_all)
         return MultiBackendAutoMLResult(
             requested_backend=req_backend,

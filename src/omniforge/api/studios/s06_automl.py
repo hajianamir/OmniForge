@@ -71,6 +71,8 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
                         task_type=tt,
                         time_budget_seconds=max(5, req.time_budget_seconds // len(active_targets)),
                         cv_folds=req.cv_folds,
+                        max_carbon_grams_co2e=req.max_carbon_grams_co2e,
+                        max_inference_latency_ms=req.max_inference_latency_ms,
                     )
                     multi_target_summary.append(
                         {
@@ -92,6 +94,8 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
             task_type=task,
             time_budget_seconds=req.time_budget_seconds,
             cv_folds=req.cv_folds,
+            max_carbon_grams_co2e=req.max_carbon_grams_co2e,
+            max_inference_latency_ms=req.max_inference_latency_ms,
         )
         eq_dict: dict[str, Any] = {}
         try:

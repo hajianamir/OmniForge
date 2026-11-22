@@ -165,6 +165,9 @@ class AutoMLRunReq(BaseModel):
     time_budget_seconds: float = Field(default=30.0, ge=5.0, le=3600.0)
     cv_folds: int = Field(default=3, ge=2, le=10)
     async_job: bool = False
+    # C3 Green-AI budgets: None means unconstrained (backward compatible).
+    max_carbon_grams_co2e: float | None = Field(default=None, ge=0.0)
+    max_inference_latency_ms: float | None = Field(default=None, ge=0.0)
 
 
 class DeepBenchReq(BaseModel):

@@ -203,6 +203,169 @@ def pseudonymize_value(value: Any, *, salt: bytes, tenant_id: str) -> str:
     return hmac.new(salt, material, hashlib.sha256).hexdigest()[:16]
 
 
+class DataFramePIIGuard:
+    """Zero-trust PII guard for DataFrames.
+
+    ``pii_policy``:
+      * ``"pseudonymize"`` — replace every PII-bearing cell with a deterministic,
+        tenant-bound HMAC-SHA256 pseudonym; no raw PII survives in the returned frame.
+      * ``"block"`` — fail-closed: raise :class:`SecurityError` if any PII cell is
+        detected; never return raw PII.
+      * ``"off"`` — no-op (backward compatibility); PII is reported but not altered.
+
+    Detection is regex-based over object/string columns (SSN, email, phone,
+    credit-card, IPv4). Audit events record only column names and cell counts —
+    never raw PII values — so logs, cache, and memory never leak PII.
+    """
+
+    PII_PATTERNS: dict[str, re.Pattern[str]] = {
+        "ssn": re.compile(r"\b\d{3}-?\d{2}-?\d{4}\b"),
+        "email": re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
+        "phone": re.compile(r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b"),
+        "credit_card": re.compile(r"\b(?:\d[ -]*?){13,16}\b"),
+        "ip_address": re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b"),
+    }
+
+    def __init__(
+        self,
+        *,
+        tenant_id: str = "default-tenant",
+        pii_policy: str = "pseudonymize",
+        audit_logger: Any | None = None,
+    ) -> None:
+        self.tenant_id = str(tenant_id or "default-tenant")
+        self.pii_policy = str(pii_policy)
+        if self.pii_policy not in ("pseudonymize", "block", "off"):
+            raise SecurityError(
+                f"Unknown pii_policy {self.pii_policy!r}; use 'pseudonymize', 'block', or 'off'.",
+            )
+        self.audit_logger = audit_logger
+        # Resolve (fail-closed in production) the tenant-bound pseudonym salt.
+        self._salt: bytes = resolve_pseudonym_salt(self.tenant_id)
+
+    # ------------------------------------------------------------------ detection
+    def _cell_has_pii(self, value: Any) -> bool:
+        if value is None or (isinstance(value, float) and value != value):  # NaN
+            return False
+        s = str(value)
+        return any(pattern.search(s) for pattern in self.PII_PATTERNS.values())
+
+    def detect(self, df: pd.DataFrame) -> dict[str, dict[str, Any]]:
+        """Scan object/string columns for PII; return {column: {pii_cells, pattern_hits}}.
+
+        No raw PII values appear in the report — only counts per column/pattern.
+        """
+        report: dict[str, dict[str, Any]] = {}
+        for col in df.columns:
+            series = df[col]
+            if series.dtype != object:
+                continue
+            pii_cells = 0
+            pattern_hits: dict[str, int] = {}
+            for val in series.dropna():
+                if not self._cell_has_pii(val):
+                    continue
+                pii_cells += 1
+                s = str(val)
+                for name, pattern in self.PII_PATTERNS.items():
+                    if pattern.search(s):
+                        pattern_hits[name] = pattern_hits.get(name, 0) + 1
+            if pii_cells:
+                report[str(col)] = {"pii_cells": int(pii_cells), "pattern_hits": pattern_hits}
+        return report
+
+    def has_pii(self, df: pd.DataFrame) -> bool:
+        return bool(self.detect(df))
+
+    # ------------------------------------------------------------------ transform / enforce
+    def transform(
+        self, df: pd.DataFrame
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
+        """Return ``(redacted_df, report)`` without leaking raw PII.
+
+        * ``pseudonymize``: every PII-bearing cell becomes a deterministic pseudonym.
+        * ``block``: raises :class:`SecurityError` if any PII cell exists (fail-closed).
+        * ``off``: returns the frame unchanged (PII still reported).
+        """
+        redacted = df.copy(deep=True)
+        report = self.detect(redacted)
+        summary: dict[str, Any] = {
+            "pii_policy": self.pii_policy,
+            "tenant_id": self.tenant_id,
+            "pii_detected": bool(report),
+            "pii_columns": sorted(report),
+            "pii_cells_total": sum(int(v["pii_cells"]) for v in report.values()),
+            "pii_report": report,
+        }
+
+        if self.pii_policy == "block":
+            if report:
+                cols = ", ".join(sorted(report))
+                total = summary["pii_cells_total"]
+                self._audit(
+                    "pii_block_rejected",
+                    details={"columns": sorted(report), "pii_cells_total": int(total)},
+                )
+                raise SecurityError(
+                    f"pii_policy='block' refused a frame containing PII in {len(report)} "
+                    f"column(s) ({total} PII-bearing cell(s)): {cols}. No raw PII is returned.",
+                )
+            self._audit("pii_scan_clean", details={"columns": list(redacted.columns)})
+            return redacted, summary
+
+        if self.pii_policy == "pseudonymize":
+            redacted_columns: dict[str, int] = {}
+            for col, info in report.items():
+                mask = redacted[col].apply(self._cell_has_pii)
+                n = int(mask.sum())
+                if n:
+                    redacted.loc[mask, col] = redacted.loc[mask, col].apply(
+                        lambda v: pseudonymize_value(
+                            str(v), salt=self._salt, tenant_id=self.tenant_id
+                        )
+                    )
+                redacted_columns[str(col)] = n
+            summary["redacted_columns"] = redacted_columns
+            self._audit(
+                "pii_redacted",
+                details={
+                    "columns": list(redacted_columns),
+                    "pii_cells_total": int(summary["pii_cells_total"]),
+                },
+            )
+            return redacted, summary
+
+        # pii_policy == "off": no-op, but still report for transparency.
+        self._audit("pii_scan_off", details={"columns": list(redacted.columns), "pii_report": report})
+        return redacted, summary
+
+    def enforce(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Convenience: return the guarded frame, raising under ``block`` on any PII.
+
+        Discards the report; use :meth:`transform` when the report is needed.
+        """
+        redacted, _ = self.transform(df)
+        return redacted
+
+    # ------------------------------------------------------------------ audit (no raw PII)
+    def _audit(self, action: str, *, details: dict[str, Any] | None = None) -> None:
+        if self.audit_logger is None:
+            return
+        try:
+            self.audit_logger.log_event(
+                action=action,
+                resource_type="dataframe",
+                resource_id=self.tenant_id,
+                actor="system",
+                role="admin",
+                status="success",
+                details=details or {},
+            )
+        except Exception:
+            # Audit must never break the data path, but must also never leak PII.
+            pass
+
+
 def _resolve_or_persist_secret(
     *,
     key_name: str,
