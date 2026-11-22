@@ -126,6 +126,34 @@ class CausalDiscovery:
         p_val = 2.0 * (1.0 - stats.t.cdf(abs(t_stat), df_resid))
         return r, float(p_val)
 
+    @staticmethod
+    def _rolling_window_drift_onset(
+        df: pd.DataFrame, time_col: str, col: str, n_windows: int = 5
+    ) -> int | None:
+        """Return the earliest time-window index where ``col`` first drifts vs baseline.
+
+        Splits the temporally-sorted frame into ``n_windows`` consecutive windows,
+        computes PSI of each later window against the first (baseline) window, and
+        returns the index of the first window whose PSI >= 0.10. Returns ``None`` if
+        no window drifts (or if there are too few rows). Lower index = earlier shift
+        = more likely upstream root cause.
+        """
+        sdf = df.sort_values(time_col)
+        vals = pd.to_numeric(sdf[col], errors="coerce").dropna()
+        if len(vals) < max(10, n_windows * 2):
+            return None
+        bounds = np.linspace(0, len(vals), n_windows + 1).astype(int)
+        baseline = vals.iloc[bounds[0] : bounds[1]].to_numpy(dtype=float)
+        det = DriftDetector()
+        for w in range(1, n_windows):
+            cur = vals.iloc[bounds[w] : bounds[w + 1]].to_numpy(dtype=float)
+            if len(cur) < 3:
+                continue
+            rep = det.detect(baseline.reshape(-1, 1), cur.reshape(-1, 1))
+            if rep.features and rep.features[0].psi is not None and rep.features[0].psi >= 0.10:
+                return w
+        return None
+
     def discover(
         self, df: pd.DataFrame, time_col: str | None = None
     ) -> dict[str, set[str]]:
@@ -191,10 +219,17 @@ class CausalDiscovery:
                     score -= 1.0
             return score
 
+        # Temporal drift onset: earlier shifting feature is upstream (root cause).
+        onset: dict[str, int | None] = {}
+        if time_col and time_col in df.columns:
+            for c in cols:
+                onset[c] = self._rolling_window_drift_onset(df, time_col, c)
+
         # Stability score: lower drift magnitude -> more likely upstream source.
         drift: dict[str, float] = {}
-        if time_col and time_col in df.columns:
-            # Rolling drift onset: split data temporally, compare first vs last third.
+        if not (time_col and time_col in df.columns):
+            drift = {c: float(df[c].std(ddof=1)) if df[c].notna().sum() > 1 else 0.0 for c in cols}
+        else:
             try:
                 sdf = df.sort_values(time_col)
                 n = len(sdf)
@@ -207,15 +242,21 @@ class CausalDiscovery:
                     drift[c] = rep.features[0].psi if rep.features else 0.0
             except Exception:  # pragma: no cover - defensive
                 drift = {c: float(df[c].std()) for c in cols}
-        else:
-            drift = {c: float(df[c].std(ddof=1)) if df[c].notna().sum() > 1 else 0.0 for c in cols}
 
         parents: dict[str, set[str]] = {c: set() for c in cols}
         for a, b in edges:
             sa, sb = upstream_score(a), upstream_score(b)
+            oa, ob = onset.get(a), onset.get(b)
             da, db = drift.get(a, 0.0), drift.get(b, 0.0)
-            # Orient higher-stability / more-sensor-like -> lower-stability / more-derived.
-            if sa > sb or (sa == sb and da < db):
+            # 1) Earlier drift onset wins (temporal causality).
+            if oa is not None and ob is not None and oa != ob:
+                parent, child = (a, b) if oa < ob else (b, a)
+            elif oa is not None and ob is None:
+                parent, child = a, b  # a shifts, b does not -> a upstream
+            elif ob is not None and oa is None:
+                parent, child = b, a
+            # 2) Fall back to naming heuristics / stability.
+            elif sa > sb or (sa == sb and da < db):
                 parent, child = a, b
             elif sb > sa or (sa == sb and db < da):
                 parent, child = b, a
@@ -225,7 +266,8 @@ class CausalDiscovery:
             parents[child].add(parent)
             logger.debug(
                 "root_cause_edge_oriented", parent=parent, child=child,
-                upstream_score_a=sa, upstream_score_b=sb, drift_a=round(da, 4), drift_b=round(db, 4),
+                upstream_score_a=sa, upstream_score_b=sb, onset_a=oa, onset_b=ob,
+                drift_a=round(da, 4), drift_b=round(db, 4),
             )
         return parents
 
@@ -334,24 +376,36 @@ class DriftRootCauseAnalyzer:
         drift_report: DriftReport = det.detect(ref, cur)
         drift_map: dict[str, FeatureDriftResult] = {f.column: f for f in drift_report.features}
 
-        # ---- Step 2: Prediction-shift attribution (Delta-SHAP style) ---------
+        # ---- Step 2: Prediction-shift attribution (exact Delta-SHAP) ---------
         attributions: dict[str, float] = {}
-        base_pred_mean = 0.0
         if model is not None and hasattr(model, "predict"):
             try:
-                base_preds = np.asarray(model.predict(ref), dtype=float).ravel()
-                base_pred_mean = float(np.mean(base_preds))
+                interp = InterpretabilityEngine(random_seed=self.random_seed)
+                # Mean SHAP attribution per feature on reference vs current samples.
+                n_attr = max(3, min(len(ref), 8))
+                ref_sample = ref.sample(n=n_attr, random_state=self.random_seed)
+                cur_sample = cur.sample(n=n_attr, random_state=self.random_seed + 1)
+
+                def _mean_attrs(sample_df: pd.DataFrame) -> dict[str, float]:
+                    agg: dict[str, list[float]] = {c: [] for c in feat_cols}
+                    for _, row in sample_df.iterrows():
+                        inst = row.to_frame().T
+                        shap_local = interp.explain_shap_local(
+                            model, ref, inst, n_samples=32
+                        )
+                        for col, val in shap_local.get("attributions", {}).items():
+                            if col in agg:
+                                agg[col].append(float(val))
+                    return {c: float(np.mean(v)) if v else 0.0 for c, v in agg.items()}
+
+                attrs_ref = _mean_attrs(ref_sample)
+                attrs_cur = _mean_attrs(cur_sample)
                 for col in feat_cols:
                     if col not in drift_map or drift_map[col].status == DriftStatus.HEALTHY:
                         continue
-                    cf = ref.copy()
-                    # Replace drifted feature with current distribution (sampled).
-                    replacement = cur[col].sample(
-                        n=len(ref), replace=True, random_state=int(rng.integers(0, 1 << 31))
-                    ).to_numpy(dtype=float)
-                    cf[col] = replacement
-                    cf_preds = np.asarray(model.predict(cf), dtype=float).ravel()
-                    attributions[col] = float(np.mean(cf_preds) - base_pred_mean)
+                    attributions[col] = round(
+                        float(attrs_cur.get(col, 0.0) - attrs_ref.get(col, 0.0)), 6
+                    )
             except Exception as exc:  # pragma: no cover - defensive
                 logger.warning("root_cause_attribution_skipped", reason=str(exc))
 

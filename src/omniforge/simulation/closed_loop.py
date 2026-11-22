@@ -196,12 +196,6 @@ class ClosedLoopMPCController:
             X0 = np.tile(x0, (H, 1))
             z0 = self._pack(U0, X0)
 
-        bounds = []
-        for _ in range(H):
-            bounds.extend(list(zip(self.u_min, self.u_max, strict=False)))
-        for _ in range(H):
-            bounds.extend(list(zip(self.x_min, self.x_max, strict=False)))
-
         constraints = [
             {
                 "type": "eq",
@@ -210,21 +204,38 @@ class ClosedLoopMPCController:
             }
         ]
 
-        result = minimize(
-            fun=lambda z: self._objective(z, r_path),
-            x0=z0,
-            jac=lambda z: self._objective_grad(z, r_path),
-            method="SLSQP",
-            bounds=bounds,
-            constraints=constraints,
-            options={"maxiter": 200, "ftol": 1e-9, "disp": False},
-        )
+        def _solve_with_bounds(u_lo: np.ndarray, u_hi: np.ndarray, x_lo: np.ndarray, x_hi: np.ndarray):
+            bds = []
+            for _ in range(H):
+                bds.extend(list(zip(u_lo, u_hi, strict=False)))
+            for _ in range(H):
+                bds.extend(list(zip(x_lo, x_hi, strict=False)))
+            return minimize(
+                fun=lambda z: self._objective(z, r_path),
+                x0=z0,
+                jac=lambda z: self._objective_grad(z, r_path),
+                method="SLSQP",
+                bounds=bds,
+                constraints=constraints,
+                options={"maxiter": 200, "ftol": 1e-9, "disp": False},
+            )
+
+        # Convergence fallback: retry with progressively relaxed bounds when SLSQP fails.
+        result = _solve_with_bounds(self.u_min, self.u_max, self.x_min, self.x_max)
+        relax = 1.0
+        while not result.success and relax < 1.5:
+            relax += 0.10
+            u_lo = self.u_min * relax
+            u_hi = self.u_max * relax
+            x_lo = self.x_min * relax
+            x_hi = self.x_max * relax
+            result = _solve_with_bounds(u_lo, u_hi, x_lo, x_hi)
 
         U, X = self._unpack(result.x)
         violations: list[str] = []
         if not result.success:
             violations.append(f"solver did not converge: {result.message}")
-        # Explicit bound check (SLSQP can tolerate small violations).
+        # Explicit bound check against ORIGINAL (unrelaxed) bounds.
         for k in range(H):
             for j in range(n_u):
                 if U[k, j] < self.u_min[j] - 1e-6 or U[k, j] > self.u_max[j] + 1e-6:
@@ -264,12 +275,19 @@ class ClosedLoopMPCController:
         setpoint: np.ndarray | None = None,
         *,
         controls_override: np.ndarray | None = None,
+        state: dict[str, Any] | None = None,
+        state_key: str | None = None,
     ) -> TwinControlReport:
         """Run closed-loop MPC over a sequence of measurements.
 
         For each measurement: solve MPC from current twin state, apply first control,
         assimilate the measurement via Kalman filter, record trajectory. Returns a
         :class:`TwinControlReport` for charting / audit.
+
+        When ``state`` and ``state_key`` are supplied, the twin state and controller
+        warm-start are checkpointed into ``state[state_key]`` after every step so the
+        closed-loop session can be restored across workbench session boundaries via
+        :meth:`restore`.
         """
         meas = [np.asarray(m, dtype=float).ravel() for m in measurements]
         n_steps = len(meas)
@@ -332,6 +350,10 @@ class ClosedLoopMPCController:
             if warm_start.size != self.horizon * (self.n_u + self.n_x):
                 warm_start = None
 
+            # Checkpoint twin state + controller warm-start for session persistence.
+            if state is not None and state_key is not None:
+                state[state_key] = self.persist(warm_start=warm_start)
+
         return TwinControlReport(
             horizon=self.horizon,
             n_steps_applied=n_steps,
@@ -343,6 +365,49 @@ class ClosedLoopMPCController:
             all_constraints_satisfied=all_satisfied and len(all_violations) == 0,
             constraint_violations=all_violations,
         )
+
+    # -- session persistence ----------------------------------------------------
+    def persist(self, *, warm_start: np.ndarray | None = None) -> dict[str, Any]:
+        """Checkpoint twin state + controller warm-start into a serializable dict.
+
+        Suitable for storage in workbench session state and restoration via
+        :meth:`restore`.
+        """
+        return {
+            "twin_x": self.twin.x.tolist(),
+            "twin_P": self.twin.P.tolist(),
+            "horizon": self.horizon,
+            "warm_start": warm_start.tolist() if warm_start is not None else None,
+            "u_min": self.u_min.tolist(),
+            "u_max": self.u_max.tolist(),
+            "x_min": self.x_min.tolist(),
+            "x_max": self.x_max.tolist(),
+        }
+
+    @staticmethod
+    def restore(
+        twin: DigitalTwinEngine,
+        payload: dict[str, Any],
+    ) -> "ClosedLoopMPCController":
+        """Restore a controller from a :meth:`persist` payload, re-bound to ``twin``.
+
+        Re-instantiates the controller with the same bounds and warm-start so a
+        closed-loop session can resume across workbench session boundaries.
+        """
+        ctrl = ClosedLoopMPCController(
+            twin,
+            horizon=int(payload.get("horizon", 10)),
+            u_min=np.asarray(payload["u_min"], dtype=float),
+            u_max=np.asarray(payload["u_max"], dtype=float),
+            x_min=np.asarray(payload["x_min"], dtype=float),
+            x_max=np.asarray(payload["x_max"], dtype=float),
+        )
+        twin.x = np.asarray(payload["twin_x"], dtype=float)
+        twin.P = np.asarray(payload["twin_P"], dtype=float)
+        warm_start = (
+            np.asarray(payload["warm_start"], dtype=float) if payload.get("warm_start") is not None else None
+        )
+        return ctrl, warm_start
 
 
 def build_default_twin(

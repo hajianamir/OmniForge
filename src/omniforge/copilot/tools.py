@@ -526,14 +526,20 @@ class CopilotToolRegistry:
         ) -> dict[str, Any]:
             """Register active model to the MLOps Model Registry (Studio 11)."""
             from omniforge.api import workbench as wb
+            from omniforge.core.types import ModelStage
 
             state = self.memory.working_state
             model = state["models"].get("pareto_champion") or state["models"].get("automl_champion")
             if model is None:
                 raise ValueError("No trained model in Copilot memory. Run train_automl or pareto_automl first.")
+            try:
+                ms = ModelStage(stage)
+            except ValueError:
+                return {
+                    "error": f"Invalid model stage '{stage}'.",
+                    "available_stages": [s.value for s in ModelStage],
+                }
             reg = wb.get_tenant_registry()
-            from omniforge.core.types import ModelStage
-            ms = ModelStage(stage)
             ver = reg.register_model(
                 model=model, model_name=model_name, owner="copilot", intended_use="",
                 stage=ms,
@@ -549,9 +555,16 @@ class CopilotToolRegistry:
             from omniforge.api import workbench as wb
             from omniforge.core.types import ModelStage
 
+            try:
+                ms = ModelStage(stage)
+            except ValueError:
+                return {
+                    "error": f"Invalid model stage '{stage}'.",
+                    "available_stages": [s.value for s in ModelStage],
+                }
             reg = wb.get_tenant_registry()
             updated = reg.transition_stage(
-                model_name, version, ModelStage(stage), fairness_report=None,
+                model_name, version, ms, fairness_report=None,
             )
             return {"updated": updated.model_dump() if hasattr(updated, "model_dump") else dict(updated)}
 

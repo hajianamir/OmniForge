@@ -248,6 +248,153 @@ def test_twin_control_tool_deterministic():
     assert len(res["control_history"]) == 5
 
 
+# --------------------------------------------------------------------------- C5: temporal DAG orientation (Item 1)
+
+
+def _make_temporal_shifted_pair(n=600, seed=21):
+    """Reference+current with a time_col; 'source' shifts early, 'derived' shifts later."""
+    rng = np.random.default_rng(seed)
+    t = np.arange(n)
+    source = rng.normal(0.0, 1.0, n)
+    noise = rng.normal(0.0, 0.5, n)
+    derived = 0.6 * source + 0.4 * noise
+    ref = pd.DataFrame({"time": t, "source": source, "derived": derived, "noise": noise})
+    cur = ref.copy()
+    # source shifts at t>=300 (early window); derived shifts at t>=450 (later window).
+    cur.loc[t >= 300, "source"] += 1.5
+    cur.loc[t >= 450, "derived"] += 1.5
+    return ref, cur
+
+
+def test_temporal_dag_orientation():
+    ref, cur = _make_temporal_shifted_pair()
+    cd = CausalDiscovery(alpha=0.05, max_cond_set_size=2, random_seed=7)
+    parents = cd.discover(pd.concat([ref, cur], ignore_index=True), time_col="time")
+    nodes = set(parents)
+    assert "source" in nodes and "derived" in nodes
+    # source shifts earlier (t>=300) than derived (t>=450) -> source should be upstream.
+    assert "derived" not in parents.get("source", set())  # source is not a child of derived
+    for child, par_set in parents.items():
+        assert child not in par_set  # no self-loop
+        assert par_set <= nodes
+
+
+# --------------------------------------------------------------------------- C5: exact Delta-SHAP integration (Item 2)
+
+
+class _PredictProbaModel:
+    """Stub classifier with predict / predict_proba / task_type / classes_."""
+
+    def __init__(self, coef, intercept=0.0, classes_=(0, 1)):
+        self.coef = np.asarray(coef, dtype=float)
+        self.intercept = float(intercept)
+        self.task_type = __import__("omniforge.core.types", fromlist=["TaskType"]).TaskType.BINARY_CLASSIFICATION
+        self.classes_ = list(classes_)
+
+    def predict(self, X):
+        X = np.asarray(X, dtype=float)
+        return (X @ self.coef + self.intercept > 0).astype(int)
+
+    def predict_proba(self, X):
+        X = np.asarray(X, dtype=float)
+        z = X @ self.coef + self.intercept
+        p = 1.0 / (1.0 + np.exp(-z))
+        return np.column_stack([1.0 - p, p])
+
+
+def test_deltashap_integration():
+    rng = np.random.default_rng(31)
+    n, n_feat = 200, 5
+    X_bg = pd.DataFrame(rng.normal(0.0, 1.0, size=(n, n_feat)), columns=[f"f{i}" for i in range(n_feat)])
+    model = _PredictProbaModel(np.ones(n_feat))
+    ref = X_bg.sample(n=60, random_state=1)
+    cur = X_bg.sample(n=60, random_state=2)
+    # Shift f0 strongly in current so it shows Delta-SHAP attribution.
+    cur = cur.copy()
+    cur["f0"] = cur["f0"] + 2.0
+
+    report = DriftRootCauseAnalyzer(random_seed=7).analyze(
+        ref, cur, model=model, feature_cols=[f"f{i}" for i in range(n_feat)]
+    )
+    assert isinstance(report, RootCauseReport)
+    # Every drifted feature should carry a Delta-SHAP attribution.
+    for f in report.drifted_features:
+        assert f.abs_delta_prediction >= 0.0
+        assert isinstance(f.delta_prediction, float)
+    assert report.total_attribution >= 0.0
+
+
+# --------------------------------------------------------------------------- C7: MPC convergence fallback (Item 3)
+
+
+def test_mpc_convergence_fallback():
+    twin = build_default_twin(n_x=2, n_u=1, dt=1.0)
+    # Extremely tight control bound -> QP likely infeasible; controller must not crash.
+    ctrl = ClosedLoopMPCController(
+        twin, horizon=6, u_min=np.array([-1e-6]), u_max=np.array([1e-6]),
+        x_min=np.array([-10.0, -10.0]), x_max=np.array([10.0, 10.0]),
+    )
+    res = ctrl.solve(x0=np.array([100.0, 100.0]), r_path=np.zeros((6, 2)))
+    assert isinstance(res.success, bool)
+    assert isinstance(res.solver_message, str)
+    assert isinstance(res.constraint_violations, list)
+    assert res.state_trajectory.shape == (7, 2)
+
+
+# --------------------------------------------------------------------------- C7: twin persistence (Item 4)
+
+
+def test_twin_persistence():
+    twin = build_default_twin(n_x=2, n_u=1, dt=1.0)
+    ctrl = ClosedLoopMPCController(twin, horizon=6)
+    measurements = [np.zeros(2) for _ in range(4)]
+    ctrl.run_closed_loop(measurements, setpoint=np.array([1.0, 0.0]))
+
+    # Checkpoint twin state + controller warm-start.
+    snapshot = ctrl.persist(warm_start=None)
+    assert "twin_x" in snapshot and "twin_P" in snapshot
+    assert snapshot["horizon"] == 6
+
+    # Restore into a fresh twin/controller.
+    twin2 = build_default_twin(n_x=2, n_u=1, dt=1.0)
+    ctrl2, warm_start = ClosedLoopMPCController.restore(twin2, snapshot)
+    assert np.allclose(twin2.x, twin.x)
+    assert np.allclose(twin2.P, twin.P)
+    assert ctrl2.horizon == 6
+
+
+# --------------------------------------------------------------------------- C4: structured error handling (Item 5)
+
+
+def test_register_model_invalid_stage():
+    from omniforge.copilot import CopilotToolRegistry
+    from omniforge.copilot.memory import CopilotMemory
+
+    mem = CopilotMemory()
+    reg = CopilotToolRegistry(mem)
+    # No trained model -> ValueError (existing behavior preserved).
+    with pytest.raises(ValueError):
+        reg.invoke("register_model", {"model_name": "m", "stage": "Staging"})
+    # Inject a model, then invalid stage -> structured error (not raised).
+    mem.set_model("m", _PredictShiftModel())
+    res = reg.invoke("register_model", {"model_name": "m", "stage": "NotAStage"})
+    assert "error" in res
+    assert "available_stages" in res
+    assert "Staging" in res["available_stages"]
+
+
+def test_promote_model_invalid_stage():
+    from omniforge.copilot import CopilotToolRegistry
+    from omniforge.copilot.memory import CopilotMemory
+
+    mem = CopilotMemory()
+    reg = CopilotToolRegistry(mem)
+    res = reg.invoke("promote_model", {"model_name": "m", "version": 1, "stage": "NotAStage"})
+    assert "error" in res
+    assert "available_stages" in res
+    assert "Production" in res["available_stages"]
+
+
 # --------------------------------------------------------------------------- version alignment
 
 
