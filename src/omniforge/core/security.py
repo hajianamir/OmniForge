@@ -356,6 +356,7 @@ class DataFramePIIGuard:
                 action=action,
                 resource_type="dataframe",
                 resource_id=self.tenant_id,
+                tenant_id=self.tenant_id,
                 actor="system",
                 role="admin",
                 status="success",
