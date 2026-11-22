@@ -77,7 +77,7 @@ const ICONS: Record<StudioId, React.ReactNode> = {
 
 const EMPTY_WS: WorkspaceState = {
   session_id: 'default',
-  platform: { name: 'OmniForge', version: '3.2.0', edition: 'Enterprise' },
+  platform: { name: 'OmniForge', version: '3.3.0', edition: 'Enterprise' },
   has_dataset: false,
   dataset_name: null,
   dataset_source: null,
@@ -300,7 +300,7 @@ export const App: React.FC = () => {
           <div className="brand-mark">Ω</div>
           <div>
             <span>{ws.platform?.name || 'OmniForge'}</span>
-            <span className="badge badge-accent" style={{ marginLeft: 8 }}>v{ws.platform?.version || '3.2.0'} · Enterprise</span>
+            <span className="badge badge-accent" style={{ marginLeft: 8 }}>v{ws.platform?.version || '3.3.0'} · Enterprise</span>
           </div>
         </div>
 

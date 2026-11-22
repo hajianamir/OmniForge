@@ -167,7 +167,7 @@ def test_sbom_generate_verify_deterministic() -> None:
     assert doc_a == doc_b  # byte-deterministic (timestamp derived from lockfile hash)
     assert doc_a["bomFormat"] == "CycloneDX"
     assert doc_a["specVersion"] == "1.5"
-    assert doc_a["metadata"]["component"]["version"] == "3.2.0"
+    assert doc_a["metadata"]["component"]["version"] == "3.3.0"
 
     props = {p["name"]: p["value"] for p in doc_a["metadata"]["properties"]}
     assert props["omniforge:lockfile:name"] == "everything.lock"

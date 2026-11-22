@@ -1,4 +1,4 @@
-# OmniForge v3.2.0 — Complete Enterprise User Guide & Analytical Reference
+# OmniForge v3.3.0 — Complete Enterprise User Guide & Analytical Reference
 
 ## 1. System Requirements
 

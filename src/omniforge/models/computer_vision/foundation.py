@@ -47,7 +47,7 @@ def probe_vision_backends() -> dict[str, Any]:
             {"id": "ultralytics", "name": "Ultralytics YOLO (Object Detection / Seg)", "available": is_package_available("ultralytics"), "version": _ver("ultralytics")},
             {"id": "transformers", "name": "HuggingFace Vision Transformers", "available": is_package_available("transformers"), "version": _ver("transformers")},
             {"id": "cv2", "name": "OpenCV", "available": is_package_available("cv2"), "version": _ver("opencv-python")},
-            {"id": "native_pyramid", "name": "OmniForge Spatial-Pyramid HOG+LBP+Gabor+HSV (Offline Always-On)", "available": True, "version": "3.2.0"},
+            {"id": "native_pyramid", "name": "OmniForge Spatial-Pyramid HOG+LBP+Gabor+HSV (Offline Always-On)", "available": True, "version": "3.3.0"},
         ],
     }
 

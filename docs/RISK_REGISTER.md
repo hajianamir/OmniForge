@@ -1,6 +1,6 @@
 # OmniForge Risk Register — NIST AI RMF (AI 100-1) Mapping
 
-**Scope:** OmniForge v3.2.0 platform (API, workbench SPA, 18 industry domain plugins, AutoML/MLOps,
+**Scope:** OmniForge v3.3.0 platform (API, workbench SPA, 18 industry domain plugins, AutoML/MLOps,
 responsible-AI modules, packaging/installer). **Framework:** NIST AI Risk Management Framework 1.0
 (GOVERN / MAP / MEASURE / MANAGE) and its trustworthy-AI characteristics. **Source of findings:**
 internal audit ([docs/AUDIT_REPORT.md](AUDIT_REPORT.md)) plus standing operational risks.

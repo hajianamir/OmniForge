@@ -1,4 +1,4 @@
-"""OmniForge v3.2.0 — Enterprise Analytics & AI Workbench (OmniForge SDK).
+"""OmniForge v3.3.0 — Enterprise Analytics & AI Workbench (OmniForge SDK).
 
 Unified end-to-end Python SDK for multi-source data ingestion, automatic format auditing,
 cleaning with deleted-row provenance, quality profiling, automated EDA, feature engineering,
