@@ -116,7 +116,7 @@ def test_feature_store_purge_expired_features(tmp_path: Path) -> None:
         }
     )
     store.register_feature_view(
-        "purge_view", df, join_keys=["entity_id"], timestamp_column="event_ts", ttl_seconds=60, materialize_online=True
+        "purge_view", df, join_keys=["entity_id"], timestamp_column="event_ts", ttl_seconds=86400 * 15, materialize_online=True
     )
 
     rep = store.purge_expired_features(as_of=recent + timedelta(days=1))

@@ -1120,47 +1120,78 @@ class ModelEquationExtractor:
             n_heads = int(getattr(model, "n_heads", 4))
             n_layers = int(getattr(model, "n_layers", 2))
             d_k = max(1, d_model // max(1, n_heads))
-            tok_w = getattr(model, "_token_w", None)
+
+            # Resolve weights from either the PyTorch backend (model._torch_net)
+            # or the pure-NumPy fallback (model._np_params).
+            tok_w = tok_b = None
+            blocks = None
+            head_w = head_b = None
+            torch_net = getattr(model, "_torch_net", None)
+            if torch_net is not None:
+                tok_w = getattr(torch_net, "feat_w", None)
+                tok_b = getattr(torch_net, "feat_b", None)
+                blocks = list(getattr(torch_net, "blocks", []) or [])
+                head_mod = getattr(torch_net, "head", None)
+                if head_mod is not None and hasattr(head_mod, "weight"):
+                    head_w = head_mod.weight
+                    head_b = head_mod.bias
+            else:
+                np_params = getattr(model, "_np_params", None) or {}
+                tok_w = np_params.get("token_w")
+                tok_b = np_params.get("token_b")
+                head_w = np_params.get("W_head")
+                head_b = np_params.get("b_head")
+
             if tok_w is not None:
-                total_params += int(np.asarray(tok_w).size)
+                tok_w = np.asarray(tok_w, dtype=float)
+                total_params += int(tok_w.size)
                 layer_rows.append(
                     {
                         "Layer": "Feature Tokenizer",
                         "Weight Shape": f"{tok_w.shape[0]} features -> d_model={d_model}",
                         "Activation": "Linear Token Projection",
-                        "Parameters": int(np.asarray(tok_w).size),
+                        "Parameters": int(tok_w.size),
                         "||W||_F": round(float(np.linalg.norm(tok_w)), 4),
-                        "||b||_2": round(float(np.linalg.norm(getattr(model, "_token_b", 0.0))), 4),
+                        "||b||_2": round(float(np.linalg.norm(np.asarray(tok_b, dtype=float) if tok_b is not None else 0.0)), 4),
                     }
                 )
-            for b_i, blk in enumerate(getattr(model, "_blocks", []), start=1):
-                blk_p = sum(int(np.asarray(v).size) for v in blk.values())
-                total_params += blk_p
-                layer_rows.append(
-                    {
-                        "Layer": f"Transformer Block {b_i}",
-                        "Weight Shape": f"d_model={d_model}, heads={n_heads} (d_k={d_k})",
-                        "Activation": "MHA + LayerNorm + GELU FFN",
-                        "Parameters": blk_p,
-                        "||W||_F": round(float(np.linalg.norm(blk.get("wq", 0.0))), 4),
-                        "||b||_2": 0.0,
-                    }
-                )
-            head = getattr(model, "_head", None)
-            if head is not None and hasattr(head, "_weights"):
-                for h_i, (w, b) in enumerate(zip(head._weights, head._biases, strict=False), start=1):
-                    n_p = int(np.asarray(w).size + np.asarray(b).size)
-                    total_params += n_p
+            if blocks:
+                for b_i, blk in enumerate(blocks, start=1):
+                    blk_p = 0
+                    wq = 0.0
+                    if hasattr(blk, "attn") and hasattr(blk.attn, "in_proj_weight"):
+                        wq = blk.attn.in_proj_weight
+                        blk_p += int(np.asarray(wq).size)
+                    if hasattr(blk, "ffn_in") and hasattr(blk.ffn_in, "weight"):
+                        blk_p += int(np.asarray(blk.ffn_in.weight).size)
+                    if hasattr(blk, "ffn_out") and hasattr(blk.ffn_out, "weight"):
+                        blk_p += int(np.asarray(blk.ffn_out.weight).size)
+                    total_params += blk_p
                     layer_rows.append(
                         {
-                            "Layer": f"Prediction Head {h_i}",
-                            "Weight Shape": f"{w.shape[0]} -> {w.shape[1]}",
-                            "Activation": "ReLU" if h_i < len(head._weights) else ("Softmax" if is_clf else "Linear"),
-                            "Parameters": n_p,
-                            "||W||_F": round(float(np.linalg.norm(w)), 4),
-                            "||b||_2": round(float(np.linalg.norm(b)), 4),
+                            "Layer": f"Transformer Block {b_i}",
+                            "Weight Shape": f"d_model={d_model}, heads={n_heads} (d_k={d_k})",
+                            "Activation": "MHA + LayerNorm + GELU FFN",
+                            "Parameters": blk_p,
+                            "||W||_F": round(float(np.linalg.norm(np.asarray(wq, dtype=float))), 4) if wq is not None else 0.0,
+                            "||b||_2": 0.0,
                         }
                     )
+            if head_w is not None:
+                head_w = np.asarray(head_w, dtype=float)
+                head_b = np.asarray(head_b, dtype=float) if head_b is not None else np.zeros((head_w.shape[1],), dtype=float)
+                n_p = int(head_w.size + head_b.size)
+                total_params += n_p
+                layer_rows.append(
+                    {
+                        "Layer": "Prediction Head",
+                        "Weight Shape": f"{head_w.shape[0]} -> {head_w.shape[1]}",
+                        "Activation": "Softmax" if is_clf else "Linear",
+                        "Parameters": n_p,
+                        "||W||_F": round(float(np.linalg.norm(head_w)), 4),
+                        "||b||_2": round(float(np.linalg.norm(head_b)), 4),
+                    }
+                )
             arch_plain.extend(
                 [
                     f"Feature Tokenization:  T_j = z_j * w_j + b_j   (each scalar feature mapped into R^{d_model})",
