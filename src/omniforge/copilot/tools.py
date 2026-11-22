@@ -392,8 +392,9 @@ class CopilotToolRegistry:
             if measurements is None:
                 import numpy as np
                 rng = np.random.default_rng(1234)
-                measurements = [rng.normal(0.0, 0.5, size=n_x) for _ in range(n_steps)]
-            meas = [np.asarray(m, dtype=float) for m in measurements][:n_steps]
+                meas = [rng.normal(0.0, 0.5, size=n_x) for _ in range(n_steps)][:n_steps]
+            else:
+                meas = [np.asarray(m, dtype=float) for m in measurements][:n_steps]
             sp = None
             if setpoint:
                 sp = np.asarray(setpoint, dtype=float).ravel()[:n_x]

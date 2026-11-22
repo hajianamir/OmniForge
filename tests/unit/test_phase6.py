@@ -27,21 +27,17 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from omniforge.core.contracts import LeakageGuard
 from omniforge.mlops.drift import DriftDetector
 from omniforge.mlops.root_cause import (
     CausalDiscovery,
     DriftRootCauseAnalyzer,
-    DriftedFeature,
     RootCauseReport,
 )
 from omniforge.simulation import (
     ClosedLoopMPCController,
-    DigitalTwinEngine,
     TwinControlReport,
     build_default_twin,
 )
-
 
 # --------------------------------------------------------------------------- C5: root cause
 
@@ -368,14 +364,16 @@ def test_twin_persistence():
 def test_register_model_invalid_stage():
     from omniforge.copilot import CopilotToolRegistry
     from omniforge.copilot.memory import CopilotMemory
+    from omniforge.core.exceptions import CopilotError
 
     mem = CopilotMemory()
     reg = CopilotToolRegistry(mem)
-    # No trained model -> ValueError (existing behavior preserved).
-    with pytest.raises(ValueError):
+    # No trained model -> CopilotError (invoke wraps handler exceptions).
+    with pytest.raises(CopilotError):
         reg.invoke("register_model", {"model_name": "m", "stage": "Staging"})
-    # Inject a model, then invalid stage -> structured error (not raised).
-    mem.set_model("m", _PredictShiftModel())
+    # Inject a model under the key tool_register_model looks up, then
+    # invalid stage -> structured error (not raised).
+    mem.set_model("automl_champion", _PredictShiftModel())
     res = reg.invoke("register_model", {"model_name": "m", "stage": "NotAStage"})
     assert "error" in res
     assert "available_stages" in res

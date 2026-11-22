@@ -204,7 +204,9 @@ class ClosedLoopMPCController:
             }
         ]
 
-        def _solve_with_bounds(u_lo: np.ndarray, u_hi: np.ndarray, x_lo: np.ndarray, x_hi: np.ndarray):
+        def _solve_with_bounds(
+            u_lo: np.ndarray, u_hi: np.ndarray, x_lo: np.ndarray, x_hi: np.ndarray
+        ) -> Any:
             bds = []
             for _ in range(H):
                 bds.extend(list(zip(u_lo, u_hi, strict=False)))
@@ -388,7 +390,7 @@ class ClosedLoopMPCController:
     def restore(
         twin: DigitalTwinEngine,
         payload: dict[str, Any],
-    ) -> "ClosedLoopMPCController":
+    ) -> tuple[ClosedLoopMPCController, np.ndarray | None]:
         """Restore a controller from a :meth:`persist` payload, re-bound to ``twin``.
 
         Re-instantiates the controller with the same bounds and warm-start so a
@@ -423,7 +425,7 @@ def build_default_twin(
         x_{k+1} = [1 dt; 0 1] x_k + [0.5 dt^2; dt] u_k + w
         y_k     = [1 0] x_k + v
     """
-    rng = np.random.default_rng(random_seed)
+    np.random.default_rng(random_seed)
     A = np.array([[1.0, dt], [0.0, 1.0]], dtype=float)
     B = np.array([[0.5 * dt * dt], [dt]], dtype=float)
     H = np.array([[1.0, 0.0]], dtype=float)

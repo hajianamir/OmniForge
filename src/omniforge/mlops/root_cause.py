@@ -171,7 +171,7 @@ class CausalDiscovery:
         if len(numeric_cols) < 2:
             return {c: set() for c in numeric_cols}
 
-        rng = np.random.default_rng(self.random_seed)
+        np.random.default_rng(self.random_seed)
         cols = list(numeric_cols)
 
         # ---- PC skeleton -------------------------------------------------------
@@ -239,7 +239,11 @@ class CausalDiscovery:
                 det = DriftDetector()
                 for c in cols:
                     rep = det.detect(early[[c]], late[[c]])
-                    drift[c] = rep.features[0].psi if rep.features else 0.0
+                    drift[c] = (
+                        float(rep.features[0].psi)
+                        if rep.features and rep.features[0].psi is not None
+                        else 0.0
+                    )
             except Exception:  # pragma: no cover - defensive
                 drift = {c: float(df[c].std()) for c in cols}
 
@@ -357,7 +361,7 @@ class DriftRootCauseAnalyzer:
         Returns a :class:`RootCauseReport` with root-cause / symptom classification
         and remediation prescriptions.
         """
-        rng = np.random.default_rng(self.random_seed)
+        np.random.default_rng(self.random_seed)
 
         # ---- feature selection -----------------------------------------------
         all_cols = [c for c in reference_df.columns if c in current_df.columns]
@@ -472,8 +476,12 @@ class DriftRootCauseAnalyzer:
             prescriptions.append("No material drift detected; no remediation required.")
         else:
             for rc in root_causes:
-                fres = drift_map.get(rc)
-                psi_str = f"PSI={fres.psi:.3f}" if fres and fres.psi is not None else "PSI=n/a"
+                drift_result: FeatureDriftResult | None = drift_map.get(rc)
+                psi_str = (
+                    f"PSI={drift_result.psi:.3f}"
+                    if drift_result is not None and drift_result.psi is not None
+                    else "PSI=n/a"
+                )
                 attr = attributions.get(rc, 0.0)
                 prescriptions.append(
                     f"ROOT CAUSE '{rc}' ({psi_str}): investigate upstream sensor/source "
@@ -481,7 +489,6 @@ class DriftRootCauseAnalyzer:
                     f"check calibration, sensor drift, or upstream ETL change."
                 )
             for sym in symptoms:
-                fres = drift_map.get(sym)
                 anc = ", ".join(
                     sorted(CausalDiscovery.upstream_ancestors(parents, sym) & drifted_set)
                 )
