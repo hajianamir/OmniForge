@@ -365,8 +365,8 @@ class OmniForgeCopilotAgent:
         elif any(k in msg for k in ("list studios", "studios", "studio overview")):
             res = self.tools.invoke("list_studios", {})
             executed.append({"tool": "list_studios", "arguments": {}, "result": res})
-            names = ", ".join(s["name"] for s in res.get("studios", []))
-            reply_parts.append(f"OmniForge Workbench has {res.get('count', 0)} studios: {names}.")
+            studio_names = ", ".join(s["name"] for s in res.get("studios", []))
+            reply_parts.append(f"OmniForge Workbench has {res.get('count', 0)} studios: {studio_names}.")
             next_steps = ["Open a studio in the Workbench UI", "Run a studio endpoint via API"]
 
         else:

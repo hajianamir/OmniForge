@@ -862,6 +862,7 @@ def s09_twin_control(
             "stage_costs": report.stage_costs,
         },
     }
+    wb = _wb()
     wb.record_lineage(
         state,
         "Studio 09 Twin Control",

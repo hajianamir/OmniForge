@@ -19,7 +19,7 @@ try:
 
     _HAS_STRUCTLOG = True
 except ImportError:
-    structlog = None  # type: ignore[assignment]
+    structlog = None
     _HAS_STRUCTLOG = False
 
 _TRACE_ID_CTX: contextvars.ContextVar[str] = contextvars.ContextVar(

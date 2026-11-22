@@ -255,7 +255,7 @@ ignore_missing_imports = true
 # where fastapi is actually installed (advanced tier / CI) the decorator typing resolves and
 # these overrides are inert.
 [[tool.mypy.overrides]]
-module = ["omniforge.api.*", "omniforge.ui.*"]
+module = ["omniforge.api.*", "omniforge.cli.*", "omniforge.ui.*"]
 disallow_untyped_decorators = false
 
 [tool.ruff]
