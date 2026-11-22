@@ -26,7 +26,7 @@ from omniforge.version import get_version_info
 def test_version_and_exception_hierarchy() -> None:
     info = get_version_info()
     assert info["name"] == "OmniForge"
-    assert info["version"] == "3.3.0"
+    assert info["version"] == "4.0.0"
     err = DataIngestionError("Bad CSV", context={"path": "x.csv"}, suggestions=["Check delimiter"])
     payload = err.to_dict()
     assert payload["error_code"].startswith("OmniForge-")

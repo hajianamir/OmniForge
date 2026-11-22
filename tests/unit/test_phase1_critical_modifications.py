@@ -44,15 +44,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_version_3_0_0_consistency() -> None:
-    """Verify canonical v3.3.0 semantic version across SDK, pyproject.toml, and SPA manifest."""
-    assert omniforge.__version__ == "3.3.0"
-    assert get_version_info()["version"] == "3.3.0"
+    """Verify canonical v4.0.0 semantic version across SDK, pyproject.toml, and SPA manifest."""
+    assert omniforge.__version__ == "4.0.0"
+    assert get_version_info()["version"] == "4.0.0"
 
     pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert pyproject["project"]["version"] == "3.3.0"
+    assert pyproject["project"]["version"] == "4.0.0"
 
     pkg_json = json.loads((REPO_ROOT / "frontend" / "package.json").read_text(encoding="utf-8"))
-    assert pkg_json["version"] == "3.3.0"
+    assert pkg_json["version"] == "4.0.0"
 
     assert omniforge.RidgeLinearBaseline is RidgeLinearBaseline
     assert omniforge.LassoLinearBaseline is LassoLinearBaseline

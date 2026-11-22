@@ -16,6 +16,9 @@ import pandas as pd
 from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
+from omniforge.api.studios.schemas import TwinControlReq
+from omniforge.simulation import ClosedLoopMPCController, build_default_twin
+
 router: APIRouter = APIRouter(tags=["workbench-s09"])
 
 _DEFAULT_NLP_TEXTS: list[str] = [
@@ -779,4 +782,91 @@ def s09_survival(req: SurvivalReq, x_session_id: str | None = Header(default="de
     }
     wb.record_lineage(state, "Studio 09 Survival", f"Kaplan-Meier + CoxPH on durations='{duration_col}' events='{event_col}'", f"n={len(work)} events={int(events.sum())}")
     payload: dict[str, Any] = wb._cache_and_respond(state, sid, "s09_survival", result)
+    return payload
+
+
+# --------------------------------------------------------------------------- Phase 6 C7: Closed-Loop Digital Twin MPC
+
+
+@router.post("/s09/twin-control")
+def s09_twin_control(
+    req: TwinControlReq,
+    x_session_id: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Run closed-loop MPC on a linear Digital Twin (receding-horizon control).
+
+    Solves the constrained quadratic program at each step, applies the first control
+    action, assimilates the next measurement, and repeats. Returns trajectory charts
+    suitable for the interactive Studio 09 twin-control panel.
+    """
+    sid = _wb()._sid(x_session_id or "default")
+    state = _wb().get_session_state(sid)
+
+    # Build a default or state-cached twin.
+    twin = state.get("uap_digital_twin")
+    if twin is None:
+        twin = build_default_twin(n_x=req.n_x, n_u=req.n_u, dt=req.dt)
+        state["uap_digital_twin"] = twin
+
+    controller = ClosedLoopMPCController(
+        twin,
+        horizon=req.horizon,
+        Q=np.diag(req.Q_diag) if req.Q_diag else None,
+        R=np.diag(req.R_diag) if req.R_diag else None,
+        u_min=np.asarray(req.u_min, dtype=float) if req.u_min else None,
+        u_max=np.asarray(req.u_max, dtype=float) if req.u_max else None,
+        x_min=np.asarray(req.x_min, dtype=float) if req.x_min else None,
+        x_max=np.asarray(req.x_max, dtype=float) if req.x_max else None,
+        random_seed=42,
+    )
+
+    # Deterministic measurement stream if none supplied.
+    if req.measurements:
+        measurements = [np.asarray(m, dtype=float) for m in req.measurements]
+        if len(measurements) < req.n_steps:
+            # Tile to required length.
+            rng = np.random.default_rng(7)
+            while len(measurements) < req.n_steps:
+                measurements.append(measurements[-1] + rng.normal(0, 0.05, size=req.n_x))
+        measurements = measurements[: req.n_steps]
+    else:
+        rng = np.random.default_rng(1234)
+        measurements = [rng.normal(0.0, 0.5, size=req.n_x) for _ in range(req.n_steps)]
+
+    setpoint = None
+    if req.setpoint:
+        sp = np.asarray(req.setpoint, dtype=float).ravel()
+        if sp.size >= req.n_x:
+            setpoint = sp[: req.n_x]
+        else:
+            setpoint = np.pad(sp, (0, req.n_x - sp.size), mode="edge")
+
+    report = controller.run_closed_loop(measurements, setpoint=setpoint)
+
+    # Cache a copy of the controller for warm-start continuation.
+    state["uap_mpc_controller"] = controller
+    state["uap_twin_control_report"] = report.model_dump()
+
+    result = {
+        "twin_control": report.model_dump(),
+        "twin_dimensions": {"n_x": req.n_x, "n_u": req.n_u},
+        "horizon": req.horizon,
+        "n_steps_applied": report.n_steps_applied,
+        "all_constraints_satisfied": report.all_constraints_satisfied,
+        "constraint_violations": report.constraint_violations,
+        "total_cost": report.total_cost,
+        "trajectory_chart": {
+            "state_trajectory": report.state_trajectory,
+            "control_history": report.control_history,
+            "setpoint": report.setpoint,
+            "stage_costs": report.stage_costs,
+        },
+    }
+    wb.record_lineage(
+        state,
+        "Studio 09 Twin Control",
+        f"Closed-loop MPC (H={req.horizon}, {report.n_steps_applied} steps)",
+        f"Constraints satisfied={report.all_constraints_satisfied}, total_cost={report.total_cost:.4f}",
+    )
+    payload: dict[str, Any] = wb._cache_and_respond(state, sid, "s09_twin_control", result)
     return payload

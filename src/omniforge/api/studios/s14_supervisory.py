@@ -13,6 +13,7 @@ import pandas as pd
 from fastapi import APIRouter, File, Form, Header, HTTPException, Response, UploadFile
 
 from omniforge.api.studios.schemas import (
+    RootCauseReq,
     SupervisoryAccessReq,
     SupervisoryDemoReq,
     SupervisoryQuickTrainReq,
@@ -20,6 +21,7 @@ from omniforge.api.studios.schemas import (
     SupervisorySQLReq,
     wb_cache_and_respond,
 )
+from omniforge.mlops.root_cause import DriftRootCauseAnalyzer
 from omniforge.core.types import TaskType
 from omniforge.core.utils import to_json_object
 from omniforge.data.ingestion import DataIngestionEngine
@@ -463,6 +465,37 @@ def s14_evaluate_single(req: SupervisorySingleReq, x_session_id: str | None = He
         max_batch_breach_rate_pct=req.max_batch_breach_rate_pct,
         min_classification_accuracy_pct=req.min_classification_accuracy_pct,
     )
+
+
+@router.post("/s14/root-cause")
+def s14_root_cause(
+    req: RootCauseReq, x_session_id: str | None = Header(default="default")
+) -> dict[str, Any]:
+    """C5 causal drift root-cause attribution in the Supervisory studio (live telemetry vs reference)."""
+    sid = _wb()._sid(x_session_id)
+    state = get_session_state(sid)
+    df = get_analysis_dataframe(state, _wb()._require_df(state))
+    num_df = df.select_dtypes(include=[np.number]).dropna()
+    if len(num_df) < 20:
+        raise HTTPException(status_code=400, detail="Root-cause analysis requires at least 20 numeric rows.")
+    cut = max(5, min(len(num_df) - 5, int(len(num_df) * 0.5)))
+    ref_df = num_df.iloc[:cut]
+    cur_df = num_df.iloc[cut:]
+    model = state.get("uap_active_model")
+    feat_cols = list(state.get("uap_active_feature_cols") or num_df.columns)
+    analyzer = DriftRootCauseAnalyzer(
+        psi_warning=req.psi_warning,
+        psi_critical=req.psi_critical,
+        max_cond_set_size=req.max_cond_set_size,
+    )
+    report = analyzer.analyze(
+        ref_df, cur_df, model=model, feature_cols=feat_cols,
+        target_col=req.target_col, time_col=req.time_col,
+    )
+    payload = wb_cache_and_respond(
+        state, sid, "s14_root_cause", {"root_cause_report": report.model_dump()}
+    )
+    return payload
 
 
 @router.get("/s14/export/{fmt}")

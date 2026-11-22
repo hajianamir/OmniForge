@@ -1425,7 +1425,7 @@ class ReportExporters:
             "from fastapi import FastAPI\n"
             "from pydantic import BaseModel\n\n"
             "from omniforge.models.base import BaseOmniForgeModel\n\n"
-            f"app = FastAPI(title={service_name!r}, version='3.3.0')\n"
+            f"app = FastAPI(title={service_name!r}, version='4.0.0')\n"
             f"MODEL = BaseOmniForgeModel.load({art_name!r})\n\n\n"
             "class PredictRequest(BaseModel):\n"
             "    records: list[dict[str, Any]]\n\n\n"

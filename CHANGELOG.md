@@ -1,12 +1,11 @@
 # Changelog
 
-## [3.3.0] - 2026-11-22
+## [4.0.0] - 2026-11-22
 ### Added
-- **Phase 5 — Security hardening & audit-chain completeness:** AuditLogger v2 with full-payload SHA-256 hash chain (all forensic fields including `role`, `trace_id`, `details`) + domain-separated HMAC-SHA256 MAC (`chain_mac`) with no legacy bypass path; optional RFC 9162-style out-of-band checkpoint anchors; flip-one-character tamper detection tests.
-- **Phase 5 — BOLA / IDOR prevention:** Workbench session IDs now bound to authenticated `(tenant_id, subject)` via namespaced `ws:<owner_tag>:<sid>` keys; cross-session data exposure eliminated.
-- **Phase 5 — App-level browser hardening:** Content-Security-Policy (Report-Only) + Strict-Transport-Security headers on the main FastAPI surface.
-- **Phase 5 — Data-quality contract:** None-safe `timeliness` in 6D quality reporting; duplicate `proxy_accuracy` alias removed; full DataFrame fingerprint via `pd.util.hash_pandas_object` (no row subsampling / cache poisoning).
-- **Phase 5 — CI completeness:** Full test suite (`pytest -q tests`) plus dedicated e2e job; no longer limited to 2 test files.
+- **Phase 6 — C5 Causal Drift Root-Cause Attribution:** `DriftRootCauseAnalyzer` (`omniforge/mlops/root_cause.py`) connects `DriftDetector` PSI/Wasserstein shifts with Delta-attribution per drifted feature and `CausalDiscovery` structural DAG upstream-ancestor traversal to isolate root-cause upstream sensor/source shifts from downstream correlated symptoms; remediation prescriptions emitted in Studios 11 (`/s11/root-cause`) and 14 (`/s14/root-cause`).
+- **Phase 6 — C7 Closed-Loop Digital Twin MPC:** `ClosedLoopMPCController` (`omniforge/simulation/closed_loop.py`) solves constrained receding-horizon quadratic control `argmin ||Hx̂−r||_Q² + ||u||_R²` subject to `u_min ≤ u ≤ u_max` and state safety bounds via `scipy.optimize.minimize` (SLSQP); exposed via `POST /s09/twin-control` with interactive trajectory charts.
+- **Phase 6 — C4 Air-Gapped Deterministic Copilot:** `CopilotToolRegistry` + `OmniForgeCopilotAgent._chat_local_planner` expanded with 12 new deterministic offline tools spanning all 15 Studios: intake/PII auditing (`pii_audit`), Split Lock enforcement (`split_lock`), honest data cleaning, 18-domain validation (`domain_validate`), Green-AI Pareto AutoML (`pareto_automl`), causal root-cause diagnosis (`root_cause_diagnosis`), closed-loop twin control (`twin_control`), model register/promote, and studio listing/overview.
+- **Version bump:** Canonical SemVer 3.3.0 → 4.0.0 across SDK, pyproject.toml, native hubs, exporters, SPA manifests, and tests.
 
 ## [3.2.0] - 2026-11-21
 ### Added

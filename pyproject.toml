@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omniforge"
-version = "3.3.0"
+version = "4.0.0"
 description = "OmniForge — Enterprise-grade, domain-agnostic Analytics & AI Workbench for Data Science, Machine Learning, Deep Learning, Forecasting, Causal Inference, Optimization, Simulation, MLOps, Responsible AI, and Decision Intelligence."
 readme = "README.md"
 license = "Apache-2.0"

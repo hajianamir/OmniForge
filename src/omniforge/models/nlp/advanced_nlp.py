@@ -59,7 +59,7 @@ def probe_nlp_backends() -> list[dict[str, Any]]:
         {"id": "transformers", "name": "HuggingFace Transformers (Zero-Shot / QA / BART / NER)", "available": is_package_available("transformers"), "version": _ver("transformers")},
         {"id": "sentence_transformers", "name": "Sentence-Transformers (Dense Semantic Embeddings)", "available": is_package_available("sentence_transformers"), "version": _ver("sentence-transformers")},
         {"id": "spacy", "name": "spaCy Industrial NLP", "available": is_package_available("spacy"), "version": _ver("spacy")},
-            {"id": "native_nlp", "name": "OmniForge Advanced NLP Suite (Offline Always-On)", "available": True, "version": "3.3.0"},
+            {"id": "native_nlp", "name": "OmniForge Advanced NLP Suite (Offline Always-On)", "available": True, "version": "4.0.0"},
     ]
 
 

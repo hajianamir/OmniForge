@@ -1,4 +1,4 @@
-# OmniForge — Enterprise Analytics & AI Workbench v3.3.0
+# OmniForge — Enterprise Analytics & AI Workbench v4.0.0
 
 **OmniForge** is a production-grade, enterprise-scale, modular Python 3.12+ (3.12–3.15) platform that unifies the complete data-to-decision lifecycle — from multi-source ingestion and 6-dimensional data quality profiling to automated EDA, leakage-safe feature engineering, baseline-first modeling, deep learning, time-series forecasting, causal inference, mathematical optimization, simulation, responsible AI, AutoML, DAG orchestration, MLOps, an AI Copilot, 18 industry domain plugins, a FastAPI backend, a **FastAPI + React/Vite TypeScript Enterprise Workbench** (pre-compiled, code-split SPA — ~63 KB gzipped for the initial entry graph, with vendor libraries and each studio group lazy-loaded on demand — featuring 60fps Canvas plots, a server-side paginated grid, GZip compression & zero Node.js at runtime), a Typer CLI, and one-click executive reporting.
 

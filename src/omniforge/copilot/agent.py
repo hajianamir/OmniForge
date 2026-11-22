@@ -290,15 +290,96 @@ class OmniForgeCopilotAgent:
             )
             next_steps = ["Explain model with SHAP/LIME", "Audit fairness & robustness", "Register model to Production"]
 
+        elif any(k in msg for k in ("root cause", "root-cause", "drift attribution", "causal drift")):
+            _ensure_dataset("classification")
+            ref_name = "reference_dataset"
+            cur_name = "current_dataset"
+            if ref_name not in self.memory.working_state["datasets"]:
+                self.tools.invoke("generate_demo_data", {"task": "classification", "n_samples": 240, "dataset_name": ref_name})
+            if cur_name not in self.memory.working_state["datasets"]:
+                self.tools.invoke("generate_demo_data", {"task": "classification", "n_samples": 240, "dataset_name": cur_name})
+            res = self.tools.invoke("root_cause_diagnosis", {"reference_dataset": ref_name, "current_dataset": cur_name})
+            executed.append({"tool": "root_cause_diagnosis", "arguments": {"reference_dataset": ref_name, "current_dataset": cur_name}, "result": res})
+            rc = res.get("root_causes", [])
+            sym = res.get("symptoms", [])
+            rx = res.get("remediation_prescriptions", [])
+            reply_parts.append(
+                f"C5 Causal Drift Root-Cause (status={res.get('overall_status')}): "
+                f"root causes={rc or 'none isolated'}, symptoms={sym or 'none'}. "
+                + (" " + " ".join(rx[:3]) if rx else "")
+            )
+            next_steps = ["Remediate upstream root-cause sensors/feeds", "Re-run drift check after remediation", "Register updated model"]
+
+        elif any(k in msg for k in ("twin control", "mpc", "closed-loop", "closed loop", "receding horizon", "digital twin control")):
+            res = self.tools.invoke("twin_control", {"n_x": 2, "n_u": 1, "horizon": 10, "n_steps": 8, "dt": 1.0})
+            executed.append({"tool": "twin_control", "arguments": {"n_x": 2, "n_u": 1, "horizon": 10, "n_steps": 8, "dt": 1.0}, "result": res})
+            reply_parts.append(
+                f"C7 Closed-Loop Twin MPC: {res['n_steps_applied']} steps applied, "
+                f"constraints satisfied={res['all_constraints_satisfied']}, total cost={res['total_cost']:.4f}."
+            )
+            next_steps = ["Inspect trajectory chart", "Tighten state safety bounds", "Export control log"]
+
+        elif any(k in msg for k in ("split lock", "split_lock", "leakage guard", "train/test integrity")):
+            res = self.tools.invoke("split_lock", {})
+            executed.append({"tool": "split_lock", "arguments": {}, "result": res})
+            passed = res.get("passed", False)
+            reply_parts.append(
+                f"Split Lock: {'PASSED' if passed else 'FAILED'} — "
+                f"row_overlap={res.get('row_overlap_count', 0)}, group_overlap={res.get('group_overlap_count', 0)}, "
+                f"temporal_valid={res.get('temporal_order_valid', True)}."
+            )
+            next_steps = ["Fix overlapping groups/rows before training", "Re-run split lock"]
+
+        elif any(k in msg for k in ("pii audit", "pii_audit", "pseudonymize", "pii guard", "zero trust pii")):
+            res = self.tools.invoke("pii_audit", {"dataset_name": None, "pii_policy": "pseudonymize"})
+            executed.append({"tool": "pii_audit", "arguments": {"dataset_name": None, "pii_policy": "pseudonymize"}, "result": res})
+            reply_parts.append(
+                f"C8 PII Audit (policy=pseudonymize): PII detected={res.get('pii_detected')}, "
+                f"columns={', '.join(res.get('pii_columns', [])) or 'none'}, cells={res.get('pii_cells_total', 0)}."
+            )
+            next_steps = ["Inspect guarded output dataset", "Re-audit with policy=block to fail-closed"]
+
+        elif any(k in msg for k in ("pareto", "green-ai", "carbon budget", "latency budget", "green automl")):
+            res = self.tools.invoke("pareto_automl", {"target_column": target_col, "time_budget_seconds": 25.0})
+            executed.append({"tool": "pareto_automl", "arguments": {"target_column": target_col, "time_budget_seconds": 25.0}, "result": res})
+            reply_parts.append(
+                f"C3 Green-AI Pareto AutoML: champion={res.get('best_algorithm')} "
+                f"({res.get('primary_metric')}={res.get('best_score')}, "
+                f"carbon={res.get('carbon_gco2e'):.6f} gCO2eq). Pareto frontier: {len(res.get('pareto_frontier', []))} candidates."
+            )
+            next_steps = ["Inspect Pareto frontier trade-offs", "Register Pareto champion", "Promote to Production"]
+
+        elif any(k in msg for k in ("domain validate", "domain_validation", "industry domain", "compliance")):
+            domain_name = target_col
+            res = self.tools.invoke("domain_validate", {"domain": domain_name, "dataset_name": None})
+            executed.append({"tool": "domain_validate", "arguments": {"domain": domain_name, "dataset_name": None}, "result": res})
+            reply_parts.append(f"Domain validation for '{domain_name}': {res.get('note', 'checks completed')}.")
+            next_steps = ["Address domain compliance gaps", "Generate Model Card"]
+
+        elif any(k in msg for k in ("register model", "model registry", "promote model", "model promotion")):
+            res = self.tools.invoke("register_model", {"model_name": "copilot_champion", "stage": "Staging"})
+            executed.append({"tool": "register_model", "arguments": {"model_name": "copilot_champion", "stage": "Staging"}, "result": res})
+            reply_parts.append(f"Model registered to MLOps Registry (Staging): {res.get('registered', {}).get('version', 'n/a')}.")
+            next_steps = ["Promote to Production", "Configure drift monitoring"]
+
+        elif any(k in msg for k in ("list studios", "studios", "studio overview")):
+            res = self.tools.invoke("list_studios", {})
+            executed.append({"tool": "list_studios", "arguments": {}, "result": res})
+            names = ", ".join(s["name"] for s in res.get("studios", []))
+            reply_parts.append(f"OmniForge Workbench has {res.get('count', 0)} studios: {names}.")
+            next_steps = ["Open a studio in the Workbench UI", "Run a studio endpoint via API"]
+
         else:
             status = self.tools.invoke("workspace_status")
             executed.append({"tool": "workspace_status", "arguments": {}, "result": status})
             reply_parts.append(
-                "I am the **OmniForge AI Copilot**. "
+                "I am the **OmniForge AI Copilot** (air-gapped deterministic planner). "
                 f"Current workspace state: {len(status['loaded_datasets'])} dataset(s), {len(status['trained_models'])} trained model(s). "
                 "You can ask me in plain English to: profile data quality, clean data, run Automated EDA, "
                 "train AutoML models with baseline benchmarks, run forecasting or causal inference, "
-                "explain models (SHAP/LIME), audit fairness, list industry domains, or export production pipeline code."
+                "explain models (SHAP/LIME), audit fairness, run drift root-cause diagnosis, "
+                "run closed-loop twin MPC control, enforce split lock, audit PII, run Green-AI Pareto AutoML, "
+                "validate against industry domains, list studios, or export production pipeline code."
             )
             next_steps = ["Profile data quality", "Run AutoML", "Generate production pipeline code"]
 

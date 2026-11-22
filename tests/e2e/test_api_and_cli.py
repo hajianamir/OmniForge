@@ -86,7 +86,7 @@ def test_fastapi_e2e_lifecycle() -> None:
 def test_typer_cli_e2e(workspace_tmp: Path) -> None:
     runner = CliRunner()
     res_ver = runner.invoke(cli, ["version"])
-    assert res_ver.exit_code == 0 and "3.3.0" in res_ver.stdout and "OmniForge" in res_ver.stdout
+    assert res_ver.exit_code == 0 and "4.0.0" in res_ver.stdout and "OmniForge" in res_ver.stdout
 
     res_dom = runner.invoke(cli, ["domains"])
     assert res_dom.exit_code == 0 and "finance" in res_dom.stdout

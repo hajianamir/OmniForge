@@ -29,13 +29,13 @@ from omniforge.version import __platform_name__, __version__, get_version_info
 
 
 def test_omniforge_v2_branding_metadata() -> None:
-    """Verify OmniForge product name and v3.3.0 semantic version metadata."""
+    """Verify OmniForge product name and v4.0.0 semantic version metadata."""
     info = get_version_info()
     assert __platform_name__ == "OmniForge"
-    assert __version__ == "3.3.0"
+    assert __version__ == "4.0.0"
     assert info["name"] == "OmniForge"
     assert info["short_name"] == "OmniForge"
-    assert info["version"] == "3.3.0"
+    assert info["version"] == "4.0.0"
 
 
 def test_format_auditor_detects_comprehensive_format_defects() -> None:

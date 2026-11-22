@@ -345,6 +345,46 @@ class CopilotReq(BaseModel):
     message: str
 
 
+# --------------------------------------------------------------------------- Phase 6 (v4.0.0) schemas
+
+
+class TwinControlReq(BaseModel):
+    """Closed-loop digital twin MPC control request (C7)."""
+
+    n_x: int = Field(default=2, ge=1, le=16, description="State dimension.")
+    n_u: int = Field(default=1, ge=1, le=8, description="Control dimension.")
+    horizon: int = Field(default=10, ge=1, le=100, description="MPC receding horizon H.")
+    n_steps: int = Field(default=8, ge=1, le=500, description="Closed-loop steps to apply.")
+    dt: float = Field(default=1.0, gt=0.0, le=3600.0, description="Sampling period.")
+    setpoint: list[float] | None = Field(default=None, description="Flat setpoint path; tiled across horizon if short.")
+    u_min: list[float] | None = Field(default=None)
+    u_max: list[float] | None = Field(default=None)
+    x_min: list[float] | None = Field(default=None)
+    x_max: list[float] | None = Field(default=None)
+    Q_diag: list[float] | None = Field(default=None, description="State cost diagonal (length n_x).")
+    R_diag: list[float] | None = Field(default=None, description="Control cost diagonal (length n_u).")
+    measurements: list[list[float]] | None = Field(default=None, description="Per-step measurements (n_steps x n_x).")
+
+
+class RootCauseReq(BaseModel):
+    """Causal drift root-cause analysis request (C5)."""
+
+    reference_dataset: str = Field(default="reference_dataset", description="Copilot/workbench dataset name for reference.")
+    current_dataset: str = Field(default="current_dataset", description="Copilot/workbench dataset name for current.")
+    target_col: str | None = None
+    time_col: str | None = None
+    psi_warning: float = Field(default=0.10, ge=0.0, le=1.0)
+    psi_critical: float = Field(default=0.25, ge=0.0, le=1.0)
+    max_cond_set_size: int = Field(default=2, ge=0, le=4)
+
+
+class CopilotToolExecReq(BaseModel):
+    """Direct Copilot tool execution request (C4 air-gapped deterministic tools)."""
+
+    tool: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
 class NonParametricRunReq(BaseModel):
     target: str | None = None
     cv_folds: int = Field(default=5, ge=2, le=10)

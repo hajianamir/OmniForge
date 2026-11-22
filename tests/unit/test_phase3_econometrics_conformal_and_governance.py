@@ -1,7 +1,7 @@
-"""Phase 3 Econometric, Conformal, Causal, DuckDB Confinement & Governance verification suite (OmniForge v3.3.0).
+"""Phase 3 Econometric, Conformal, Causal, DuckDB Confinement & Governance verification suite (OmniForge v4.0.0).
 
 Verifies literature-exact implementations across all Phase 3 pillars:
-1. Canonical SemVer 3.3.0 alignment across SDK, pyproject, native hubs, exporters & SPA manifests.
+1. Canonical SemVer 4.0.0 alignment across SDK, pyproject, native hubs, exporters & SPA manifests.
 2. Exact directional CIs, non-central t power/sample size (Cohen 1988), Székely-Rizzo (2013, 2014)
    unbiased U-centered distance correlation, Demšar (2006) Studentized-range Nemenyi + Iman-Davenport F_F,
    AIC/BIC distribution ranking, and strict 2x2 Fisher's exact guard.
@@ -59,25 +59,25 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_version_3_1_0_canonical_alignment() -> None:
-    """Verify canonical v3.3.0 version across SDK, pyproject, SPA manifests, and native hubs."""
-    assert omniforge.__version__ == "3.3.0"
-    assert get_version_info()["version"] == "3.3.0"
+    """Verify canonical v4.0.0 version across SDK, pyproject, SPA manifests, and native hubs."""
+    assert omniforge.__version__ == "4.0.0"
+    assert get_version_info()["version"] == "4.0.0"
 
     pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert pyproject["project"]["version"] == "3.3.0"
+    assert pyproject["project"]["version"] == "4.0.0"
 
     pkg_json = json.loads((REPO_ROOT / "frontend" / "package.json").read_text(encoding="utf-8"))
     pkg_lock = json.loads((REPO_ROOT / "frontend" / "package-lock.json").read_text(encoding="utf-8"))
-    assert pkg_json["version"] == "3.3.0"
-    assert pkg_lock["version"] == "3.3.0"
-    assert pkg_lock["packages"][""]["version"] == "3.3.0"
+    assert pkg_json["version"] == "4.0.0"
+    assert pkg_lock["version"] == "4.0.0"
+    assert pkg_lock["packages"][""]["version"] == "4.0.0"
 
     native_automl = {b["id"]: b["version"] for b in probe_automl_backends() if b["category"].startswith("Native")}
-    assert all(v == "3.3.0" for v in native_automl.values())
+    assert all(v == "4.0.0" for v in native_automl.values())
     vis_native = [b for b in probe_vision_backends()["backends"] if b["id"] == "native_pyramid"][0]
     nlp_native = [b for b in probe_nlp_backends() if b["id"] == "native_nlp"][0]
-    assert vis_native["version"] == "3.3.0"
-    assert nlp_native["version"] == "3.3.0"
+    assert vis_native["version"] == "4.0.0"
+    assert nlp_native["version"] == "4.0.0"
 
 
 def test_exact_directional_cis_and_noncentral_t_power() -> None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "3.3.0"
+__version__ = "4.0.0"
 __edition__ = "Enterprise Analytics & AI Workbench"
 __platform_name__ = "OmniForge"
 __short_name__ = "OmniForge"

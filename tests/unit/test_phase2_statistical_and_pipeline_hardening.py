@@ -61,26 +61,26 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_version_3_0_1_canonical_alignment(tmp_path: Path) -> None:
-    """Verify canonical v3.3.0 version across Python SDK, hubs, exporters, pyproject, and SPA manifests."""
-    assert omniforge.__version__ == "3.3.0"
-    assert get_version_info()["version"] == "3.3.0"
+    """Verify canonical v4.0.0 version across Python SDK, hubs, exporters, pyproject, and SPA manifests."""
+    assert omniforge.__version__ == "4.0.0"
+    assert get_version_info()["version"] == "4.0.0"
 
     pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert pyproject["project"]["version"] == "3.3.0"
+    assert pyproject["project"]["version"] == "4.0.0"
 
     pkg_json = json.loads((REPO_ROOT / "frontend" / "package.json").read_text(encoding="utf-8"))
     pkg_lock = json.loads((REPO_ROOT / "frontend" / "package-lock.json").read_text(encoding="utf-8"))
-    assert pkg_json["version"] == "3.3.0"
-    assert pkg_lock["version"] == "3.3.0"
-    assert pkg_lock["packages"][""]["version"] == "3.3.0"
+    assert pkg_json["version"] == "4.0.0"
+    assert pkg_lock["version"] == "4.0.0"
+    assert pkg_lock["packages"][""]["version"] == "4.0.0"
 
     native_automl = {b["id"]: b["version"] for b in probe_automl_backends() if b["category"].startswith("Native")}
-    assert all(v == "3.3.0" for v in native_automl.values())
+    assert all(v == "4.0.0" for v in native_automl.values())
 
     vis_native = [b for b in probe_vision_backends()["backends"] if b["id"] == "native_pyramid"][0]
     nlp_native = [b for b in probe_nlp_backends() if b["id"] == "native_nlp"][0]
-    assert vis_native["version"] == "3.3.0"
-    assert nlp_native["version"] == "3.3.0"
+    assert vis_native["version"] == "4.0.0"
+    assert nlp_native["version"] == "4.0.0"
 
     rng = np.random.default_rng(7)
     X_small = pd.DataFrame({"x1": rng.normal(size=30), "x2": rng.normal(size=30)})
@@ -91,7 +91,7 @@ def test_version_3_0_1_canonical_alignment(tmp_path: Path) -> None:
     svc_dir = tmp_path / "svc"
     ReportExporters.export_microservice_bundle(svc_dir, model_artifact_path=art_path, service_name="TestSvc")
     app_code = (svc_dir / "app.py").read_text(encoding="utf-8")
-    assert "version='3.3.0'" in app_code
+    assert "version='4.0.0'" in app_code
 
 
 def test_feature_selector_chi2_mrmr_boruta_stability_and_strict_validation() -> None:
