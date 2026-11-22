@@ -184,6 +184,7 @@ def run_environment_check() -> dict[str, Any]:
         "pptx",
         "reportlab",
         "nbformat",
+        "defusedxml",
     ]
     optional_modules = [
         "torch",
@@ -219,11 +220,12 @@ def run_environment_check() -> dict[str, Any]:
     if not ui_app_path.exists():
         ui_app_path = resolve_resource_path("ui/app.py")
     config_path = resolve_resource_path("configs/default.yaml")
+    static_index = Path(__file__).resolve().parent / "ui" / "static_app" / "index.html"
 
     missing_required = [m for m, ok in module_status.items() if not ok]
     python_ok = sys.version_info >= (3, 12)
     domains_ok = len(domains) >= 18
-    ui_ok = ui_app_path.exists()
+    ui_ok = ui_app_path.exists() and static_index.is_file()
     overall_ok = python_ok and domains_ok and ui_ok and len(missing_required) == 0
 
     return {
@@ -240,6 +242,7 @@ def run_environment_check() -> dict[str, Any]:
         "resources": {
             "ui_app_path": str(ui_app_path),
             "ui_app_exists": ui_ok,
+            "static_app_exists": static_index.is_file(),
             "default_config_path": str(config_path),
             "default_config_exists": config_path.exists(),
         },

@@ -8,8 +8,15 @@ import numpy as np
 import pandas as pd
 from fastapi import APIRouter, Header, HTTPException
 
+from omniforge.core.utils import to_json_object
 from omniforge.data.cleaning import benford_digit_test, cleaning_distortion_audit, robust_mahalanobis_outliers
 from omniforge.ui.state import get_analysis_dataframe, get_session_state
+
+
+def _wb() -> Any:
+    from omniforge.api import workbench as wb
+
+    return wb
 
 router = APIRouter(tags=["workbench-s01"])
 
@@ -17,7 +24,7 @@ router = APIRouter(tags=["workbench-s01"])
 @router.post("/s01/advanced_audit")
 def s01_advanced_audit(x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     """Run Benford's Law, MCD Robust Mahalanobis outliers, and Cleaning Distortion Audit."""
-    sid = (x_session_id or "default").strip() or "default"
+    sid = _wb()._sid(x_session_id)
     state = get_session_state(sid)
     raw = state.get("uap_df")
     if raw is None or len(raw) == 0:
@@ -34,8 +41,10 @@ def s01_advanced_audit(x_session_id: str | None = Header(default="default")) -> 
         if isinstance(raw_df, pd.DataFrame) and not raw_df.empty
         else {"columns_audited": 0, "per_column": {}, "high_distortion_columns": []}
     )
-    return {
-        "benford_tests": benford_results,
-        "robust_mahalanobis": mcd_res,
-        "cleaning_distortion": distortion,
-    }
+    return to_json_object(
+        {
+            "benford_tests": benford_results,
+            "robust_mahalanobis": mcd_res,
+            "cleaning_distortion": distortion,
+        }
+    )

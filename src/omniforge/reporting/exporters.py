@@ -6,7 +6,9 @@ import base64
 import csv
 import io
 import json
+import math
 import re
+import tempfile
 import zipfile
 from html import escape as html_escape
 from pathlib import Path
@@ -28,10 +30,22 @@ _FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
 
 def sanitize_spreadsheet_value(val: Any) -> Any:
-    """Neutralize spreadsheet formula injection (CWE-1236) in CSV/XLSX string cells."""
-    if isinstance(val, str):
-        stripped = val.lstrip(" \t\r\n")
-        if stripped.startswith(_FORMULA_PREFIXES):
+    """Neutralize spreadsheet formula injection (CWE-1236) in CSV/XLSX string cells.
+
+    Preserves legitimate signed numeric literals (e.g. ``"-42.5"``, ``"+3.14e-2"``) while
+    prefixing a leading single quote onto strings starting with ``=``, ``+``, ``-``, ``@``,
+    tab, or carriage-return characters.
+    """
+    if isinstance(val, str) and val:
+        stripped = val.lstrip(" ")
+        if val[0] in ("\t", "\r") or stripped.startswith(_FORMULA_PREFIXES):
+            if stripped[0] in ("+", "-"):
+                try:
+                    num = float(stripped)
+                    if math.isfinite(num):
+                        return val
+                except ValueError:
+                    pass
             return f"'{val}"
     return val
 
@@ -160,7 +174,9 @@ class ReportExporters:
             lines.append("")
 
         for sec in payload.get("sections", []):
-            lines.extend([f"## {sec.get('heading', 'Section')}", str(sec.get("body", "")), ""])
+            sec_heading = sec.get("heading") or sec.get("title") or "Section"
+            sec_body = sec.get("body") if sec.get("body") is not None else sec.get("narrative", "")
+            lines.extend([f"## {sec_heading}", str(sec_body), ""])
             for b in sec.get("bullets") or []:
                 lines.append(f"- {b}")
             if sec.get("bullets"):
@@ -276,10 +292,12 @@ class ReportExporters:
                     )
                 formulas_html = "".join(f_cards)
 
+            sec_heading = sec.get("heading") or sec.get("title") or ""
+            sec_body = sec.get("body") if sec.get("body") is not None else sec.get("narrative", "")
             sections_blocks.append(
                 f"<section class='card'>"
-                f"<h2>{html_escape(str(sec.get('heading', '')))}</h2>"
-                f"<p>{html_escape(str(sec.get('body', '')))}</p>"
+                f"<h2>{html_escape(str(sec_heading))}</h2>"
+                f"<p>{html_escape(str(sec_body))}</p>"
                 f"{bullets_html}{formulas_html}{charts_html}{sec_tables_html}"
                 f"</section>"
             )
@@ -410,7 +428,8 @@ class ReportExporters:
 
         for sec in payload.get("sections") or []:
             sid = str(sec.get("section_id", "section"))
-            stitle = str(sec.get("heading", sid))
+            stitle = str(sec.get("heading") or sec.get("title") or sid)
+            sbody = sec.get("body") if sec.get("body") is not None else sec.get("narrative", "")
             rows_out.append(
                 {
                     "section_id": sid,
@@ -418,7 +437,7 @@ class ReportExporters:
                     "record_type": "narrative",
                     "item_name": stitle,
                     "metric_or_rule": "summary",
-                    "value_or_expression": _clean_text(sec.get("body", "")),
+                    "value_or_expression": _clean_text(sbody),
                     "explanation_or_reason": " | ".join(_clean_text(b) for b in (sec.get("bullets") or [])),
                     "extra_details": "",
                 }
@@ -501,11 +520,15 @@ class ReportExporters:
                 }
             )
 
-        # UTF-8 with BOM so Microsoft Excel opens Unicode/symbols cleanly on Windows & macOS
+        # UTF-8 with BOM so Microsoft Excel opens Unicode/symbols cleanly on Windows & macOS;
+        # apply CWE-1236 formula sanitization across every cell.
+        sanitized_rows = [
+            {k: sanitize_spreadsheet_value(v) for k, v in r.items()} for r in rows_out
+        ]
         with path.open("w", encoding="utf-8-sig", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=fieldnames)
             writer.writeheader()
-            writer.writerows(rows_out)
+            writer.writerows(sanitized_rows)
         return path
 
     @staticmethod
@@ -523,18 +546,22 @@ class ReportExporters:
                 for k in r:
                     if k not in cols:
                         cols.append(k)
-            w = csv.DictWriter(buf, fieldnames=cols)
+            w = csv.DictWriter(buf, fieldnames=[sanitize_spreadsheet_value(str(c)) for c in cols])
+            col_map = [(c, sanitize_spreadsheet_value(str(c))) for c in cols]
             w.writeheader()
             for r in rows:
-                w.writerow({c: _clean_text(r.get(c, "")) for c in cols})
+                w.writerow({safe_c: sanitize_spreadsheet_value(_clean_text(r.get(orig_c, ""))) for orig_c, safe_c in col_map})
             return buf.getvalue().encode("utf-8-sig")
 
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            # 1. Master unified CSV
-            tmp_master = zip_path.parent / "_tmp_master_report.csv"
-            ReportExporters.to_csv(payload, tmp_master)
-            zf.write(tmp_master, arcname="00_complete_unified_report.csv")
-            tmp_master.unlink(missing_ok=True)
+            # 1. Master unified CSV (isolated temp file to prevent concurrent export collisions)
+            with tempfile.NamedTemporaryFile(dir=zip_path.parent, prefix="_tmp_master_", suffix=".csv", delete=False) as tf:
+                tmp_master = Path(tf.name)
+            try:
+                ReportExporters.to_csv(payload, tmp_master)
+                zf.write(tmp_master, arcname="00_complete_unified_report.csv")
+            finally:
+                tmp_master.unlink(missing_ok=True)
 
             # 2. KPIs
             if payload.get("kpis"):
@@ -587,7 +614,7 @@ class ReportExporters:
         wrap_align = Alignment(vertical="top", wrap_text=True)
 
         def _style_table_sheet(ws: Any, headers: list[str], rows: list[list[Any]], *, mono_cols: set[int] | None = None) -> None:
-            ws.append(headers)
+            ws.append([sanitize_spreadsheet_value(h) for h in headers])
             for c_idx in range(1, len(headers) + 1):
                 cell = ws.cell(row=1, column=c_idx)
                 cell.font = hdr_font
@@ -596,7 +623,8 @@ class ReportExporters:
                 cell.border = thin_border
             ws.row_dimensions[1].height = 24
             for r_idx, row_vals in enumerate(rows, start=2):
-                ws.append(row_vals)
+                safe_vals = [sanitize_spreadsheet_value(v) for v in row_vals]
+                ws.append(safe_vals)
                 fill = zebra_fill if r_idx % 2 == 0 else None
                 for c_idx, _val in enumerate(row_vals, start=1):
                     cell = ws.cell(row=r_idx, column=c_idx)
@@ -622,17 +650,17 @@ class ReportExporters:
         ws = wb.active
         ws.title = _safe_sheet_name("01_Executive_Summary", used_names)
         ws.merge_cells("A1:C1")
-        ws["A1"] = str(payload.get("title", "OmniForge Report"))
+        ws["A1"] = sanitize_spreadsheet_value(str(payload.get("title", "OmniForge Report")))
         ws["A1"].font = title_font
         ws["A1"].fill = blue_fill
         ws["A1"].alignment = Alignment(horizontal="left", vertical="center")
         ws.row_dimensions[1].height = 30
 
         meta_rows = [
-            ("Study / Domain", str(payload.get("domain", "general")), ""),
-            ("Author", str(payload.get("author", "OmniForge Enterprise")), ""),
-            ("Generated At", str(payload.get("generated_at", "")), ""),
-            ("Selected Sections", ", ".join(payload.get("selected_sections") or []), ""),
+            ("Study / Domain", sanitize_spreadsheet_value(str(payload.get("domain", "general"))), ""),
+            ("Author", sanitize_spreadsheet_value(str(payload.get("author", "OmniForge Enterprise"))), ""),
+            ("Generated At", sanitize_spreadsheet_value(str(payload.get("generated_at", ""))), ""),
+            ("Selected Sections", sanitize_spreadsheet_value(", ".join(payload.get("selected_sections") or [])), ""),
         ]
         for r in meta_rows:
             ws.append(list(r))
@@ -646,7 +674,7 @@ class ReportExporters:
             ws.cell(row=kpi_hdr_row, column=c).font = hdr_font
             ws.cell(row=kpi_hdr_row, column=c).fill = navy_fill
         for k, v in (payload.get("kpis") or {}).items():
-            ws.append([str(k), _clean_text(v), ""])
+            ws.append([sanitize_spreadsheet_value(str(k)), sanitize_spreadsheet_value(_clean_text(v)), ""])
             for c in range(1, 4):
                 ws.cell(row=ws.max_row, column=c).border = thin_border
                 ws.cell(row=ws.max_row, column=c).alignment = wrap_align
@@ -658,11 +686,13 @@ class ReportExporters:
             ws.cell(row=sec_hdr_row, column=c).font = hdr_font
             ws.cell(row=sec_hdr_row, column=c).fill = navy_fill
         for sec in payload.get("sections") or []:
+            sec_heading = sec.get("heading") or sec.get("title") or ""
+            sec_body = sec.get("body") if sec.get("body") is not None else sec.get("narrative", "")
             ws.append(
                 [
-                    str(sec.get("heading", "")),
-                    str(sec.get("body", "")),
-                    "\n".join(f"• {b}" for b in (sec.get("bullets") or [])),
+                    sanitize_spreadsheet_value(str(sec_heading)),
+                    sanitize_spreadsheet_value(str(sec_body)),
+                    sanitize_spreadsheet_value("\n".join(f"• {b}" for b in (sec.get("bullets") or []))),
                 ]
             )
             for c in range(1, 4):
@@ -677,7 +707,7 @@ class ReportExporters:
                 ws.cell(row=rec_hdr, column=c).font = hdr_font
                 ws.cell(row=rec_hdr, column=c).fill = navy_fill
             for idx, rec in enumerate(payload["recommendations"], start=1):
-                ws.append([idx, str(rec), ""])
+                ws.append([idx, sanitize_spreadsheet_value(str(rec)), ""])
                 ws.cell(row=ws.max_row, column=2).alignment = wrap_align
 
         ws.column_dimensions["A"].width = 30
@@ -918,8 +948,10 @@ class ReportExporters:
         # Render each selected section with narrative, bullets, equations, charts, and tables
         for sec in payload.get("sections") or []:
             sid = str(sec.get("section_id", ""))
-            doc.add_heading(str(sec.get("heading", "Section")), level=1)
-            body_txt = str(sec.get("body", "")).strip()
+            sec_heading = sec.get("heading") or sec.get("title") or "Section"
+            sec_body = sec.get("body") if sec.get("body") is not None else sec.get("narrative", "")
+            doc.add_heading(str(sec_heading), level=1)
+            body_txt = str(sec_body).strip()
             if body_txt:
                 p = doc.add_paragraph(body_txt)
                 p.runs[0].font.size = Pt(10)
@@ -1170,9 +1202,11 @@ class ReportExporters:
         # Render each selected section
         for sec in payload.get("sections") or []:
             sid = str(sec.get("section_id", ""))
-            story.append(Paragraph(xml_escape(str(sec.get("heading", "Section"))), s_h1))
-            if sec.get("body"):
-                story.append(Paragraph(xml_escape(str(sec["body"])), s_body))
+            sec_heading = sec.get("heading") or sec.get("title") or "Section"
+            sec_body = sec.get("body") if sec.get("body") is not None else sec.get("narrative", "")
+            story.append(Paragraph(xml_escape(str(sec_heading)), s_h1))
+            if sec_body:
+                story.append(Paragraph(xml_escape(str(sec_body)), s_body))
                 story.append(Spacer(1, 4))
             for b in sec.get("bullets") or []:
                 story.append(Paragraph(f"• {xml_escape(str(b))}", s_bullet))
@@ -1278,12 +1312,14 @@ class ReportExporters:
 
         # Narrative slides
         for sec in payload.get("sections") or []:
+            sec_heading = sec.get("heading") or sec.get("title") or ""
+            sec_body = sec.get("body") if sec.get("body") is not None else sec.get("narrative", "")
             sl = prs.slides.add_slide(prs.slide_layouts[1])
-            sl.shapes.title.text = str(sec.get("heading", ""))[:80]
+            sl.shapes.title.text = str(sec_heading)[:80]
             tf = sl.placeholders[1].text_frame
             tf.clear()
             p0 = tf.paragraphs[0]
-            p0.text = str(sec.get("body", ""))[:600]
+            p0.text = str(sec_body)[:600]
             p0.font.size = Pt(13)
             for b in (sec.get("bullets") or [])[:5]:
                 pb = tf.add_paragraph()
@@ -1377,33 +1413,32 @@ class ReportExporters:
         """Export a self-contained Docker + FastAPI microservice bundle for one-click deployment."""
         bundle_dir = Path(output_dir)
         bundle_dir.mkdir(parents=True, exist_ok=True)
+        src_art = Path(model_artifact_path)
+        art_name = src_art.name
+        if not art_name or art_name in (".", "..") or "/" in art_name or "\\" in art_name:
+            raise ReportingError(f"Invalid model artifact filename: {model_artifact_path!r}")
 
-        app_code = f'''"""Auto-exported OmniForge FastAPI Inference Microservice: {service_name}."""
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import Any
-from omniforge.models.base import BaseOmniForgeModel
-
-app = FastAPI(title="{service_name}", version="2.0.0")
-MODEL = BaseOmniForgeModel.load("{Path(model_artifact_path).name}")
-
-
-class PredictRequest(BaseModel):
-    records: list[dict[str, Any]]
-
-
-@app.get("/health")
-def health() -> dict[str, str]:
-    return {{"status": "ok", "model": MODEL.name}}
-
-
-@app.post("/predict")
-def predict(req: PredictRequest) -> dict[str, Any]:
-    import pandas as pd
-    df = pd.DataFrame(req.records)
-    preds = MODEL.predict(df).tolist()
-    return {{"model": MODEL.name, "predictions": preds}}
-'''
+        safe_doc_title = service_name.replace('"""', "'''").replace("\r", " ").replace("\n", " ")
+        app_code = (
+            f'"""Auto-exported OmniForge FastAPI Inference Microservice: {safe_doc_title}."""\n'
+            "from typing import Any\n\n"
+            "from fastapi import FastAPI\n"
+            "from pydantic import BaseModel\n\n"
+            "from omniforge.models.base import BaseOmniForgeModel\n\n"
+            f"app = FastAPI(title={service_name!r}, version='3.2.0')\n"
+            f"MODEL = BaseOmniForgeModel.load({art_name!r})\n\n\n"
+            "class PredictRequest(BaseModel):\n"
+            "    records: list[dict[str, Any]]\n\n\n"
+            "@app.get('/health')\n"
+            "def health() -> dict[str, str]:\n"
+            "    return {'status': 'ok', 'model': MODEL.name}\n\n\n"
+            "@app.post('/predict')\n"
+            "def predict(req: PredictRequest) -> dict[str, Any]:\n"
+            "    import pandas as pd\n\n"
+            "    df = pd.DataFrame(req.records)\n"
+            "    preds = MODEL.predict(df).tolist()\n"
+            "    return {'model': MODEL.name, 'predictions': preds}\n"
+        )
         dockerfile = """FROM python:3.12-slim
 WORKDIR /service
 COPY . /service
@@ -1413,9 +1448,11 @@ CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
 """
         (bundle_dir / "app.py").write_text(app_code, encoding="utf-8")
         (bundle_dir / "Dockerfile").write_text(dockerfile, encoding="utf-8")
-        src_art = Path(model_artifact_path)
-        if src_art.exists():
+        if src_art.is_file():
             import shutil
 
             shutil.copy2(src_art, bundle_dir / src_art.name)
+            meta_sidecar = Path(f"{src_art}.meta.json")
+            if meta_sidecar.is_file():
+                shutil.copy2(meta_sidecar, bundle_dir / meta_sidecar.name)
         return bundle_dir

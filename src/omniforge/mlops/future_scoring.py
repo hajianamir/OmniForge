@@ -14,13 +14,39 @@ from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import create_engine, text
 
-from omniforge.core.exceptions import DataIngestionError
+from omniforge.core.exceptions import DataIngestionError, DependencyMissingError, SecurityError
 from omniforge.core.logging import get_logger
 from omniforge.core.types import TaskType
+from omniforge.data.connectors import validate_readonly_sql
+from omniforge.data.ingestion import DataIngestionEngine
 
 logger = get_logger(__name__)
+
+
+def _redact_uri_secret_in_error(err_text: str, raw_uri: str) -> str:
+    """Scrub any password embedded in ``raw_uri`` from downstream driver exception text."""
+    from urllib.parse import urlparse
+
+    try:
+        pw = urlparse(raw_uri).password
+    except ValueError:
+        pw = None
+    if pw:
+        return err_text.replace(pw, "***")
+    return err_text
+
+
+def _require_sqlalchemy() -> tuple[Any, Any]:
+    """Import SQLAlchemy lazily so core-only ``omniforge.mlops`` imports work without ``omniforge[data]``."""
+    try:
+        from sqlalchemy import create_engine, text
+    except ImportError as exc:
+        raise DependencyMissingError(
+            "Install 'sqlalchemy' (or 'omniforge[data]') for SQL-backed future target scoring.",
+            suggestions=["pip install 'omniforge[data]'"],
+        ) from exc
+    return create_engine, text
 
 
 @dataclass
@@ -83,6 +109,11 @@ class FutureTargetPredictor:
         seed: int = 42,
     ) -> tuple[str, str, pd.DataFrame]:
         """Create a realistic sample SQLite database matching the analyzed feature schema for instant SQL testing."""
+        create_engine, _ = _require_sqlalchemy()
+        clean_table = (
+            "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in table_name.strip())
+            or "incoming_future_data"
+        )
         rng = np.random.default_rng(seed)
         target_path = Path(db_path).resolve()
         target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -114,30 +145,39 @@ class FutureTargetPredictor:
         uri = f"sqlite:///{target_path.as_posix()}"
         engine = create_engine(uri)
         try:
-            sample_df.to_sql(table_name, engine, if_exists="replace", index=False)
+            sample_df.to_sql(clean_table, engine, if_exists="replace", index=False)
         finally:
             engine.dispose()
-        query = f"SELECT * FROM {table_name}"
+        query = f'SELECT * FROM "{clean_table}"'
         return uri, query, sample_df
 
     @staticmethod
     def load_from_sql(connection_uri: str, query: str) -> pd.DataFrame:
         """Load incoming future feature records from any SQLAlchemy-supported SQL database."""
-        if not connection_uri.strip():
+        raw_uri = connection_uri.strip()
+        if not raw_uri:
             raise DataIngestionError("SQL connection URI cannot be empty.")
         if not query.strip():
             raise DataIngestionError("SQL query cannot be empty.")
-        engine = create_engine(connection_uri.strip())
+        validated_sql = validate_readonly_sql(query.strip())
+        create_engine, text = _require_sqlalchemy()
+        engine: Any = None
         try:
+            engine = create_engine(raw_uri)
             with engine.connect() as conn:
-                df = pd.read_sql_query(text(query.strip()), conn)
+                df = pd.read_sql_query(text(validated_sql), conn)
+        except SecurityError:
+            raise
         except Exception as exc:
+            safe_uri = DataIngestionEngine._sanitize_uri(raw_uri)
+            safe_err = _redact_uri_secret_in_error(str(exc), raw_uri)
             raise DataIngestionError(
-                f"Failed to execute SQL query on '{connection_uri.strip()}': {exc}",
+                f"Failed to execute SQL query on '{safe_uri}': {safe_err}",
                 cause=exc,
             ) from exc
         finally:
-            engine.dispose()
+            if engine is not None:
+                engine.dispose()
         return df
 
     @staticmethod
@@ -149,16 +189,27 @@ class FutureTargetPredictor:
         if_exists: Literal["append", "replace"] = "replace",
     ) -> dict[str, Any]:
         """Persist scored future target predictions back into a SQL database table."""
-        if not connection_uri.strip():
+        raw_uri = connection_uri.strip()
+        if not raw_uri:
             raise DataIngestionError("SQL connection URI cannot be empty.")
+        create_engine, _ = _require_sqlalchemy()
         clean_table = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in table_name.strip()) or "omniforge_future_predictions"
-        engine = create_engine(connection_uri.strip())
+        engine: Any = None
         try:
+            engine = create_engine(raw_uri)
             predictions_df.to_sql(clean_table, engine, if_exists=if_exists, index=False)
+        except Exception as exc:
+            safe_uri = DataIngestionEngine._sanitize_uri(raw_uri)
+            safe_err = _redact_uri_secret_in_error(str(exc), raw_uri)
+            raise DataIngestionError(
+                f"Failed to persist predictions to '{safe_uri}' (table '{clean_table}'): {safe_err}",
+                cause=exc,
+            ) from exc
         finally:
-            engine.dispose()
+            if engine is not None:
+                engine.dispose()
         return {
-            "connection_uri": connection_uri.strip(),
+            "connection_uri": DataIngestionEngine._sanitize_uri(raw_uri),
             "table_name": clean_table,
             "rows_written": int(len(predictions_df)),
             "columns_written": int(predictions_df.shape[1]),

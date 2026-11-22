@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -108,27 +109,64 @@ class AutoMLPipelineSearch:
             return TaskType.BINARY_CLASSIFICATION if s.nunique() <= 2 else TaskType.MULTICLASS_CLASSIFICATION
         return TaskType.REGRESSION
 
-    def _sklearn_estimator_for_cv(self, alg: str, is_clf: bool, n_rows: int = 0) -> Any:
+    def _sklearn_estimator_for_cv(
+        self,
+        alg: str,
+        is_clf: bool,
+        n_rows: int = 0,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
         """Return a fresh scikit-learn estimator for fold-isolated ColumnTransformer Pipeline CV."""
+        hp = dict(params or {})
         if is_clf:
             if alg == "random_forest":
-                return RandomForestClassifier(n_estimators=100, random_state=self.random_seed, n_jobs=-1)
+                return RandomForestClassifier(
+                    n_estimators=int(hp.get("n_estimators", 100)),
+                    max_depth=hp.get("max_depth"),
+                    random_state=self.random_seed,
+                    n_jobs=-1,
+                )
             if alg == "extra_trees":
-                return ExtraTreesClassifier(n_estimators=100, random_state=self.random_seed, n_jobs=-1)
+                return ExtraTreesClassifier(
+                    n_estimators=int(hp.get("n_estimators", 100)),
+                    max_depth=hp.get("max_depth"),
+                    random_state=self.random_seed,
+                    n_jobs=-1,
+                )
             if alg == "gradient_boosting":
-                if n_rows > 3000:
+                if n_rows > 3000 and not hp:
                     return HistGradientBoostingClassifier(max_iter=100, random_state=self.random_seed)
-                return GradientBoostingClassifier(n_estimators=80, random_state=self.random_seed)
+                return GradientBoostingClassifier(
+                    n_estimators=int(hp.get("n_estimators", 80)),
+                    learning_rate=float(hp.get("learning_rate", 0.1)),
+                    max_depth=int(hp.get("max_depth", 3)),
+                    random_state=self.random_seed,
+                )
             return LogisticRegression(max_iter=500, random_state=self.random_seed)
         if alg == "random_forest":
-            return RandomForestRegressor(n_estimators=100, random_state=self.random_seed, n_jobs=-1)
+            return RandomForestRegressor(
+                n_estimators=int(hp.get("n_estimators", 100)),
+                max_depth=hp.get("max_depth"),
+                random_state=self.random_seed,
+                n_jobs=-1,
+            )
         if alg == "extra_trees":
-            return ExtraTreesRegressor(n_estimators=100, random_state=self.random_seed, n_jobs=-1)
+            return ExtraTreesRegressor(
+                n_estimators=int(hp.get("n_estimators", 100)),
+                max_depth=hp.get("max_depth"),
+                random_state=self.random_seed,
+                n_jobs=-1,
+            )
         if alg == "gradient_boosting":
-            if n_rows > 3000:
+            if n_rows > 3000 and not hp:
                 return HistGradientBoostingRegressor(max_iter=100, random_state=self.random_seed)
-            return GradientBoostingRegressor(n_estimators=80, random_state=self.random_seed)
-        return Ridge(alpha=1.0)
+            return GradientBoostingRegressor(
+                n_estimators=int(hp.get("n_estimators", 80)),
+                learning_rate=float(hp.get("learning_rate", 0.1)),
+                max_depth=int(hp.get("max_depth", 3)),
+                random_state=self.random_seed,
+            )
+        return Ridge(alpha=float(hp.get("alpha", 1.0)))
 
     def fit(
         self,
@@ -179,22 +217,26 @@ class AutoMLPipelineSearch:
         y_tr = y_arr[tr_idx]
         y_va = y_arr[va_idx]
 
-        # Extract group vector aligned to X_work for fold-isolated GroupKFold CV
-        groups_arr: np.ndarray | None = None
+        # Extract group vector strictly on the TRAINING partition (tr_idx) so CV & HPO never touch X_va
+        groups_tr: np.ndarray | None = None
         if split_cfg.group_col and split_cfg.group_col in split_frame.columns:
-            groups_arr = split_frame[split_cfg.group_col].astype(str).to_numpy()
+            groups_tr = split_frame.iloc[tr_idx][split_cfg.group_col].astype(str).to_numpy()
 
-        # Sort X_work chronologically if time_series CV is active
-        cv_X = X_work
-        cv_y = y_arr
-        cv_groups = groups_arr
+        # Sort X_tr chronologically if time_series CV is active (keeping X_va strictly isolated as outer holdout)
+        cv_X = X_tr
+        cv_y = y_tr
+        cv_groups = groups_tr
         if split_res.strategy_used == "time_series" and split_cfg.time_col and split_cfg.time_col in split_frame.columns:
-            order = pd.to_datetime(split_frame[split_cfg.time_col], errors="coerce", format="mixed")
-            sort_idx = np.argsort(order.to_numpy() if order.notna().sum() >= len(order) * 0.8 else split_frame[split_cfg.time_col].to_numpy(), kind="mergesort")
-            cv_X = X_work.iloc[sort_idx].reset_index(drop=True)
-            cv_y = y_arr[sort_idx]
-            if groups_arr is not None:
-                cv_groups = groups_arr[sort_idx]
+            tr_time_col = split_frame.iloc[tr_idx][split_cfg.time_col]
+            order = pd.to_datetime(tr_time_col, errors="coerce", format="mixed")
+            sort_idx = np.argsort(
+                order.to_numpy() if order.notna().sum() >= len(order) * 0.8 else tr_time_col.to_numpy(),
+                kind="mergesort",
+            )
+            cv_X = X_tr.iloc[sort_idx].reset_index(drop=True)
+            cv_y = y_tr[sort_idx]
+            if groups_tr is not None:
+                cv_groups = groups_tr[sort_idx]
 
         def _score_model(model: BaseOmniForgeModel) -> float:
             preds = model.predict(X_va)
@@ -346,11 +388,36 @@ class AutoMLPipelineSearch:
                     except Exception as exc:
                         logger.warning("automl_deep_candidate_failed", model=d_name, error=str(exc))
 
-            # 3. Bayesian Hyperparameter Tuning of top tree candidates
+            # 3. Bayesian Hyperparameter Tuning of top tree candidates via Inner CV on (cv_X, cv_y)
+            # Per Cawley & Talbot (2010, JMLR), HPO never evaluates on outer holdout (X_va, y_va).
             fitted_candidates.sort(key=lambda t: t[1], reverse=is_clf)
             top_tunable = [
                 name for name, _, _ in fitted_candidates if name in ("random_forest", "gradient_boosting", "extra_trees")
             ][: self.tune_top_k]
+            tuned_params_map: dict[str, dict[str, Any]] = {}
+
+            inner_folds: list[tuple[np.ndarray, np.ndarray]] = []
+            if top_tunable and len(cv_X) >= 6:
+                try:
+                    inner_cfg = SplitConfig(
+                        strategy=split_cfg.strategy,
+                        test_size=0.20,
+                        cv_folds=max(2, min(3, self.cv_folds)),
+                        group_col=split_cfg.group_col,
+                        time_col=split_cfg.time_col,
+                        gap=split_cfg.gap,
+                        random_seed=self.random_seed,
+                    )
+                    inner_cv_obj, inner_cv_groups = LeakageSafeSplitter(inner_cfg).build_cv_splitter(
+                        cv_X, cv_y, is_classification=is_clf, groups=cv_groups
+                    )
+                    inner_folds = [
+                        (np.asarray(f_tr, dtype=int), np.asarray(f_va, dtype=int))
+                        for f_tr, f_va in inner_cv_obj.split(cv_X, cv_y, inner_cv_groups)
+                        if len(f_tr) > 0 and len(f_va) > 0
+                    ]
+                except Exception as exc:
+                    logger.debug("inner_hpo_cv_fallback", error=str(exc))
 
             for alg in top_tunable:
                 if time.perf_counter() - t0 > self.time_budget_seconds * 0.85:
@@ -376,9 +443,32 @@ class AutoMLPipelineSearch:
                 )
 
                 def _trial_obj(params: dict[str, Any], _alg: str = alg) -> float:
-                    cand = ClassicalMLModel(_alg, task_type=task, random_seed=self.random_seed, track_carbon=False, **params)
-                    cand.fit(X_tr, y_tr)
-                    return _score_model(cand)
+                    if inner_folds:
+                        fold_scores: list[float] = []
+                        for f_tr, f_va in inner_folds:
+                            cand = ClassicalMLModel(
+                                _alg, task_type=task, random_seed=self.random_seed, track_carbon=False, **params
+                            )
+                            cand.fit(cv_X.iloc[f_tr].reset_index(drop=True), cv_y[f_tr])
+                            f_preds = cand.predict(cv_X.iloc[f_va].reset_index(drop=True))
+                            f_sc = (
+                                float(f1_score(cv_y[f_va], f_preds, average="weighted", zero_division=0))
+                                if is_clf
+                                else float(root_mean_squared_error(cv_y[f_va], f_preds))
+                            )
+                            fold_scores.append(f_sc)
+                        return float(np.mean(fold_scores))
+                    cut = max(2, int(len(cv_X) * 0.8))
+                    cand = ClassicalMLModel(
+                        _alg, task_type=task, random_seed=self.random_seed, track_carbon=False, **params
+                    )
+                    cand.fit(cv_X.iloc[:cut].reset_index(drop=True), cv_y[:cut])
+                    sub_preds = cand.predict(cv_X.iloc[cut:].reset_index(drop=True))
+                    return (
+                        float(f1_score(cv_y[cut:], sub_preds, average="weighted", zero_division=0))
+                        if is_clf
+                        else float(root_mean_squared_error(cv_y[cut:], sub_preds))
+                    )
 
                 hpo_res = hpo.optimize(space, _trial_obj)
                 tuned = ClassicalMLModel(
@@ -388,6 +478,7 @@ class AutoMLPipelineSearch:
                 tuned.fit(X_tr, y_tr)
                 sc = _score_model(tuned)
                 t_name = f"{alg}_tuned"
+                tuned_params_map[t_name] = dict(hpo_res.best_params)
                 leaderboard.append(
                     {
                         "model": t_name,
@@ -399,10 +490,10 @@ class AutoMLPipelineSearch:
                 )
                 fitted_candidates.append((t_name, sc, tuned))
 
-            # 4. Automatic Top-3 Voting Ensemble
+            # 4. Automatic Top-3 Voting Ensemble (deep-clone candidates so all_fitted_models stay unmutated)
             fitted_candidates.sort(key=lambda t: t[1], reverse=is_clf)
             if self.enable_ensembling and len(fitted_candidates) >= 2:
-                top_models = [m for _, _, m in fitted_candidates[:3]]
+                top_models = [copy.deepcopy(m) for _, _, m in fitted_candidates[:3]]
                 ens = VotingEnsembleModel(
                     estimators=top_models, task_type=task, random_seed=self.random_seed, track_carbon=False
                 )
@@ -424,18 +515,21 @@ class AutoMLPipelineSearch:
             for cand_name, _, cand_model in fitted_candidates:
                 all_fitted_models[cand_name] = cand_model
             fitted_candidates.sort(key=lambda t: t[1], reverse=is_clf)
-            best_name, best_val_score, best_model = fitted_candidates[0]
+            best_name, best_val_score, best_cand_model = fitted_candidates[0]
+            best_model = copy.deepcopy(best_cand_model)
             best_model.fit(X_work, y_arr)
             all_fitted_models[best_name] = best_model
             best_model.metadata_.baseline_comparison = baselines
             best_model.metadata_.metrics[primary_metric] = round(best_val_score, 6)
 
-            # Build and fit a clean deployable sklearn ColumnTransformer Pipeline alongside champion
+            # Build and fit a clean deployable sklearn ColumnTransformer Pipeline preserving tuned HPO params
             try:
                 base_alg = best_name.replace("_tuned", "")
                 sk_est = self._sklearn_estimator_for_cv(
                     base_alg if base_alg in cv_supported else ("random_forest" if is_clf else "ridge"),
                     is_clf,
+                    n_rows=len(X_work),
+                    params=tuned_params_map.get(best_name),
                 )
                 best_sklearn_pipeline = LeakageSafePipelineBuilder.build_ml_pipeline(
                     X_work,

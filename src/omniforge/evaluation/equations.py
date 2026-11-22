@@ -429,8 +429,8 @@ class ModelEquationExtractor:
         if cls_name in {"DummyRegressorBaseline", "DummyClassifierBaseline"}:
             return cls._extract_dummy_baseline(model, model_name, model_family, target_name, task_str)
 
-        # 2. Linear / Logistic Baselines (RidgeLinearBaseline, LogisticBaseline, _ParametricRefWrapper)
-        if cls_name in {"RidgeLinearBaseline", "LogisticBaseline", "_ParametricRefWrapper"}:
+        # 2. Linear / Logistic Baselines (RidgeLinearBaseline, LassoLinearBaseline, LogisticBaseline, _ParametricRefWrapper)
+        if cls_name in {"RidgeLinearBaseline", "LassoLinearBaseline", "LogisticBaseline", "_ParametricRefWrapper"}:
             return cls._extract_linear_model(
                 estimator=getattr(model, "_model", None),
                 scaler=getattr(model, "_scaler", None),
@@ -540,7 +540,7 @@ class ModelEquationExtractor:
                 unwrapped_est = steps_list[-1]
         est_cls = type(unwrapped_est).__name__
         est_cls_low = est_cls.lower()
-        if est_cls in {"Ridge", "LinearRegression", "Lasso", "ElasticNet", "HuberRegressor", "BayesianRidge", "LogisticRegression", "SGDRegressor", "SGDClassifier"} and hasattr(unwrapped_est, "coef_"):
+        if est_cls in {"Ridge", "RidgeCV", "LinearRegression", "Lasso", "LassoCV", "ElasticNet", "ElasticNetCV", "HuberRegressor", "BayesianRidge", "LogisticRegression", "SGDRegressor", "SGDClassifier"} and hasattr(unwrapped_est, "coef_"):
             return cls._extract_linear_model(
                 estimator=unwrapped_est,
                 scaler=unwrapped_scaler,
@@ -1359,7 +1359,8 @@ class ModelEquationExtractor:
                         notes.append(f"Exact Level-2 Meta-Learner combines base models: {', '.join(m_names)}.")
                     else:
                         plain = f"{target_name}_hat(x) = Meta({', '.join(f'{n}(x)' for n in m_names)})"
-                        latex = rf"\widehat{{\text{{{t_tex}}}}}(x) = g_{{\text{{meta}}}}\!\left({', '.join(rf'\hat{{f}}_{{\text{{{_escape_latex(n)}}}}}(x)' for n in m_names)}\right)"
+                        meta_args = ", ".join(rf"\hat{{f}}_{{\text{{{_escape_latex(n)}}}}}(x)" for n in m_names)
+                        latex = rf"\widehat{{\text{{{t_tex}}}}}(x) = g_{{\text{{meta}}}}\!\left({meta_args}\right)"
                 else:
                     w = 1.0 / len(m_names)
                     plain = f"{target_name}_hat(x) = " + " + ".join(f"{w:.3f} * {n}(x)" for n in m_names)
@@ -1370,7 +1371,8 @@ class ModelEquationExtractor:
             elif hasattr(model, "layer_models_") or hasattr(model, "meta_model_"):
                 base_names = list(getattr(model, "base_model_names_", []) or ["GBDT", "ExtraTrees", "RandomForest", "Ridge"])
                 plain = f"{target_name}_hat(x) = MetaStack({', '.join(f'{n}(x)' for n in base_names)})   [Multi-Layer Out-of-Fold Stacker]"
-                latex = rf"\widehat{{\text{{{t_tex}}}}}(x) = g_{{\text{{stack}}}}\!\left({', '.join(rf'\hat{{f}}_{{\text{{{_escape_latex(n)}}}}}(x)' for n in base_names)}\right)"
+                stack_args = ", ".join(rf"\hat{{f}}_{{\text{{{_escape_latex(n)}}}}}(x)" for n in base_names)
+                latex = rf"\widehat{{\text{{{t_tex}}}}}(x) = g_{{\text{{stack}}}}\!\left({stack_args}\right)"
                 arch_plain.append(f"Multi-Layer Stacker combines {len(base_names)} out-of-fold learners via regularized Level-2 meta-learner.")
                 notes.append("Out-of-fold stacking prevents Level-2 overfitting while capturing both linear and tree-based interactions.")
             else:

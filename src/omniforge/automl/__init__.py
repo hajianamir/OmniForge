@@ -3,6 +3,7 @@
 from omniforge.automl.backends import (
     AutoMLBackendHub,
     GeneticPipelineAutoML,
+    MetaFeatureWarmStartAutoML,
     MetaLearningBayesianAutoML,
     MultiBackendAutoMLResult,
     MultiLayerStackingAutoML,
@@ -19,7 +20,8 @@ __all__ = [
     "GeneticPipelineAutoML",
     "HPOResult",
     "HyperparameterOptimizer",
-    "MetaLearningBayesianAutoML",
+    "MetaFeatureWarmStartAutoML",
+    "MetaLearningBayesianAutoML",  # deprecated alias
     "MultiBackendAutoMLResult",
     "MultiLayerStackingAutoML",
     "NeuralArchitectureSearcher",

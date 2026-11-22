@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,18 @@ from omniforge.core.logging import get_logger
 from omniforge.core.utils import compute_dataframe_checksum
 
 logger = get_logger(__name__)
+
+_SAFE_DATASET_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _validate_version_identifier(value: str, label: str) -> str:
+    """Validate dataset names, version IDs, and tags against CWE-22 path traversal tokens."""
+    cleaned = str(value).strip()
+    if not cleaned or ".." in cleaned or not _SAFE_DATASET_ID_RE.fullmatch(cleaned):
+        raise DataError(
+            f"Invalid {label} '{value}': must match ^[A-Za-z0-9][A-Za-z0-9._-]{{0,127}}$ without '..' or path separators."
+        )
+    return cleaned
 
 
 class DatasetVersion(BaseModel):
@@ -51,6 +64,16 @@ class DatasetVersionManager:
     def _save_manifest(self, manifest: dict[str, Any]) -> None:
         self._manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
+    def _resolve_confined_snapshot_path(self, raw_path: str | Path) -> Path:
+        """Resolve a snapshot path and verify canonical containment inside ``self.store_dir`` (CWE-22)."""
+        base_dir = self.store_dir.resolve()
+        candidate = Path(raw_path).resolve()
+        if candidate == base_dir or not candidate.is_relative_to(base_dir):
+            raise DataError(
+                f"Refusing snapshot path outside dataset version store (CWE-22 protection): '{raw_path}'."
+            )
+        return candidate
+
     def commit(
         self,
         df: pd.DataFrame,
@@ -61,48 +84,55 @@ class DatasetVersionManager:
         metadata: dict[str, Any] | None = None,
     ) -> DatasetVersion:
         """Persist a versioned immutable Parquet/JSON snapshot of ``df``."""
+        safe_ds = _validate_version_identifier(dataset_name, "dataset name")
+        safe_tag = _validate_version_identifier(tag, "version tag") if tag is not None else None
         manifest = self._load_manifest()
-        history: list[dict[str, Any]] = manifest["datasets"].setdefault(dataset_name, [])
+        history: list[dict[str, Any]] = manifest["datasets"].setdefault(safe_ds, [])
         checksum = compute_dataframe_checksum(df)
         version_num = len(history) + 1
         version_id = f"v{version_num}_{checksum[:10]}"
         parent_id = history[-1]["version_id"] if history else None
 
-        ds_dir = self.store_dir / dataset_name
+        ds_dir = self._resolve_confined_snapshot_path(self.store_dir / safe_ds)
         ds_dir.mkdir(parents=True, exist_ok=True)
         try:
-            artifact_path = ds_dir / f"{version_id}.parquet"
+            artifact_path = self._resolve_confined_snapshot_path(ds_dir / f"{version_id}.parquet")
             df.to_parquet(artifact_path, index=False)
+        except DataError:
+            raise
         except Exception:
-            artifact_path = ds_dir / f"{version_id}.json"
+            artifact_path = self._resolve_confined_snapshot_path(ds_dir / f"{version_id}.json")
             df.to_json(artifact_path, orient="table")
 
         version = DatasetVersion(
-            dataset_name=dataset_name,
+            dataset_name=safe_ds,
             version_id=version_id,
-            tag=tag,
+            tag=safe_tag,
             checksum_sha256=checksum,
             parent_version_id=parent_id,
             n_rows=int(len(df)),
             n_columns=int(len(df.columns)),
             columns=[str(c) for c in df.columns],
             dtypes={str(c): str(dt) for c, dt in zip(df.columns, df.dtypes, strict=False)},
-            storage_path=str(artifact_path.resolve()),
+            storage_path=str(artifact_path),
             message=message,
             metadata=metadata or {},
         )
         history.append(version.model_dump())
         self._save_manifest(manifest)
-        logger.info("dataset_version_committed", dataset=dataset_name, version_id=version_id)
+        logger.info("dataset_version_committed", dataset=safe_ds, version_id=version_id)
         return version
 
     def checkout(
         self, dataset_name: str, version_or_tag: str | None = None
     ) -> tuple[pd.DataFrame, DatasetVersion]:
         """Load a specific version, tag, or latest snapshot of ``dataset_name``."""
-        versions = self.list_versions(dataset_name)
+        safe_ds = _validate_version_identifier(dataset_name, "dataset name")
+        if version_or_tag is not None and version_or_tag != "latest":
+            version_or_tag = _validate_version_identifier(version_or_tag, "version_or_tag")
+        versions = self.list_versions(safe_ds)
         if not versions:
-            raise DataError(f"No versions found for dataset '{dataset_name}'.")
+            raise DataError(f"No versions found for dataset '{safe_ds}'.")
         selected: DatasetVersion | None = None
         if version_or_tag is None or version_or_tag == "latest":
             selected = versions[-1]
@@ -113,9 +143,9 @@ class DatasetVersionManager:
                     break
         if selected is None:
             raise DataError(
-                f"Version or tag '{version_or_tag}' not found for dataset '{dataset_name}'."
+                f"Version or tag '{version_or_tag}' not found for dataset '{safe_ds}'."
             )
-        path = Path(selected.storage_path)
+        path = self._resolve_confined_snapshot_path(selected.storage_path)
         if path.suffix == ".parquet":
             df = pd.read_parquet(path)
         elif path.suffix == ".json":
@@ -129,8 +159,9 @@ class DatasetVersionManager:
 
     def list_versions(self, dataset_name: str) -> list[DatasetVersion]:
         """List all recorded versions of ``dataset_name`` in chronological order."""
+        safe_ds = _validate_version_identifier(dataset_name, "dataset name")
         manifest = self._load_manifest()
-        return [DatasetVersion(**rec) for rec in manifest["datasets"].get(dataset_name, [])]
+        return [DatasetVersion(**rec) for rec in manifest["datasets"].get(safe_ds, [])]
 
     def diff(
         self, dataset_name: str, version_a: str, version_b: str

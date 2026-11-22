@@ -2,15 +2,60 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import pandas as pd
 
 from omniforge.copilot.memory import CopilotMemory
 from omniforge.core.exceptions import CopilotError
 from omniforge.core.utils import to_json_object
+
+_FORBIDDEN_SYSTEM_PREFIXES: tuple[str, ...] = ("/etc", "/proc", "/sys", "/root", "/dev", "/var/run")
+
+
+def _validate_copilot_ingest_source(source: str) -> str | Path:
+    """Enforce OWASP LLM06 / MITRE CWE-22 path confinement on Copilot file ingestion."""
+    raw = str(source).strip()
+    if not raw or "\x00" in raw:
+        raise CopilotError("Invalid or empty data source provided to Copilot tool_ingest_data.")
+
+    parsed = urlparse(raw)
+    if parsed.scheme in ("http", "https"):
+        return raw
+    if parsed.scheme and parsed.scheme not in ("file", ""):
+        raise CopilotError(
+            f"Unsupported URI scheme {parsed.scheme!r} in Copilot tool_ingest_data; only confined local files or http(s) URLs are permitted."
+        )
+
+    local_str = parsed.path if parsed.scheme == "file" else raw
+    path_parts = Path(local_str).parts
+    if ".." in path_parts:
+        raise CopilotError(f"Path traversal ('..') is forbidden in Copilot data ingestion: {source!r}")
+
+    allowed_root = Path(os.environ.get("OMNIFORGE_COPILOT_INGEST_ROOT") or Path.cwd()).resolve()
+    cand = Path(local_str)
+    resolved = (cand if cand.is_absolute() else (allowed_root / cand)).resolve()
+
+    resolved_posix = resolved.as_posix()
+    for prefix in _FORBIDDEN_SYSTEM_PREFIXES:
+        if resolved_posix == prefix or resolved_posix.startswith(prefix + "/"):
+            raise CopilotError(f"Access to sensitive system path is forbidden: {source!r}")
+
+    if not resolved.is_relative_to(allowed_root):
+        raise CopilotError(
+            f"Data source {source!r} resolves outside allowed Copilot ingest root ({allowed_root})."
+        )
+
+    rel_parts = resolved.relative_to(allowed_root).parts
+    if any(part.startswith(".") for part in rel_parts):
+        raise CopilotError(f"Access to hidden dotfiles or secret directories is forbidden: {source!r}")
+
+    return resolved
 
 
 @dataclass
@@ -67,7 +112,8 @@ class CopilotToolRegistry:
         def tool_ingest_data(source: str, dataset_name: str = "dataset") -> dict[str, Any]:
             from omniforge.data.ingestion import DataIngestionEngine
 
-            res = DataIngestionEngine().ingest(source, name=dataset_name)
+            safe_source = _validate_copilot_ingest_source(source)
+            res = DataIngestionEngine().ingest(safe_source, name=dataset_name)
             self.memory.set_dataset(dataset_name, res.data)
             self.memory.working_state["reports"][f"meta_{dataset_name}"] = res.metadata
             return {

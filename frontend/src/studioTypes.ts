@@ -565,6 +565,8 @@ export interface ChatResponse {
   history?: ChatTurn[];
   reply?: string;
   answer?: string;
+  provider_used?: string;
+  suggested_actions?: string[];
   [key: string]: unknown;
 }
 

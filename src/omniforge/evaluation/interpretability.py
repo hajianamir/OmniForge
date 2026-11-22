@@ -66,22 +66,43 @@ class InterpretabilityEngine:
         pred_val = float(self._predict_scalar(model, x_row)[0])
 
         shap_vals = np.zeros(n_feats, dtype=float)
+        if n_feats == 0 or n_samples <= 0 or len(bg) == 0:
+            return {
+                "method": "monte_carlo_shap",
+                "expected_value": round(pred_val, 6),
+                "prediction": round(pred_val, 6),
+                "attributions": {},
+            }
+
         bg_idx = rng.integers(0, len(bg), size=n_samples)
-        sampled_base_preds: list[float] = []
+        perms = [rng.permutation(n_feats) for _ in range(n_samples)]
 
-        for s in range(n_samples):
-            perm = rng.permutation(n_feats)
-            base_row = bg.iloc[[int(bg_idx[s])]].copy()
-            prev_pred = float(self._predict_scalar(model, base_row)[0])
-            sampled_base_preds.append(prev_pred)
-            for feat_i in perm:
-                col = cols[feat_i]
-                base_row[col] = x_row[col].values[0]
-                new_pred = float(self._predict_scalar(model, base_row)[0])
-                shap_vals[feat_i] += new_pred - prev_pred
-                prev_pred = new_pred
+        # Vectorized coalition batch: evaluate all n_samples * (n_feats + 1) rows in one model call
+        n_steps = n_feats + 1
+        batch_df = bg.iloc[np.repeat(bg_idx, n_steps)].reset_index(drop=True).copy()
+        use_instance = np.zeros((n_samples, n_steps, n_feats), dtype=bool)
+        for s, perm in enumerate(perms):
+            for step, feat_i in enumerate(perm):
+                use_instance[s, step + 1 :, int(feat_i)] = True
+        mask_2d = use_instance.reshape(n_samples * n_steps, n_feats)
+        for j, col in enumerate(cols):
+            col_mask = mask_2d[:, j]
+            if np.any(col_mask):
+                inst_val = x_row[col].iloc[0]
+                if (
+                    isinstance(batch_df[col].dtype, pd.CategoricalDtype)
+                    and pd.notna(inst_val)
+                    and inst_val not in batch_df[col].cat.categories
+                ):
+                    batch_df[col] = batch_df[col].cat.add_categories([inst_val])
+                batch_df.loc[col_mask, col] = inst_val
 
-        expected_val = float(np.mean(sampled_base_preds)) if sampled_base_preds else 0.0
+        all_preds = np.asarray(self._predict_scalar(model, batch_df), dtype=float).reshape(n_samples, n_steps)
+        expected_val = float(np.mean(all_preds[:, 0]))
+        diffs = np.diff(all_preds, axis=1)
+        for s, perm in enumerate(perms):
+            shap_vals[perm] += diffs[s]
+
         shap_vals /= max(n_samples, 1)
         attributions = {
             str(col): round(float(val), 6)
@@ -175,15 +196,15 @@ class InterpretabilityEngine:
         """Compute Partial Dependence (PDP) and Individual Conditional Expectation (ICE) profiles."""
         sample_df = X.head(min(len(X), 200)).copy()
         vals = pd.to_numeric(sample_df[feature], errors="coerce").dropna()
-        grid = np.linspace(float(vals.quantile(0.05)), float(vals.quantile(0.95)), grid_resolution)
-        pdp_means: list[float] = []
-        pdp_stds: list[float] = []
-        for g_val in grid:
-            mod = sample_df.copy()
-            mod[feature] = g_val
-            preds = self._predict_scalar(model, mod)
-            pdp_means.append(round(float(np.mean(preds)), 6))
-            pdp_stds.append(round(float(np.std(preds)), 6))
+        if len(vals) == 0 or len(sample_df) == 0:
+            return {"feature": feature, "grid": [], "pdp_mean": [], "pdp_std": []}
+        grid = np.linspace(float(vals.quantile(0.05)), float(vals.quantile(0.95)), max(1, int(grid_resolution)))
+        n_rows = len(sample_df)
+        stacked = pd.concat([sample_df] * len(grid), ignore_index=True)
+        stacked[feature] = np.repeat(grid, n_rows)
+        all_preds = np.asarray(self._predict_scalar(model, stacked), dtype=float).reshape(len(grid), n_rows)
+        pdp_means = [round(float(v), 6) for v in np.mean(all_preds, axis=1)]
+        pdp_stds = [round(float(v), 6) for v in np.std(all_preds, axis=1)]
         return {
             "feature": feature,
             "grid": [round(float(v), 6) for v in grid],
@@ -199,25 +220,74 @@ class InterpretabilityEngine:
         *,
         desired_class: Any,
         n_candidates: int = 400,
+        immutable_features: list[str] | None = None,
+        feature_bounds: dict[str, tuple[float, float]] | None = None,
+        respect_domain_bounds: bool = True,
     ) -> dict[str, Any]:
-        """Search for the nearest plausible counterfactual record achieving ``desired_class``."""
+        """Search for the nearest plausible counterfactual record achieving ``desired_class``.
+
+        Minimizes the Wachter, Mittelstadt & Russell (2017, *Harvard J. Law & Tech.* 31(2), Eq. 4)
+        and Mothilal, Sharma & Tan (2020, DiCE) inverse-MAD normalized :math:`L_1` distance
+        subject to actionability (``immutable_features``) and domain box constraints.
+        """
         rng = np.random.default_rng(self.random_seed)
         x_row = instance.to_frame().T if isinstance(instance, pd.Series) else instance.iloc[[0]].copy()
-        num_cols = list(X_background.select_dtypes(include=[np.number]).columns)
-        stds = X_background[num_cols].std().replace(0.0, 1.0).fillna(1.0).to_numpy(dtype=float)
+        frozen = set(immutable_features or [])
+        num_cols = [c for c in X_background.select_dtypes(include=[np.number]).columns if c not in frozen]
+        if not num_cols:
+            return {"found": False, "desired_class": desired_class, "changes": {}, "distance_metric": "wachter_l1_mad"}
 
+        bg_num = X_background[num_cols].apply(pd.to_numeric, errors="coerce")
+        stds = bg_num.std(ddof=1).replace(0.0, 1.0).fillna(1.0).to_numpy(dtype=float)
+        medians = bg_num.median().fillna(0.0).to_numpy(dtype=float)
+        raw_mad = np.nanmedian(np.abs(bg_num.to_numpy(dtype=float) - medians[None, :]), axis=0)
+        mads = np.where(np.isfinite(raw_mad) & (raw_mad > 1e-9), 1.4826 * raw_mad, stds)
+        mads = np.where(mads > 1e-9, mads, 1.0)
+
+        lows = np.full(len(num_cols), -np.inf, dtype=float)
+        highs = np.full(len(num_cols), np.inf, dtype=float)
+        if respect_domain_bounds:
+            emp_min = bg_num.min().to_numpy(dtype=float)
+            emp_max = bg_num.max().to_numpy(dtype=float)
+            lows = np.where(np.isfinite(emp_min), emp_min, lows)
+            highs = np.where(np.isfinite(emp_max), emp_max, highs)
+        if feature_bounds:
+            for idx_c, col in enumerate(num_cols):
+                if col in feature_bounds:
+                    lo_b, hi_b = feature_bounds[col]
+                    lows[idx_c] = float(lo_b)
+                    highs[idx_c] = float(hi_b)
+
+        x0 = x_row[num_cols].to_numpy(dtype=float).ravel()
         cands = pd.concat([x_row] * n_candidates, ignore_index=True)
-        scales = np.linspace(0.1, 2.5, n_candidates)[:, None]
-        deltas = rng.normal(0.0, 1.0, size=(n_candidates, len(num_cols))) * scales * stds[None, :]
-        cands[num_cols] = cands[num_cols].to_numpy(dtype=float) + deltas
+        scales = np.linspace(0.05, 3.0, n_candidates)[:, None]
+        raw_deltas = rng.normal(0.0, 1.0, size=(n_candidates, len(num_cols))) * scales * stds[None, :]
+        # Encourage sparse feature edits on the first half of candidates (DiCE sparsity prior)
+        if len(num_cols) > 1 and n_candidates >= 4:
+            half = n_candidates // 2
+            sparse_mask = rng.uniform(0.0, 1.0, size=(half, len(num_cols))) < min(1.0, 2.0 / len(num_cols))
+            empty_rows = ~np.any(sparse_mask, axis=1)
+            if np.any(empty_rows):
+                chosen_cols = rng.integers(0, len(num_cols), size=int(np.sum(empty_rows)))
+                sparse_mask[empty_rows, chosen_cols] = True
+            raw_deltas[:half] *= sparse_mask.astype(float)
+
+        cand_vals = np.clip(x0[None, :] + raw_deltas, lows[None, :], highs[None, :])
+        eff_deltas = cand_vals - x0[None, :]
+        cands[num_cols] = cand_vals
 
         preds = model.predict(cands)
         matched = np.where(preds == desired_class)[0]
         if len(matched) == 0:
-            return {"found": False, "desired_class": desired_class, "changes": {}}
+            return {"found": False, "desired_class": desired_class, "changes": {}, "distance_metric": "wachter_l1_mad"}
 
-        dists = np.linalg.norm(deltas[matched] / stds[None, :], axis=1)
-        best_idx = int(matched[int(np.argmin(dists))])
+        wachter_l1 = np.sum(np.abs(eff_deltas[matched]) / mads[None, :], axis=1)
+        sparsity = np.sum(np.abs(eff_deltas[matched]) > 1e-4, axis=1)
+        # Lexicographic tie-breaking favoring sparser counterfactuals at equal Wachter L1 distance
+        score = wachter_l1 + 0.01 * sparsity
+        best_local = int(np.argmin(score))
+        best_idx = int(matched[best_local])
+        best_dist = float(wachter_l1[best_local])
         changes = {
             col: {
                 "from": round(float(x_row[col].iloc[0]), 6),
@@ -230,6 +300,8 @@ class InterpretabilityEngine:
         return {
             "found": True,
             "desired_class": desired_class,
-            "normalized_distance": round(float(np.min(dists)), 4),
+            "normalized_distance": round(best_dist, 4),
+            "distance_metric": "wachter_l1_mad",
+            "sparsity_changed_features": len(changes),
             "changes": changes,
         }

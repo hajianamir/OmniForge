@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -19,6 +19,7 @@ class KaplanMeierEstimator:
         self.alpha = float(alpha)
         self.survival_table_: pd.DataFrame = pd.DataFrame()
         self.median_survival_time_: float | None = None
+        self.rmst_: dict[str, float] = {}
 
     def fit(self, durations: pd.Series | np.ndarray, events: pd.Series | np.ndarray) -> KaplanMeierEstimator:
         """Compute Kaplan-Meier survival probabilities and Kalbfleisch-Prentice log-log Greenwood CIs."""
@@ -67,7 +68,51 @@ class KaplanMeierEstimator:
         self.survival_table_ = pd.DataFrame(rows)
         below_half = self.survival_table_[self.survival_table_["survival_prob"] <= 0.5]
         self.median_survival_time_ = float(below_half["time"].iloc[0]) if len(below_half) > 0 else None
+        self.rmst_ = self.restricted_mean_survival_time()
         return self
+
+    def restricted_mean_survival_time(self, tau: float | None = None) -> dict[str, float]:
+        """Compute Restricted Mean Survival Time (RMST) up to ``tau`` with Greenwood tail-integral SE (Royston & Parmar 2013)."""
+        if self.survival_table_.empty:
+            raise ModelError("KaplanMeierEstimator must be fitted before computing RMST.")
+        tbl = self.survival_table_
+        max_time = float(tbl["time"].iloc[-1])
+        tau_val = max(0.0, float(tau) if tau is not None else max_time)
+        if tau_val <= 0.0:
+            return {"tau": 0.0, "rmst": 0.0, "std_err": 0.0, "ci_lower": 0.0, "ci_upper": 0.0}
+
+        sub = tbl[tbl["time"] <= tau_val].reset_index(drop=True)
+        times = sub["time"].to_numpy(dtype=float)
+        survs = sub["survival_prob"].to_numpy(dtype=float)
+        at_risk = sub["at_risk"].to_numpy(dtype=float)
+        deaths = sub["events"].to_numpy(dtype=float)
+
+        # Exact step-function area int_0^tau S_hat(u) du with S_hat(0) = 1.0
+        knots = np.concatenate(([0.0], times, [tau_val] if (len(times) == 0 or times[-1] < tau_val) else []))
+        levels = np.concatenate(([1.0], survs))[: len(knots) - 1]
+        seg_areas = levels * np.diff(knots)
+        rmst = float(np.sum(seg_areas))
+
+        # Tail integrals A_k = int_{t_k}^{tau} S_hat(u) du for Greenwood RMST variance
+        # Note: seg_areas[0] covers [0, t_1); seg_areas[k+1:] covers [t_{k+1}, tau], and [t_k, next_knot) is seg_areas[k+1]
+        tail_from_knot = np.cumsum(seg_areas[::-1])[::-1]
+        var_rmst = 0.0
+        for idx in range(len(times)):
+            d_k = deaths[idx]
+            n_k = at_risk[idx]
+            if d_k > 0.0 and n_k > d_k and times[idx] < tau_val:
+                area_after_tk = float(tail_from_knot[idx + 1]) if (idx + 1) < len(tail_from_knot) else 0.0
+                var_rmst += (area_after_tk**2) * (d_k / (n_k * (n_k - d_k)))
+
+        se_rmst = float(np.sqrt(max(0.0, var_rmst)))
+        z_crit = float(stats.norm.ppf(1.0 - self.alpha / 2.0))
+        return {
+            "tau": round(tau_val, 6),
+            "rmst": round(rmst, 6),
+            "std_err": round(se_rmst, 6),
+            "ci_lower": round(max(0.0, rmst - z_crit * se_rmst), 6),
+            "ci_upper": round(min(tau_val, rmst + z_crit * se_rmst), 6),
+        }
 
     @staticmethod
     def log_rank_test(
@@ -126,6 +171,8 @@ class CoxPHModel:
         self.baseline_times_: np.ndarray = np.array([], dtype=float)
         self.baseline_cum_hazard_: np.ndarray = np.array([], dtype=float)
         self.concordance_index_: float = 0.5
+        self._cov_std_: np.ndarray = np.empty((0, 0), dtype=float)
+        self.ph_test_results_: dict[str, Any] = {}
 
     def _partial_loglik_grad_hess(
         self,
@@ -257,6 +304,7 @@ class CoxPHModel:
             cov_std = np.linalg.inv(info + np.eye(p, dtype=float) * 1e-12)
         except np.linalg.LinAlgError:
             cov_std = np.linalg.pinv(info)
+        self._cov_std_ = cov_std
         cov_orig = cov_std / np.outer(scales, scales)
         se_orig = np.sqrt(np.maximum(np.diag(cov_orig), 0.0))
         self.standard_errors_ = se_orig
@@ -293,7 +341,137 @@ class CoxPHModel:
         self.baseline_times_ = unique_event_times
         self.baseline_cum_hazard_ = np.asarray(base_h, dtype=float)
         self.concordance_index_ = self.compute_c_index(T, E, X @ beta)
+        self.ph_test_results_ = self._compute_ph_test_from_sorted(X, T, E, time_transform="km")
         return self
+
+    def _compute_ph_test_from_sorted(
+        self,
+        X_std: np.ndarray,
+        T_sorted: np.ndarray,
+        E_sorted: np.ndarray,
+        *,
+        time_transform: Literal["km", "rank", "log", "identity"] = "km",
+    ) -> dict[str, Any]:
+        """Schoenfeld (1982) residuals & Grambsch-Therneau (1994, Biometrika) Proportional Hazards test."""
+        p = X_std.shape[1]
+        ev_indices = np.flatnonzero(E_sorted == 1)
+        n_events = len(ev_indices)
+        if n_events < max(3, p + 1) or self._cov_std_.size == 0:
+            return {
+                "time_transform": time_transform,
+                "n_events": int(n_events),
+                "global_chi2": 0.0,
+                "global_df": int(p),
+                "global_p_value": 1.0,
+                "proportional_hazards_satisfied": True,
+                "covariates": {},
+            }
+
+        eta = np.clip(X_std @ self.standardized_coef_, -30.0, 30.0)
+        w = np.exp(eta)
+        rev_w = np.cumsum(w[::-1])[::-1]
+        wx = X_std * w[:, None]
+        rev_wx = np.cumsum(wx[::-1], axis=0)[::-1]
+
+        schoenfeld = np.zeros((n_events, p), dtype=float)
+        ev_times = T_sorted[ev_indices]
+        unique_ev = np.unique(ev_times)
+        pos_cursor = 0
+        for t_k in unique_ev:
+            risk_start = int(np.searchsorted(T_sorted, t_k, side="left"))
+            w_r = float(rev_w[risk_start])
+            x_r = rev_wx[risk_start]
+            tie_mask = (T_sorted == t_k) & (E_sorted == 1)
+            d_k = int(np.sum(tie_mask))
+            if d_k == 0:
+                continue
+            if self.ties == "efron" and d_k > 1:
+                w_d = float(np.sum(w[tie_mask]))
+                x_d = np.sum(wx[tie_mask], axis=0)
+                expected_x = np.zeros(p, dtype=float)
+                for m in range(d_k):
+                    frac = float(m) / float(d_k)
+                    w_m = max(w_r - frac * w_d, 1e-15)
+                    expected_x += (x_r - frac * x_d) / w_m
+                expected_x /= float(d_k)
+            else:
+                expected_x = x_r / max(w_r, 1e-15)
+            schoenfeld[pos_cursor : pos_cursor + d_k] = X_std[tie_mask] - expected_x[None, :]
+            pos_cursor += d_k
+
+        if time_transform == "rank":
+            g_raw = stats.rankdata(ev_times, method="average").astype(float)
+        elif time_transform == "log":
+            g_raw = np.log(np.maximum(ev_times, 1e-12))
+        elif time_transform == "identity":
+            g_raw = ev_times.astype(float)
+        else:
+            km = KaplanMeierEstimator().fit(T_sorted, E_sorted)
+            km_map = dict(zip(km.survival_table_["time"].to_numpy(), km.survival_table_["survival_prob"].to_numpy(), strict=False))
+            g_raw = np.array([1.0 - float(km_map.get(float(t_val), 0.0)) for t_val in ev_times], dtype=float)
+
+        g_centered = g_raw - float(np.mean(g_raw))
+        g2 = float(np.sum(g_centered**2))
+        if g2 <= 1e-15:
+            return {
+                "time_transform": time_transform,
+                "n_events": int(n_events),
+                "global_chi2": 0.0,
+                "global_df": int(p),
+                "global_p_value": 1.0,
+                "proportional_hazards_satisfied": True,
+                "covariates": {},
+            }
+
+        # Grambsch & Therneau (1994, Biometrika 81(3): 515-526) score test under homogeneous variance V_bar = (d * V)^(-1)
+        u_g = schoenfeld.T @ g_centered  # shape (p,)
+        v_mat = self._cov_std_
+        vu = v_mat @ u_g
+        global_chi2 = max(0.0, float(n_events / g2) * float(u_g @ vu))
+        global_p = float(stats.chi2.sf(global_chi2, df=p))
+
+        cov_tests: dict[str, dict[str, float | bool]] = {}
+        for j, name in enumerate(self.feature_names_):
+            v_jj = max(float(v_mat[j, j]), 1e-15)
+            chi2_j = max(0.0, float(n_events / g2) * float((vu[j] ** 2) / v_jj))
+            p_j = float(stats.chi2.sf(chi2_j, df=1))
+            # Correlation between scaled Schoenfeld residual component and transformed time
+            scaled_j = float(n_events) * (schoenfeld @ v_mat[:, j])
+            denom_corr = float(np.sqrt(g2 * max(float(np.sum((scaled_j - np.mean(scaled_j)) ** 2)), 1e-15)))
+            rho_j = float(np.sum(g_centered * (scaled_j - np.mean(scaled_j))) / denom_corr) if denom_corr > 0.0 else 0.0
+            cov_tests[name] = {
+                "rho": round(float(np.clip(rho_j, -1.0, 1.0)), 6),
+                "chi2": round(chi2_j, 6),
+                "p_value": round(p_j, 6),
+                "violates_ph": bool(p_j < 0.05),
+            }
+
+        return {
+            "time_transform": time_transform,
+            "n_events": int(n_events),
+            "global_chi2": round(global_chi2, 6),
+            "global_df": int(p),
+            "global_p_value": round(global_p, 6),
+            "proportional_hazards_satisfied": bool(global_p >= 0.05),
+            "covariates": cov_tests,
+        }
+
+    def check_proportional_hazards(
+        self,
+        df: pd.DataFrame,
+        *,
+        duration_col: str = "duration",
+        event_col: str = "event",
+        time_transform: Literal["km", "rank", "log", "identity"] = "km",
+    ) -> dict[str, Any]:
+        """Run Grambsch-Therneau (1994) Schoenfeld residual test of the Proportional Hazards assumption."""
+        if len(self.coef_) == 0:
+            raise ModelError("CoxPHModel must be fitted before check_proportional_hazards().")
+        order = np.argsort(df[duration_col].to_numpy(dtype=float), kind="mergesort")
+        X_std = self._scaler.transform(df[self.feature_names_].to_numpy(dtype=float)[order])
+        T_s = df[duration_col].to_numpy(dtype=float)[order]
+        E_s = df[event_col].to_numpy(dtype=int)[order]
+        return self._compute_ph_test_from_sorted(X_std, T_s, E_s, time_transform=time_transform)
 
     def predict_risk(self, X: pd.DataFrame | np.ndarray) -> np.ndarray:
         """Predict mean-centered relative hazard risk score exp((X - mu) @ beta_orig)."""
@@ -309,23 +487,76 @@ class CoxPHModel:
 
     @staticmethod
     def compute_c_index(durations: np.ndarray, events: np.ndarray, risk_scores: np.ndarray) -> float:
-        """Compute Harrell's Concordance Index (C-index) properly including tied event/censoring pairs."""
+        """Compute Harrell's Concordance Index (C-index) via chunk-vectorized risk-set comparisons."""
         t = np.asarray(durations, dtype=float).ravel()
         e = np.asarray(events, dtype=int).ravel()
         r = np.asarray(risk_scores, dtype=float).ravel()
+        ev_idx = np.flatnonzero(e == 1)
+        if len(ev_idx) == 0 or len(t) < 2:
+            return 0.5
+
         concordant = 0.0
         permissible = 0.0
-        n = len(t)
-        for i in range(n):
-            if e[i] != 1:
-                continue
-            for j in range(n):
-                if i == j:
-                    continue
-                if t[j] > t[i] or (t[j] == t[i] and e[j] == 0):
-                    permissible += 1.0
-                    if r[i] > r[j]:
-                        concordant += 1.0
-                    elif r[i] == r[j]:
-                        concordant += 0.5
-        return round(concordant / max(permissible, 1.0), 6)
+        chunk = 512
+        for start in range(0, len(ev_idx), chunk):
+            idx = ev_idx[start : start + chunk]
+            ti = t[idx][:, None]
+            ri = r[idx][:, None]
+            # Permissible j: t_j > t_i OR (t_j == t_i AND e_j == 0); note e_i == 1 excludes i == j automatically
+            perm_mask = (t[None, :] > ti) | ((t[None, :] == ti) & (e[None, :] == 0))
+            permissible += float(np.sum(perm_mask))
+            concordant += float(np.sum(perm_mask & (ri > r[None, :])))
+            concordant += 0.5 * float(np.sum(perm_mask & (ri == r[None, :])))
+
+        return round(concordant / max(permissible, 1.0), 6) if permissible > 0.0 else 0.5
+
+    @staticmethod
+    def compute_uno_c_index(
+        durations_train: np.ndarray,
+        events_train: np.ndarray,
+        durations_eval: np.ndarray,
+        events_eval: np.ndarray,
+        risk_scores: np.ndarray,
+        *,
+        tau: float | None = None,
+    ) -> float:
+        """Compute Uno et al. (2011, Stat. Med.) IPCW Concordance Index consistent under heavy censoring."""
+        t_tr = np.asarray(durations_train, dtype=float).ravel()
+        e_tr = np.asarray(events_train, dtype=int).ravel()
+        t_ev = np.asarray(durations_eval, dtype=float).ravel()
+        e_ev = np.asarray(events_eval, dtype=int).ravel()
+        r_ev = np.asarray(risk_scores, dtype=float).ravel()
+
+        if len(t_ev) < 2 or len(t_tr) == 0:
+            return 0.5
+
+        # Kaplan-Meier estimator of censoring distribution G(t) = P(C > t) where censoring is event (1 - delta)
+        cens_km = KaplanMeierEstimator().fit(t_tr, 1 - e_tr)
+        g_times = cens_km.survival_table_["time"].to_numpy(dtype=float)
+        g_probs = cens_km.survival_table_["survival_prob"].to_numpy(dtype=float)
+
+        tau_lim = float(tau) if tau is not None else float(np.max(t_ev))
+        ev_idx = np.flatnonzero((e_ev == 1) & (t_ev <= tau_lim))
+        if len(ev_idx) == 0:
+            return 0.5
+
+        # Left-continuous censoring survival G(T_i-) = P(C >= T_i)
+        pos_left = np.searchsorted(g_times, t_ev[ev_idx], side="left") - 1
+        g_minus = np.where(pos_left >= 0, g_probs[np.maximum(pos_left, 0)], 1.0)
+        g_clamped = np.maximum(g_minus, 0.05)  # Tail weight stabilization per Uno et al. (2011)
+        ipcw_weights = 1.0 / (g_clamped**2)
+
+        num = 0.0
+        den = 0.0
+        chunk = 512
+        for start in range(0, len(ev_idx), chunk):
+            idx = ev_idx[start : start + chunk]
+            w_i = ipcw_weights[start : start + chunk][:, None]
+            ti = t_ev[idx][:, None]
+            ri = r_ev[idx][:, None]
+            perm_mask = (t_ev[None, :] > ti) | ((t_ev[None, :] == ti) & (e_ev[None, :] == 0))
+            den += float(np.sum(w_i * perm_mask))
+            scores_pair = np.where(ri > r_ev[None, :], 1.0, np.where(ri == r_ev[None, :], 0.5, 0.0))
+            num += float(np.sum(w_i * perm_mask * scores_pair))
+
+        return round(num / max(den, 1e-12), 6) if den > 0.0 else 0.5

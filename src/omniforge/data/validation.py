@@ -77,24 +77,89 @@ class Expectation(BaseModel):
     description: str = ""
 
 
+_BUILTIN_EXPECTATION_TYPES: frozenset[str] = frozenset(
+    {
+        "expect_table_row_count_to_be_between",
+        "expect_table_columns_to_match_set",
+        "expect_column_to_exist",
+        "expect_column_values_to_not_be_null",
+        "expect_column_null_ratio_to_be_below",
+        "expect_column_values_to_be_unique",
+        "expect_column_values_to_be_between",
+        "expect_column_values_to_be_in_set",
+        "expect_column_values_to_match_regex",
+        "expect_column_dtype",
+        "expect_column_values_to_be_increasing",
+        "expect_column_distribution_ks_test",
+        "expect_column_pair_values_a_to_be_greater_than_b",
+    }
+)
+
+_SUPPORTED_RULE_SHORTHANDS: tuple[str, ...] = (
+    "range",
+    "not_null",
+    "null_ratio",
+    "in_set",
+    "unique",
+    "regex",
+    "dtype",
+    "increasing",
+    "ks_test",
+    "pair_greater",
+    "column_exists",
+    "row_count",
+    "columns_match_set",
+)
+
+
 class ValidationRule(BaseModel):
-    """Concise shorthand validation rule convertible into a Great Expectations :class:`Expectation`."""
+    """Concise shorthand validation rule convertible into a Great Expectations :class:`Expectation`.
+
+    Aligned with ISO/IEC 25012:2008 data-quality dimensions (Completeness, Uniqueness, Validity,
+    Consistency, Accuracy) and Great Expectations Core expectation semantics.
+
+    Supported ``rule_type`` shorthands:
+        ``range`` (``min``/``min_value``, ``max``/``max_value``, ``mostly``),
+        ``not_null`` (``mostly``),
+        ``null_ratio`` (``max_null_ratio``/``max_ratio``),
+        ``in_set`` (``values``/``value_set``),
+        ``unique``,
+        ``regex`` (``regex``/``pattern``, ``mostly``),
+        ``dtype`` (``dtype``/``expected_dtype``),
+        ``increasing`` (``strict``),
+        ``ks_test`` (``reference_values``, ``alpha``),
+        ``pair_greater`` (``column_b`` plus ``column``/``column_a``, ``or_equal``),
+        ``column_exists``, ``row_count``, ``columns_match_set``,
+        any canonical ``expect_*`` identifier, or ``custom:<name>`` for registered custom validators.
+    """
 
     name: str
-    rule_type: str  # range, not_null, in_set, unique, regex
+    rule_type: str
     column: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
     severity: ValidationSeverity = ValidationSeverity.ERROR
 
     def to_expectation(self) -> Expectation:
-        """Convert this concise rule into a canonical :class:`Expectation`."""
-        rt = self.rule_type.lower()
-        if rt == "range":
+        """Convert this concise rule into a validated canonical :class:`Expectation`."""
+        rt = self.rule_type.strip().lower()
+        p = dict(self.params)
+
+        if rt in ("range", "between"):
             kw: dict[str, Any] = {}
-            if "min" in self.params:
-                kw["min_value"] = self.params["min"]
-            if "max" in self.params:
-                kw["max_value"] = self.params["max"]
+            if "min" in p or "min_value" in p:
+                kw["min_value"] = p.get("min_value", p.get("min"))
+            if "max" in p or "max_value" in p:
+                kw["max_value"] = p.get("max_value", p.get("max"))
+            if "mostly" in p:
+                mostly = float(p["mostly"])
+                if not 0.0 <= mostly <= 1.0:
+                    raise DataValidationError(f"Rule '{self.name}': 'mostly' must be in [0.0, 1.0], got {mostly}.")
+                kw["mostly"] = mostly
+            if "min_value" in kw and "max_value" in kw and kw["min_value"] is not None and kw["max_value"] is not None:
+                if float(kw["min_value"]) > float(kw["max_value"]):
+                    raise DataValidationError(
+                        f"Rule '{self.name}': min ({kw['min_value']}) cannot exceed max ({kw['max_value']})."
+                    )
             return Expectation(
                 expectation_type="expect_column_values_to_be_between",
                 column=self.column,
@@ -102,23 +167,51 @@ class ValidationRule(BaseModel):
                 severity=self.severity,
                 description=self.name,
             )
-        if rt == "not_null":
+
+        if rt in ("not_null", "non_null"):
+            kw_nn: dict[str, Any] = {}
+            if "mostly" in p:
+                mostly = float(p["mostly"])
+                if not 0.0 <= mostly <= 1.0:
+                    raise DataValidationError(f"Rule '{self.name}': 'mostly' must be in [0.0, 1.0], got {mostly}.")
+                kw_nn["mostly"] = mostly
             return Expectation(
                 expectation_type="expect_column_values_to_not_be_null",
                 column=self.column,
-                kwargs=dict(self.params),
+                kwargs=kw_nn,
                 severity=self.severity,
                 description=self.name,
             )
+
+        if rt in ("null_ratio", "max_null_ratio"):
+            raw_max = p.get("max_null_ratio", p.get("max_ratio", 0.1))
+            max_r = float(raw_max)
+            if not 0.0 <= max_r <= 1.0:
+                raise DataValidationError(
+                    f"Rule '{self.name}': 'max_null_ratio' must be in [0.0, 1.0], got {max_r}."
+                )
+            return Expectation(
+                expectation_type="expect_column_null_ratio_to_be_below",
+                column=self.column,
+                kwargs={"max_null_ratio": max_r},
+                severity=self.severity,
+                description=self.name,
+            )
+
         if rt == "in_set":
-            vals = self.params.get("values", self.params.get("value_set", []))
+            vals = p.get("values", p.get("value_set", p.get("allowed_values")))
+            if vals is None or isinstance(vals, (str, bytes)) or not hasattr(vals, "__iter__"):
+                raise DataValidationError(
+                    f"Rule '{self.name}' (in_set) requires an iterable 'values' or 'value_set' parameter."
+                )
             return Expectation(
                 expectation_type="expect_column_values_to_be_in_set",
                 column=self.column,
-                kwargs={"value_set": vals},
+                kwargs={"value_set": list(vals)},
                 severity=self.severity,
                 description=self.name,
             )
+
         if rt == "unique":
             return Expectation(
                 expectation_type="expect_column_values_to_be_unique",
@@ -127,12 +220,158 @@ class ValidationRule(BaseModel):
                 severity=self.severity,
                 description=self.name,
             )
-        return Expectation(
-            expectation_type=self.rule_type,
-            column=self.column,
-            kwargs=dict(self.params),
-            severity=self.severity,
-            description=self.name,
+
+        if rt in ("regex", "match_regex"):
+            raw_pat = p.get("regex", p.get("pattern"))
+            if not isinstance(raw_pat, str) or raw_pat == "":
+                raise DataValidationError(
+                    f"Rule '{self.name}' (regex) requires a non-empty string 'regex' or 'pattern' parameter."
+                )
+            try:
+                re.compile(raw_pat)
+            except re.error as exc:
+                raise DataValidationError(
+                    f"Rule '{self.name}' has invalid regular expression {raw_pat!r}: {exc}",
+                    cause=exc,
+                ) from exc
+            kw_rx: dict[str, Any] = {"regex": raw_pat}
+            if "mostly" in p:
+                mostly = float(p["mostly"])
+                if not 0.0 <= mostly <= 1.0:
+                    raise DataValidationError(f"Rule '{self.name}': 'mostly' must be in [0.0, 1.0], got {mostly}.")
+                kw_rx["mostly"] = mostly
+            return Expectation(
+                expectation_type="expect_column_values_to_match_regex",
+                column=self.column,
+                kwargs=kw_rx,
+                severity=self.severity,
+                description=self.name,
+            )
+
+        if rt in ("dtype", "type"):
+            raw_dt = p.get("dtype", p.get("expected_dtype", p.get("type")))
+            if not isinstance(raw_dt, str) or not raw_dt.strip():
+                raise DataValidationError(
+                    f"Rule '{self.name}' (dtype) requires a non-empty 'dtype' or 'expected_dtype' parameter."
+                )
+            return Expectation(
+                expectation_type="expect_column_dtype",
+                column=self.column,
+                kwargs={"dtype": raw_dt.strip()},
+                severity=self.severity,
+                description=self.name,
+            )
+
+        if rt in ("increasing", "monotonic_increasing"):
+            return Expectation(
+                expectation_type="expect_column_values_to_be_increasing",
+                column=self.column,
+                kwargs={"strict": bool(p.get("strict", False))},
+                severity=self.severity,
+                description=self.name,
+            )
+
+        if rt in ("ks_test", "distribution_ks"):
+            ref_vals = p.get("reference_values", p.get("reference"))
+            if ref_vals is None:
+                raise DataValidationError(
+                    f"Rule '{self.name}' (ks_test) requires 'reference_values' in params."
+                )
+            alpha = float(p.get("alpha", 0.05))
+            if not 0.0 < alpha < 1.0:
+                raise DataValidationError(f"Rule '{self.name}' (ks_test): 'alpha' must be in (0, 1), got {alpha}.")
+            return Expectation(
+                expectation_type="expect_column_distribution_ks_test",
+                column=self.column,
+                kwargs={"reference_values": list(np.asarray(ref_vals, dtype=float).ravel()), "alpha": alpha},
+                severity=self.severity,
+                description=self.name,
+            )
+
+        if rt in ("pair_greater", "column_pair_greater"):
+            col_a = self.column or p.get("column_a")
+            col_b = p.get("column_b", p.get("other_column"))
+            if not isinstance(col_a, str) or not col_a.strip() or not isinstance(col_b, str) or not col_b.strip():
+                raise DataValidationError(
+                    f"Rule '{self.name}' (pair_greater) requires both 'column' (or 'column_a') and 'column_b'."
+                )
+            return Expectation(
+                expectation_type="expect_column_pair_values_a_to_be_greater_than_b",
+                column=col_a.strip(),
+                kwargs={"column_b": col_b.strip(), "or_equal": bool(p.get("or_equal", True))},
+                severity=self.severity,
+                description=self.name,
+            )
+
+        if rt in ("column_exists", "exists"):
+            return Expectation(
+                expectation_type="expect_column_to_exist",
+                column=self.column,
+                kwargs={},
+                severity=self.severity,
+                description=self.name,
+            )
+
+        if rt == "row_count":
+            kw_rc: dict[str, Any] = {}
+            min_rc = p.get("min_value", p.get("min"))
+            max_rc = p.get("max_value", p.get("max"))
+            if min_rc is not None:
+                kw_rc["min_value"] = int(min_rc)
+            if max_rc is not None:
+                kw_rc["max_value"] = int(max_rc)
+            if "min_value" in kw_rc and "max_value" in kw_rc and kw_rc["min_value"] > kw_rc["max_value"]:
+                raise DataValidationError(
+                    f"Rule '{self.name}' (row_count) has min_value ({kw_rc['min_value']}) > max_value ({kw_rc['max_value']})."
+                )
+            return Expectation(
+                expectation_type="expect_table_row_count_to_be_between",
+                column=None,
+                kwargs=kw_rc,
+                severity=self.severity,
+                description=self.name,
+            )
+
+        if rt == "columns_match_set":
+            cols = p.get("column_set", p.get("columns"))
+            if cols is None or isinstance(cols, (str, bytes)) or not hasattr(cols, "__iter__"):
+                raise DataValidationError(
+                    f"Rule '{self.name}' (columns_match_set) requires an iterable 'column_set' parameter."
+                )
+            return Expectation(
+                expectation_type="expect_table_columns_to_match_set",
+                column=None,
+                kwargs={"column_set": [str(c) for c in cols], "allow_extra": bool(p.get("allow_extra", True))},
+                severity=self.severity,
+                description=self.name,
+            )
+
+        if rt in _BUILTIN_EXPECTATION_TYPES:
+            return Expectation(
+                expectation_type=rt,
+                column=self.column,
+                kwargs=p,
+                severity=self.severity,
+                description=self.name,
+            )
+
+        if self.rule_type.startswith("custom:"):
+            custom_name = self.rule_type.split(":", 1)[1].strip()
+            if not custom_name:
+                raise DataValidationError(f"Rule '{self.name}' has empty custom validator name.")
+            return Expectation(
+                expectation_type=custom_name,
+                column=self.column,
+                kwargs=p,
+                severity=self.severity,
+                description=self.name,
+            )
+
+        raise DataValidationError(
+            f"Unsupported validation rule_type '{self.rule_type}' in rule '{self.name}'.",
+            suggestions=[
+                f"Use one of: {', '.join(_SUPPORTED_RULE_SHORTHANDS)}, a canonical 'expect_*' type, or 'custom:<name>'."
+            ],
         )
 
 
@@ -459,32 +698,58 @@ class DataValidator:
             )
 
         if etype == "expect_column_values_to_match_regex":
-            pattern = re.compile(str(kw["regex"]))
+            raw_pat = kw.get("regex", kw.get("pattern"))
+            if not isinstance(raw_pat, str) or raw_pat == "":
+                return ExpectationResult(
+                    expectation_name=etype,
+                    column=col,
+                    passed=False,
+                    severity=ValidationSeverity.ERROR,
+                    message=f"Missing or empty 'regex' pattern for column '{col}'.",
+                    remediation="Provide a valid regular expression in kwargs['regex'].",
+                )
+            try:
+                pattern = re.compile(raw_pat)
+            except re.error as exc:
+                return ExpectationResult(
+                    expectation_name=etype,
+                    column=col,
+                    passed=False,
+                    severity=ValidationSeverity.ERROR,
+                    message=f"Invalid regex {raw_pat!r} for '{col}': {exc}",
+                    remediation="Correct regular expression syntax.",
+                )
+            mostly = float(kw.get("mostly", 1.0))
             non_null_mask = series.notna()
             fail_mask = non_null_mask & (~series.astype(str).apply(lambda s: bool(pattern.search(s))))
             fail_cnt = int(fail_mask.sum())
-            ok = fail_cnt == 0
+            denom = max(int(non_null_mask.sum()), 1)
+            ok = (1.0 - fail_cnt / denom) >= mostly if non_null_mask.any() else True
             return ExpectationResult(
                 expectation_name=etype,
                 column=col,
                 passed=ok,
                 severity=sev,
+                observed_value=round(1.0 - fail_cnt / denom, 4) if non_null_mask.any() else 1.0,
+                expected_value={"regex": raw_pat, "mostly": mostly},
                 unexpected_count=fail_cnt,
-                unexpected_ratio=round(fail_cnt / n_rows, 4),
+                unexpected_ratio=round(fail_cnt / denom, 4) if non_null_mask.any() else 0.0,
                 sample_failing_indices=df.index[fail_mask].tolist()[:10],
                 message=f"Values match regex in '{col}'" if ok else f"{fail_cnt} values failed regex in '{col}'",
                 remediation="" if ok else f"Clean malformed string formats in '{col}'.",
             )
 
         if etype == "expect_column_dtype":
-            expected_kind = str(kw.get("dtype", "numeric")).lower()
+            expected_kind = str(kw.get("dtype", kw.get("expected_dtype", "numeric"))).lower().strip()
+            is_bool = bool(pd.api.types.is_bool_dtype(series))
             ok = (
-                (expected_kind == "numeric" and pd.api.types.is_numeric_dtype(series))
-                or (expected_kind == "integer" and pd.api.types.is_integer_dtype(series))
+                (expected_kind == "numeric" and pd.api.types.is_numeric_dtype(series) and not is_bool)
+                or (expected_kind in ("integer", "int") and pd.api.types.is_integer_dtype(series) and not is_bool)
                 or (expected_kind == "float" and pd.api.types.is_float_dtype(series))
                 or (expected_kind == "datetime" and pd.api.types.is_datetime64_any_dtype(series))
-                or (expected_kind == "string" and (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)))
-                or (expected_kind == "boolean" and pd.api.types.is_bool_dtype(series))
+                or (expected_kind in ("string", "str") and (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)))
+                or (expected_kind in ("boolean", "bool") and is_bool)
+                or (expected_kind in ("categorical", "category") and isinstance(series.dtype, pd.CategoricalDtype))
                 or (expected_kind == str(series.dtype).lower())
             )
             return ExpectationResult(
@@ -499,17 +764,19 @@ class DataValidator:
             )
 
         if etype == "expect_column_values_to_be_increasing":
+            strict = bool(kw.get("strict", False))
             non_null = series.dropna()
-            ok = bool(non_null.is_monotonic_increasing)
+            ok = bool(non_null.is_monotonic_increasing) and (not strict or bool(non_null.is_unique))
+            label = "strictly increasing" if strict else "monotonically increasing"
             return ExpectationResult(
                 expectation_name=etype,
                 column=col,
                 passed=ok,
                 severity=sev,
                 observed_value=ok,
-                expected_value=True,
-                message=f"Column '{col}' is monotonically increasing" if ok else f"Column '{col}' is not monotonically increasing",
-                remediation="" if ok else f"Sort dataset by '{col}' before time-series modeling.",
+                expected_value={"increasing": True, "strict": strict},
+                message=f"Column '{col}' is {label}" if ok else f"Column '{col}' is not {label}",
+                remediation="" if ok else f"Sort or deduplicate dataset by '{col}' before time-series modeling.",
             )
 
         if etype == "expect_column_distribution_ks_test":
@@ -534,8 +801,8 @@ class DataValidator:
             )
 
         if etype == "expect_column_pair_values_a_to_be_greater_than_b":
-            col_b = str(kw["column_b"])
-            if col_b not in df.columns:
+            col_b = str(kw.get("column_b", ""))
+            if not col_b or col_b not in df.columns:
                 return ExpectationResult(
                     expectation_name=etype,
                     column=col,
@@ -544,10 +811,24 @@ class DataValidator:
                     message=f"Comparison column '{col_b}' missing.",
                 )
             or_equal = bool(kw.get("or_equal", True))
-            a = pd.to_numeric(df[col], errors="coerce")
-            b = pd.to_numeric(df[col_b], errors="coerce")
-            both_valid = a.notna() & b.notna()
-            fail_mask = both_valid & (~(a >= b) if or_equal else ~(a > b))
+            op_sym = ">=" if or_equal else ">"
+            s_a, s_b = df[col], df[col_b]
+            raw_both_non_null = s_a.notna() & s_b.notna()
+            if pd.api.types.is_datetime64_any_dtype(s_a) or pd.api.types.is_datetime64_any_dtype(s_b):
+                a_cmp = pd.to_datetime(s_a, errors="coerce", format="mixed")
+                b_cmp = pd.to_datetime(s_b, errors="coerce", format="mixed")
+            else:
+                a_num = pd.to_numeric(s_a, errors="coerce")
+                b_num = pd.to_numeric(s_b, errors="coerce")
+                if raw_both_non_null.any() and not (a_num.notna() & b_num.notna()).any():
+                    a_cmp = pd.to_datetime(s_a, errors="coerce", format="mixed")
+                    b_cmp = pd.to_datetime(s_b, errors="coerce", format="mixed")
+                else:
+                    a_cmp, b_cmp = a_num, b_num
+            both_parsed = a_cmp.notna() & b_cmp.notna()
+            unparseable_mask = raw_both_non_null & (~both_parsed)
+            order_fail_mask = both_parsed & (~(a_cmp >= b_cmp) if or_equal else ~(a_cmp > b_cmp))
+            fail_mask = unparseable_mask | order_fail_mask
             fail_cnt = int(fail_mask.sum())
             ok = fail_cnt == 0
             return ExpectationResult(
@@ -558,7 +839,7 @@ class DataValidator:
                 unexpected_count=fail_cnt,
                 unexpected_ratio=round(fail_cnt / n_rows, 4),
                 sample_failing_indices=df.index[fail_mask].tolist()[:10],
-                message=f"'{col}' >= '{col_b}' holds" if ok else f"{fail_cnt} rows violate '{col}' >= '{col_b}'",
+                message=f"'{col}' {op_sym} '{col_b}' holds" if ok else f"{fail_cnt} rows violate '{col}' {op_sym} '{col_b}'",
                 remediation="" if ok else f"Reconcile cross-column business invariant between '{col}' and '{col_b}'.",
             )
 

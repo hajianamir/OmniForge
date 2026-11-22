@@ -1,16 +1,16 @@
-# mypy: ignore-errors
-"""s04_stats router."""
+"""Studio 04 (Automated EDA & Hypothesis Lab) router."""
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Header, HTTPException
 
-from omniforge.eda import AutomatedEDA, StatisticalAnalyzer
+from omniforge.api.studios.schemas import HypothesisReq, wb_cache_and_respond
 from omniforge.core.performance import smart_sample_df
+from omniforge.eda import AutomatedEDA, StatisticalAnalyzer
 
 router = APIRouter(tags=["workbench-s04"])
 
@@ -59,7 +59,7 @@ def s04_run_eda(x_session_id: str | None = Header(default="default")) -> dict[st
     ][:20]
     insights = [i.model_dump() if hasattr(i, "model_dump") else i for i in getattr(eda, "insights", [])]
     _wb().record_lineage(state, "EDA", "Completed Automated EDA", f"Numeric={len(num_cols)} | Sampled={was_sampled}")
-    return _wb()._cache_and_respond(
+    return wb_cache_and_respond(
         state,
         sid,
         "s04_eda",
@@ -86,41 +86,34 @@ def _run_single_stat_test(
     t = test_type.lower()
     if t == "shapiro":
         res = StatisticalAnalyzer.normality_test(df[col_a].dropna().iloc[:5000], alpha=alpha)
-        return res.model_dump() if hasattr(res, "model_dump") else dict(res)
+        out = res.model_dump() if hasattr(res, "model_dump") else dict(res)
+        out.setdefault("significant", bool(res.reject_null))
+        return out
     if t == "ks_normality":
-        vals = pd.to_numeric(df[col_a], errors="coerce").dropna().to_numpy(dtype=float)
-        vals = vals[np.isfinite(vals)]
-        z = (vals - np.mean(vals)) / max(float(np.std(vals, ddof=1)), 1e-12)
-        stat, pval = sp_stats.kstest(z, "norm")
+        res = StatisticalAnalyzer.normality_test(
+            df[col_a].dropna().iloc[:5000], alpha=alpha, method="kolmogorov_smirnov"
+        )
         return {
-            "test_name": "Kolmogorov-Smirnov Normality Test",
-            "statistic": round(float(stat), 5),
-            "p_value": float(pval),
+            "test_name": "Lilliefors / KS Normality Test",
+            "statistic": round(float(res.statistic), 5),
+            "p_value": float(res.p_value),
             "alpha": alpha,
-            "significant": bool(pval < alpha),
-            "interpretation": f"KS D={stat:.4f}, p={pval:.4g} — {'rejects' if pval < alpha else 'consistent with'} normality.",
+            "significant": bool(res.reject_null),
+            "interpretation": res.interpretation,
         }
     if t == "anderson":
         vals = pd.to_numeric(df[col_a], errors="coerce").dropna().to_numpy(dtype=float)
         vals = vals[np.isfinite(vals)]
-        try:
-            ad = sp_stats.anderson(vals[:5000], dist="norm", method="interpolate")
-            pval = float(getattr(ad, "pvalue", 0.25))
-            sig = bool(pval < alpha)
-            interp = f"A²={ad.statistic:.4f}, p={pval:.4g} — {'non-normal' if sig else 'compatible with Gaussian'}."
-        except TypeError:
-            ad = sp_stats.anderson(vals[:5000], dist="norm")
-            crit_5 = float(ad.critical_values[2])
-            sig = bool(ad.statistic > crit_5)
-            pval = 0.01 if sig else 0.25
-            interp = f"A²={ad.statistic:.4f} vs 5% critical={crit_5:.4f} — {'non-normal' if sig else 'compatible with Gaussian'}."
+        if len(vals) < 5:
+            raise HTTPException(status_code=400, detail="Anderson-Darling test requires at least 5 numeric observations.")
+        res_ad = StatisticalAnalyzer.anderson_darling_test(vals[:5000], alpha=alpha)
         return {
             "test_name": "Anderson-Darling Normality Test",
-            "statistic": round(float(ad.statistic), 5),
-            "p_value": round(pval, 6),
+            "statistic": round(float(res_ad.statistic), 5),
+            "p_value": round(float(res_ad.p_value), 6),
             "alpha": alpha,
-            "significant": sig,
-            "interpretation": interp,
+            "significant": bool(res_ad.reject_null),
+            "interpretation": res_ad.interpretation,
         }
     if t == "dagostino":
         vals = pd.to_numeric(df[col_a], errors="coerce").dropna().to_numpy(dtype=float)
@@ -141,38 +134,87 @@ def _run_single_stat_test(
         vals = vals[np.isfinite(vals)][:4000]
         if len(vals) < 15:
             raise HTTPException(status_code=400, detail="Distribution fitting needs at least 15 values.")
-        candidates = [("Normal", sp_stats.norm), ("Student-t", sp_stats.t), ("Laplace", sp_stats.laplace), ("Logistic", sp_stats.logistic)]
-        if float(np.min(vals)) > 0:
-            candidates.extend([("Log-Normal", sp_stats.lognorm), ("Exponential", sp_stats.expon), ("Gamma", sp_stats.gamma)])
-        fits = []
-        for dname, dist in candidates:
+        n_obs = len(vals)
+        # Candidate tuple: (display_name, scipy_dist, fit_kwargs, k_free_params)
+        candidates: list[tuple[str, Any, dict[str, Any], int]] = [
+            ("Normal", sp_stats.norm, {}, 2),
+            ("Student-t", sp_stats.t, {}, 3),
+            ("Laplace", sp_stats.laplace, {}, 2),
+            ("Logistic", sp_stats.logistic, {}, 2),
+        ]
+        if float(np.min(vals)) > 0.0:
+            candidates.extend(
+                [
+                    ("Log-Normal", sp_stats.lognorm, {"floc": 0.0}, 2),
+                    ("Exponential", sp_stats.expon, {"floc": 0.0}, 1),
+                    ("Gamma", sp_stats.gamma, {"floc": 0.0}, 2),
+                ]
+            )
+        fits: list[dict[str, Any]] = []
+        for dname, dist, fit_kw, k_params in candidates:
             try:
-                params = dist.fit(vals)
-                ks_s, ks_p = sp_stats.kstest(vals, dist.cdf, args=params)
-                fits.append({"distribution": dname, "ks_stat": round(float(ks_s), 5), "p_value": round(float(ks_p), 5), "good_fit": bool(ks_p >= alpha)})
+                params = dist.fit(vals, **fit_kw)
+                logpdf = np.asarray(dist.logpdf(vals, *params), dtype=float)
+                if not np.all(np.isfinite(logpdf)):
+                    logpdf = np.clip(np.nan_to_num(logpdf, nan=-700.0, neginf=-700.0, posinf=700.0), -700.0, 700.0)
+                ll = float(np.sum(logpdf))
+                aic = 2.0 * k_params - 2.0 * ll
+                bic = k_params * float(np.log(n_obs)) - 2.0 * ll
+                ks_s, ks_p_raw = sp_stats.kstest(vals, dist.cdf, args=params)
+                # Use composite-hypothesis Lilliefors p-value for Normal instead of unadjusted KS after MLE
+                if dname == "Normal":
+                    lf_res = StatisticalAnalyzer.normality_test(
+                        pd.Series(vals), alpha=alpha, method="kolmogorov_smirnov"
+                    )
+                    gof_p = float(lf_res.p_value) if np.isfinite(lf_res.p_value) else float(ks_p_raw)
+                else:
+                    gof_p = float(ks_p_raw)
+                fits.append(
+                    {
+                        "distribution": dname,
+                        "k_params": k_params,
+                        "log_likelihood": round(ll, 3),
+                        "aic": round(aic, 3),
+                        "bic": round(bic, 3),
+                        "ks_stat": round(float(ks_s), 5),
+                        "p_value": round(gof_p, 5),
+                        "good_fit": bool(gof_p >= alpha),
+                    }
+                )
             except Exception:
                 continue
-        fits.sort(key=lambda r: float(str(r["ks_stat"])))
-        best: dict[str, Any] = fits[0] if fits else {"distribution": "Normal", "ks_stat": 0.0, "p_value": 1.0}
+        # Rank by Akaike Information Criterion (Akaike 1974) to penalize parameter complexity fairly
+        fits.sort(key=lambda r: (float(r["aic"]), float(r["ks_stat"])))
+        best: dict[str, Any] = fits[0] if fits else {"distribution": "Normal", "aic": 0.0, "bic": 0.0, "ks_stat": 0.0, "p_value": 1.0}
         return {
             "test_name": f"Distribution Goodness-of-Fit ({col_a})",
             "statistic": best["ks_stat"],
             "p_value": best["p_value"],
             "alpha": alpha,
             "significant": bool(best["p_value"] < alpha),
-            "interpretation": f"Best-fitting family is {best['distribution']} (KS={best['ks_stat']:.4f}, p={best['p_value']:.4g}).",
+            "interpretation": (
+                f"Best-fitting family by AIC is {best['distribution']} "
+                f"(AIC={best.get('aic', 0.0):.2f}, BIC={best.get('bic', 0.0):.2f}, KS={best['ks_stat']:.4f}, p={best['p_value']:.4g})."
+            ),
             "extra_table": fits,
         }
     if t in ("pearson", "spearman", "kendall") and col_b and col_b in df.columns:
-        res = StatisticalAnalyzer.correlation_test(df[col_a], df[col_b], method=t, alpha=alpha)  # type: ignore[arg-type]
+        res = StatisticalAnalyzer.correlation_test(df[col_a], df[col_b], method=cast(Any, t), alpha=alpha)
         return res.model_dump() if hasattr(res, "model_dump") else dict(res)
     if t == "chi_square" and col_b and col_b in df.columns:
         res = StatisticalAnalyzer.chi_square_independence(df[col_a], df[col_b], alpha=alpha)
         return res.model_dump() if hasattr(res, "model_dump") else dict(res)
     if t == "fisher_exact" and col_b and col_b in df.columns:
-        ct = pd.crosstab(df[col_a].astype(str), df[col_b].astype(str)).iloc[:2, :2]
+        sub_cat = df[[col_a, col_b]].dropna()
+        ct = pd.crosstab(sub_cat[col_a], sub_cat[col_b])
         if ct.shape != (2, 2):
-            raise HTTPException(status_code=400, detail="Fisher Exact test requires two columns with at least 2 categories each.")
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Fisher's Exact Test requires a strict 2x2 contingency table "
+                    f"(got {ct.shape[0]}x{ct.shape[1]}); use 'chi_square' for R×C tables."
+                ),
+            )
         odds, pval = sp_stats.fisher_exact(ct.to_numpy())
         return {
             "test_name": "Fisher's Exact Test (2x2)",
@@ -238,7 +280,7 @@ def _run_single_stat_test(
 
 
 @router.post("/s04/hypothesis")
-def s04_run_hypothesis(req: _wb().HypothesisReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
+def s04_run_hypothesis(req: HypothesisReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
     df = _wb().get_analysis_dataframe(state, _wb()._require_df(state))
@@ -299,7 +341,7 @@ def s04_run_hypothesis(req: _wb().HypothesisReq, x_session_id: str | None = Head
                 r["p_value_fdr"] = round(bh_adj[i], 6)
                 r["significant_fdr"] = bool(bh_adj[i] < req.alpha)
         state["uap_hypothesis_battery"] = battery
-        return _wb()._cache_and_respond(
+        return wb_cache_and_respond(
             state,
             sid,
             "s04_hypothesis",
@@ -315,7 +357,7 @@ def s04_run_hypothesis(req: _wb().HypothesisReq, x_session_id: str | None = Head
     if not req.col_a or req.col_a not in df.columns:
         raise HTTPException(status_code=400, detail=f"Column '{req.col_a}' not found.")
     result = _run_single_stat_test(df, req.test_type, req.col_a, req.col_b, req.alpha)
-    return _wb()._cache_and_respond(state, sid, "s04_hypothesis", {"mode": "custom", "result": result})
+    return wb_cache_and_respond(state, sid, "s04_hypothesis", {"mode": "custom", "result": result})
 
 
 # ---------------------------------------------------------------------------

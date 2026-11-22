@@ -1,14 +1,14 @@
-# mypy: ignore-errors
-"""s05_features router."""
+"""Studio 05 (Feature Engineering & Selection) router."""
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
 from fastapi import APIRouter, Header, HTTPException
 
+from omniforge.api.studios.schemas import FeatureEngReq, FeatureSelReq, wb_cache_and_respond
 from omniforge.features import FeatureConfig, FeatureEngineeringPipeline, FeatureSelector
 
 router = APIRouter(tags=["workbench-s05"])
@@ -20,7 +20,7 @@ def _wb() -> Any:
 
 
 @router.post("/s05/engineer")
-def s05_engineer_features(req: _wb().FeatureEngReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
+def s05_engineer_features(req: FeatureEngReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
     df = _wb()._require_df(state)
@@ -56,14 +56,17 @@ def s05_engineer_features(req: _wb().FeatureEngReq, x_session_id: str | None = H
             extract_datetime_features=req.add_datetime_features,
         )
     fe = FeatureEngineeringPipeline(cfg)
+    primary_target = next((t for t in _wb().get_selected_targets(state, df) if t in df.columns), None)
     train_df, _test_df, _lock = _wb().get_active_split_frames(state, df)
     split_locked = isinstance(train_df, pd.DataFrame) and not train_df.empty and all(c in train_df.columns for c in feat_cols)
     if split_locked:
-        fe.fit(train_df[feat_cols])
+        y_fit_fe = train_df[primary_target] if (primary_target and primary_target in train_df.columns) else None
+        fe.fit(train_df[feat_cols], y_fit_fe)
         transformed = fe.transform(df[feat_cols])
         leakage_warning = None
     else:
-        transformed = fe.fit_transform(df[feat_cols])
+        y_full_fe = df[primary_target] if primary_target else None
+        transformed = fe.fit_transform(df[feat_cols], y_full_fe)
         leakage_warning = "Split Lock is not active; feature engineering was fitted on full dataset."
     new_cols = [c for c in transformed.columns if c not in df.columns]
     if req.commit and new_cols:
@@ -77,7 +80,7 @@ def s05_engineer_features(req: _wb().FeatureEngReq, x_session_id: str | None = H
             details=", ".join(new_cols[:8]),
             preserve_stage="s05_features",
         )
-    return _wb()._cache_and_respond(
+    return wb_cache_and_respond(
         state,
         sid,
         "s05_engineer",
@@ -92,7 +95,7 @@ def s05_engineer_features(req: _wb().FeatureEngReq, x_session_id: str | None = H
 
 
 @router.post("/s05/select")
-def s05_select_features(req: _wb().FeatureSelReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
+def s05_select_features(req: FeatureSelReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
     df = _wb().get_analysis_dataframe(state, _wb()._require_df(state))
@@ -115,21 +118,33 @@ def s05_select_features(req: _wb().FeatureSelReq, x_session_id: str | None = Hea
     selected: list[str] = []
     scores: dict[str, float] = {}
 
+    last_error: Exception | None = None
     for m_name in methods:
         try:
-            selector = FeatureSelector(method=m_name, task=task_str, max_features=min(req.top_k, X_fit.shape[1]))
+            selector = FeatureSelector(
+                method=cast(Any, m_name), task=cast(Any, task_str), max_features=min(req.top_k, X_fit.shape[1])
+            )
             selector.fit(X_fit, y_fit)
             s_dict = dict(selector.scores_)
             max_v = max((abs(float(v)) for v in s_dict.values()), default=1.0) or 1.0
             for k, v in s_dict.items():
                 if k in consensus:
                     consensus[k].append(abs(float(v)) / max_v)
-            method_breakdown.append({"method": m_name, "top_5": list(selector.selected_features_)[:5]})
+            method_breakdown.append({"method": selector.method, "top_5": list(selector.selected_features_)[:5]})
             if not selected:
                 selected = list(selector.selected_features_)
                 scores = {k: float(v) for k, v in s_dict.items()}
-        except Exception:
+        except Exception as exc:
+            last_error = exc
+            if len(methods) == 1:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
             continue
+
+    if not method_breakdown:
+        raise HTTPException(
+            status_code=400,
+            detail=str(last_error) if last_error is not None else "No feature selection method succeeded.",
+        )
 
     if len(methods) > 1:
         scores = {k: round(float(np.mean(vs)), 6) if vs else 0.0 for k, vs in consensus.items()}
@@ -142,9 +157,17 @@ def s05_select_features(req: _wb().FeatureSelReq, x_session_id: str | None = Hea
     )
     state["uap_fs_selected_cols"] = selected
     state["uap_fs_scores"] = scores
-    if req.commit:
+    if req.commit and selected:
         full_df = _wb()._require_df(state)
-        keep_raw = [c for c in full_df.columns if c in selected or c == target]
+        target_set = set(targets) | {target}
+        selected_set = set(selected)
+        keep_raw = [
+            c
+            for c in full_df.columns
+            if c in selected_set
+            or c in target_set
+            or any(sel.startswith(f"{c}_") for sel in selected_set)
+        ]
         dropped = [c for c in full_df.columns if c not in keep_raw]
         if dropped:
             _wb().set_excluded_columns(
@@ -163,7 +186,7 @@ def s05_select_features(req: _wb().FeatureSelReq, x_session_id: str | None = Hea
                 reason=f"Feature selection kept top {len(selected)} highest-signal predictors.",
                 sample_identifiers=dropped[:10],
             )
-    return _wb()._cache_and_respond(
+    return wb_cache_and_respond(
         state,
         sid,
         "s05_select",

@@ -1,4 +1,5 @@
-FROM python:3.15-slim AS builder
+ARG PYTHON_IMAGE=python:3.12-slim
+FROM ${PYTHON_IMAGE} AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -20,9 +21,9 @@ COPY src ./src
 COPY configs ./configs
 
 RUN pip install --upgrade pip && \
-    pip wheel --wheel-dir=/wheels ".[api,ui,reporting,forecasting]"
+    pip wheel --wheel-dir=/wheels ".[api,ui,reporting,data,forecasting]"
 
-FROM python:3.15-slim AS runtime
+FROM ${PYTHON_IMAGE} AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

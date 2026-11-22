@@ -1,4 +1,3 @@
-# mypy: disable-error-code="no-any-return"
 """Studio 14 (Supervisory Prediction Monitor) router."""
 
 from __future__ import annotations
@@ -7,12 +6,20 @@ import io
 import math
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 import pandas as pd
 from fastapi import APIRouter, File, Form, Header, HTTPException, Response, UploadFile
 
+from omniforge.api.studios.schemas import (
+    SupervisoryAccessReq,
+    SupervisoryDemoReq,
+    SupervisoryQuickTrainReq,
+    SupervisorySingleReq,
+    SupervisorySQLReq,
+    wb_cache_and_respond,
+)
 from omniforge.core.types import TaskType
 from omniforge.core.utils import to_json_object
 from omniforge.data.ingestion import DataIngestionEngine
@@ -21,16 +28,7 @@ from omniforge.models.deep import FTTransformerModel, MLPModel, ResNetTabularMod
 from omniforge.models.nonparametric import NadarayaWatsonKernelModel, PenalizedSplineGAMModel
 from omniforge.ui.state import get_analysis_dataframe, get_selected_targets, get_session_state, record_lineage
 
-if TYPE_CHECKING:
-    from omniforge.api.workbench import (
-        SupervisoryAccessReq,
-        SupervisoryDemoReq,
-        SupervisoryQuickTrainReq,
-        SupervisorySingleReq,
-        SupervisorySQLReq,
-    )
-
-router = APIRouter(tags=["workbench-s14"])
+router: APIRouter = APIRouter(tags=["workbench-s14"])
 
 
 def _wb() -> Any:
@@ -101,8 +99,10 @@ def s14_quick_train(req: SupervisoryQuickTrainReq, x_session_id: str | None = He
     if not target:
         raise HTTPException(status_code=400, detail="Select a target column first before training a supervisory model.")
     X, y, task = _wb()._prepare_xy(df, target)
+    if len(X) < 6:
+        raise HTTPException(status_code=400, detail="Supervisory quick-train requires at least 6 rows.")
     is_clf = task in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION)
-    split = max(10, int(len(X) * 0.8))
+    split = min(len(X) - 2, max(2, int(len(X) * 0.8)))
     X_tr, X_te = X.iloc[:split], X.iloc[split:]
     y_tr, y_te = y.iloc[:split], y.iloc[split:]
 
@@ -256,7 +256,7 @@ def _run_supervisory_eval(
         f"Evaluated {kpis.get('n_records', len(incoming_df))} rows ({source_label})",
         f"Status={eval_res.get('system_status')} | Breaches={kpis.get('breach_count', 0)}",
     )
-    return _wb()._cache_and_respond(
+    return wb_cache_and_respond(
         state,
         sid,
         "s14_supervisory",
@@ -294,7 +294,7 @@ async def s14_evaluate_file(
             status_code=400,
             detail="Pickle/joblib uploads are blocked for security (CWE-502). Please upload CSV, Parquet, Excel, or JSON.",
         )
-    raw = await file.read()
+    raw = await _wb().read_upload_bounded(file)
     if suffix in {".xlsx", ".xls", ".xlsm"} and sheet_name:
         incoming = _wb().read_excel_sheet(raw, sheet_name=sheet_name)
     else:

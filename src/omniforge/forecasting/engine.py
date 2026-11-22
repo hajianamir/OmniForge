@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
+from scipy import stats
 from sklearn.model_selection import TimeSeriesSplit
 
 from omniforge.core.carbon import CarbonTracker
@@ -69,6 +70,71 @@ def _forecast_metrics(
         cov = float(np.mean((yt >= y_lo) & (yt <= y_hi)))
         res["interval_coverage"] = round(cov, 4)
     return res
+
+
+def diebold_mariano_test(
+    y_true: np.ndarray | list[float],
+    y_pred_1: np.ndarray | list[float],
+    y_pred_2: np.ndarray | list[float],
+    *,
+    horizon: int = 1,
+    loss: Literal["squared", "abs"] = "squared",
+) -> dict[str, Any]:
+    """Harvey, Leybourne & Newbold (1997, IJF 13:281-291) finite-sample modified Diebold-Mariano (1995) test.
+
+    Tests H0: E[L(e_{1,t}) - L(e_{2,t})] = 0 using HAC autocovariances up to lag ``horizon - 1``
+    (falling back to positive-definite Newey-West Bartlett weights if truncated rectangular variance <= 0)
+    and evaluates the HLN-modified statistic against Student-t_{n - 1}.
+    """
+    yt = np.asarray(y_true, dtype=float).ravel()
+    p1 = np.asarray(y_pred_1, dtype=float).ravel()
+    p2 = np.asarray(y_pred_2, dtype=float).ravel()
+    n = len(yt)
+    if len(p1) != n or len(p2) != n or n < 4:
+        return {"evaluable": False, "reason": "Requires equal-length forecast arrays with n >= 4."}
+    e1 = yt - p1
+    e2 = yt - p2
+    d = (e1**2 - e2**2) if loss == "squared" else (np.abs(e1) - np.abs(e2))
+    d_bar = float(np.mean(d))
+    d_c = d - d_bar
+    h_eff = min(max(1, int(horizon)), max(1, n // 2))
+
+    gamma_0 = float(np.dot(d_c, d_c) / n)
+    if gamma_0 <= 1e-18:
+        return {
+            "evaluable": True,
+            "dm_statistic": 0.0,
+            "hln_statistic": 0.0,
+            "p_value": 1.0,
+            "mean_loss_diff": round(d_bar, 6),
+            "preferred_model": "tie",
+            "n": n,
+        }
+
+    gammas = [float(np.dot(d_c[k:], d_c[:-k]) / n) for k in range(1, h_eff)]
+    var_d = (gamma_0 + 2.0 * sum(gammas)) / float(n)
+    if var_d <= 1e-18:
+        # Newey-West (1987) Bartlett kernel guarantees strictly positive-semidefinite spectral density
+        bartlett_sum = sum((1.0 - float(k) / float(h_eff)) * gammas[k - 1] for k in range(1, h_eff))
+        var_d = max((gamma_0 + 2.0 * bartlett_sum) / float(n), gamma_0 / (float(n) * 100.0))
+
+    dm_raw = float(d_bar / np.sqrt(var_d))
+    hln_num = max(float(n + 1 - 2 * h_eff) + float(h_eff * (h_eff - 1)) / float(n), 1.0)
+    hln_factor = float(np.sqrt(hln_num / float(n)))
+    dm_hln = float(hln_factor * dm_raw)
+    p_val = float(2.0 * stats.t.sf(abs(dm_hln), df=n - 1))
+    preferred = "model_1" if d_bar < -1e-12 else ("model_2" if d_bar > 1e-12 else "tie")
+    return {
+        "evaluable": True,
+        "dm_statistic": round(dm_raw, 6),
+        "hln_statistic": round(dm_hln, 6),
+        "p_value": round(p_val, 6),
+        "mean_loss_diff": round(d_bar, 6),
+        "preferred_model": preferred,
+        "loss": loss,
+        "horizon": h_eff,
+        "n": n,
+    }
 
 
 @dataclass
@@ -195,7 +261,12 @@ class ForecastingEngine:
                 except Exception as exc:
                     logger.warning("foundation_forecast_failed", error=str(exc))
 
-            leaderboard.sort(key=lambda row: row["smape"])
+            leaderboard.sort(
+                key=lambda row: (
+                    not np.isfinite(float(row.get("smape", float("inf")))),
+                    float(row.get("smape", float("inf"))),
+                )
+            )
             non_baseline = [r for r in leaderboard if r["model"] in fitted_builders]
             champion_name = non_baseline[0]["model"] if non_baseline else leaderboard[0]["model"]
 
@@ -235,7 +306,8 @@ class ForecastingEngine:
             # Refit champion on full causal series
             future_fc = self._refit_and_predict(champion_name, fitted_builders, full_causal_series, horizon)
 
-            # Build top-3 inverse-sMAPE weighted ensemble forecast
+            # Build top-3 inverse-sMAPE weighted ensemble forecast with exact Law of Total Variance intervals
+            # (Wallis 2005; Gneiting & Ranjan 2013): combines within-model aleatoric variance + epistemic disagreement.
             top_models = [r["model"] for r in non_baseline[:3]]
             ensemble_fc: pd.DataFrame | None = None
             if len(top_models) >= 2:
@@ -243,14 +315,44 @@ class ForecastingEngine:
                 inv_w = np.array([1.0 / smape_map[m] for m in top_models], dtype=float)
                 weights = inv_w / inv_w.sum()
                 fcs = [self._refit_and_predict(m, fitted_builders, full_causal_series, horizon) for m in top_models]
+                means_mat = np.vstack([f["yhat"].to_numpy(dtype=float) for f in fcs])
+                lo_mat = np.vstack([f["yhat_lower"].to_numpy(dtype=float) for f in fcs])
+                hi_mat = np.vstack([f["yhat_upper"].to_numpy(dtype=float) for f in fcs])
+                mu_ens = np.average(means_mat, axis=0, weights=weights)
+
+                alpha_ci = float(np.clip(1.0 - self.confidence_level, 1e-4, 0.5))
+                z_ci = max(float(stats.norm.ppf(1.0 - alpha_ci / 2.0)), 1e-6)
+                # Directional implied within-model std (reduces identically to symmetric sigma_k when intervals are symmetric)
+                sigma_lo = np.maximum(means_mat - lo_mat, 0.0) / z_ci
+                sigma_hi = np.maximum(hi_mat - means_mat, 0.0) / z_ci
+                epistemic_var = np.average((means_mat - mu_ens[None, :]) ** 2, axis=0, weights=weights)
+                total_sd_lo = np.sqrt(np.average(sigma_lo**2, axis=0, weights=weights) + epistemic_var)
+                total_sd_hi = np.sqrt(np.average(sigma_hi**2, axis=0, weights=weights) + epistemic_var)
+
                 ensemble_fc = pd.DataFrame(
                     {
                         "step": np.arange(1, horizon + 1),
-                        "yhat": np.average([f["yhat"].to_numpy() for f in fcs], axis=0, weights=weights),
-                        "yhat_lower": np.average([f["yhat_lower"].to_numpy() for f in fcs], axis=0, weights=weights),
-                        "yhat_upper": np.average([f["yhat_upper"].to_numpy() for f in fcs], axis=0, weights=weights),
+                        "yhat": mu_ens,
+                        "yhat_lower": mu_ens - z_ci * total_sd_lo,
+                        "yhat_upper": mu_ens + z_ci * total_sd_hi,
                     }
                 )
+
+            dm_summary: dict[str, Any] | None = None
+            if len(non_baseline) >= 2:
+                m1_name = non_baseline[0]["model"]
+                m2_name = non_baseline[1]["model"]
+                if m1_name in val_preds_map and m2_name in val_preds_map and len(y_val) >= 4:
+                    dm_summary = {
+                        "model_1": m1_name,
+                        "model_2": m2_name,
+                        **diebold_mariano_test(
+                            y_val,
+                            val_preds_map[m1_name]["yhat"].to_numpy(dtype=float),
+                            val_preds_map[m2_name]["yhat"].to_numpy(dtype=float),
+                            horizon=1,
+                        ),
+                    }
 
             if time_col and time_col in work.columns and pd.api.types.is_datetime64_any_dtype(work[time_col]):
                 last_ts = pd.to_datetime(work[time_col].iloc[-1])
@@ -279,7 +381,9 @@ class ForecastingEngine:
                 "n_history": len(full_causal_series),
                 "validation_horizon": val_h,
                 "causal_imputation_verified": True,
+                "ensemble_variance_method": "law_of_total_variance_mixture",
                 "rolling_cv_results": rolling_cv_results,
+                "diebold_mariano_vs_runner_up": dm_summary,
             },
         )
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -38,18 +38,52 @@ def split_conformal_quantile(scores: np.ndarray, alpha: float) -> tuple[float, b
 
 
 class ConformalPredictor:
-    """Split Conformal Prediction providing finite-sample coverage guarantees for regression & classification."""
+    """Split & Mondrian Conformal Prediction with LAC and Adaptive Prediction Sets (APS, Romano et al. 2020)."""
 
-    def __init__(self, model: BaseOmniForgeModel, alpha: float = 0.1) -> None:
+    def __init__(
+        self,
+        model: BaseOmniForgeModel,
+        alpha: float = 0.1,
+        *,
+        score_method: Literal["lac", "aps"] = "lac",
+        allow_empty: bool = False,
+        random_seed: int = 42,
+    ) -> None:
         self.model = model
         self.alpha = float(np.clip(alpha, 0.001, 0.5))
+        self.score_method: Literal["lac", "aps"] = score_method
+        self.allow_empty = bool(allow_empty)
+        self.random_seed = int(random_seed)
         self.quantile_: float = 0.0
         self.n_calibration_: int = 0
         self.finite_sample_valid_: bool = False
+        self.group_quantiles_: dict[str, float] = {}
+        self.group_validity_: dict[str, bool] = {}
         self.is_calibrated_: bool = False
 
-    def calibrate(self, X_cal: pd.DataFrame | np.ndarray, y_cal: pd.Series | np.ndarray) -> ConformalPredictor:
-        """Compute finite-sample conformal nonconformity quantile on a calibration split."""
+    @staticmethod
+    def _aps_scores_matrix(proba: np.ndarray, u_vec: np.ndarray) -> np.ndarray:
+        """Compute exact Romano, Sesia & Candès (2020, NeurIPS Eq. 7) randomized APS scores s(x, y, u) for all classes."""
+        n, k = proba.shape
+        out = np.empty((n, k), dtype=float)
+        for i in range(n):
+            row = np.asarray(proba[i], dtype=float)
+            # Deterministic descending sort (mergesort preserves class-index tie breaking)
+            order = np.argsort(-row, kind="mergesort")
+            sorted_p = row[order]
+            cum_before = np.concatenate(([0.0], np.cumsum(sorted_p)[:-1]))
+            s_sorted = cum_before + float(u_vec[i]) * sorted_p
+            out[i, order] = s_sorted
+        return out
+
+    def calibrate(
+        self,
+        X_cal: pd.DataFrame | np.ndarray,
+        y_cal: pd.Series | np.ndarray,
+        *,
+        groups: np.ndarray | pd.Series | list[Any] | None = None,
+    ) -> ConformalPredictor:
+        """Compute finite-sample conformal nonconformity quantile(s) (global + optional Mondrian group-conditional)."""
         y_arr = np.asarray(y_cal)
         n = len(y_arr)
         if n < 5:
@@ -59,16 +93,38 @@ class ConformalPredictor:
             proba = self.model.predict_proba(X_cal)
             classes = list(self.model.classes_) if self.model.classes_ is not None else list(range(proba.shape[1]))
             cls_to_idx = {c: i for i, c in enumerate(classes)}
-            scores = np.array(
-                [1.0 - float(proba[i, cls_to_idx[y_arr[i]]]) if y_arr[i] in cls_to_idx else 1.0 for i in range(n)],
-                dtype=float,
-            )
+            if self.score_method == "aps":
+                rng = np.random.default_rng(self.random_seed)
+                u_cal = rng.uniform(0.0, 1.0, size=n)
+                aps_mat = self._aps_scores_matrix(proba, u_cal)
+                scores = np.array(
+                    [float(aps_mat[i, cls_to_idx[y_arr[i]]]) if y_arr[i] in cls_to_idx else 1.0 for i in range(n)],
+                    dtype=float,
+                )
+            else:
+                scores = np.array(
+                    [1.0 - float(proba[i, cls_to_idx[y_arr[i]]]) if y_arr[i] in cls_to_idx else 1.0 for i in range(n)],
+                    dtype=float,
+                )
         else:
             preds = self.model.predict(X_cal).astype(float)
             scores = np.abs(y_arr.astype(float) - preds)
 
         self.quantile_, self.finite_sample_valid_ = split_conformal_quantile(scores, self.alpha)
         self.n_calibration_ = n
+        self.group_quantiles_ = {}
+        self.group_validity_ = {}
+        if groups is not None:
+            g_arr = np.asarray(groups).astype(str)
+            if len(g_arr) != n:
+                raise EvaluationError("groups length must match X_cal / y_cal calibration sample size.")
+            for grp in sorted(np.unique(g_arr).tolist()):
+                g_scores = scores[g_arr == grp]
+                if len(g_scores) >= 2:
+                    gq, g_valid = split_conformal_quantile(g_scores, self.alpha)
+                    self.group_quantiles_[grp] = gq
+                    self.group_validity_[grp] = g_valid
+
         if not self.finite_sample_valid_:
             logger.warning(
                 "conformal_calibration_sample_small",
@@ -79,28 +135,62 @@ class ConformalPredictor:
         self.is_calibrated_ = True
         return self
 
-    def predict_intervals(self, X: pd.DataFrame | np.ndarray) -> dict[str, np.ndarray]:
-        """Return distribution-free prediction intervals ``[lower, upper]`` for regression."""
+    def _resolve_thresholds(self, n_rows: int, groups: np.ndarray | pd.Series | list[Any] | None) -> np.ndarray:
+        if groups is None or not self.group_quantiles_:
+            return np.full(n_rows, self.quantile_, dtype=float)
+        g_arr = np.asarray(groups).astype(str)
+        if len(g_arr) != n_rows:
+            raise EvaluationError("groups length must match X row count.")
+        return np.array([self.group_quantiles_.get(g, self.quantile_) for g in g_arr], dtype=float)
+
+    def predict_intervals(
+        self,
+        X: pd.DataFrame | np.ndarray,
+        *,
+        groups: np.ndarray | pd.Series | list[Any] | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Return distribution-free (global or Mondrian group-conditional) prediction intervals ``[lower, upper]``."""
         if not self.is_calibrated_:
             raise EvaluationError("Call calibrate() before predict_intervals().")
         preds = self.model.predict(X).astype(float)
+        q_vec = self._resolve_thresholds(len(preds), groups)
         return {
             "prediction": preds,
-            "lower": preds - self.quantile_,
-            "upper": preds + self.quantile_,
-            "interval_width": np.full(len(preds), 2.0 * self.quantile_),
+            "lower": preds - q_vec,
+            "upper": preds + q_vec,
+            "interval_width": 2.0 * q_vec,
         }
 
-    def predict_sets(self, X: pd.DataFrame | np.ndarray) -> list[list[Any]]:
-        """Return conformal prediction label sets for classification."""
+    def predict_sets(
+        self,
+        X: pd.DataFrame | np.ndarray,
+        *,
+        groups: np.ndarray | pd.Series | list[Any] | None = None,
+    ) -> list[list[Any]]:
+        """Return conformal prediction label sets (LAC or APS, with optional Mondrian group thresholds)."""
         if not self.is_calibrated_:
             raise EvaluationError("Call calibrate() before predict_sets().")
         proba = self.model.predict_proba(X)
         classes = list(self.model.classes_) if self.model.classes_ is not None else list(range(proba.shape[1]))
+        q_vec = self._resolve_thresholds(len(proba), groups)
         sets: list[list[Any]] = []
-        for row in proba:
-            included = [classes[i] for i, p in enumerate(row) if (1.0 - p) <= self.quantile_]
-            if not included:
+
+        if self.score_method == "aps":
+            rng = np.random.default_rng(self.random_seed + 10_007)
+            u_test = rng.uniform(0.0, 1.0, size=len(proba))
+            aps_mat = self._aps_scores_matrix(proba, u_test)
+            for idx, row_scores in enumerate(aps_mat):
+                q_i = float(q_vec[idx])
+                included = [classes[j] for j, sc in enumerate(row_scores) if sc <= q_i]
+                if not included and not self.allow_empty:
+                    included = [classes[int(np.argmax(proba[idx]))]]
+                sets.append(included)
+            return sets
+
+        for idx, row in enumerate(proba):
+            q_i = float(q_vec[idx])
+            included = [classes[i] for i, p in enumerate(row) if (1.0 - p) <= q_i]
+            if not included and not self.allow_empty:
                 included = [classes[int(np.argmax(row))]]
             sets.append(included)
         return sets
@@ -170,7 +260,12 @@ def adaptive_conformal_intervals(
     gamma: float = 0.05,
     window: int = 30,
 ) -> dict[str, Any]:
-    """Adaptive Conformal Inference (ACI, Gibbs & Candes 2021) for non-exchangeable time series."""
+    """Adaptive Conformal Inference (ACI, Gibbs & Candès 2021, NeurIPS Eq. 2 & Thm. 4.1) for non-exchangeable series.
+
+    Maintains unclipped ``alpha_{t+1} = alpha_t + gamma * (alpha - err_t)`` (naturally bounded in
+    ``[-gamma, 1 + gamma]``) so Theorem 4.1's exact deterministic long-run coverage bound
+    ``|mean(err_t) - alpha| <= (max(alpha, 1 - alpha) + gamma) / (n * gamma)`` holds under arbitrary distribution shift.
+    """
     yt = np.asarray(y_true, dtype=float).ravel()
     yp = np.asarray(y_pred, dtype=float).ravel()
     if len(yt) != len(yp) or len(yt) < 5:
@@ -184,31 +279,66 @@ def adaptive_conformal_intervals(
     upper = np.empty(n, dtype=float)
     alpha_t = float(alpha)
     covered = np.zeros(n, dtype=bool)
+    unbounded_steps = 0
 
     for t in range(n):
-        if t == 0:
-            q_t = 0.0
+        start = max(0, t - max(2, window))
+        cal_res = residuals[start:t]
+        m = len(cal_res)
+
+        if alpha_t <= 0.0:
+            # Gibbs & Candès (2021, Eq. 2): when alpha_t <= 0, formal conformal set C_t(X_t) = (-inf, +inf) -> err_t = 0.
+            # Emit strictly causal finite display envelope from past residuals only (zero peeking at yt[t]!).
+            unbounded_steps += 1
+            q_t = float(np.max(cal_res) * 3.0 + 1.0) if m > 0 else max(abs(float(yp[t])) * 0.25, 1.0)
+            lower[t] = float(yp[t] - q_t)
+            upper[t] = float(yp[t] + q_t)
+            err_t = 0.0
+        elif alpha_t >= 1.0:
+            # Gibbs & Candès (2021, Eq. 2): when alpha_t >= 1, formal conformal set C_t(X_t) = empty -> err_t = 1.
+            lower[t] = float(yp[t])
+            upper[t] = float(yp[t])
+            err_t = 1.0
+        elif m == 0:
+            q_t = max(abs(float(yp[t])) * 0.10, 1e-3)
+            lower[t] = float(yp[t] - q_t)
+            upper[t] = float(yp[t] + q_t)
+            err_t = 0.0 if (lower[t] <= yt[t] <= upper[t]) else 1.0
         else:
-            start = max(0, t - max(2, window))
-            cal_res = residuals[start:t]
-            q_level = float(np.clip(1.0 - alpha_t, 0.0, 1.0))
-            q_t = float(np.quantile(cal_res, q_level))
-        lower[t] = yp[t] - q_t
-        upper[t] = yp[t] + q_t
-        err_t = 0.0 if (lower[t] <= yt[t] <= upper[t]) else 1.0
+            # Finite-sample conformal order statistic k = ceil((m + 1) * (1 - alpha_t))
+            k = int(np.ceil((m + 1) * (1.0 - alpha_t)))
+            if k > m:
+                unbounded_steps += 1
+                q_t = float(np.max(cal_res) * 3.0 + 1e-3)
+                lower[t] = float(yp[t] - q_t)
+                upper[t] = float(yp[t] + q_t)
+                err_t = 0.0
+            else:
+                idx = max(k, 1) - 1
+                q_t = float(np.partition(cal_res, idx)[idx])
+                lower[t] = float(yp[t] - q_t)
+                upper[t] = float(yp[t] + q_t)
+                err_t = 0.0 if (lower[t] <= yt[t] <= upper[t]) else 1.0
+
         covered[t] = err_t == 0.0
-        alpha_t = float(np.clip(alpha_t + gamma * (alpha - err_t), 0.001, 0.999))
+        # Strictly unclipped update preserves telescoping sum in Theorem 4.1
+        alpha_t = float(alpha_t + gamma * (alpha - err_t))
 
     eval_start = min(5, n - 1)
     emp_cov = float(np.mean(covered[eval_start:]))
+    full_cov = float(np.mean(covered))
     avg_width = float(np.mean(upper[eval_start:] - lower[eval_start:]))
+    theo_bound = float((max(alpha, 1.0 - alpha) + gamma) / (n * gamma))
     return {
         "lower": lower,
         "upper": upper,
         "empirical_coverage": round(emp_cov, 6),
+        "full_run_coverage": round(full_cov, 6),
         "target_coverage": round(1.0 - alpha, 6),
         "avg_width": round(avg_width, 6),
         "final_alpha_t": round(alpha_t, 6),
+        "unbounded_steps": int(unbounded_steps),
+        "theoretical_coverage_error_bound": round(theo_bound, 6),
     }
 
 
@@ -235,14 +365,13 @@ def knn_shapley_valuation(
     for j in range(n_va):
         dists = np.linalg.norm(X_tr - X_va[j], axis=1)
         order = np.argsort(dists)
-        s = np.zeros(n_tr, dtype=float)
-        match_last = 1.0 if y_tr[order[-1]] == y_va[j] else 0.0
-        s[n_tr - 1] = match_last / n_tr
-        for i in range(n_tr - 2, -1, -1):
-            m_curr = 1.0 if y_tr[order[i]] == y_va[j] else 0.0
-            m_next = 1.0 if y_tr[order[i + 1]] == y_va[j] else 0.0
-            rank = i + 1
-            s[i] = s[i + 1] + ((m_curr - m_next) / k_eff) * (min(k_eff, rank) / rank)
+        matches = (y_tr[order] == y_va[j]).astype(float)
+        s = np.empty(n_tr, dtype=float)
+        s[-1] = matches[-1] / n_tr
+        if n_tr > 1:
+            ranks = np.arange(1, n_tr, dtype=float)
+            deltas = ((matches[:-1] - matches[1:]) / k_eff) * (np.minimum(k_eff, ranks) / ranks)
+            s[:-1] = s[-1] + np.cumsum(deltas[::-1])[::-1]
         shapley[order] += s / n_va
 
     neg_mask = shapley < 0.0
@@ -347,7 +476,7 @@ def nested_cv_evaluate(
     return {
         "outer_scores": outer_scores,
         "mean_outer_score": round(float(np.mean(outer_scores)), 6),
-        "std_outer_score": round(float(np.std(outer_scores)), 6),
+        "std_outer_score": round(float(np.std(outer_scores, ddof=1) if len(outer_scores) > 1 else 0.0), 6),
         "chosen_params_per_fold": chosen_params,
     }
 

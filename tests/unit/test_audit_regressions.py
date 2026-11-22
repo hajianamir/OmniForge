@@ -515,7 +515,9 @@ def test_advanced_audit_and_mining_endpoints() -> None:
     from fastapi.testclient import TestClient
 
     from omniforge.api.main import app
+    from omniforge.api.workbench import _sid
     from omniforge.config.settings import get_settings
+    from omniforge.core.types import Principal
     from omniforge.ui.state import get_session_state
 
     rng = np.random.default_rng(7)
@@ -526,7 +528,14 @@ def test_advanced_audit_and_mining_endpoints() -> None:
             "target": rng.normal(10.0, 2.0, 60),
         }
     )
-    state = get_session_state("adv-ep-test")
+    # Workbench sessions are namespaced per authenticated principal (BOLA fix), so the
+    # state the test plants must live under the SAME namespaced key the cookie principal lands in.
+    cookie_principal = Principal(
+        subject="local_workbench_user",
+        roles=["admin"],
+        tenant_id=get_settings().default_tenant_id,
+    )
+    state = get_session_state(_sid("adv-ep-test", cookie_principal))
     state["uap_df"] = df
     state["uap_raw_df"] = df.copy()
     state["uap_target_col"] = "target"
@@ -721,14 +730,14 @@ def test_feature_store_and_csv_formula_sanitization() -> None:
     assert resp.status_code == 401
 
 
-def test_quality_timeliness_none_and_proxy_accuracy() -> None:
-    """Verify DataQualityEvaluator returns None for timeliness without timestamp and exposes proxy_accuracy."""
+def test_quality_timeliness_none_and_no_proxy_accuracy() -> None:
+    """Verify DataQualityEvaluator returns None for timeliness without timestamp and does not leak the removed proxy_accuracy duplicate."""
     from omniforge.data.quality import DataQualityProfiler
 
     df_no_ts = pd.DataFrame({"a": [1.0, 2.0, 3.0, 4.0, 5.0], "b": ["x", "y", "x", "y", "x"]})
     report = DataQualityProfiler().profile(df_no_ts)
     assert report.dimensions["timeliness"] is None
-    assert "proxy_accuracy" in report.dimensions
+    assert "proxy_accuracy" not in report.dimensions  # removed: duplicated accuracy, not an ISO/IEC 25012 dimension
     assert 0.0 <= report.overall_score <= 100.0
 
 
@@ -853,7 +862,7 @@ def test_p3_all_domain_plugins_load_and_generate_samples() -> None:
     """Verify all registered domain YAML plugins exist and are non-empty."""
     from pathlib import Path
 
-    domains_dir = Path("/home/user/OmniForge/src/omniforge/domains")
+    domains_dir = Path(__file__).resolve().parents[2] / "src" / "omniforge" / "domains"
     py_plugins = [p for p in sorted(domains_dir.glob("*.py")) if p.name != "__init__.py"]
     assert len(py_plugins) >= 18
     for p in py_plugins:
@@ -874,7 +883,7 @@ def test_p3_promotion_gate_and_changelog() -> None:
         validate_production_promotion_gate({"model": "ok"}, None)
     gate = validate_production_promotion_gate({"model": "ok"}, {"dataset": "ok"})
     assert gate["approved"] is True
-    assert Path("/home/user/OmniForge/CHANGELOG.md").exists()
+    assert (Path(__file__).resolve().parents[2] / "CHANGELOG.md").exists()
 
 
 

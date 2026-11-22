@@ -26,7 +26,7 @@ import {
   Unlock,
   X,
 } from 'lucide-react';
-import { apiDelete, apiDownload, apiGet, apiPost, apiUpload } from './api';
+import { apiDelete, apiDownload, apiGet, apiPost, apiUpload, toErrorMessage } from './api';
 import type { HandbookSectionId } from './components/HelpGuideModal';
 import type { StudioCache, StudioPayload, StudioResultKey } from './studioTypes';
 import { STUDIOS, type StudioId, type WorkspaceState } from './types';
@@ -77,7 +77,7 @@ const ICONS: Record<StudioId, React.ReactNode> = {
 
 const EMPTY_WS: WorkspaceState = {
   session_id: 'default',
-  platform: { name: 'OmniForge', version: '2.0.0', edition: 'Enterprise' },
+  platform: { name: 'OmniForge', version: '3.2.0', edition: 'Enterprise' },
   has_dataset: false,
   dataset_name: null,
   dataset_source: null,
@@ -244,26 +244,35 @@ export const App: React.FC = () => {
   }, [ws.excluded_columns, syncState, bumpGrid]);
 
   const handleSaveProject = useCallback(async () => {
-    const fd = new FormData();
-    fd.append('project_name', projName || ws.project_name);
-    fd.append('notes', projNotes);
-    await apiDownload('/api/workbench/workspace/save', `${projName || 'omniforge_project'}.omniforge`, 'POST', fd);
-    flash('Saved portable .omniforge workspace project.');
-    setModal('none');
+    try {
+      const fd = new FormData();
+      fd.append('project_name', projName || ws.project_name);
+      fd.append('notes', projNotes);
+      await apiDownload('/api/workbench/workspace/save', `${projName || 'omniforge_project'}.omniforge`, 'POST', fd);
+      flash('Saved portable .omniforge workspace project.');
+      setModal('none');
+    } catch (err: unknown) {
+      flash(`Save failed: ${toErrorMessage(err)}`);
+    }
   }, [projName, projNotes, ws.project_name, flash]);
 
   const handleLoadProject = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const fd = new FormData();
-    fd.append('file', file);
-    const res = await apiUpload<{ state: WorkspaceState }>('/api/workbench/workspace/load', fd);
-    syncState(res.state);
-    fetchServerCache();
-    bumpGrid();
-    flash(`Restored OmniForge project '${file.name}'.`);
-    setModal('none');
-    e.target.value = '';
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      const res = await apiUpload<{ state: WorkspaceState }>('/api/workbench/workspace/load', fd);
+      syncState(res.state);
+      fetchServerCache();
+      bumpGrid();
+      flash(`Restored OmniForge project '${file.name}'.`);
+      setModal('none');
+    } catch (err: unknown) {
+      flash(`Restore failed: ${toErrorMessage(err)}`);
+    } finally {
+      e.target.value = '';
+    }
   }, [syncState, fetchServerCache, bumpGrid, flash]);
 
   // Memoized so keep-alive studios (display:none) do not re-render on every
@@ -291,7 +300,7 @@ export const App: React.FC = () => {
           <div className="brand-mark">Ω</div>
           <div>
             <span>{ws.platform?.name || 'OmniForge'}</span>
-            <span className="badge badge-accent" style={{ marginLeft: 8 }}>v{ws.platform?.version || '2.0.0'} · Enterprise</span>
+            <span className="badge badge-accent" style={{ marginLeft: 8 }}>v{ws.platform?.version || '3.2.0'} · Enterprise</span>
           </div>
         </div>
 

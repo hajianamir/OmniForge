@@ -141,6 +141,13 @@ class AssociationRuleMiner:
                 conviction = (1.0 - supp_b) / max(1.0 - conf, 1e-6) if conf < 0.9999 else 999.0
                 ant_str = " AND ".join(names[x] for x in ant)
                 cons_str = names[cons_idx]
+                cnt_ab = int(round(supp_ab * n))
+                cnt_a = max(cnt_ab, int(round(supp_a * n)))
+                cnt_b = max(cnt_ab, int(round(supp_b * n)))
+                # Webb (2007, Machine Learning) exact one-sided hypergeometric p-value for positive rule association
+                p_hyper = float(stats.hypergeom.sf(max(cnt_ab - 1, 0), n, min(cnt_b, n), min(cnt_a, n)))
+                if not np.isfinite(p_hyper):
+                    p_hyper = 1.0
                 rules.append(
                     {
                         "antecedent": ant_str,
@@ -151,9 +158,18 @@ class AssociationRuleMiner:
                         "lift": round(lift, 4),
                         "leverage": round(leverage, 4),
                         "conviction": round(min(conviction, 999.0), 3),
-                        "count": int(round(supp_ab * n)),
+                        "count": cnt_ab,
+                        "p_value": round(p_hyper, 8),
                     }
                 )
+
+        if rules:
+            from omniforge.eda.statistics import StatisticalAnalyzer
+
+            q_vals = StatisticalAnalyzer.adjust_p_values([float(r["p_value"]) for r in rules], method="fdr_bh")
+            for r_row, q_v in zip(rules, q_vals, strict=False):
+                r_row["fdr_q_value"] = round(float(q_v), 8)
+                r_row["significant"] = bool(q_v < 0.05)
 
         rules.sort(key=lambda r: (r["lift"], r["confidence"], r["support"]), reverse=True)
         itemsets_out = [
@@ -226,6 +242,11 @@ class AssociationRuleMiner:
                 conf = sup_ab / max(s_ant, 1e-12)
                 lift = conf / max(s_con, 1e-12)
                 if conf >= min_confidence and lift >= min_lift:
+                    cnt_ant = int(item_counts[ant])
+                    cnt_con = int(item_counts[con])
+                    p_hyper = float(stats.hypergeom.sf(max(int(cnt) - 1, 0), n_tx, min(cnt_con, n_tx), min(cnt_ant, n_tx)))
+                    if not np.isfinite(p_hyper):
+                        p_hyper = 1.0
                     rules.append(
                         {
                             "antecedent": [ant],
@@ -234,8 +255,16 @@ class AssociationRuleMiner:
                             "confidence": round(conf, 6),
                             "lift": round(lift, 6),
                             "count": int(cnt),
+                            "p_value": round(p_hyper, 8),
                         }
                     )
+        if rules:
+            from omniforge.eda.statistics import StatisticalAnalyzer
+
+            q_vals = StatisticalAnalyzer.adjust_p_values([float(r["p_value"]) for r in rules], method="fdr_bh")
+            for r_row, q_v in zip(rules, q_vals, strict=False):
+                r_row["fdr_q_value"] = round(float(q_v), 8)
+                r_row["significant"] = bool(q_v < 0.05)
         rules.sort(key=lambda r: (r["lift"], r["confidence"], r["support"]), reverse=True)
         return {
             "n_transactions": int(n_tx),

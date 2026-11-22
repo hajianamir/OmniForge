@@ -231,7 +231,8 @@ class MLPModel(BaseOmniForgeModel):
                 grads_b: list[np.ndarray] = [np.empty(0)] * len(self._biases)
 
                 for li in range(len(self._weights) - 1, -1, -1):
-                    grads_w[li] = acts[li].T @ delta + self.weight_decay * self._weights[li]
+                    # Pure data-loss gradient (decoupled from weight decay per Loshchilov & Hutter 2019 AdamW)
+                    grads_w[li] = acts[li].T @ delta
                     grads_b[li] = np.sum(delta, axis=0, keepdims=True)
                     if li > 0:
                         delta = delta @ self._weights[li].T
@@ -251,6 +252,9 @@ class MLPModel(BaseOmniForgeModel):
                     mb_hat = m_b[li] / (1.0 - beta1**step)
                     vb_hat = v_b[li] / (1.0 - beta2**step)
 
+                    # Decoupled weight decay (AdamW): w <- (1 - lr * lambda) * w - lr * m_hat / (sqrt(v_hat) + eps)
+                    if self.weight_decay > 0.0:
+                        self._weights[li] *= 1.0 - self.learning_rate * self.weight_decay
                     self._weights[li] -= self.learning_rate * mw_hat / (np.sqrt(vw_hat) + eps)
                     self._biases[li] -= self.learning_rate * mb_hat / (np.sqrt(vb_hat) + eps)
 

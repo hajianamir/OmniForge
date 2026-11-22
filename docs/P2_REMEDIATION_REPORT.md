@@ -1,5 +1,9 @@
 # OmniForge v2.0.0 — Phase P2 Remediation Report
 
+> ⚠️ **HISTORICAL (2026-11-18) — ارقام این گزارش منسوخ است.** پس از ممیزی سه‌دوره‌ای (۲۰۲۶-۱۱-۲۱) و رفع P0/P1، وضعیت واقعی در `docs/AUDIT_REPORT.md` (پیوست الف) ثبت شده است: suite ‎`190 passed / 1 skipped`‎، ruff ۰ خطا، mypy ۰ خطا (۱۸۵ فایل)، پوشش ۷۸٪. اعداد «85 passed / 166 files» این سند وضعیت همان تاریخ است و تکرارپذیر نیست.
+>
+> **HISTORICAL — numbers are stale.** See `docs/AUDIT_REPORT.md` (Appendix A) for the 2026-11-21 state.
+
 **Date:** 2026-11-18 · **Scope:** P2-1 … P2-9 (+ P2-10 documentation alignment discovered during review) · **Verdict: all items closed, all gates green, zero regressions.**
 
 Every number in this report comes from a command that was actually executed in the workspace

@@ -10,6 +10,8 @@ import os
 import re
 import secrets
 import stat
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -71,6 +73,134 @@ def _default_key_store_dir() -> Path:
         return Path.home() / ".omniforge" / "keys"
     except Exception:
         return Path(".omniforge_workspace") / "keys"
+
+
+_PSEUDONYM_SALT_CONTEXT = b"omniforge:pseudonym:v1"
+_PSEUDONYMIZATION_MIN_SALT_BYTES = 16
+_PSEUDONYMIZATION_PROD_MIN_SALT_BYTES = 32
+
+
+def _sanitize_tenant_for_env(tenant_id: str) -> str:
+    out = re.sub(r"[^A-Za-z0-9]+", "_", (tenant_id or "default")).strip("_").upper()
+    return out or "DEFAULT"
+
+
+def _default_tenant() -> str:
+    try:
+        from omniforge.config.settings import get_settings
+
+        return str(get_settings().default_tenant_id or "default-tenant")
+    except Exception:
+        return "default-tenant"
+
+
+def _salt_strength_ok(raw: bytes, *, minimum: int) -> bool:
+    if len(raw) < minimum:
+        return False
+    lowered = raw.decode("utf-8", errors="ignore").lower()
+    return not any(marker in lowered for marker in _INSECURE_PLACEHOLDER_MARKERS)
+
+
+def _dev_persisted_tenant_salt(tenant_id: str) -> bytes:
+    """Non-production fallback: a per-tenant random 0600 keyfile (never a public constant)."""
+    scope = _sanitize_tenant_for_env(tenant_id)
+    key_dir = _default_key_store_dir()
+    key_file = key_dir / f"pseudonym-salt-{scope}.key"
+    try:
+        if key_file.is_file():
+            existing = key_file.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing.encode("utf-8")
+        key_dir.mkdir(parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        fd = os.open(key_file, flags, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(secrets.token_urlsafe(48))
+        return key_file.read_text(encoding="utf-8").strip().encode("utf-8")
+    except OSError:
+        # Read-only key store: derive an ephemeral process-local salt instead of failing.
+        # Such pseudonyms are not stable across restarts — surface that honestly in the docs.
+        logger.warning(
+            "pseudonym_salt_ephemeral",
+            tenant=tenant_id,
+            note="Could not persist a dev pseudonym salt (read-only key store); "
+            "pseudonyms will not be stable across process restarts. Set OMNIFORGE_PSEUDONYM_SALTS instead.",
+        )
+        return hashlib.sha256(_PSEUDONYM_SALT_CONTEXT + secrets.token_bytes(32)).digest()
+
+
+def resolve_pseudonym_salt(tenant_id: str | None = None) -> bytes:
+    """Resolve the pseudonymization salt for ``tenant_id`` from env/KMS.
+
+    Resolution order (first non-empty wins):
+      1. ``OMNIFORGE_PSEUDONYM_SALT__<SANITIZED_TENANT>`` (e.g. tenant "default-tenant" ->
+         ``OMNIFORGE_PSEUDONYM_SALT__DEFAULT_TENANT``)
+      2. ``OMNIFORGE_PSEUDONYM_SALTS`` — JSON object mapping tenant id -> salt
+         (intended for KMS/Vault-rendered env; parse errors are fatal, never silently ignored)
+      3. ``OMNIFORGE_PSEUDONYM_SALT`` — global fallback salt
+
+    Production requires at least one of the above with a high-entropy (>= 32 bytes),
+    non-placeholder salt; otherwise :class:`SecurityError` is raised (fail-closed).
+    Non-production falls back to a per-tenant random 0600 keyfile (or an ephemeral
+    process-local salt when the key store is not writable).
+    """
+    tenant = (tenant_id or _default_tenant()).strip() or "default-tenant"
+    sanitized = _sanitize_tenant_for_env(tenant)
+
+    candidate: bytes | None
+    raw: str | None = os.getenv(f"OMNIFORGE_PSEUDONYM_SALT__{sanitized}")
+    if raw and raw.strip():
+        candidate = raw.strip().encode("utf-8")
+        source = f"OMNIFORGE_PSEUDONYM_SALT__{sanitized}"
+    else:
+        json_env = os.getenv("OMNIFORGE_PSEUDONYM_SALTS")
+        if json_env and json_env.strip():
+            try:
+                mapping = json.loads(json_env)
+            except json.JSONDecodeError as exc:
+                raise SecurityError(
+                    "OMNIFORGE_PSEUDONYM_SALTS is not valid JSON; refusing to pseudonymize.",
+                    suggestions=["Fix the JSON object mapping tenant ids to high-entropy salts."],
+                ) from exc
+            if not isinstance(mapping, dict):
+                raise SecurityError(
+                    "OMNIFORGE_PSEUDONYM_SALTS must be a JSON object of {tenant_id: salt}.",
+                    suggestions=['Render a JSON object from your KMS/Vault, e.g. {"default-tenant": "<48 random bytes>"}.'],
+                )
+            raw = mapping.get(tenant)
+            candidate = str(raw).strip().encode("utf-8") if raw else None
+            source = "OMNIFORGE_PSEUDONYM_SALTS"
+        else:
+            raw = os.getenv("OMNIFORGE_PSEUDONYM_SALT")
+            candidate = raw.strip().encode("utf-8") if raw and raw.strip() else None
+            source = "OMNIFORGE_PSEUDONYM_SALT"
+
+    if candidate is not None:
+        minimum = _PSEUDONYMIZATION_PROD_MIN_SALT_BYTES if _is_production_env() else _PSEUDONYMIZATION_MIN_SALT_BYTES
+        if not _salt_strength_ok(candidate, minimum=minimum):
+            raise SecurityError(
+                f"Pseudonym salt from {source} is too weak (need >= {minimum} high-entropy, non-placeholder bytes).",
+                suggestions=[
+                    f'Set {source} to a high-entropy random secret (e.g. `python -c \'import secrets; print(secrets.token_urlsafe(48))\'`).',
+                ],
+            )
+        return candidate
+
+    if _is_production_env():
+        raise SecurityError(
+            f"No pseudonymization salt configured for tenant '{tenant}' in production.",
+            suggestions=[
+                f"Set OMNIFORGE_PSEUDONYM_SALT__{sanitized} or include '{tenant}' in OMNIFORGE_PSEUDONYM_SALTS (JSON map from KMS/Vault).",
+                "Without a per-tenant salt, anonymized values are dictionary-attackable; OmniForge refuses to run.",
+            ],
+        )
+    return _dev_persisted_tenant_salt(tenant)
+
+
+def pseudonymize_value(value: Any, *, salt: bytes, tenant_id: str) -> str:
+    """Deterministic, tenant-bound HMAC-SHA256 pseudonym (versioned, 16 hex chars of the HMAC)."""
+    material = _PSEUDONYM_SALT_CONTEXT + b"\x00" + tenant_id.encode("utf-8") + b"\x00" + str(value).encode("utf-8")
+    return hmac.new(salt, material, hashlib.sha256).hexdigest()[:16]
 
 
 def _resolve_or_persist_secret(
@@ -602,15 +732,48 @@ class JWTManager:
 
 
 class AccessController:
-    """Combined RBAC and ABAC policy enforcement engine with multi-tenant isolation."""
+    """Combined RBAC and ABAC policy enforcement engine with multi-tenant isolation.
+
+    Cross-tenant authorization is restricted to the ``platform_admin`` role (P1-12) and, when
+    constructed with ``audit_logger=``, EVERY cross-tenant decision (allow or deny) is written to
+    the tamper-evident audit trail — fail-closed: an allow decision is refused if the audit write
+    fails. Tenant isolation failures raise before any permission check.
+    """
 
     def __init__(
         self,
         role_permissions: dict[str, frozenset[str]] | None = None,
         enforce_tenant_isolation: bool = True,
+        audit_logger: AuditLogger | None = None,
     ) -> None:
         self._role_permissions = dict(role_permissions or RBAC_ROLE_PERMISSIONS)
         self._enforce_tenant_isolation = enforce_tenant_isolation
+        self._audit_logger = audit_logger
+
+    def _audit_cross_tenant(
+        self,
+        principal: Principal,
+        permission: str,
+        resource_tenant_id: str,
+        *,
+        status: str,
+    ) -> None:
+        if self._audit_logger is None:
+            return
+        self._audit_logger.log_event(
+            action="authorize:cross_tenant",
+            resource_type="tenant",
+            resource_id=str(resource_tenant_id),
+            actor=principal.subject,
+            role=",".join(principal.roles),
+            tenant_id=principal.tenant_id,
+            status=status,
+            details={
+                "permission": permission,
+                "principal_tenant": principal.tenant_id,
+                "resource_tenant": resource_tenant_id,
+            },
+        )
 
     def get_permissions(self, principal: Principal) -> set[str]:
         """Compute effective permission set for a principal."""
@@ -633,7 +796,9 @@ class AccessController:
             AuthorizationError: If any authorization check fails.
         """
         if self._enforce_tenant_isolation and resource_tenant_id is not None:
-            if "admin" not in principal.roles and principal.tenant_id != resource_tenant_id:
+            cross_tenant = principal.tenant_id != resource_tenant_id
+            if cross_tenant and "platform_admin" not in principal.roles:
+                self._audit_cross_tenant(principal, permission, str(resource_tenant_id), status="denied")
                 raise AuthorizationError(
                     f"Cross-tenant access denied for principal '{principal.subject}'.",
                     context={
@@ -642,6 +807,16 @@ class AccessController:
                     },
                     suggestions=["Authenticate within the target tenant context."],
                 )
+            if cross_tenant:
+                try:
+                    self._audit_cross_tenant(principal, permission, str(resource_tenant_id), status="success")
+                except OSError as exc:
+                    raise SecurityError(
+                        "Cross-tenant authorization refused: the mandatory audit record could not be written.",
+                        suggestions=[
+                            "Check audit log writability/disk space; cross-tenant access is fail-closed by design.",
+                        ],
+                    ) from exc
 
         effective_permissions = self.get_permissions(principal)
         if permission not in effective_permissions:
@@ -728,16 +903,34 @@ class PIIRedactor:
         df: pd.DataFrame,
         columns: list[str] | None = None,
         strategy: str = "hash",
-        salt: str = "uap-pii-salt",
+        salt: str | bytes | None = None,
+        tenant_id: str | None = None,
     ) -> pd.DataFrame:
         """Anonymize specified (or automatically detected) PII columns in a DataFrame.
 
         Args:
             df: Input DataFrame.
             columns: Columns to anonymize; auto-detected if ``None``.
-            strategy: ``"hash"`` (salted SHA-256 prefix), ``"mask"``, or ``"drop"``.
-            salt: Cryptographic salt for deterministic pseudonymization.
+            strategy: ``"hash"`` (tenant-bound HMAC-SHA256 pseudonym), ``"mask"``, or ``"drop"``.
+            salt: Explicit KMS-fetched salt (bytes or string). ``None`` resolves from
+                ``OMNIFORGE_PSEUDONYM_SALT__<TENANT>`` / ``OMNIFORGE_PSEUDONYM_SALTS`` (JSON map) /
+                ``OMNIFORGE_PSEUDONYM_SALT`` via :func:`resolve_pseudonym_salt`. In production at
+                least one of those MUST be configured — there is no public default.
+            tenant_id: Tenant scope for pseudonymization and salt resolution
+                (defaults to ``settings.default_tenant_id``).
+
+        Hash pseudonyms are deterministic per (tenant, value) pair via HMAC-SHA256 with the
+        versioned domain separator ``omniforge:pseudonym:v1``. The same value pseudonymizes
+        identically within a tenant and differently across tenants. Salt resolution is lazy:
+        ``mask``/``drop`` strategies need no secret and never trigger salt resolution.
         """
+        tenant = (tenant_id or _default_tenant()).strip() or "default-tenant"
+        salt_bytes: bytes | None = None
+        if strategy == "hash":
+            if salt is not None:
+                salt_bytes = salt.encode("utf-8") if isinstance(salt, str) else bytes(salt)
+            else:
+                salt_bytes = resolve_pseudonym_salt(tenant)
         target_cols = columns if columns is not None else list(self.scan_dataframe(df).keys())
         result = df.copy()
         for col in target_cols:
@@ -749,22 +942,523 @@ class PIIRedactor:
                 result[col] = result[col].apply(
                     lambda v: "***MASKED***" if pd.notna(v) else v
                 )
-            else:
+            elif strategy == "hash":
+                assert salt_bytes is not None  # guaranteed: resolved above when strategy == "hash"
+                hash_salt = salt_bytes
                 result[col] = result[col].apply(
-                    lambda v: hashlib.sha256(f"{salt}:{v}".encode()).hexdigest()[:16]
+                    lambda v, salt=hash_salt: pseudonymize_value(v, salt=salt, tenant_id=tenant)
                     if pd.notna(v)
                     else v
                 )
+            else:
+                raise ValueError(f"Unknown anonymization strategy: {strategy!r} (expected 'hash', 'mask', or 'drop')")
         return result
 
 
-class AuditLogger:
-    """Hash-chained, tamper-evident enterprise audit trail persisted as JSONL."""
+# ---------------------------------------------------------------------------
+# Pure-ASGI hardening middleware: request body size limit + sliding-window rate limit
+# ---------------------------------------------------------------------------
+Scope = dict[str, Any]
+Receive = Any
+Send = Any
+ASGIApp = Any
 
-    def __init__(self, log_path: str | Path = "./.omniforge_workspace/audit.jsonl") -> None:
+
+class _PayloadTooLarge(BaseException):
+    """Internal signal used to abort an in-flight oversized request body.
+
+    Deliberately derives from ``BaseException`` (not ``Exception``) so Starlette's
+    exception handlers and application-level ``except Exception`` blocks do not
+    swallow it and turn a 413 into a 500.
+    """
+
+
+async def _send_simple_json(send: Send, status: int, payload: dict[str, Any], extra_headers: list[tuple[bytes, bytes]] | None = None) -> None:
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    headers = [
+        (b"content-type", b"application/json"),
+        (b"content-length", str(len(body)).encode("ascii")),
+    ]
+    if extra_headers:
+        headers.extend(extra_headers)
+    await send({"type": "http.response.start", "status": status, "headers": headers})
+    await send({"type": "http.response.body", "body": body})
+
+
+class RequestBodySizeLimitMiddleware:
+    """Reject HTTP requests whose body exceeds ``max_body_bytes`` with HTTP 413.
+
+    Two layers of enforcement:
+      1. A ``Content-Length`` pre-check rejects oversized requests before any byte
+         of the body is consumed (covers the common case, zero-copy rejection).
+      2. Streaming enforcement counts bytes across ``http.request`` messages, so
+         chunked-transfer bodies without ``Content-Length`` are bounded as well.
+    """
+
+    def __init__(self, app: ASGIApp, max_body_bytes: int = 268_435_456) -> None:
+        self.app = app
+        self.max_body_bytes = int(max_body_bytes)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        limit = self.max_body_bytes
+        for name, value in scope.get("headers", []):
+            if name.lower() == b"content-length":
+                try:
+                    declared = int(value)
+                except ValueError:
+                    declared = -1
+                if declared > limit:
+                    await _send_simple_json(
+                        send,
+                        413,
+                        {
+                            "detail": f"Request body exceeds the {limit // (1024 * 1024)} MB limit.",
+                            "error_type": "PayloadTooLarge",
+                        },
+                    )
+                    return
+        received = 0
+
+        async def limited_receive() -> dict[str, Any]:
+            nonlocal received
+            message: dict[str, Any] = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    raise _PayloadTooLarge()
+            return message
+
+        response_started = False
+
+        async def wrapped_send(message: dict[str, Any]) -> None:
+            nonlocal response_started
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, wrapped_send)
+        except _PayloadTooLarge:
+            if not response_started:
+                await _send_simple_json(
+                    send,
+                    413,
+                    {
+                        "detail": f"Request body exceeds the {limit // (1024 * 1024)} MB limit.",
+                        "error_type": "PayloadTooLarge",
+                    },
+                )
+            # else: the downstream app already started responding; there is nothing
+            # safe left to send — the connection is torn down with the client informed
+            # via the truncated response.
+
+
+class SlidingWindowRateLimitMiddleware:
+    """Per-client-IP sliding-window rate limiter (HTTP 429 + ``Retry-After``).
+
+    Implements the ``api.rate_limit_per_minute`` policy declared in configuration.
+    Keyed by the ASGI client host (NOT ``X-Forwarded-For``, which is spoofable);
+    deployments sitting behind a single trusted proxy share one bucket unless the
+    limit is raised via ``OMNIFORGE_API__RATE_LIMIT_PER_MINUTE`` (0 disables).
+    Health probe paths are exempt so load balancers are never throttled.
+
+    The backend is pluggable via ``omniforge.core.rate_limit``: the default is a
+    per-process in-memory window; pass ``limiter=`` (e.g. a ``RedisSlidingWindowLimiter``
+    or ``ResilientRateLimiter``) to enforce one shared window across processes.
+    """
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        max_requests_per_minute: int = 300,
+        window_seconds: float = 60.0,
+        exclude_paths: frozenset[str] = frozenset({"/health", "/api/v1/health"}),
+        clock: Any = None,
+        limiter: Any = None,
+    ) -> None:
+        from omniforge.core.rate_limit import InMemorySlidingWindowLimiter
+
+        self.app = app
+        self.max_rpm = int(max_requests_per_minute)
+        self.window_seconds = float(window_seconds)
+        self.exclude_paths = frozenset(exclude_paths)
+        self._clock = clock or time.monotonic
+        self._limiter = limiter or InMemorySlidingWindowLimiter(
+            max_requests=self.max_rpm, window_seconds=self.window_seconds, clock=self._clock
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") != "http" or self.max_rpm <= 0:
+            await self.app(scope, receive, send)
+            return
+        if scope.get("path", "") in self.exclude_paths:
+            await self.app(scope, receive, send)
+            return
+        client = scope.get("client") or ("unknown", 0)
+        key = str(client[0])
+        decision = await self._limiter.hit(key)
+        if not decision["allowed"]:
+            await _send_simple_json(
+                send,
+                429,
+                {
+                    "detail": "Rate limit exceeded. Slow down and retry shortly.",
+                    "error_type": "TooManyRequests",
+                },
+                extra_headers=[(b"retry-after", str(decision["retry_after"]).encode("ascii"))],
+            )
+            return
+        await self.app(scope, receive, send)
+
+
+_AUDIT_HMAC_CONTEXT = b"omniforge-audit-event-v2"
+
+_CHECKPOINT_HMAC_CONTEXT = b"omniforge-audit-checkpoint-v1"
+
+
+def _checkpoint_disabled(value: str | None) -> bool:
+    return not value or value.strip().lower() in {"0", "false", "off", "none"}
+
+
+def _verify_anchor_records(
+    hashes: list[str],
+    checkpoint_lines: list[str],
+    verify_mac: Callable[[dict[str, Any]], bool],
+) -> tuple[bool, int, str]:
+    """Shared consistency check for anchor checkpoints against the parsed log hashes."""
+    checked = 0
+    last_seq = 0
+    max_covered = 0
+    for line in checkpoint_lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            return False, checked, "anchor contains unparseable line"
+        if not verify_mac(record):
+            return False, checked, f"checkpoint #{record.get('seq')} fails HMAC verification"
+        seq = int(record.get("seq") or 0)
+        if seq <= last_seq:
+            return False, checked, f"checkpoint seq #{seq} is not strictly increasing"
+        last_seq = seq
+        record_count = int(record.get("record_count") or 0)
+        head_hash = str(record.get("head_hash") or "")
+        if not (1 <= record_count <= len(hashes)):
+            return (
+                False,
+                checked,
+                f"checkpoint #{seq} covers record {record_count}, outside the log ({len(hashes)} records)",
+            )
+        if hashes[record_count - 1] != head_hash:
+            return False, checked, f"checkpoint #{seq} disagrees with the log at record {record_count} (re-chained log?)"
+        max_covered = max(max_covered, record_count)
+        checked += 1
+    return True, checked, f"anchor OK ({checked} checkpoints, anchored through record {max_covered} of {len(hashes)})"
+
+
+def _read_log_hashes(log_path: Path) -> tuple[list[str], str | None]:
+    """Return (event_hash list, error detail or None)."""
+    hashes: list[str] = []
+    if not log_path.exists():
+        return hashes, None
+    with log_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                return [], "audit log contains unparseable line"
+            hashes.append(str(record.get("event_hash") or ""))
+    return hashes, None
+
+
+class AuditCheckpointAnchor:
+    """Out-of-band (RFC 9162-style) checkpoint anchor for the audit log.
+
+    Optionally enabled by setting ``OMNIFORGE_AUDIT__ANCHOR_PATH`` to a separate append-only
+    JSONL checkpoint file (ideally on a different mount or shipped to an independent store),
+    or by passing ``anchor_path=`` to :class:`AuditLogger`. After every anchored event, a
+    checkpoint record is appended::
+
+        {"version": "v1", "seq": N, "record_count": M, "head_hash": "<sha256>",
+         "timestamp": "<iso8601>", "mac": "<hmac-sha256>"}
+
+    ``mac`` is a domain-separated HMAC-SHA256 over the canonical checkpoint fields, keyed with
+    material from ``OMNIFORGE_AUDIT__CHECKPOINT_KEY`` (derived with its own domain separator and
+    persisted as a 0600 keyfile outside production, matching the rest of the key-management
+    posture). An attacker who can rewrite the audit JSONL but cannot mint a valid checkpoint MAC
+    cannot launder a re-chained log into something the anchor accepts.
+
+    Honest limits: truncating BOTH the log tail and the trailing checkpoints consistently is
+    indistinguishable without an external witness/replication step, and a host compromise that
+    exposes the checkpoint key defeats the anchor too. The anchor raises the bar from
+    "file-write on the audit log is enough" to "file-write AND checkpoint key are required".
+    Replicate the checkpoint file to independent storage for witness-grade guarantees.
+
+    ``anchor_every`` (``OMNIFORGE_AUDIT__ANCHOR_EVERY``, default 1) controls checkpoint cadence;
+    every Nth event (counting from the first record already in the log) is anchored. ``1`` means
+    every event.
+    """
+
+    VERSION = "v1"
+
+    def __init__(self, checkpoint_path: str | Path, explicit_key: str | bytes | None = None) -> None:
+        self._path = Path(checkpoint_path)
+        self._key = _resolve_or_persist_secret(
+            key_name="audit-checkpoint-hmac",
+            explicit=explicit_key,
+            env_vars=("OMNIFORGE_AUDIT__CHECKPOINT_KEY",),
+        )
+        self._mac_key = hashlib.sha256(b"omniforge:audit-checkpoint:v1:" + self._key).digest()
+        self._last_seq = self._load_last_seq()
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    @staticmethod
+    def _canonical(fields: dict[str, Any]) -> bytes:
+        return json.dumps(fields, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+
+    def _mac(self, fields: dict[str, Any]) -> str:
+        material = _CHECKPOINT_HMAC_CONTEXT + b"\x00" + self._canonical(fields)
+        return hmac.new(self._mac_key, material, hashlib.sha256).hexdigest()
+
+    def _fields(self, record: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "version": record.get("version"),
+            "seq": record.get("seq"),
+            "record_count": record.get("record_count"),
+            "head_hash": record.get("head_hash"),
+            "timestamp": record.get("timestamp"),
+        }
+
+    def _verify_checkpoint(self, record: dict[str, Any]) -> bool:
+        mac = str(record.get("mac") or "")
+        if not mac:
+            return False
+        try:
+            expected = self._mac(self._fields(record))
+        except (ValueError, TypeError):
+            return False
+        return hmac.compare_digest(expected, mac)
+
+    def _load_last_seq(self) -> int:
+        if not self._path.exists():
+            return 0
+        last_seq = 0
+        try:
+            with self._path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    record = json.loads(line)
+                    if not self._verify_checkpoint(record):
+                        raise SecurityError(
+                            "Audit checkpoint anchor fails HMAC verification; refusing to extend a forged anchor.",
+                            suggestions=[
+                                "Treat the checkpoint file as tampered. Compare against a replicated anchor copy.",
+                            ],
+                        )
+                    seq = int(record.get("seq") or 0)
+                    if seq <= last_seq:
+                        raise SecurityError(
+                            "Audit checkpoint anchor seq is not strictly increasing; refusing to extend it.",
+                            suggestions=[
+                                "Treat the checkpoint file as rewritten. Restore it from a replicated copy.",
+                            ],
+                        )
+                    last_seq = seq
+        except json.JSONDecodeError as exc:
+            raise SecurityError(
+                "Audit checkpoint anchor contains an unparseable line; refusing to extend it.",
+                suggestions=["Restore the checkpoint file from a replicated copy or archive it before continuing."],
+            ) from exc
+        return last_seq
+
+    def anchor_event(self, *, record_count: int, head_hash: str) -> dict[str, Any]:
+        """Append a MACed checkpoint covering ``record_count`` records with head ``head_hash``."""
+        seq = self._last_seq + 1
+        fields = {
+            "version": self.VERSION,
+            "seq": seq,
+            "record_count": int(record_count),
+            "head_hash": str(head_hash),
+            "timestamp": datetime.now(UTC).isoformat(),
+        }
+        record = {**fields, "mac": self._mac(fields)}
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with self._path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+        self._last_seq = seq
+        return record
+
+    def verify_log(self, log_path: str | Path) -> tuple[bool, int, str]:
+        """Verify this anchor against ``log_path`` (uses the anchor's own checkpoint key). Returns ``(ok, checkpoints_checked, detail)``."""
+        log_path = Path(log_path)
+        hashes, error = _read_log_hashes(log_path)
+        if error is not None:
+            return False, 0, error
+        checkpoint_lines: list[str] = []
+        if not self._path.exists():
+            return False, 0, "anchor file not found; cannot confirm out-of-band checkpoints"
+        with self._path.open("r", encoding="utf-8") as handle:
+            checkpoint_lines = [ln.strip() for ln in handle if ln.strip()]
+        return _verify_anchor_records(hashes, checkpoint_lines, self._verify_checkpoint)
+
+    @classmethod
+    def verify_against_log(cls, log_path: str | Path, checkpoint_path: str | Path, explicit_key: str | bytes | None = None) -> tuple[bool, int, str]:
+        """Verify ``checkpoint_path`` against ``log_path`` with an env/explicit checkpoint key.
+
+        Convenience wrapper for offline/SIEM verification. The key resolves from
+        ``OMNIFORGE_AUDIT__CHECKPOINT_KEY`` (or ``explicit_key``); in non-production local setups a
+        generated 0600 keyfile is reused so unsigned verification never silently succeeds.
+        """
+        log_path = Path(log_path)
+        checkpoint_path = Path(checkpoint_path)
+        if not checkpoint_path.exists():
+            return False, 0, "anchor file not found; cannot confirm out-of-band checkpoints"
+        key = _resolve_or_persist_secret(
+            key_name="audit-checkpoint-hmac",
+            explicit=explicit_key,
+            env_vars=("OMNIFORGE_AUDIT__CHECKPOINT_KEY",),
+        )
+        verifier = cls.__new__(cls)
+        verifier._path = checkpoint_path
+        verifier._key = key
+        verifier._mac_key = hashlib.sha256(b"omniforge:audit-checkpoint:v1:" + key).digest()
+        verifier._last_seq = 0
+        return verifier.verify_log(log_path)
+
+
+
+class AuditLogger:
+    """Hash-chained, HMAC-signed, tamper-evident enterprise audit trail persisted as JSONL.
+
+    v2 design: every forensic-relevant field (including ``role``, ``trace_id`` and
+    ``details``) is covered by the SHA-256 hash payload, and each record carries a
+    domain-separated HMAC-SHA256 MAC (``chain_mac``) over the hash. Verification
+    requires both the hash and the MAC; editing any covered field in the stored log
+    invalidates the chain. There is intentionally NO unsigned legacy verification
+    path — an unauthenticated (subset) hash would let a log-file attacker forge or
+    strip records without the MAC key.
+    Note: for full tamper-evidence across host compromise, anchor checkpoints
+    externally (RFC 9162-style); this implementation covers in-band integrity only.
+    """
+
+    def __init__(
+        self,
+        log_path: str | Path = "./.omniforge_workspace/audit.jsonl",
+        *,
+        anchor_path: str | Path | None = None,
+        checkpoint_key: str | bytes | None = None,
+        anchor_every: int | None = None,
+    ) -> None:
         self._path = Path(log_path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._audit_signer: ArtifactSigner | None = None
         self._last_hash = self._load_last_hash()
+        self._record_count = self._count_records()
+        # Out-of-band checkpoint anchor (audit P1-11/anchor item). Opt-in: set
+        # OMNIFORGE_AUDIT__ANCHOR_PATH (or pass anchor_path=) to a separate append-only file;
+        # explicitly disabled with 0/false/off/none. Unset by default so local runs are unchanged.
+        env_anchor = os.getenv("OMNIFORGE_AUDIT__ANCHOR_PATH")
+        if anchor_path is None and not _checkpoint_disabled(env_anchor):
+            anchor_path = env_anchor.strip() if env_anchor else None
+        if checkpoint_key is None:
+            checkpoint_key = os.getenv("OMNIFORGE_AUDIT__CHECKPOINT_KEY") or None
+        if anchor_every is None:
+            raw_every = os.getenv("OMNIFORGE_AUDIT__ANCHOR_EVERY", "1").strip()
+            try:
+                anchor_every = int(raw_every)
+            except ValueError as exc:
+                raise SecurityError(
+                    f"OMNIFORGE_AUDIT__ANCHOR_EVERY must be a positive integer, got {raw_every!r}.",
+                    suggestions=["Set OMNIFORGE_AUDIT__ANCHOR_EVERY to a positive integer (1 = anchor every event)."],
+                ) from exc
+        if anchor_every < 1:
+            raise SecurityError(
+                f"OMNIFORGE_AUDIT__ANCHOR_EVERY must be >= 1, got {anchor_every}.",
+                suggestions=["Set OMNIFORGE_AUDIT__ANCHOR_EVERY to a positive integer (1 = anchor every event)."],
+            )
+        self._anchor_every = anchor_every
+        self._anchor: AuditCheckpointAnchor | None = (
+            AuditCheckpointAnchor(anchor_path, checkpoint_key) if anchor_path else None
+        )
+
+    def _count_records(self) -> int:
+        if not self._path.exists():
+            return 0
+        with self._path.open("r", encoding="utf-8") as handle:
+            return sum(1 for line in handle if line.strip())
+
+    def _signer(self) -> ArtifactSigner:
+        if self._audit_signer is None:
+            self._audit_signer = ArtifactSigner()
+        return self._audit_signer
+
+    @staticmethod
+    def _canonical_payload(fields: dict[str, Any]) -> bytes:
+        """Canonical JSON encoding used both for hashing and MAC verification."""
+        return json.dumps(fields, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+
+    @staticmethod
+    def _event_fields(source: AuditEvent | dict[str, Any]) -> dict[str, Any]:
+        """Full v2 payload: EVERY forensic-relevant field is covered by the hash chain."""
+        if isinstance(source, AuditEvent):
+            return {
+                "event_id": source.event_id,
+                "timestamp": source.timestamp,
+                "tenant_id": source.tenant_id,
+                "actor": source.actor,
+                "role": source.role,
+                "action": source.action,
+                "resource_type": source.resource_type,
+                "resource_id": source.resource_id,
+                "status": source.status,
+                "trace_id": source.trace_id,
+                "details": source.details,
+                "previous_hash": source.previous_hash,
+            }
+        return {
+            "event_id": source.get("event_id"),
+            "timestamp": source.get("timestamp"),
+            "tenant_id": source.get("tenant_id"),
+            "actor": source.get("actor"),
+            "role": source.get("role"),
+            "action": source.get("action"),
+            "resource_type": source.get("resource_type"),
+            "resource_id": source.get("resource_id"),
+            "status": source.get("status"),
+            "trace_id": source.get("trace_id"),
+            "details": source.get("details") or {},
+            "previous_hash": source.get("previous_hash"),
+        }
+
+    @staticmethod
+    def _verify_record(record: dict[str, Any], signer: ArtifactSigner) -> bool:
+        """v2 verification: full-payload hash + domain-separated HMAC-SHA256 MAC.
+
+        There is deliberately NO legacy/bypass path: a log record must carry both a
+        correct full-payload SHA-256 ``event_hash`` and a valid ``chain_mac``.
+        """
+        event_hash = str(record.get("event_hash") or "")
+        chain_mac = str(record.get("chain_mac") or "")
+        if not event_hash or not chain_mac:
+            return False
+        try:
+            recomputed = hashlib.sha256(AuditLogger._canonical_payload(AuditLogger._event_fields(record))).hexdigest()
+            if not hmac.compare_digest(recomputed, event_hash):
+                return False
+            return signer.verify_bytes(bytes.fromhex(recomputed), chain_mac, context=_AUDIT_HMAC_CONTEXT)
+        except (ValueError, TypeError):
+            return False
 
     def _load_last_hash(self) -> str:
         if not self._path.exists() or self._path.stat().st_size == 0:
@@ -777,9 +1471,20 @@ class AuditLogger:
         if not last_line:
             return "0" * 64
         try:
-            return str(json.loads(last_line).get("event_hash", "0" * 64))
+            record = json.loads(last_line)
         except json.JSONDecodeError:
-            return "0" * 64
+            raise SecurityError(
+                "Audit log's last record is not valid JSON; refusing to extend an unverifiable chain.",
+                suggestions=["Restore the audit log from a trusted backup or archive it before continuing."],
+            ) from None
+        if not AuditLogger._verify_record(record, self._signer()):
+            raise SecurityError(
+                "Audit log's last record fails integrity verification (hash/MAC mismatch).",
+                suggestions=[
+                    "Treat the audit log as tampered. Investigate, then restore from an external checkpoint/backup."
+                ],
+            )
+        return str(record.get("event_hash", "0" * 64))
 
     def log_event(
         self,
@@ -793,7 +1498,7 @@ class AuditLogger:
         status: str = "success",
         details: dict[str, Any] | None = None,
     ) -> AuditEvent:
-        """Append a cryptographically chained audit event to the audit log."""
+        """Append a cryptographically chained, HMAC-signed audit event to the audit log."""
         event = AuditEvent(
             tenant_id=tenant_id,
             actor=actor,
@@ -806,65 +1511,87 @@ class AuditLogger:
             details=details or {},
             previous_hash=self._last_hash,
         )
-        hash_payload = json.dumps(
-            {
-                "event_id": event.event_id,
-                "timestamp": event.timestamp,
-                "tenant_id": event.tenant_id,
-                "actor": event.actor,
-                "action": event.action,
-                "resource_type": event.resource_type,
-                "resource_id": event.resource_id,
-                "status": event.status,
-                "previous_hash": event.previous_hash,
-            },
-            sort_keys=True,
-        ).encode("utf-8")
-        event.event_hash = hashlib.sha256(hash_payload).hexdigest()
+        event.event_hash = hashlib.sha256(self._canonical_payload(self._event_fields(event))).hexdigest()
+        event.chain_mac = self._signer().sign_bytes(bytes.fromhex(event.event_hash), context=_AUDIT_HMAC_CONTEXT)
         self._last_hash = event.event_hash
 
         with self._path.open("a", encoding="utf-8") as handle:
             handle.write(event.model_dump_json() + "\n")
+        self._record_count += 1
+        if self._anchor is not None and self._record_count % self._anchor_every == 0:
+            try:
+                self._anchor.anchor_event(record_count=self._record_count, head_hash=event.event_hash)
+            except OSError as exc:
+                raise SecurityError(
+                    "Audit checkpoint anchor could not be written; the event remains in the log but is unanchored.",
+                    suggestions=[
+                        "Check that OMNIFORGE_AUDIT__ANCHOR_PATH points at a writable, preferably external, location.",
+                        "Re-run verification (AuditLogger.verify_with_anchor) and investigate the coverage gap.",
+                    ],
+                ) from exc
         return event
 
-    def verify_chain(self) -> tuple[bool, int]:
-        """Verify cryptographic continuity of the entire audit log.
+    @classmethod
+    def verify_file(cls, log_path: str | Path) -> tuple[bool, int]:
+        """Verify a JSONL audit log without constructing a logger (for SIEM/ops tooling).
 
-        Returns:
-            Tuple of ``(is_valid, total_events_checked)``.
+        Same semantics as :meth:`verify_chain` but never raises on a corrupt last record.
         """
-        if not self._path.exists():
+        path = Path(log_path)
+        if not path.exists():
             return True, 0
+        records: list[dict[str, Any]] = []
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.strip():
+                        records.append(json.loads(line))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return False, 0
+        signer = ArtifactSigner()
         expected_prev = "0" * 64
         count = 0
-        with self._path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                if not line.strip():
-                    continue
-                record = json.loads(line)
-                if record.get("previous_hash") != expected_prev:
-                    return False, count
-                recomputed = hashlib.sha256(
-                    json.dumps(
-                        {
-                            "event_id": record["event_id"],
-                            "timestamp": record["timestamp"],
-                            "tenant_id": record["tenant_id"],
-                            "actor": record["actor"],
-                            "action": record["action"],
-                            "resource_type": record["resource_type"],
-                            "resource_id": record["resource_id"],
-                            "status": record["status"],
-                            "previous_hash": record["previous_hash"],
-                        },
-                        sort_keys=True,
-                    ).encode("utf-8")
-                ).hexdigest()
-                if record.get("event_hash") != recomputed:
-                    return False, count
-                expected_prev = recomputed
-                count += 1
+        for record in records:
+            if record.get("previous_hash") != expected_prev:
+                return False, count
+            if not AuditLogger._verify_record(record, signer):
+                return False, count
+            expected_prev = str(record.get("event_hash") or "")
+            count += 1
         return True, count
+
+    def verify_chain(self) -> tuple[bool, int]:
+        """Verify cryptographic continuity and integrity of the entire audit log.
+
+        Every record is validated with a full-payload SHA-256 hash plus a domain-separated
+        HMAC-SHA256 MAC. Returns:
+            Tuple of ``(is_valid, total_events_checked)``.
+        """
+        return AuditLogger.verify_file(self._path)
+
+
+    @property
+    def anchor_enabled(self) -> bool:
+        """True when out-of-band checkpoint anchoring is configured for this log."""
+        return self._anchor is not None
+
+    def verify_anchor(self) -> tuple[bool, int, str]:
+        """Verify out-of-band checkpoints against the log. Returns ``(ok, checkpoints_checked, detail)``.
+
+        When anchoring is not configured this returns ``(True, 0, "anchor not configured ...")`` so
+        callers can distinguish "verified-but-absent" from "verified-and-present" via the detail.
+        """
+        if self._anchor is None:
+            return True, 0, "anchor not configured (in-band integrity only)"
+        return self._anchor.verify_log(self._path)
+
+    def verify_with_anchor(self) -> tuple[bool, int, str]:
+        """Verify the in-band chain AND the out-of-band anchor. Returns ``(ok, events_checked, detail)``."""
+        chain_ok, count = self.verify_chain()
+        if not chain_ok:
+            return False, count, "audit chain integrity failed"
+        anchor_ok, _checked, detail = self.verify_anchor()
+        return anchor_ok, count, detail
 
     def read_events(self, limit: int = 100) -> list[AuditEvent]:
         """Read the most recent ``limit`` audit events."""

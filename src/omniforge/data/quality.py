@@ -211,7 +211,6 @@ class DataQualityProfiler:
             "validity": round(validity, 2),
             "consistency": round(consistency, 2),
             "accuracy": round(accuracy, 2),
-            "proxy_accuracy": round(accuracy, 2),
             "timeliness": round(timeliness, 2) if timeliness is not None else None,
         }
         evaluable_weights = {
@@ -298,56 +297,146 @@ class DataQualityProfiler:
         return "F"
 
     @staticmethod
-    def little_mcar_test(df: pd.DataFrame, alpha: float = 0.05) -> dict[str, Any]:
-        """Little's (1988) MCAR chi-square test on numeric columns with missing values."""
+    def little_mcar_test(
+        df: pd.DataFrame,
+        alpha: float = 0.05,
+        max_iter: int = 100,
+        tol: float = 1e-6,
+    ) -> dict[str, Any]:
+        """Little's (1988, JASA 83:1198-1202) MCAR test via Multivariate Normal EM MLE.
+
+        Includes both partially missing and fully observed numeric covariates so MAR
+        mechanisms dependent on fully observed predictors are properly detected.
+        """
         from scipy import stats
 
         num_df = df.select_dtypes(include=[np.number]).copy()
-        num_df = num_df.loc[:, num_df.isna().any(axis=0) & ~num_df.isna().all(axis=0)]
-        if num_df.shape[1] < 2 or len(num_df) < 10:
+        # Exclude boolean columns, completely missing columns, and zero-variance columns
+        keep_cols = [
+            c
+            for c in num_df.columns
+            if not pd.api.types.is_bool_dtype(num_df[c])
+            and not num_df[c].isna().all()
+            and int(num_df[c].dropna().nunique()) > 1
+        ]
+        num_df = num_df[keep_cols].replace([np.inf, -np.inf], np.nan)
+        has_any_missing = bool(num_df.isna().any().any()) if num_df.shape[1] > 0 else False
+        # Drop rows where ALL numeric variables are missing (p_j = 0 contributes nothing to likelihood)
+        if num_df.shape[1] > 0:
+            num_df = num_df.loc[~num_df.isna().all(axis=1)]
+
+        if num_df.shape[1] < 2 or len(num_df) < 10 or not has_any_missing:
             return {
                 "status": "not_applicable",
-                "reason": "Need at least 2 numeric columns with partial missingness and >= 10 rows.",
+                "reason": "Need at least 2 non-constant numeric columns, >= 10 non-empty rows, and at least 1 missing value.",
                 "statistic": None,
                 "df": None,
                 "p_value": None,
                 "is_mcar": None,
             }
 
-        mu_hat = num_df.mean(axis=0).to_numpy(dtype=float)
-        sigma_hat = num_df.cov().to_numpy(dtype=float)
-        if np.any(~np.isfinite(mu_hat)) or np.any(~np.isfinite(sigma_hat)):
+        X_mat = num_df.to_numpy(dtype=float)
+        obs_mat = ~np.isnan(X_mat)
+        n_rows, p = X_mat.shape
+
+        # Group rows by missingness pattern once
+        pattern_groups: dict[tuple[bool, ...], np.ndarray] = {}
+        for row_idx in range(n_rows):
+            pat = tuple(bool(v) for v in obs_mat[row_idx])
+            if pat not in pattern_groups:
+                pattern_groups[pat] = []  # type: ignore[assignment]
+            pattern_groups[pat].append(row_idx)  # type: ignore[attr-defined]
+        pattern_indices = {pat: np.asarray(idxs, dtype=int) for pat, idxs in pattern_groups.items()}
+
+        if len(pattern_indices) <= 1:
             return {
                 "status": "not_applicable",
-                "reason": "Insufficient pairwise observations to estimate covariance.",
+                "reason": "Insufficient distinct missingness patterns for Little's MCAR test.",
+                "statistic": None,
+                "df": 0,
+                "p_value": None,
+                "is_mcar": None,
+            }
+
+        # Initialize EM from observed column means & diagonal/sample covariance
+        mu = np.nanmean(X_mat, axis=0)
+        if np.any(~np.isfinite(mu)):
+            return {
+                "status": "not_applicable",
+                "reason": "Insufficient observations to initialize column means.",
                 "statistic": None,
                 "df": None,
                 "p_value": None,
                 "is_mcar": None,
             }
+        X_init = np.where(obs_mat, X_mat, mu)
+        centered_init = X_init - mu
+        sigma = (centered_init.T @ centered_init) / max(n_rows, 1)
+        diag_scale = max(float(np.mean(np.diag(sigma))), 1e-6)
+        jitter = 1e-8 * diag_scale * np.eye(p)
+        sigma = sigma + jitter
 
-        patterns = num_df.notna().apply(lambda r: tuple(r.tolist()), axis=1)
+        em_converged = False
+        em_iters = 0
+        for it in range(1, max(1, max_iter) + 1):
+            em_iters = it
+            X_expected = X_mat.copy()
+            cov_cond_sum = np.zeros((p, p), dtype=float)
+
+            for pat, idxs in pattern_indices.items():
+                obs_mask = np.asarray(pat, dtype=bool)
+                miss_mask = ~obs_mask
+                if not np.any(miss_mask):
+                    continue
+                if not np.any(obs_mask):
+                    X_expected[np.ix_(idxs, miss_mask)] = mu[miss_mask]
+                    cov_cond_sum[np.ix_(miss_mask, miss_mask)] += len(idxs) * sigma[np.ix_(miss_mask, miss_mask)]
+                    continue
+
+                sigma_oo = sigma[np.ix_(obs_mask, obs_mask)]
+                sigma_mo = sigma[np.ix_(miss_mask, obs_mask)]
+                sigma_mm = sigma[np.ix_(miss_mask, miss_mask)]
+                sigma_oo_inv = np.linalg.pinv(sigma_oo, rcond=1e-10)
+                beta_mo = sigma_mo @ sigma_oo_inv  # (p_miss, p_obs)
+
+                diff_obs = X_mat[np.ix_(idxs, obs_mask)] - mu[obs_mask]
+                X_expected[np.ix_(idxs, miss_mask)] = mu[miss_mask] + diff_obs @ beta_mo.T
+
+                cond_cov = sigma_mm - beta_mo @ sigma_mo.T
+                cond_cov = 0.5 * (cond_cov + cond_cov.T)
+                cov_cond_sum[np.ix_(miss_mask, miss_mask)] += len(idxs) * cond_cov
+
+            mu_next = X_expected.mean(axis=0)
+            centered = X_expected - mu_next
+            sigma_next = ((centered.T @ centered) + cov_cond_sum) / float(n_rows)
+            sigma_next = 0.5 * (sigma_next + sigma_next.T) + jitter
+
+            denom = max(float(np.linalg.norm(mu)) + float(np.linalg.norm(sigma, ord="fro")), 1e-12)
+            delta = (float(np.linalg.norm(mu_next - mu)) + float(np.linalg.norm(sigma_next - sigma, ord="fro"))) / denom
+            mu, sigma = mu_next, sigma_next
+            if delta < tol:
+                em_converged = True
+                break
+
+        # Little (1988, p. 1199, Eq. 2): finite-sample bias-adjusted ML covariance tilde{Sigma} = (N / (N - 1)) * Sigma_ML
+        sigma_tilde = sigma * (float(n_rows) / float(max(n_rows - 1, 1)))
+
         chi2_stat = 0.0
         total_obs_dims = 0
         n_patterns = 0
-        p = num_df.shape[1]
-
-        for pat, idx in patterns.groupby(patterns).groups.items():
+        for pat, idxs in pattern_indices.items():
             obs_mask = np.asarray(pat, dtype=bool)
             p_j = int(obs_mask.sum())
-            if p_j == 0:
-                continue
-            sub = num_df.loc[idx, num_df.columns[obs_mask]].to_numpy(dtype=float)
-            n_j = len(sub)
-            if n_j == 0:
+            if p_j == 0 or len(idxs) == 0:
                 continue
             n_patterns += 1
             total_obs_dims += p_j
-            y_bar_j = sub.mean(axis=0)
-            diff = y_bar_j - mu_hat[obs_mask]
-            cov_j = sigma_hat[np.ix_(obs_mask, obs_mask)]
-            cov_inv = np.linalg.pinv(cov_j)
-            chi2_stat += float(n_j * (diff @ cov_inv @ diff))
+            y_bar_j = X_mat[np.ix_(idxs, obs_mask)].mean(axis=0)
+            diff = y_bar_j - mu[obs_mask]
+            cov_j = sigma_tilde[np.ix_(obs_mask, obs_mask)]
+            cov_inv = np.linalg.pinv(cov_j, rcond=1e-10)
+            quad = float(len(idxs) * (diff @ cov_inv @ diff))
+            chi2_stat += max(0.0, quad)
 
         dof = total_obs_dims - p
         if dof <= 0 or n_patterns <= 1:
@@ -369,5 +458,8 @@ class DataQualityProfiler:
             "alpha": float(alpha),
             "is_mcar": bool(p_val >= alpha),
             "n_patterns": int(n_patterns),
+            "estimator": "mvn_em_mle",
+            "em_iterations": int(em_iters),
+            "em_converged": bool(em_converged),
         }
 

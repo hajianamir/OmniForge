@@ -7,6 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import yaml
 
 from omniforge.core.exceptions import PipelineError
@@ -36,11 +37,59 @@ def _builtin_step_handlers() -> dict[str, Callable[..., Any]]:
         ctx.set(f"{output_key}_metadata", res.metadata)
         return res.data
 
+    def step_split(
+        ctx: PipelineContext,
+        input_key: str = "raw_data",
+        target_column: str | None = None,
+        strategy: str = "auto",
+        test_size: float = 0.20,
+        val_size: float = 0.0,
+        group_col: str | None = None,
+        time_col: str | None = None,
+        gap: int = 0,
+        random_seed: int = 42,
+        **kw: Any,
+    ) -> Any:
+        from omniforge.data.splitting import LeakageSafeSplitter, SplitConfig
+
+        df = _resolve_df(ctx, input_key)
+        cfg = SplitConfig(
+            strategy=strategy,  # type: ignore[arg-type]
+            test_size=test_size,
+            val_size=val_size,
+            group_col=group_col,
+            time_col=time_col,
+            gap=gap,
+            random_seed=random_seed,
+        )
+        res = LeakageSafeSplitter(cfg).split(
+            df,
+            target_col=target_column if (target_column and target_column in df.columns) else None,
+        )
+        ctx.set("train_data", res.train_df)
+        ctx.set("test_data", res.test_df)
+        if res.val_df is not None:
+            ctx.set("val_data", res.val_df)
+        ctx.set("split_result", res)
+        return res.train_df
+
     def step_clean(ctx: PipelineContext, input_key: str = "raw_data", output_key: str = "clean_data", **kw: Any) -> Any:
         from omniforge.data.cleaning import CleaningConfig, DataCleaner
 
-        df = _resolve_df(ctx, input_key)
         cleaner = DataCleaner(CleaningConfig(**kw))
+        tr_df = ctx.get("train_data")
+        te_df = ctx.get("test_data")
+        if isinstance(tr_df, pd.DataFrame) and isinstance(te_df, pd.DataFrame):
+            tr_clean, report = cleaner.fit_transform(tr_df)
+            te_clean, te_report = cleaner.transform(te_df)
+            ctx.set("train_data", tr_clean)
+            ctx.set("test_data", te_clean)
+            ctx.set(output_key, tr_clean)
+            ctx.set("cleaning_report", report)
+            ctx.set("test_cleaning_report", te_report)
+            return tr_clean
+
+        df = _resolve_df(ctx, input_key)
         cleaned, report = cleaner.fit_transform(df)
         ctx.set(output_key, cleaned)
         ctx.set("cleaning_report", report)
@@ -80,16 +129,56 @@ def _builtin_step_handlers() -> dict[str, Callable[..., Any]]:
     ) -> Any:
         from omniforge.features.engineering import FeatureConfig, FeatureEngineeringPipeline
 
+        fe = FeatureEngineeringPipeline(FeatureConfig(**kw))
+        tr_df = ctx.get("train_data")
+        te_df = ctx.get("test_data")
+        if isinstance(tr_df, pd.DataFrame) and isinstance(te_df, pd.DataFrame):
+            has_t = bool(target_column and target_column in tr_df.columns)
+            y_tr = tr_df[target_column] if has_t else None
+            X_tr = tr_df.drop(columns=[target_column]) if has_t else tr_df
+            X_te = te_df.drop(columns=[target_column]) if (target_column and target_column in te_df.columns) else te_df
+            tr_eng = fe.fit_transform(X_tr, y_tr)
+            te_eng = fe.transform(X_te)
+            if has_t and target_column:
+                tr_eng[target_column] = y_tr.to_numpy()  # type: ignore[union-attr]
+            if target_column and target_column in te_df.columns:
+                te_eng[target_column] = te_df[target_column].to_numpy()
+            ctx.set("train_data", tr_eng)
+            ctx.set("test_data", te_eng)
+            ctx.set(output_key, tr_eng)
+            ctx.set("feature_pipeline", fe)
+            return tr_eng
+
         df = _resolve_df(ctx, input_key)
         y = df[target_column] if (target_column and target_column in df.columns) else None
         X = df.drop(columns=[target_column]) if (target_column and target_column in df.columns) else df
-        fe = FeatureEngineeringPipeline(FeatureConfig(**kw))
         X_eng = fe.fit_transform(X, y)
         if y is not None and target_column:
             X_eng[target_column] = y.values
         ctx.set(output_key, X_eng)
         ctx.set("feature_pipeline", fe)
         return X_eng
+
+    def _prepare_train_and_holdout(
+        ctx: PipelineContext,
+        input_key: str,
+        target_column: str,
+        *,
+        fit_full_data: bool = False,
+    ) -> pd.DataFrame:
+        tr_df = ctx.get("train_data")
+        if isinstance(tr_df, pd.DataFrame) and target_column in tr_df.columns:
+            return tr_df
+        df = _resolve_df(ctx, input_key)
+        if not fit_full_data and len(df) >= 10 and target_column in df.columns:
+            from omniforge.data.splitting import LeakageSafeSplitter, SplitConfig
+
+            split_res = LeakageSafeSplitter(SplitConfig(test_size=0.20, random_seed=42)).split(
+                df, target_col=target_column
+            )
+            ctx.set("_eval_holdout_data", split_res.test_df)
+            return split_res.train_df
+        return df
 
     def step_train(
         ctx: PipelineContext,
@@ -101,7 +190,8 @@ def _builtin_step_handlers() -> dict[str, Callable[..., Any]]:
     ) -> Any:
         from omniforge.models.registry import create_model
 
-        df = _resolve_df(ctx, input_key)
+        fit_full = bool(kw.pop("fit_full_data", False))
+        df = _prepare_train_and_holdout(ctx, input_key, target_column, fit_full_data=fit_full)
         X = df.drop(columns=[target_column])
         y = df[target_column]
         model = create_model(model_name, task_type=TaskType(task_type), **kw)
@@ -117,7 +207,8 @@ def _builtin_step_handlers() -> dict[str, Callable[..., Any]]:
     ) -> Any:
         from omniforge.automl.pipeline_search import AutoMLPipelineSearch
 
-        df = _resolve_df(ctx, input_key)
+        fit_full = bool(kw.pop("fit_full_data", False))
+        df = _prepare_train_and_holdout(ctx, input_key, target_column, fit_full_data=fit_full)
         X = df.drop(columns=[target_column])
         y = df[target_column]
         res = AutoMLPipelineSearch(**kw).fit(X, y)
@@ -134,7 +225,19 @@ def _builtin_step_handlers() -> dict[str, Callable[..., Any]]:
         from omniforge.evaluation.metrics import MetricsEvaluator
 
         model = ctx.get("trained_model")
-        df = ctx.get(input_key)
+        if model is None:
+            raise PipelineError("step_evaluate requires a fitted 'trained_model' in PipelineContext.")
+        te_df = ctx.get("test_data")
+        auto_holdout = ctx.get("_eval_holdout_data")
+        if isinstance(te_df, pd.DataFrame) and target_column in te_df.columns:
+            df = te_df
+            ctx.set("evaluation_split", "test_holdout")
+        elif isinstance(auto_holdout, pd.DataFrame) and target_column in auto_holdout.columns:
+            df = auto_holdout
+            ctx.set("evaluation_split", "auto_holdout")
+        else:
+            df = _resolve_df(ctx, input_key)
+            ctx.set("evaluation_split", "in_sample")
         X = df.drop(columns=[target_column])
         y = df[target_column].to_numpy()
         preds = model.predict(X)
@@ -147,6 +250,7 @@ def _builtin_step_handlers() -> dict[str, Callable[..., Any]]:
 
     return {
         "ingest": step_ingest,
+        "split": step_split,
         "clean": step_clean,
         "quality": step_quality,
         "validate": step_validate,
@@ -253,26 +357,30 @@ class PipelineBuilder:
     def export_python_code(dag: PipelineDAG) -> str:
         """Export any visual/declarative :class:`PipelineDAG` into standalone runnable Python code."""
         spec = dag.to_dict()
-        spec_json = json.dumps(spec, indent=4)
-        return f'''"""Auto-exported OmniForge Production Pipeline: {dag.name}."""
-
-from __future__ import annotations
-
-from omniforge.pipelines import PipelineBuilder, PipelineExecutor
-
-PIPELINE_SPEC = {spec_json}
-
-
-def run_pipeline(initial_artifacts: dict | None = None):
-    """Build and execute the '{dag.name}' DAG with full auditing and reproducibility."""
-    dag = PipelineBuilder.from_dict(PIPELINE_SPEC)
-    executor = PipelineExecutor()
-    return executor.execute(dag, initial_artifacts=initial_artifacts or {{}})
-
-
-if __name__ == "__main__":
-    result = run_pipeline()
-    print("Pipeline status:", result.status)
-    for rec in result.step_records:
-        print(f"  - {{rec.step_id}} ({{rec.step_type}}): {{rec.status}} in {{rec.duration_seconds:.3f}}s")
-'''
+        spec_json_literal = repr(json.dumps(spec, sort_keys=True))
+        safe_title = (
+            str(dag.name)
+            .replace("\\", "\\\\")
+            .replace('"""', '\\"\\"\\"')
+            .replace("'''", "\\'\\'\\'")
+            .replace("\n", " ")
+            .replace("\r", " ")
+        )
+        return (
+            f'"""Auto-exported OmniForge Production Pipeline: {safe_title}."""\n\n'
+            "from __future__ import annotations\n\n"
+            "import json\n\n"
+            "from omniforge.pipelines import PipelineBuilder, PipelineExecutor\n\n"
+            f"_PIPELINE_SPEC_JSON = {spec_json_literal}\n"
+            "PIPELINE_SPEC = json.loads(_PIPELINE_SPEC_JSON)\n\n\n"
+            "def run_pipeline(initial_artifacts: dict | None = None):\n"
+            f'    """Build and execute the {safe_title!r} DAG with full auditing and reproducibility."""\n'
+            "    dag = PipelineBuilder.from_dict(PIPELINE_SPEC)\n"
+            "    executor = PipelineExecutor()\n"
+            "    return executor.execute(dag, initial_artifacts=initial_artifacts or {})\n\n\n"
+            'if __name__ == "__main__":\n'
+            "    result = run_pipeline()\n"
+            '    print("Pipeline status:", result.status)\n'
+            "    for rec in result.step_records:\n"
+            '        print(f"  - {rec.step_id} ({rec.step_type}): {rec.status} in {rec.duration_seconds:.3f}s")\n'
+        )

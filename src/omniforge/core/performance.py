@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import threading
+import time
 from collections import OrderedDict
 from typing import Any
 
@@ -19,45 +20,69 @@ def parallel_n_jobs(cap: int = 8) -> int:
 
 
 def compute_df_fingerprint(df: pd.DataFrame) -> str:
-    """Compute a fast, deterministic sub-millisecond fingerprint for a DataFrame without scanning all cells."""
+    """Compute a deterministic, collision-safe fingerprint for a DataFrame.
+
+    Full-content scheme ("v2"): the hash covers shape, column names/order + dtypes, and the
+    Pandas row hashes of *every* row (not a 64-row subsample), plus a per-column null-count
+    summary. blake2b-128 over the full payload makes accidental collisions
+    negligible for cache-key purposes. The fingerprint is NOT a security boundary and NOT
+    stable across Pandas versions' internal hashing, so it is used only for in-process caching.
+    """
     h = hashlib.blake2b(digest_size=16)
+    h.update(b"omniforge-df-fingerprint-v2|")
     h.update(f"{df.shape[0]}x{df.shape[1]}".encode())
     h.update("|".join(f"{c}:{dt}" for c, dt in zip(df.columns, df.dtypes, strict=False)).encode())
     n = len(df)
     if n > 0:
-        if n <= 64:
-            sample = df
-        else:
-            idx = np.linspace(0, n - 1, 64, dtype=int)
-            sample = df.iloc[idx]
         try:
-            row_hashes = pd.util.hash_pandas_object(sample, index=True).to_numpy(dtype=np.uint64)
+            h.update("|".join(str(int(v)) for v in df.isna().sum(axis=0).tolist()).encode())
+        except Exception:  # duplicate labels or exotic dtypes — the row-hash lane still catches content changes
+            pass
+        try:
+            row_hashes = pd.util.hash_pandas_object(df, index=True).to_numpy(dtype=np.uint64)
             h.update(row_hashes.tobytes())
         except Exception:
-            h.update(repr(sample.head(16).to_numpy().tolist()).encode("utf-8", errors="ignore"))
+            # Exceptional path (exotic/unhashable dtypes): fall back to a full CSV payload hash.
+            h.update(df.to_csv(index=True).encode("utf-8", errors="ignore"))
     return h.hexdigest()
 
 
 class DataFrameCache:
-    """Thread-safe LRU memoization cache keyed by fast DataFrame fingerprint and parameter signature."""
+    """Thread-safe LRU memoization cache keyed by full-content DataFrame fingerprint and parameter signature.
 
-    def __init__(self, max_entries: int = 64) -> None:
+    ``ttl_seconds`` is opt-in (default ``None`` preserves historical unbounded-entry semantics other
+    than the correctness fix of hashing all rows). When set, entries older than the TTL are evicted
+    lazily on access and eagerly on write.
+    """
+
+    def __init__(self, max_entries: int = 64, ttl_seconds: float | None = None) -> None:
         self._max_entries = max(4, int(max_entries))
+        self._ttl_seconds = None if ttl_seconds is None else max(0.0, float(ttl_seconds))
         self._lock = threading.RLock()
-        self._store: OrderedDict[tuple[str, str, str], Any] = OrderedDict()
+        self._store: OrderedDict[tuple[str, str, str], tuple[float, Any]] = OrderedDict()
+        self._now = time.monotonic
+
+    def _fresh(self, ts: float) -> bool:
+        if self._ttl_seconds is None:
+            return True
+        return (self._now() - ts) <= self._ttl_seconds
 
     def get(self, namespace: str, df: pd.DataFrame, params: str = "") -> tuple[bool, Any]:
         key = (namespace, compute_df_fingerprint(df), params)
         with self._lock:
-            if key in self._store:
-                self._store.move_to_end(key)
-                return True, self._store[key]
+            entry = self._store.get(key)
+            if entry is not None:
+                ts, value = entry
+                if self._fresh(ts):
+                    self._store.move_to_end(key)
+                    return True, value
+                self._store.pop(key, None)
         return False, None
 
     def set(self, namespace: str, df: pd.DataFrame, value: Any, params: str = "") -> None:
         key = (namespace, compute_df_fingerprint(df), params)
         with self._lock:
-            self._store[key] = value
+            self._store[key] = (self._now(), value)
             self._store.move_to_end(key)
             while len(self._store) > self._max_entries:
                 self._store.popitem(last=False)

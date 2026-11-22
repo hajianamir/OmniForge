@@ -25,6 +25,7 @@ class AutoencoderModel(BaseOmniForgeModel):
         learning_rate: float = 1e-2,
         batch_size: int = 64,
         contamination: float = 0.05,
+        weight_decay: float = 1e-4,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -35,6 +36,7 @@ class AutoencoderModel(BaseOmniForgeModel):
             epochs=epochs,
             learning_rate=learning_rate,
             contamination=contamination,
+            weight_decay=weight_decay,
             **kwargs,
         )
         self.latent_dim = int(latent_dim)
@@ -43,6 +45,7 @@ class AutoencoderModel(BaseOmniForgeModel):
         self.learning_rate = float(learning_rate)
         self.batch_size = int(batch_size)
         self.contamination = float(contamination)
+        self.weight_decay = max(0.0, float(weight_decay))
         self._scaler = StandardScaler()
         self._weights: list[np.ndarray] = []
         self._biases: list[np.ndarray] = []
@@ -92,7 +95,7 @@ class AutoencoderModel(BaseOmniForgeModel):
                 grads_w: list[np.ndarray] = [np.empty(0)] * len(self._weights)
                 grads_b: list[np.ndarray] = [np.empty(0)] * len(self._biases)
                 for li in range(len(self._weights) - 1, -1, -1):
-                    grads_w[li] = acts[li].T @ delta + 1e-4 * self._weights[li]
+                    grads_w[li] = acts[li].T @ delta
                     grads_b[li] = np.sum(delta, axis=0, keepdims=True)
                     if li > 0:
                         t = np.tanh(pre[li - 1])
@@ -108,6 +111,8 @@ class AutoencoderModel(BaseOmniForgeModel):
                     vw_h = v_w[li] / (1.0 - 0.999**step)
                     mb_h = m_b[li] / (1.0 - 0.9**step)
                     vb_h = v_b[li] / (1.0 - 0.999**step)
+                    if self.weight_decay > 0.0:
+                        self._weights[li] *= 1.0 - self.learning_rate * self.weight_decay
                     self._weights[li] -= self.learning_rate * mw_h / (np.sqrt(vw_h) + 1e-8)
                     self._biases[li] -= self.learning_rate * mb_h / (np.sqrt(vb_h) + 1e-8)
 

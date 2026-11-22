@@ -134,6 +134,30 @@ RBAC_ROLE_PERMISSIONS: Final[dict[str, frozenset[str]]] = {
             "security:manage",
         }
     ),
+    # Platform-level operator (P1-12). Same permission set as tenant ``admin`` PLUS the
+    # out-of-band privilege to bypass tenant isolation. Tenant ``admin`` is tenant-scoped;
+    # cross-tenant access requires this role explicitly. Grant sparingly (IdP group mapping).
+    "platform_admin": frozenset(
+        {
+            "data:read",
+            "data:write",
+            "data:delete",
+            "model:read",
+            "model:train",
+            "model:deploy",
+            "model:promote",
+            "model:delete",
+            "pipeline:read",
+            "pipeline:execute",
+            "pipeline:write",
+            "mlops:read",
+            "mlops:write",
+            "copilot:use",
+            "report:generate",
+            "audit:read",
+            "security:manage",
+        }
+    ),
     "data_scientist": frozenset(
         {
             "data:read",

@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 from pydantic import BaseModel, Field
 from scipy.stats import norm
+from scipy.stats import t as student_t
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.model_selection import KFold, StratifiedKFold
@@ -40,6 +41,8 @@ class CausalEffectResult(BaseModel):
 class CausalInferenceEngine:
     """Comprehensive causal effect estimation, CATE uplift modeling, and refutation suite."""
 
+    _SUPPORTED_METHODS = frozenset({"aipw", "ipw", "psm", "dml", "iv_2sls", "t_learner", "s_learner", "x_learner"})
+
     def __init__(self, random_seed: int = 42, bootstrap_rounds: int = 40) -> None:
         self.random_seed = random_seed
         self.bootstrap_rounds = max(10, int(bootstrap_rounds))
@@ -60,8 +63,25 @@ class CausalInferenceEngine:
         Supported methods: ``aipw`` (Doubly Robust), ``ipw``, ``psm``, ``dml``, ``iv_2sls``,
         ``t_learner``, ``s_learner``, ``x_learner``.
         """
-        required = [treatment_col, outcome_col, *confounders]
+        est_method = method.lower()
+        if est_method not in self._SUPPORTED_METHODS:
+            raise CausalInferenceError(
+                f"Unsupported causal estimation method '{method}'. Supported: {sorted(self._SUPPORTED_METHODS)}"
+            )
+        if treatment_col == outcome_col:
+            raise CausalInferenceError("treatment_col and outcome_col must be distinct columns.")
+        dedup_confounders = list(dict.fromkeys(confounders))
+        forbidden = {treatment_col, outcome_col}
         if instrument_col:
+            forbidden.add(instrument_col)
+        overlap = [c for c in dedup_confounders if c in forbidden]
+        if overlap:
+            raise CausalInferenceError(
+                f"Confounders cannot include treatment, outcome, or instrument columns: {overlap}"
+            )
+
+        required = list(dict.fromkeys([treatment_col, outcome_col, *dedup_confounders]))
+        if instrument_col and instrument_col not in required:
             required.append(instrument_col)
         missing = [c for c in required if c not in df.columns]
         if missing:
@@ -71,15 +91,22 @@ class CausalInferenceEngine:
         if len(work) < 20:
             raise CausalInferenceError("At least 20 complete observations are required for causal inference.")
 
-        X = work[confounders].to_numpy(dtype=float)
+        if dedup_confounders:
+            X_df = pd.get_dummies(work[dedup_confounders], drop_first=True, dtype=float)
+            X = X_df.to_numpy(dtype=float)
+        else:
+            X = np.empty((len(work), 0), dtype=float)
         T = work[treatment_col].to_numpy(dtype=float)
         Y = work[outcome_col].to_numpy(dtype=float)
         Z = work[instrument_col].to_numpy(dtype=float) if instrument_col else None
 
         n_treated = int(np.sum(T == 1))
         n_control = int(np.sum(T == 0))
+        if est_method not in {"dml", "iv_2sls"} and (n_treated < 2 or n_control < 2):
+            raise CausalInferenceError(
+                f"Method '{est_method}' requires at least 2 treated (T=1) and 2 control (T=0) observations."
+            )
 
-        est_method = method.lower()
         ate, cate, extra, analytic_se = self._dispatch_estimator(est_method, X, T, Y, Z)
 
         # Use theoretically valid closed-form variance estimators when available:
@@ -125,9 +152,18 @@ class CausalInferenceEngine:
                 "max": round(float(np.max(cate)), 6),
             }
 
+        dof_sens = max(len(Y) - X.shape[1] - 2, 1)
+        sens_bounds = self.compute_sensitivity_bounds(ate, se, dof=dof_sens)
+        extra = {
+            **extra,
+            "sensitivity_rv_q": sens_bounds["robustness_value_q"],
+            "sensitivity_rv_q_alpha": sens_bounds["robustness_value_q_alpha"],
+        }
+
         refutations: dict[str, Any] = {}
         if run_refutations:
             refutations = self._run_refutations(est_method, X, T, Y, Z, ate)
+            refutations["unobserved_confounder_sensitivity"] = sens_bounds
 
         logger.info("causal_ate_estimated", method=est_method, ate=round(ate, 4), p_value=round(p_val, 6))
         return CausalEffectResult(
@@ -193,6 +229,8 @@ class CausalInferenceEngine:
         Y: np.ndarray,
         Z: np.ndarray | None,
     ) -> tuple[float, np.ndarray | None, dict[str, Any], float | None]:
+        if X.shape[1] == 0 and method != "iv_2sls":
+            X = np.zeros((len(Y), 1), dtype=float)
         if method == "ipw":
             ps_raw, ps = self._fit_propensity_with_raw(X, T)
             w1 = T / ps
@@ -207,6 +245,12 @@ class CausalInferenceEngine:
             ess1 = float((sum_w1**2) / max(float(np.sum(w1**2)), 1e-12))
             ess0 = float((sum_w0**2) / max(float(np.sum(w0**2)), 1e-12))
             trimmed = float(np.mean((ps_raw < 0.05) | (ps_raw > 0.95)))
+            bal = self._compute_covariate_balance_smd(
+                X,
+                T,
+                w_treated=w1[T == 1],
+                w_control=w0[T == 0],
+            )
             return (
                 ate_hajek,
                 None,
@@ -217,6 +261,7 @@ class CausalInferenceEngine:
                     "effective_sample_size_treated": round(ess1, 2),
                     "effective_sample_size_control": round(ess0, 2),
                     "propensity_trimmed_share": round(trimmed, 4),
+                    **bal,
                 },
                 None,
             )
@@ -273,6 +318,13 @@ class CausalInferenceEngine:
             var_pate = float(np.sum((tau_i - ate) ** 2 + (k_m * k_m + k_m) * sigma2_hat) / (n * n))
             var_sate = float(np.sum(((1.0 + k_m) ** 2) * sigma2_hat) / (n * n))
             ai_se = float(np.sqrt(max(var_pate, var_sate, 0.0)))
+            # Matched sample balance: each treated unit i matched to matched_c_global[i]
+            bal_psm = self._compute_covariate_balance_smd(
+                X,
+                T,
+                matched_treated_X=X[t_idx],
+                matched_control_X=X[matched_c_global],
+            )
             return (
                 ate,
                 tau_i,
@@ -282,6 +334,7 @@ class CausalInferenceEngine:
                     "se_method": "abadie_imbens_2006_analytical",
                     "max_match_multiplicity": int(np.max(k_m)),
                     "sate_std_error": round(float(np.sqrt(max(var_sate, 0.0))), 6),
+                    **bal_psm,
                 },
                 ai_se,
             )
@@ -409,7 +462,13 @@ class CausalInferenceEngine:
         psi = (m1_oof - m0_oof) + T * (Y - m1_oof) / ps_oof - (1.0 - T) * (Y - m0_oof) / (1.0 - ps_oof)
         ate = float(np.mean(psi))
         # Efficient Influence Function (EIF) SE: sd(psi, ddof=1) / sqrt(n)
-        eif_se = float(np.std(psi, ddof=1) / np.sqrt(n)) if n > 1 else 0.0
+        eif_se = float(np.sqrt(np.var(psi, ddof=1) / n)) if n > 1 else 0.0
+        bal_aipw = self._compute_covariate_balance_smd(
+            X,
+            T,
+            w_treated=(1.0 / ps_oof[T == 1]),
+            w_control=(1.0 / (1.0 - ps_oof[T == 0])),
+        )
         return (
             ate,
             (m1_oof - m0_oof),
@@ -417,6 +476,7 @@ class CausalInferenceEngine:
                 "mean_propensity": round(float(np.mean(ps_oof)), 4),
                 "cross_fit_folds": n_splits if min_arm >= 4 else 1,
                 "se_method": "efficient_influence_function",
+                **bal_aipw,
             },
             eif_se,
         )
@@ -457,8 +517,14 @@ class CausalInferenceEngine:
         X_aug = np.column_stack([X, rng.normal(0.0, 1.0, size=len(X))])
         rcc_ate, _, _, _ = self._dispatch_estimator(method, X_aug, T, Y, Z)
 
-        # 3. 80% data subset stability check
-        sub_idx = rng.choice(len(Y), size=int(len(Y) * 0.8), replace=False)
+        # 3. 80% data subset stability check (preserve >=2 per arm for binary-treatment estimators)
+        sub_size = max(4, int(len(Y) * 0.8))
+        sub_idx = rng.choice(len(Y), size=sub_size, replace=False)
+        if method not in {"dml", "iv_2sls"}:
+            for _ in range(10):
+                if int(np.sum(T[sub_idx] == 1)) >= 2 and int(np.sum(T[sub_idx] == 0)) >= 2:
+                    break
+                sub_idx = rng.choice(len(Y), size=sub_size, replace=False)
         sub_ate, _, _, _ = self._dispatch_estimator(
             method, X[sub_idx], T[sub_idx], Y[sub_idx], Z[sub_idx] if Z is not None else None
         )
@@ -481,16 +547,123 @@ class CausalInferenceEngine:
         }
 
     @staticmethod
+    def _compute_covariate_balance_smd(
+        X: np.ndarray,
+        T: np.ndarray,
+        *,
+        w_treated: np.ndarray | None = None,
+        w_control: np.ndarray | None = None,
+        matched_treated_X: np.ndarray | None = None,
+        matched_control_X: np.ndarray | None = None,
+    ) -> dict[str, Any]:
+        """Compute Austin (2009, Stat. Med. 28:3083-3107) unadjusted and adjusted Standardized Mean Differences (SMD)."""
+        X1 = X[T == 1]
+        X0 = X[T == 0]
+        if X.shape[1] == 0 or len(X1) < 2 or len(X0) < 2:
+            return {
+                "max_abs_smd_unadjusted": 0.0,
+                "max_abs_smd_adjusted": 0.0,
+                "covariate_balance_achieved": True,
+            }
+        v1 = np.var(X1, axis=0, ddof=1)
+        v0 = np.var(X0, axis=0, ddof=1)
+        pooled_sd = np.sqrt(0.5 * (v1 + v0))
+        valid = pooled_sd > 1e-12
+        if not np.any(valid):
+            return {
+                "max_abs_smd_unadjusted": 0.0,
+                "max_abs_smd_adjusted": 0.0,
+                "covariate_balance_achieved": True,
+            }
+        denom = np.where(valid, pooled_sd, 1.0)
+        smd_raw = np.where(valid, np.abs(np.mean(X1, axis=0) - np.mean(X0, axis=0)) / denom, 0.0)
+
+        if matched_treated_X is not None and matched_control_X is not None:
+            m1_adj = np.mean(matched_treated_X, axis=0)
+            m0_adj = np.mean(matched_control_X, axis=0)
+        elif w_treated is not None and w_control is not None and float(np.sum(w_treated)) > 0 and float(np.sum(w_control)) > 0:
+            m1_adj = np.average(X1, axis=0, weights=w_treated)
+            m0_adj = np.average(X0, axis=0, weights=w_control)
+        else:
+            m1_adj = np.mean(X1, axis=0)
+            m0_adj = np.mean(X0, axis=0)
+
+        smd_adj = np.where(valid, np.abs(m1_adj - m0_adj) / denom, 0.0)
+        max_raw = float(np.max(smd_raw))
+        max_adj = float(np.max(smd_adj))
+        return {
+            "max_abs_smd_unadjusted": round(max_raw, 4),
+            "max_abs_smd_adjusted": round(max_adj, 4),
+            "covariate_balance_achieved": bool(max_adj < 0.10),
+        }
+
+    @staticmethod
+    def compute_sensitivity_bounds(
+        ate: float,
+        std_error: float,
+        dof: int,
+        *,
+        q: float = 1.0,
+        alpha: float = 0.05,
+    ) -> dict[str, Any]:
+        """Cinelli & Hazlett (2020, JRSS-B 82(1):39-67, Eq. 17-19) Omitted Variable Bias Robustness Values.
+
+        Computes ``partial_r2_treatment_outcome`` (``R^2_{Y~T|X}``), ``robustness_value_q`` (``RV_q``: minimum
+        partial R^2 an unobserved confounder must share with BOTH treatment and outcome to reduce the point
+        estimate by fraction ``q``), and ``robustness_value_q_alpha`` (``RV_{q,alpha}``: minimum partial R^2
+        required to render the effect statistically insignificant at level ``alpha``).
+        """
+        df_eff = max(int(dof), 1)
+        q_eff = float(np.clip(q, 1e-6, 1.0))
+        if std_error <= 1e-12 or abs(ate) <= 1e-12:
+            return {
+                "method": "cinelli_hazlett_2020_ovb",
+                "t_statistic": 0.0,
+                "dof": df_eff,
+                "partial_r2_treatment_outcome": 0.0,
+                "robustness_value_q": 0.0,
+                "robustness_value_q_alpha": 0.0,
+                "alpha": float(alpha),
+                "robust_to_moderate_confounding": False,
+            }
+        t_stat = abs(float(ate)) / float(std_error)
+        r2_yd = float((t_stat * t_stat) / (t_stat * t_stat + df_eff))
+        f_y = float(t_stat / np.sqrt(df_eff))
+        f_q = q_eff * f_y
+        rv_q = float(0.5 * (np.sqrt(f_q**4 + 4.0 * (f_q**2)) - (f_q**2)))
+
+        t_crit = float(student_t.ppf(1.0 - alpha / 2.0, df=df_eff))
+        f_qa = max(f_q - (t_crit / float(np.sqrt(df_eff))), 0.0)
+        rv_qa = float(0.5 * (np.sqrt(f_qa**4 + 4.0 * (f_qa**2)) - (f_qa**2))) if f_qa > 0.0 else 0.0
+        return {
+            "method": "cinelli_hazlett_2020_ovb",
+            "t_statistic": round(t_stat, 6),
+            "dof": df_eff,
+            "partial_r2_treatment_outcome": round(r2_yd, 6),
+            "robustness_value_q": round(rv_q, 6),
+            "robustness_value_q_alpha": round(rv_qa, 6),
+            "alpha": float(alpha),
+            "robust_to_moderate_confounding": bool(rv_qa >= 0.05),
+        }
+
+    @staticmethod
     def export_dowhy_gml(treatment_col: str, outcome_col: str, confounders: list[str]) -> str:
         """Export a DoWhy-compatible GML causal DAG string for external graph/refutation tooling."""
-        nodes = [treatment_col, outcome_col, *confounders]
+
+        def _esc(val: str) -> str:
+            return str(val).replace("\\", "\\\\").replace('"', '\\"')
+
+        t_esc = _esc(treatment_col)
+        y_esc = _esc(outcome_col)
+        c_esc = [_esc(c) for c in dict.fromkeys(confounders) if c not in {treatment_col, outcome_col}]
+        nodes = [t_esc, y_esc, *c_esc]
         lines = ["graph [", "  directed 1"]
         for n in nodes:
             lines.append(f'  node [ id "{n}" label "{n}" ]')
-        lines.append(f'  edge [ source "{treatment_col}" target "{outcome_col}" ]')
-        for c in confounders:
-            lines.append(f'  edge [ source "{c}" target "{treatment_col}" ]')
-            lines.append(f'  edge [ source "{c}" target "{outcome_col}" ]')
+        lines.append(f'  edge [ source "{t_esc}" target "{y_esc}" ]')
+        for c in c_esc:
+            lines.append(f'  edge [ source "{c}" target "{t_esc}" ]')
+            lines.append(f'  edge [ source "{c}" target "{y_esc}" ]')
         lines.append("]")
         return "\n".join(lines)
 

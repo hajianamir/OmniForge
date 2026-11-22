@@ -10,13 +10,27 @@ from sklearn.preprocessing import StandardScaler
 from omniforge.core.types import TaskType
 from omniforge.core.utils import is_package_available
 from omniforge.models.base import BaseOmniForgeModel
-from omniforge.models.deep.mlp import MLPModel
 
 
-def _layer_norm(x: np.ndarray, eps: float = 1e-5) -> np.ndarray:
+def _layer_norm_with_cache(x: np.ndarray, eps: float = 1e-5) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     mean = np.mean(x, axis=-1, keepdims=True)
-    var = np.var(x, axis=-1, keepdims=True)
-    return np.asarray((x - mean) / np.sqrt(var + eps), dtype=float)
+    xc = x - mean
+    inv_std = 1.0 / np.sqrt(np.mean(xc * xc, axis=-1, keepdims=True) + eps)
+    x_hat = xc * inv_std
+    return np.asarray(x_hat, dtype=np.float64), x_hat, inv_std
+
+
+def _layer_norm_backward(dy: np.ndarray, x_hat: np.ndarray, inv_std: np.ndarray) -> np.ndarray:
+    return np.asarray(
+        inv_std * (dy - np.mean(dy, axis=-1, keepdims=True) - x_hat * np.mean(dy * x_hat, axis=-1, keepdims=True)),
+        dtype=np.float64,
+    )
+
+
+def _softmax_last(x: np.ndarray) -> np.ndarray:
+    shifted = x - np.max(x, axis=-1, keepdims=True)
+    exps = np.exp(shifted)
+    return np.asarray(exps / np.maximum(np.sum(exps, axis=-1, keepdims=True), 1e-12), dtype=np.float64)
 
 
 class TabularTransformerModel(BaseOmniForgeModel):
@@ -32,6 +46,7 @@ class TabularTransformerModel(BaseOmniForgeModel):
         n_layers: int = 2,
         epochs: int = 50,
         learning_rate: float = 1e-2,
+        weight_decay: float = 1e-4,
         task_type: TaskType = TaskType.BINARY_CLASSIFICATION,
         **kwargs: Any,
     ) -> None:
@@ -43,6 +58,7 @@ class TabularTransformerModel(BaseOmniForgeModel):
             n_layers=n_layers,
             epochs=epochs,
             learning_rate=learning_rate,
+            weight_decay=weight_decay,
             **kwargs,
         )
         self.d_model = int(d_model)
@@ -52,61 +68,253 @@ class TabularTransformerModel(BaseOmniForgeModel):
         self.n_layers = max(1, int(n_layers))
         self.epochs = int(epochs)
         self.learning_rate = float(learning_rate)
+        self.weight_decay = max(0.0, float(weight_decay))
         self._scaler = StandardScaler()
-        self._token_w: np.ndarray | None = None
-        self._token_b: np.ndarray | None = None
-        self._blocks: list[dict[str, np.ndarray]] = []
-        self._head: MLPModel | None = None
+        self._np_params: dict[str, np.ndarray] = {}
         self._torch_net: Any = None
         self._idx_to_label: dict[int, Any] = {}
         self.last_attention_weights_: np.ndarray | None = None
 
-    def _init_numpy_transformer(self, n_features: int) -> None:
+    def _init_numpy_transformer(self, n_features: int, out_dim: int) -> None:
         rng = np.random.default_rng(self.random_seed)
         d = self.d_model
-        scale = 1.0 / np.sqrt(d)
-        self._token_w = rng.normal(0.0, scale, size=(n_features, d))
-        self._token_b = rng.normal(0.0, 0.02, size=(n_features, d))
-        self._blocks = []
-        for _ in range(self.n_layers):
-            self._blocks.append(
+        scale = 1.0 / np.sqrt(max(d, 1))
+        params: dict[str, np.ndarray] = {
+            "token_w": rng.normal(0.0, scale, size=(n_features, d)).astype(np.float64),
+            "token_b": np.zeros((n_features, d), dtype=np.float64),
+            "cls_token": rng.normal(0.0, 0.02, size=(1, 1, d)).astype(np.float64),
+            "W_head": rng.normal(0.0, 1.0 / np.sqrt(d + n_features), size=(d + n_features, out_dim)).astype(np.float64),
+            "b_head": np.zeros((1, out_dim), dtype=np.float64),
+        }
+        for li in range(self.n_layers):
+            params[f"W_q_{li}"] = rng.normal(0.0, scale, size=(d, d)).astype(np.float64)
+            params[f"W_k_{li}"] = rng.normal(0.0, scale, size=(d, d)).astype(np.float64)
+            params[f"W_v_{li}"] = rng.normal(0.0, scale, size=(d, d)).astype(np.float64)
+            params[f"W_o_{li}"] = rng.normal(0.0, scale, size=(d, d)).astype(np.float64)
+            params[f"W_ff1_{li}"] = rng.normal(0.0, np.sqrt(2.0 / d), size=(d, d * 2)).astype(np.float64)
+            params[f"b_ff1_{li}"] = np.zeros((1, 1, d * 2), dtype=np.float64)
+            params[f"W_ff2_{li}"] = rng.normal(0.0, scale, size=(d * 2, d)).astype(np.float64)
+            params[f"b_ff2_{li}"] = np.zeros((1, 1, d), dtype=np.float64)
+        self._np_params = params
+
+    def _forward_numpy_with_cache(self, X: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+        """Forward pass of Pre-Norm [CLS] FT-Transformer returning logits and exact backprop cache."""
+        p = self._np_params
+        xb = np.asarray(X, dtype=np.float64)
+        b_sz, n_f = xb.shape
+        d = self.d_model
+        heads = self.n_heads
+        head_dim = d // heads
+        attn_scale = 1.0 / np.sqrt(max(head_dim, 1))
+
+        feat_tokens = xb[:, :, None] * p["token_w"][None, :, :] + p["token_b"][None, :, :]
+        cls_tok = np.broadcast_to(p["cls_token"], (b_sz, 1, d))
+        h = np.concatenate([cls_tok, feat_tokens], axis=1)  # (B, L=F+1, D)
+        seq_len = h.shape[1]
+
+        layer_caches: list[dict[str, np.ndarray]] = []
+        last_attn = None
+        for li in range(self.n_layers):
+            h_norm, h_hat, h_inv = _layer_norm_with_cache(h)
+            q = (h_norm @ p[f"W_q_{li}"]).reshape(b_sz, seq_len, heads, head_dim).transpose(0, 2, 1, 3)
+            k = (h_norm @ p[f"W_k_{li}"]).reshape(b_sz, seq_len, heads, head_dim).transpose(0, 2, 1, 3)
+            v = (h_norm @ p[f"W_v_{li}"]).reshape(b_sz, seq_len, heads, head_dim).transpose(0, 2, 1, 3)
+
+            scores = (q @ k.transpose(0, 1, 3, 2)) * attn_scale
+            attn = _softmax_last(scores)
+            last_attn = attn.mean(axis=1)  # (B, L, L)
+            av = attn @ v
+            ctx = av.transpose(0, 2, 1, 3).reshape(b_sz, seq_len, d)
+            h_mid = h + ctx @ p[f"W_o_{li}"]
+
+            m_norm, m_hat, m_inv = _layer_norm_with_cache(h_mid)
+            ff_pre = m_norm @ p[f"W_ff1_{li}"] + p[f"b_ff1_{li}"]
+            ff_act = np.maximum(0.0, ff_pre)
+            h_next = h_mid + ff_act @ p[f"W_ff2_{li}"] + p[f"b_ff2_{li}"]
+
+            layer_caches.append(
                 {
-                    "W_q": rng.normal(0.0, scale, size=(d, d)),
-                    "W_k": rng.normal(0.0, scale, size=(d, d)),
-                    "W_v": rng.normal(0.0, scale, size=(d, d)),
-                    "W_o": rng.normal(0.0, scale, size=(d, d)),
-                    "W_ff1": rng.normal(0.0, scale, size=(d, d * 2)),
-                    "W_ff2": rng.normal(0.0, scale, size=(d * 2, d)),
+                    "h_norm": h_norm,
+                    "h_hat": h_hat,
+                    "h_inv": h_inv,
+                    "q": q,
+                    "k": k,
+                    "v": v,
+                    "attn": attn,
+                    "ctx": ctx,
+                    "m_norm": m_norm,
+                    "m_hat": m_hat,
+                    "m_inv": m_inv,
+                    "ff_pre": ff_pre,
+                    "ff_act": ff_act,
                 }
             )
+            h = h_next
 
-    def _encode_numpy(self, X: np.ndarray) -> np.ndarray:
-        """Feature tokenization + Multi-Head Scaled Dot-Product Self-Attention + FFN."""
-        assert self._token_w is not None and self._token_b is not None
-        # Tokenize each scalar feature into a d_model vector: (N, F, D)
-        tokens = X[:, :, None] * self._token_w[None, :, :] + self._token_b[None, :, :]
-        n, f, d = tokens.shape
-        head_dim = d // self.n_heads
+        cls_out, cls_hat, cls_inv = _layer_norm_with_cache(h[:, 0, :])
+        feat_cat = np.hstack([cls_out, xb])
+        logits = feat_cat @ p["W_head"] + p["b_head"]
+        cache = {
+            "xb": xb,
+            "seq_len": seq_len,
+            "layer_caches": layer_caches,
+            "cls_hat": cls_hat,
+            "cls_inv": cls_inv,
+            "feat_cat": feat_cat,
+            "last_attn": last_attn,
+        }
+        return logits, cache
 
-        h = tokens
-        attn_weights = None
-        for blk in self._blocks:
-            q = (h @ blk["W_q"]).reshape(n, f, self.n_heads, head_dim).transpose(0, 2, 1, 3)
-            k = (h @ blk["W_k"]).reshape(n, f, self.n_heads, head_dim).transpose(0, 2, 1, 3)
-            v = (h @ blk["W_v"]).reshape(n, f, self.n_heads, head_dim).transpose(0, 2, 1, 3)
-            scores = (q @ k.transpose(0, 1, 3, 2)) / np.sqrt(head_dim)
-            scores -= np.max(scores, axis=-1, keepdims=True)
-            attn = np.exp(scores)
-            attn /= np.maximum(np.sum(attn, axis=-1, keepdims=True), 1e-12)
-            attn_weights = attn.mean(axis=1)  # (N, F, F)
-            ctx = (attn @ v).transpose(0, 2, 1, 3).reshape(n, f, d)
-            h = _layer_norm(h + ctx @ blk["W_o"])
-            ff = np.maximum(0.0, h @ blk["W_ff1"]) @ blk["W_ff2"]
-            h = _layer_norm(h + ff)
+    def _backward_numpy(self, d_logits: np.ndarray, cache: dict[str, Any]) -> dict[str, np.ndarray]:
+        """Exact analytical backpropagation through head, Pre-Norm FFN, Multi-Head Attention, and Feature Tokenizer."""
+        p = self._np_params
+        xb: np.ndarray = cache["xb"]
+        b_sz = xb.shape[0]
+        seq_len = int(cache["seq_len"])
+        d = self.d_model
+        heads = self.n_heads
+        head_dim = d // heads
+        attn_scale = 1.0 / np.sqrt(max(head_dim, 1))
 
-        self.last_attention_weights_ = attn_weights
-        # Concatenate attention-pooled representation with original scaled features (residual skip)
-        return np.hstack([h.mean(axis=1), X])
+        grads: dict[str, np.ndarray] = {}
+        feat_cat: np.ndarray = cache["feat_cat"]
+        grads["W_head"] = feat_cat.T @ d_logits
+        grads["b_head"] = np.sum(d_logits, axis=0, keepdims=True)
+
+        d_feat_cat = d_logits @ p["W_head"].T
+        d_cls_out = d_feat_cat[:, :d]
+        dh = np.zeros((b_sz, seq_len, d), dtype=np.float64)
+        dh[:, 0, :] = _layer_norm_backward(d_cls_out, cache["cls_hat"], cache["cls_inv"])
+
+        layer_caches: list[dict[str, np.ndarray]] = cache["layer_caches"]
+        for li in range(self.n_layers - 1, -1, -1):
+            lc = layer_caches[li]
+            # FFN residual backward
+            d_h_mid = dh.copy()
+            ff_act = lc["ff_act"]
+            ff_pre = lc["ff_pre"]
+            m_norm = lc["m_norm"]
+            grads[f"W_ff2_{li}"] = ff_act.reshape(-1, d * 2).T @ dh.reshape(-1, d)
+            grads[f"b_ff2_{li}"] = np.sum(dh, axis=(0, 1), keepdims=True)
+            d_ff_act = dh @ p[f"W_ff2_{li}"].T
+            d_ff_pre = d_ff_act * (ff_pre > 0.0)
+            grads[f"W_ff1_{li}"] = m_norm.reshape(-1, d).T @ d_ff_pre.reshape(-1, d * 2)
+            grads[f"b_ff1_{li}"] = np.sum(d_ff_pre, axis=(0, 1), keepdims=True)
+            d_m_norm = d_ff_pre @ p[f"W_ff1_{li}"].T
+            d_h_mid += _layer_norm_backward(d_m_norm, lc["m_hat"], lc["m_inv"])
+
+            # Multi-Head Self-Attention residual backward
+            dh_prev = d_h_mid.copy()
+            ctx = lc["ctx"]
+            grads[f"W_o_{li}"] = ctx.reshape(-1, d).T @ d_h_mid.reshape(-1, d)
+            d_ctx = d_h_mid @ p[f"W_o_{li}"].T
+            d_av = d_ctx.reshape(b_sz, seq_len, heads, head_dim).transpose(0, 2, 1, 3)
+
+            attn = lc["attn"]
+            q, k, v = lc["q"], lc["k"], lc["v"]
+            d_attn = d_av @ v.transpose(0, 1, 3, 2)
+            d_v = attn.transpose(0, 1, 3, 2) @ d_av
+            d_scores = attn * (d_attn - np.sum(d_attn * attn, axis=-1, keepdims=True)) * attn_scale
+            d_q = d_scores @ k
+            d_k = d_scores.transpose(0, 1, 3, 2) @ q
+
+            dq_flat = d_q.transpose(0, 2, 1, 3).reshape(b_sz, seq_len, d)
+            dk_flat = d_k.transpose(0, 2, 1, 3).reshape(b_sz, seq_len, d)
+            dv_flat = d_v.transpose(0, 2, 1, 3).reshape(b_sz, seq_len, d)
+
+            h_norm = lc["h_norm"]
+            h_flat = h_norm.reshape(-1, d)
+            grads[f"W_q_{li}"] = h_flat.T @ dq_flat.reshape(-1, d)
+            grads[f"W_k_{li}"] = h_flat.T @ dk_flat.reshape(-1, d)
+            grads[f"W_v_{li}"] = h_flat.T @ dv_flat.reshape(-1, d)
+
+            d_h_norm = dq_flat @ p[f"W_q_{li}"].T + dk_flat @ p[f"W_k_{li}"].T + dv_flat @ p[f"W_v_{li}"].T
+            dh = dh_prev + _layer_norm_backward(d_h_norm, lc["h_hat"], lc["h_inv"])
+
+        grads["cls_token"] = np.sum(dh[:, 0:1, :], axis=0, keepdims=True)
+        d_feat_tok = dh[:, 1:, :]
+        grads["token_w"] = np.sum(d_feat_tok * xb[:, :, None], axis=0)
+        grads["token_b"] = np.sum(d_feat_tok, axis=0)
+        return grads
+
+    def _fit_numpy(self, X_scaled: np.ndarray, y: np.ndarray, is_clf: bool) -> None:
+        self.framework = "omniforge_numpy_transformer"
+        self.metadata_.framework = self.framework
+        n, n_feats = X_scaled.shape
+        if is_clf:
+            classes = np.unique(y)
+            l2i = {c: i for i, c in enumerate(classes)}
+            self._idx_to_label = {i: c for i, c in enumerate(classes)}
+            y_idx = np.array([l2i[v] for v in y], dtype=int)
+            out_dim = max(2, len(classes))
+        else:
+            y_idx = np.empty(0, dtype=int)
+            out_dim = 1
+
+        self._init_numpy_transformer(n_feats, out_dim)
+        m_state = {k: np.zeros_like(v) for k, v in self._np_params.items()}
+        v_state = {k: np.zeros_like(v) for k, v in self._np_params.items()}
+        rng = np.random.default_rng(self.random_seed)
+        bs = min(128, max(16, n))
+        step = 0
+        self.loss_history_ = []
+        y_float = y.astype(np.float64).reshape(-1, 1) if not is_clf else np.empty((0, 1))
+
+        for _ in range(self.epochs):
+            perm = rng.permutation(n)
+            ep_loss = 0.0
+            n_batches = 0
+            for start in range(0, n, bs):
+                idx = perm[start : start + bs]
+                xb = X_scaled[idx]
+                cur_bs = len(xb)
+                logits, cache = self._forward_numpy_with_cache(xb)
+                if is_clf:
+                    probs = _softmax_last(logits)
+                    yb = y_idx[idx]
+                    ep_loss += float(-np.mean(np.log(np.clip(probs[np.arange(cur_bs), yb], 1e-12, 1.0))))
+                    d_logits = probs.copy()
+                    d_logits[np.arange(cur_bs), yb] -= 1.0
+                    d_logits /= float(cur_bs)
+                else:
+                    yb_f = y_float[idx]
+                    diff = logits - yb_f
+                    ep_loss += float(np.mean(diff**2))
+                    d_logits = (2.0 * diff) / float(cur_bs)
+
+                grads = self._backward_numpy(d_logits, cache)
+                # Global gradient norm clipping (max_norm = 2.0) matching PyTorch trainer
+                sq_norm = sum(float(np.sum(g * g)) for g in grads.values())
+                tot_norm = float(np.sqrt(max(sq_norm, 0.0)))
+                if tot_norm > 2.0:
+                    clip_coef = 2.0 / (tot_norm + 1e-12)
+                    for k_name in grads:
+                        grads[k_name] *= clip_coef
+
+                step += 1
+                b1_corr = 1.0 - (0.9**step)
+                b2_corr = 1.0 - (0.999**step)
+                for k_name, param in self._np_params.items():
+                    g = grads[k_name]
+                    m_state[k_name] = 0.9 * m_state[k_name] + 0.1 * g
+                    v_state[k_name] = 0.999 * v_state[k_name] + 0.001 * (g * g)
+                    m_hat = m_state[k_name] / b1_corr
+                    v_hat = v_state[k_name] / b2_corr
+                    # Decoupled AdamW weight decay on projection matrices (not biases / cls_token)
+                    if self.weight_decay > 0.0 and k_name.startswith(("W_", "token_w")):
+                        param *= 1.0 - self.learning_rate * self.weight_decay
+                    param -= self.learning_rate * m_hat / (np.sqrt(v_hat) + 1e-8)
+                n_batches += 1
+
+            self.loss_history_.append(round(ep_loss / max(n_batches, 1), 6))
+
+        _, eval_cache = self._forward_numpy_with_cache(X_scaled[: min(n, 256)])
+        last_attn = eval_cache["last_attn"]
+        if last_attn is not None:
+            self.last_attention_weights_ = last_attn
+            cls_to_feat = np.mean(last_attn[:, 0, 1:], axis=0)
+            s_val = float(np.sum(cls_to_feat))
+            self.feature_importances_ = (cls_to_feat / s_val) if s_val > 1e-12 else np.ones(n_feats) / max(n_feats, 1)
 
     def _fit(self, X: np.ndarray, y: np.ndarray | None, **kwargs: Any) -> None:
         assert y is not None
@@ -116,21 +324,7 @@ class TabularTransformerModel(BaseOmniForgeModel):
         if is_package_available("torch"):
             self._fit_torch(X_scaled, y, is_clf)
             return
-
-        self.framework = "omniforge_numpy_transformer"
-        self.metadata_.framework = self.framework
-        self._init_numpy_transformer(X_scaled.shape[1])
-        encoded = self._encode_numpy(X_scaled)
-        self._head = MLPModel(
-            hidden_dims=(self.d_model,),
-            epochs=self.epochs,
-            learning_rate=self.learning_rate,
-            task_type=self.task_type,
-            random_seed=self.random_seed,
-            track_carbon=False,
-        )
-        self._head.fit(encoded, y)
-        self.loss_history_: list[float] = list(self._head.loss_history_)
+        self._fit_numpy(X_scaled, y, is_clf)
 
     def _fit_torch(self, X: np.ndarray, y: np.ndarray, is_clf: bool) -> None:
         import torch
@@ -244,8 +438,12 @@ class TabularTransformerModel(BaseOmniForgeModel):
             if self.task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
                 return np.array([self._idx_to_label[int(i)] for i in np.argmax(out, axis=1)])
             return np.asarray(out.ravel(), dtype=float)
-        assert self._head is not None
-        return self._head.predict(self._encode_numpy(X_scaled))
+        logits, cache = self._forward_numpy_with_cache(X_scaled)
+        if cache["last_attn"] is not None:
+            self.last_attention_weights_ = cache["last_attn"]
+        if self.task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
+            return np.array([self._idx_to_label[int(i)] for i in np.argmax(logits, axis=1)])
+        return np.asarray(logits.ravel(), dtype=float)
 
     def _predict_proba(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
         X_scaled = self._scaler.transform(X)
@@ -255,8 +453,10 @@ class TabularTransformerModel(BaseOmniForgeModel):
             with torch.no_grad():
                 logits = self._torch_net(torch.tensor(X_scaled.astype(np.float32)))
                 return np.asarray(torch.softmax(logits, dim=-1).numpy(), dtype=float)
-        assert self._head is not None
-        return self._head.predict_proba(self._encode_numpy(X_scaled))
+        logits_np, cache = self._forward_numpy_with_cache(X_scaled)
+        if cache["last_attn"] is not None:
+            self.last_attention_weights_ = cache["last_attn"]
+        return _softmax_last(logits_np)
 
 
 FTTransformerModel = TabularTransformerModel

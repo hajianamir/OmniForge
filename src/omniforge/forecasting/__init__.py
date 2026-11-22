@@ -1,6 +1,6 @@
 """Advanced enterprise time-series forecasting engine."""
 
-from omniforge.forecasting.engine import ForecastingEngine, ForecastingReport
+from omniforge.forecasting.engine import ForecastingEngine, ForecastingReport, diebold_mariano_test
 from omniforge.models.time_series import (
     DeepForecaster,
     FoundationForecaster,
@@ -17,4 +17,5 @@ __all__ = [
     "HierarchicalReconciler",
     "MLForecaster",
     "StatisticalForecaster",
+    "diebold_mariano_test",
 ]

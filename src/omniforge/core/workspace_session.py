@@ -30,7 +30,12 @@ STATE_FILENAME = "session_state.joblib"
 FORMAT_VERSION = "2.0"
 _WORKSPACE_HMAC_CONTEXT = b"omniforge:workspace:v2"
 _MAX_ARCHIVE_ENTRIES = 64
+_MAX_MANIFEST_BYTES = 4 * 1024 * 1024  # 4 MiB ceiling for manifest.json stream
 _MAX_ARCHIVE_UNCOMPRESSED_BYTES = 512 * 1024 * 1024  # 512 MiB zip-bomb guard
+_STREAM_READ_CHUNK_BYTES = 64 * 1024
+_ALLOWED_ZIP_COMPRESS_TYPES: frozenset[int] = frozenset(
+    {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
+)
 
 # Keys that are runtime-only, non-serializable clients, or UI upload widget transients
 _EXCLUDED_EXACT_KEYS: frozenset[str] = frozenset(
@@ -361,36 +366,108 @@ class WorkspaceSessionManager:
             notes=notes,
         )
 
+    @staticmethod
+    def _read_zip_member_bounded(zf: zipfile.ZipFile, member_name: str, *, max_bytes: int) -> bytes:
+        """Stream-decompress a ZIP member enforcing ``max_bytes`` on actual decompressed output (CWE-409)."""
+        chunks: list[bytes] = []
+        total = 0
+        read_step = max(1, min(_STREAM_READ_CHUNK_BYTES, max_bytes + 1))
+        with zf.open(member_name, mode="r") as stream:
+            while True:
+                chunk = stream.read(read_step)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise DataValidationError(
+                        f"Invalid OmniForge project archive: decompressed stream for '{member_name}' "
+                        f"exceeds safety limit ({max_bytes} bytes).",
+                        suggestions=["Ensure the workspace archive is legitimate and within size limits."],
+                    )
+                chunks.append(chunk)
+        return b"".join(chunks)
+
     @classmethod
-    def inspect_bytes(cls, data: bytes) -> WorkspaceManifest:
+    def _validate_archive_structure_and_manifest(
+        cls,
+        zf: zipfile.ZipFile,
+        *,
+        max_uncompressed_bytes: int = _MAX_ARCHIVE_UNCOMPRESSED_BYTES,
+    ) -> tuple[WorkspaceManifest, int]:
+        """Validate ZIP entry count, compression types, member hygiene, header sizes, and manifest JSON."""
+        infos = zf.infolist()
+        if len(infos) > _MAX_ARCHIVE_ENTRIES:
+            raise DataValidationError(
+                "Invalid OmniForge project archive: excessive ZIP entry count.",
+                suggestions=["Only upload archives created by OmniForge Project Save."],
+            )
+        seen_names: set[str] = set()
+        for info in infos:
+            fname = info.filename
+            if (
+                not fname
+                or "\x00" in fname
+                or fname.startswith(("/", "\\"))
+                or "\\" in fname
+                or ".." in fname.split("/")
+            ):
+                raise DataValidationError(
+                    f"Invalid OmniForge project archive: unsafe ZIP member path '{fname}'.",
+                    suggestions=["Only upload archives created by OmniForge Project Save."],
+                )
+            if fname in seen_names:
+                raise DataValidationError(
+                    f"Invalid OmniForge project archive: duplicate ZIP member '{fname}'.",
+                    suggestions=["Only upload unmodified archives created by OmniForge Project Save."],
+                )
+            if info.compress_type not in _ALLOWED_ZIP_COMPRESS_TYPES:
+                raise DataValidationError(
+                    f"Invalid OmniForge project archive: unsupported ZIP compression method ({info.compress_type}).",
+                    suggestions=["Only upload standard DEFLATE/STORED archives created by OmniForge Project Save."],
+                )
+            seen_names.add(fname)
+
+        total_uncompressed = sum(max(0, int(info.file_size)) for info in infos)
+        if total_uncompressed > max_uncompressed_bytes:
+            raise DataValidationError(
+                "Invalid OmniForge project archive: uncompressed payload exceeds safety limit.",
+                suggestions=["Ensure the workspace archive is legitimate and within size limits."],
+            )
+        if MANIFEST_FILENAME not in seen_names or STATE_FILENAME not in seen_names:
+            raise DataValidationError(
+                "Invalid OmniForge project archive: missing required manifest or state payload.",
+                suggestions=["Ensure the uploaded file was saved by OmniForge Project Save (.omniforge)."],
+            )
+        manifest_cap = min(_MAX_MANIFEST_BYTES, max_uncompressed_bytes)
+        manifest_bytes = cls._read_zip_member_bounded(zf, MANIFEST_FILENAME, max_bytes=manifest_cap)
+        raw_manifest = json.loads(manifest_bytes.decode("utf-8"))
+        return WorkspaceManifest.model_validate(raw_manifest), len(manifest_bytes)
+
+    @classmethod
+    def inspect_bytes(
+        cls,
+        data: bytes,
+        *,
+        max_uncompressed_bytes: int = _MAX_ARCHIVE_UNCOMPRESSED_BYTES,
+    ) -> WorkspaceManifest:
         """Read and validate the manifest of a ``.omniforge`` project archive without restoring it."""
         if not data:
             raise DataValidationError(
                 "Project file is empty.",
                 suggestions=["Select a valid saved .omniforge workspace project file."],
             )
+        if len(data) > max_uncompressed_bytes:
+            raise DataValidationError(
+                "Invalid OmniForge project archive: archive size exceeds safety limit.",
+                suggestions=["Ensure the workspace archive is legitimate and within size limits."],
+            )
         try:
             with zipfile.ZipFile(io.BytesIO(data), mode="r") as zf:
-                infos = zf.infolist()
-                if len(infos) > _MAX_ARCHIVE_ENTRIES:
-                    raise DataValidationError(
-                        "Invalid OmniForge project archive: excessive ZIP entry count.",
-                        suggestions=["Only upload archives created by OmniForge Project Save."],
-                    )
-                total_uncompressed = sum(info.file_size for info in infos)
-                if total_uncompressed > _MAX_ARCHIVE_UNCOMPRESSED_BYTES:
-                    raise DataValidationError(
-                        "Invalid OmniForge project archive: uncompressed payload exceeds safety limit.",
-                        suggestions=["Ensure the workspace archive is legitimate and within size limits."],
-                    )
-                names = {info.filename for info in infos}
-                if MANIFEST_FILENAME not in names or STATE_FILENAME not in names:
-                    raise DataValidationError(
-                        "Invalid OmniForge project archive: missing required manifest or state payload.",
-                        suggestions=["Ensure the uploaded file was saved by OmniForge Project Save (.omniforge)."],
-                    )
-                raw_manifest = json.loads(zf.read(MANIFEST_FILENAME).decode("utf-8"))
-                return WorkspaceManifest.model_validate(raw_manifest)
+                manifest, _ = cls._validate_archive_structure_and_manifest(
+                    zf,
+                    max_uncompressed_bytes=max_uncompressed_bytes,
+                )
+                return manifest
         except DataValidationError:
             raise
         except Exception as exc:
@@ -406,6 +483,11 @@ class WorkspaceSessionManager:
         src = Path(path)
         if not src.exists():
             raise DataValidationError(f"Workspace project file not found: {src}")
+        if src.stat().st_size > _MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+            raise DataValidationError(
+                "Workspace project file exceeds maximum archive size limit.",
+                suggestions=["Ensure the workspace archive is legitimate and within size limits."],
+            )
         return cls.inspect_bytes(src.read_bytes())
 
     @classmethod
@@ -414,12 +496,36 @@ class WorkspaceSessionManager:
         data: bytes,
         *,
         require_signature: bool = True,
+        max_uncompressed_bytes: int = _MAX_ARCHIVE_UNCOMPRESSED_BYTES,
     ) -> tuple[dict[str, Any], WorkspaceManifest]:
         """Verify SHA-256 + HMAC-SHA256 signature and safely deserialize a ``.omniforge`` archive."""
-        manifest = cls.inspect_bytes(data)
+        if not data:
+            raise DataValidationError(
+                "Project file is empty.",
+                suggestions=["Select a valid saved .omniforge workspace project file."],
+            )
+        if len(data) > max_uncompressed_bytes:
+            raise DataValidationError(
+                "Invalid OmniForge project archive: archive size exceeds safety limit.",
+                suggestions=["Ensure the workspace archive is legitimate and within size limits."],
+            )
         try:
             with zipfile.ZipFile(io.BytesIO(data), mode="r") as zf:
-                payload_bytes = zf.read(STATE_FILENAME)
+                manifest, manifest_len = cls._validate_archive_structure_and_manifest(
+                    zf,
+                    max_uncompressed_bytes=max_uncompressed_bytes,
+                )
+                remaining_budget = max_uncompressed_bytes - manifest_len
+                if remaining_budget <= 0:
+                    raise DataValidationError(
+                        "Invalid OmniForge project archive: uncompressed payload exceeds safety limit.",
+                        suggestions=["Ensure the workspace archive is legitimate and within size limits."],
+                    )
+                payload_bytes = cls._read_zip_member_bounded(
+                    zf,
+                    STATE_FILENAME,
+                    max_bytes=remaining_budget,
+                )
             actual_sha = hashlib.sha256(payload_bytes).hexdigest()
             if manifest.payload_sha256 and actual_sha != manifest.payload_sha256:
                 raise DataValidationError(
@@ -467,6 +573,11 @@ class WorkspaceSessionManager:
         src = Path(path)
         if not src.exists():
             raise DataValidationError(f"Workspace project file not found: {src}")
+        if src.stat().st_size > _MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+            raise DataValidationError(
+                "Workspace project file exceeds maximum archive size limit.",
+                suggestions=["Ensure the workspace archive is legitimate and within size limits."],
+            )
         return cls.load_from_bytes(src.read_bytes())
 
     @classmethod
@@ -497,7 +608,12 @@ class WorkspaceSessionManager:
     def delete_local_project(cls, path: str | Path) -> bool:
         """Delete a local ``.omniforge`` or legacy ``.uap`` project snapshot file if it exists."""
         target = Path(path)
-        if target.exists() and target.is_file() and target.suffix.lower() in LEGACY_PROJECT_EXTENSIONS:
+        if (
+            not target.is_symlink()
+            and target.exists()
+            and target.is_file()
+            and target.suffix.lower() in LEGACY_PROJECT_EXTENSIONS
+        ):
             target.unlink()
             return True
         return False

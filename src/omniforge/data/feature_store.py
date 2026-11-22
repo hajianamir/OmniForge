@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -20,6 +21,18 @@ from omniforge.core.logging import get_logger
 from omniforge.core.utils import safe_json_default
 
 logger = get_logger(__name__)
+
+_SAFE_STORE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _validate_store_identifier(value: str, label: str) -> str:
+    """Validate logical Feature Store identifiers against CWE-22 path traversal tokens."""
+    cleaned = str(value).strip()
+    if not cleaned or ".." in cleaned or not _SAFE_STORE_NAME_RE.fullmatch(cleaned):
+        raise FeatureEngineeringError(
+            f"Invalid {label} '{value}': must match ^[A-Za-z0-9][A-Za-z0-9._-]{{0,127}}$ without '..' or path separators."
+        )
+    return cleaned
 
 
 @contextmanager
@@ -100,10 +113,21 @@ class LocalFeatureStore:
     def _save_registry(self, reg: dict[str, Any]) -> None:
         self._registry_path.write_text(json.dumps(reg, indent=2), encoding="utf-8")
 
+    def _resolve_confined_offline_path(self, raw_path: str | Path) -> Path:
+        """Resolve an offline feature artifact path and enforce strict CWE-22 directory confinement."""
+        base_dir = self._offline_dir.resolve()
+        candidate = Path(raw_path).resolve()
+        if candidate == base_dir or not candidate.is_relative_to(base_dir):
+            raise FeatureEngineeringError(
+                f"Refusing path outside feature store offline directory (CWE-22 protection): '{raw_path}'."
+            )
+        return candidate
+
     def register_entity(self, entity: FeatureEntity) -> FeatureEntity:
         """Register or update an entity definition."""
+        safe_name = _validate_store_identifier(entity.name, "entity name")
         reg = self._load_registry()
-        reg["entities"][entity.name] = entity.model_dump()
+        reg["entities"][safe_name] = entity.model_copy(update={"name": safe_name}).model_dump()
         self._save_registry(reg)
         return entity
 
@@ -121,10 +145,11 @@ class LocalFeatureStore:
         tags: dict[str, str] | None = None,
     ) -> FeatureViewSpec:
         """Persist a feature table into the offline store and optionally materialize online."""
+        safe_name = _validate_store_identifier(name, "feature view name")
         missing_keys = [k for k in join_keys if k not in df.columns]
         if missing_keys:
             raise FeatureEngineeringError(
-                f"Join keys {missing_keys} missing from feature DataFrame for view '{name}'."
+                f"Join keys {missing_keys} missing from feature DataFrame for view '{safe_name}'."
             )
         if timestamp_column and timestamp_column not in df.columns:
             raise FeatureEngineeringError(
@@ -133,11 +158,11 @@ class LocalFeatureStore:
 
         excluded = set(join_keys) | ({timestamp_column} if timestamp_column else set())
         feature_cols = [str(c) for c in df.columns if c not in excluded]
-        offline_path = self._offline_dir / f"{name}.parquet"
+        offline_path = self._resolve_confined_offline_path(self._offline_dir / f"{safe_name}.parquet")
         df.to_parquet(offline_path, index=False)
 
         spec = FeatureViewSpec(
-            name=name,
+            name=safe_name,
             entity_names=entity_names or join_keys,
             join_keys=join_keys,
             timestamp_column=timestamp_column,
@@ -145,21 +170,23 @@ class LocalFeatureStore:
             ttl_seconds=ttl_seconds,
             description=description,
             tags=tags or {},
-            offline_path=str(offline_path.resolve()),
+            offline_path=str(offline_path),
         )
         reg = self._load_registry()
-        reg["feature_views"][name] = spec.model_dump()
+        reg["feature_views"][safe_name] = spec.model_dump()
         self._save_registry(reg)
 
         if materialize_online:
-            self.materialize_to_online(name)
-        logger.info("feature_view_registered", view=name, n_features=len(feature_cols), rows=len(df))
+            self.materialize_to_online(safe_name)
+        logger.info("feature_view_registered", view=safe_name, n_features=len(feature_cols), rows=len(df))
         return spec
 
     def materialize_to_online(self, view_name: str) -> int:
         """Materialize latest entity feature vectors from offline storage into SQLite online store."""
-        spec = self.get_feature_view(view_name)
-        df = pd.read_parquet(spec.offline_path)
+        safe_view = _validate_store_identifier(view_name, "feature view name")
+        spec = self.get_feature_view(safe_view)
+        safe_offline = self._resolve_confined_offline_path(spec.offline_path)
+        df = pd.read_parquet(safe_offline)
         if spec.timestamp_column and spec.timestamp_column in df.columns:
             df = df.sort_values(spec.timestamp_column).drop_duplicates(
                 subset=spec.join_keys, keep="last"
@@ -225,8 +252,10 @@ class LocalFeatureStore:
 
         result = entity_df.copy()
         for view_name, feats in grouped.items():
-            spec = self.get_feature_view(view_name)
-            view_df = pd.read_parquet(spec.offline_path)
+            safe_view = _validate_store_identifier(view_name, "feature view name")
+            spec = self.get_feature_view(safe_view)
+            safe_offline = self._resolve_confined_offline_path(spec.offline_path)
+            view_df = pd.read_parquet(safe_offline)
             selected_feats = spec.feature_columns if "*" in feats else [f for f in feats if f in view_df.columns]
             keep_cols = list(dict.fromkeys(spec.join_keys + ([spec.timestamp_column] if spec.timestamp_column else []) + selected_feats))
             view_sub = view_df[keep_cols].copy()
@@ -255,37 +284,170 @@ class LocalFeatureStore:
                 result = result.merge(dedup_view, on=spec.join_keys, how="left", suffixes=("", f"__{view_name}"))
         return result
 
+    @staticmethod
+    def _parse_utc_timestamp(ts_val: Any) -> pd.Timestamp | None:
+        if ts_val is None or (isinstance(ts_val, float) and np.isnan(ts_val)):
+            return None
+        try:
+            parsed = pd.Timestamp(ts_val)
+            if pd.isna(parsed):
+                return None
+            return parsed.tz_localize("UTC") if parsed.tzinfo is None else parsed.tz_convert("UTC")
+        except Exception:
+            return None
+
     def get_online_features(
         self,
         view_name: str,
         entity_rows: list[dict[str, Any]],
         features: list[str] | None = None,
+        *,
+        enforce_ttl: bool = True,
+        as_of: datetime | str | None = None,
     ) -> list[dict[str, Any]]:
-        """Retrieve low-latency feature vectors for real-time inference requests."""
-        spec = self.get_feature_view(view_name)
+        """Retrieve low-latency feature vectors for real-time inference with Feast-compatible TTL freshness enforcement."""
+        safe_view = _validate_store_identifier(view_name, "feature view name")
+        spec = self.get_feature_view(safe_view)
         target_feats = features or spec.feature_columns
+        ref_ts = self._parse_utc_timestamp(as_of) if as_of is not None else pd.Timestamp.now(tz="UTC")
         output: list[dict[str, Any]] = []
         with _sqlite_conn(self._online_db) as conn:
             for row in entity_rows:
                 key_str = json.dumps([str(row[k]) for k in spec.join_keys], ensure_ascii=False)
                 cur = conn.execute(
-                    "SELECT features_json FROM online_features WHERE view_name = ? AND entity_key = ?",
-                    (view_name, key_str),
+                    "SELECT features_json, event_timestamp, updated_at FROM online_features WHERE view_name = ? AND entity_key = ?",
+                    (safe_view, key_str),
                 )
                 rec = cur.fetchone()
-                stored = json.loads(rec[0]) if rec else {}
+                stored: dict[str, Any] = {}
+                if rec:
+                    expired = False
+                    if enforce_ttl and spec.ttl_seconds > 0 and ref_ts is not None:
+                        ev_ts = self._parse_utc_timestamp(rec[1]) or self._parse_utc_timestamp(rec[2])
+                        if ev_ts is not None and (ref_ts - ev_ts).total_seconds() > float(spec.ttl_seconds):
+                            expired = True
+                    if not expired:
+                        stored = json.loads(rec[0])
                 item = {k: row[k] for k in spec.join_keys}
                 for f in target_feats:
                     item[f] = stored.get(f)
                 output.append(item)
         return output
 
+    def purge_expired_features(
+        self,
+        view_name: str | None = None,
+        *,
+        as_of: datetime | str | None = None,
+    ) -> dict[str, int]:
+        """Enforce retention policy by purging expired records from offline Parquet and SQLite online stores."""
+        ref_ts = self._parse_utc_timestamp(as_of) or pd.Timestamp.now(tz="UTC")
+        views = [self.get_feature_view(view_name)] if view_name is not None else self.list_feature_views()
+        offline_purged = 0
+        online_purged = 0
+        processed = 0
+
+        for spec in views:
+            if spec.ttl_seconds <= 0:
+                continue
+            processed += 1
+            cutoff_utc = ref_ts - pd.Timedelta(seconds=float(spec.ttl_seconds))
+
+            # 1. Purge expired rows in offline Parquet store when timestamp_column is configured
+            safe_offline = self._resolve_confined_offline_path(spec.offline_path)
+            if safe_offline.exists() and spec.timestamp_column:
+                df = pd.read_parquet(safe_offline)
+                if spec.timestamp_column in df.columns and len(df) > 0:
+                    ts_ser = pd.to_datetime(df[spec.timestamp_column], utc=True, errors="coerce")
+                    keep_mask = ts_ser.isna() | (ts_ser >= cutoff_utc)
+                    removed = int((~keep_mask).sum())
+                    if removed > 0:
+                        df.loc[keep_mask].reset_index(drop=True).to_parquet(safe_offline, index=False)
+                        offline_purged += removed
+
+            # 2. Purge expired rows in SQLite online_features table
+            with _sqlite_conn(self._online_db) as conn:
+                rows = conn.execute(
+                    "SELECT entity_key, event_timestamp, updated_at FROM online_features WHERE view_name = ?",
+                    (spec.name,),
+                ).fetchall()
+                expired_keys: list[tuple[str, str]] = []
+                for e_key, ev_raw, up_raw in rows:
+                    row_ts = self._parse_utc_timestamp(ev_raw) or self._parse_utc_timestamp(up_raw)
+                    if row_ts is not None and row_ts < cutoff_utc:
+                        expired_keys.append((spec.name, str(e_key)))
+                if expired_keys:
+                    conn.executemany(
+                        "DELETE FROM online_features WHERE view_name = ? AND entity_key = ?",
+                        expired_keys,
+                    )
+                    conn.commit()
+                    online_purged += len(expired_keys)
+
+        return {
+            "views_processed": processed,
+            "offline_rows_purged": offline_purged,
+            "online_rows_purged": online_purged,
+        }
+
+    def delete_entity_data(self, entity_filters: dict[str, Any]) -> dict[str, int]:
+        """GDPR Art. 17 Right-to-Erasure: purge matching entity records across all offline and online feature views."""
+        if not entity_filters:
+            raise FeatureEngineeringError("entity_filters cannot be empty for delete_entity_data().")
+        offline_deleted = 0
+        online_deleted = 0
+
+        for spec in self.list_feature_views():
+            matched_keys = [k for k in spec.join_keys if k in entity_filters]
+            if not matched_keys:
+                continue
+
+            safe_offline = self._resolve_confined_offline_path(spec.offline_path)
+            if safe_offline.exists():
+                df = pd.read_parquet(safe_offline)
+                if len(df) > 0:
+                    del_mask = pd.Series(True, index=df.index)
+                    for k in matched_keys:
+                        del_mask &= df[k].astype(str) == str(entity_filters[k])
+                    cnt = int(del_mask.sum())
+                    if cnt > 0:
+                        df.loc[~del_mask].reset_index(drop=True).to_parquet(safe_offline, index=False)
+                        offline_deleted += cnt
+
+            key_positions = [(idx, str(entity_filters[k])) for idx, k in enumerate(spec.join_keys) if k in entity_filters]
+            with _sqlite_conn(self._online_db) as conn:
+                rows = conn.execute(
+                    "SELECT entity_key FROM online_features WHERE view_name = ?",
+                    (spec.name,),
+                ).fetchall()
+                to_delete: list[tuple[str, str]] = []
+                for (ekey_raw,) in rows:
+                    try:
+                        parsed_key = json.loads(ekey_raw)
+                    except Exception:
+                        continue
+                    if isinstance(parsed_key, list) and all(
+                        pos < len(parsed_key) and str(parsed_key[pos]) == target_val
+                        for pos, target_val in key_positions
+                    ):
+                        to_delete.append((spec.name, str(ekey_raw)))
+                if to_delete:
+                    conn.executemany(
+                        "DELETE FROM online_features WHERE view_name = ? AND entity_key = ?",
+                        to_delete,
+                    )
+                    conn.commit()
+                    online_deleted += len(to_delete)
+
+        return {"offline_rows_deleted": offline_deleted, "online_rows_deleted": online_deleted}
+
     def get_feature_view(self, name: str) -> FeatureViewSpec:
         """Retrieve a registered feature view specification."""
+        safe_name = _validate_store_identifier(name, "feature view name")
         reg = self._load_registry()
-        if name not in reg["feature_views"]:
-            raise FeatureEngineeringError(f"Feature view '{name}' is not registered.")
-        return FeatureViewSpec(**reg["feature_views"][name])
+        if safe_name not in reg["feature_views"]:
+            raise FeatureEngineeringError(f"Feature view '{safe_name}' is not registered.")
+        return FeatureViewSpec(**reg["feature_views"][safe_name])
 
     def list_feature_views(self) -> list[FeatureViewSpec]:
         """List all registered feature views."""

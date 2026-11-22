@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from omniforge.api.auth import get_api_key
 from omniforge.api.main import app
-from omniforge.core.types import TaskType
+from omniforge.core.types import Principal, TaskType
 from omniforge.evaluation.equations import ModelEquationExtractor
 from omniforge.models.nonparametric import (
     DistanceWeightedKNNModel,
@@ -304,8 +304,13 @@ def test_cleaning_clustering_provenance_and_stage_persistence() -> None:
     )
     assert r_s14_eval.status_code == 200, r_s14_eval.text
 
-    # Verify internal session state has exact processed data vs untouched raw data
-    internal = get_session_state(sid)
+    # Verify internal session state has exact processed data vs untouched raw data.
+    # (Workbench HTTP sessions are namespaced per authenticated principal to prevent BOLA,
+    # so the direct probe must pass the same principal explicitly.)
+    from omniforge.api.workbench import _sid
+
+    api_key_principal = Principal(subject="api_key_principal", roles=["admin"], tenant_id="default-tenant")
+    internal = get_session_state(_sid(sid, api_key_principal))
     assert len(internal["uap_raw_df"]) == raw_rows
     assert len(internal["uap_df"]) == expected_after_cl
     assert int(internal["uap_df"].isna().sum().sum()) == 0
