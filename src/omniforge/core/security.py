@@ -258,7 +258,7 @@ class DataFramePIIGuard:
         report: dict[str, dict[str, Any]] = {}
         for col in df.columns:
             series = df[col]
-            if series.dtype != object:
+            if not pd.api.types.is_string_dtype(series):
                 continue
             pii_cells = 0
             pattern_hits: dict[str, int] = {}
@@ -315,7 +315,7 @@ class DataFramePIIGuard:
 
         if self.pii_policy == "pseudonymize":
             redacted_columns: dict[str, int] = {}
-            for col, info in report.items():
+            for col, _info in report.items():
                 mask = redacted[col].apply(self._cell_has_pii)
                 n = int(mask.sum())
                 if n:

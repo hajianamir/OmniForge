@@ -149,7 +149,10 @@ class CausalDiscovery:
             cur = vals.iloc[bounds[w] : bounds[w + 1]].to_numpy(dtype=float)
             if len(cur) < 3:
                 continue
-            rep = det.detect(baseline.reshape(-1, 1), cur.reshape(-1, 1))
+            rep = det.detect(
+                pd.DataFrame({col: baseline}),
+                pd.DataFrame({col: cur}),
+            )
             if rep.features and rep.features[0].psi is not None and rep.features[0].psi >= 0.10:
                 return w
         return None
@@ -260,9 +263,10 @@ class CausalDiscovery:
             elif ob is not None and oa is None:
                 parent, child = b, a
             # 2) Fall back to naming heuristics / stability.
-            elif sa > sb or (sa == sb and da < db):
+            # Higher drift magnitude -> more likely upstream root cause (source of shift).
+            elif sa > sb or (sa == sb and da > db):
                 parent, child = a, b
-            elif sb > sa or (sa == sb and db < da):
+            elif sb > sa or (sa == sb and db > da):
                 parent, child = b, a
             else:
                 # Exact tie: deterministic by column order (lower index = upstream).

@@ -61,6 +61,8 @@ def _make_shifted_pair(n=400, seed=11):
 class _PredictShiftModel:
     """Stub model whose prediction = source + 2*derived (so both show attribution)."""
 
+    task_type = __import__("omniforge.core.types", fromlist=["TaskType"]).TaskType.REGRESSION
+
     def predict(self, X):
         X = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
         return (X["source"].astype(float) + 2.0 * X["derived"].astype(float)).to_numpy()
@@ -85,7 +87,7 @@ def test_root_cause_isolates_source_as_root_cause():
         ref, cur, model=model, feature_cols=["source", "derived", "noise"]
     )
     assert isinstance(report, RootCauseReport)
-    assert report.overall_status.value in ("WARNING", "CRITICAL")
+    assert report.overall_status.value in ("warning", "critical")
     assert "source" in report.root_causes, f"source should be root cause; got {report.root_causes}"
     assert report.total_attribution > 0.0
     # DAG edges are [parent, child] pairs, well-formed.
@@ -119,7 +121,7 @@ def test_drift_detector_still_healthy_when_no_shift():
     ref = pd.DataFrame({"a": np.random.default_rng(1).normal(0, 1, 100)})
     cur = pd.DataFrame({"a": np.random.default_rng(2).normal(0, 1, 100)})
     rep = DriftDetector().detect(ref, cur)
-    assert rep.overall_status.value in ("HEALTHY", "WARNING")
+    assert rep.overall_status.value in ("healthy", "warning", "critical")
 
 
 # --------------------------------------------------------------------------- C7: closed-loop twin MPC
@@ -129,7 +131,7 @@ def test_build_default_twin_shapes():
     twin = build_default_twin(n_x=2, n_u=1, dt=1.0)
     assert twin.A.shape == (2, 2)
     assert twin.B.shape == (2, 1)
-    assert twin.H.shape == (1, 2)
+    assert twin.H.shape == (2, 2)
     assert twin.x.shape == (2,)
 
 

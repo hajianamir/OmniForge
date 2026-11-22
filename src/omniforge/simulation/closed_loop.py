@@ -50,7 +50,7 @@ class TwinControlReport(BaseModel):
 
     horizon: int
     n_steps_applied: int
-    setpoint: list[float]
+    setpoint: list[list[float]]  # per-step applied setpoints
     state_trajectory: list[list[float]]  # per-step applied states
     control_history: list[list[float]]  # per-step applied controls
     stage_costs: list[float]
@@ -428,8 +428,8 @@ def build_default_twin(
     np.random.default_rng(random_seed)
     A = np.array([[1.0, dt], [0.0, 1.0]], dtype=float)
     B = np.array([[0.5 * dt * dt], [dt]], dtype=float)
-    H = np.array([[1.0, 0.0]], dtype=float)
+    H = np.eye(n_x, dtype=float)
     Q = np.eye(n_x, dtype=float) * 0.01
-    R = np.eye(n_u, dtype=float) * 0.1
+    R = np.eye(n_x, dtype=float) * 0.1
     x0 = np.zeros(n_x, dtype=float)
     return DigitalTwinEngine(A=A, B=B, H=H, Q=Q, R=R, x0=x0)
