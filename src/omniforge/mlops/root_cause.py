@@ -496,6 +496,10 @@ class DriftRootCauseAnalyzer:
                 )
 
         total_attribution = float(sum(abs(v) for v in attributions.values()))
+        # Net signed prediction shift attributed to drift (Delta-SHAP).
+        prediction_shift = (
+            round(float(sum(attributions.values())), 6) if attributions else 0.0
+        )
 
         return RootCauseReport(
             overall_status=drift_report.overall_status,
@@ -505,7 +509,7 @@ class DriftRootCauseAnalyzer:
             root_causes=root_causes,
             symptoms=symptoms,
             dag_edges=dag_edges,
-            prediction_shift=round(base_pred_mean, 6),
+            prediction_shift=prediction_shift,
             total_attribution=round(total_attribution, 6),
             remediation_prescriptions=prescriptions,
         )

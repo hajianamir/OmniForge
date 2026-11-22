@@ -28,7 +28,6 @@ import pandas as pd
 import pytest
 
 from omniforge.core.contracts import LeakageGuard
-from omniforge.core.security import DataFramePIIGuard
 from omniforge.mlops.drift import DriftDetector
 from omniforge.mlops.root_cause import (
     CausalDiscovery,
