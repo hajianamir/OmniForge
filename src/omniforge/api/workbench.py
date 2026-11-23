@@ -1253,7 +1253,8 @@ def s02_run_clustering(req: ClusterReq, x_session_id: str | None = Header(defaul
     sid = _sid(x_session_id)
     state = get_session_state(sid)
     df = get_analysis_dataframe(state, _require_df(state))
-    helper_cols = {"cluster_id", "is_anomaly", "anomaly_score"}
+    targets = set(_wb().get_selected_targets(state, df))
+    helper_cols = {"cluster_id", "is_anomaly", "anomaly_score"} | targets
     num_cols = req.features or [
         c for c in df.select_dtypes(include=[np.number]).columns if c not in helper_cols
     ]

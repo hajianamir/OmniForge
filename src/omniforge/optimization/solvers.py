@@ -256,7 +256,13 @@ class OptimizationEngine:
         port_vol = float(np.sqrt(max(float(w_opt @ cov_sym @ w_opt), 0.0)))
         sharpe = (port_ret - float(risk_free_rate)) / max(port_vol, 1e-12)
         names = asset_names or [f"asset_{i}" for i in range(n)]
-        weights_map = {name: round(float(val), 6) for name, val in zip(names, w_opt, strict=False)}
+        if len(names) != n:
+            raise OptimizationError(
+                f"asset_names length ({len(names)}) must match number of assets ({n})."
+            )
+        if len(set(names)) != len(names):
+            raise OptimizationError("asset_names must contain unique names.")
+        weights_map = {name: round(float(val), 6) for name, val in zip(names, w_opt)}
         return OptimizationResult(
             problem_type="portfolio_mean_variance",
             status="optimal",

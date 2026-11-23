@@ -61,7 +61,7 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
         if len(active_targets) > 1:
             for extra_t in active_targets[1:]:
                 try:
-                    Xt, yt, tt = _wb()._prepare_xy(df, extra_t, raw_features=True)
+                    Xt, yt, tt = _wb()._prepare_xy(automl_source, extra_t, raw_features=True)
                     wdf_t = Xt.copy()
                     wdf_t[extra_t] = yt.to_numpy()
                     res_t = AutoMLBackendHub.run(
@@ -84,7 +84,10 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
                     )
                 except Exception:
                     multi_target_summary.append({"target": extra_t, "task_type": "error", "best_model": None, "best_score": None})
-        X, y, task = _wb()._prepare_xy(df, target, raw_features=True)
+        # Honor Split Lock: train only on train partition when lock is active
+        train_df, _test_df, _lock = _wb().get_active_split_frames(state, df)
+        automl_source = train_df if (train_df is not None and not train_df.empty and _lock is not None) else df
+        X, y, task = _wb()._prepare_xy(automl_source, target, raw_features=True)
         work_df = X.copy()
         work_df[target] = y.to_numpy()
         res = AutoMLBackendHub.run(

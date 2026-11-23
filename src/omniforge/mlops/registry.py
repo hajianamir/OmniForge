@@ -77,6 +77,7 @@ class RegisteredModelVersion(BaseModel):
     approved_domains: list[str] = Field(default_factory=list)
     risk_tier: Literal["low", "medium", "high", "critical"] = "medium"
     fairness_passed: bool | None = None
+    encrypted_at_rest: bool = False
     registered_at: str
     updated_at: str
 
@@ -87,7 +88,7 @@ class ModelRegistry:
     _SELECT_COLS = (
         "model_name, version, stage, artifact_path, checksum_sha256, metrics_json, tags_json, "
         "description, owner, intended_use, approved_domains_json, risk_tier, fairness_passed, "
-        "registered_at, updated_at"
+        "encrypted_at_rest, registered_at, updated_at"
     )
 
     def __init__(
@@ -128,6 +129,7 @@ class ModelRegistry:
                     approved_domains_json TEXT NOT NULL DEFAULT '[]',
                     risk_tier TEXT NOT NULL DEFAULT 'medium',
                     fairness_passed INTEGER DEFAULT NULL,
+                    encrypted_at_rest INTEGER DEFAULT 0,
                     registered_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (model_name, version)
@@ -283,6 +285,7 @@ class ModelRegistry:
             approved_domains=[str(d).strip() for d in (approved_domains or []) if str(d).strip()],
             risk_tier=norm_tier,  # type: ignore[arg-type]
             fairness_passed=eff_fairness,
+            encrypted_at_rest=encrypt,
             registered_at=now,
             updated_at=now,
         )
@@ -298,8 +301,8 @@ class ModelRegistry:
                 INSERT INTO model_versions
                 (model_name, version, stage, artifact_path, checksum_sha256, metrics_json, tags_json,
                  description, owner, intended_use, approved_domains_json, risk_tier, fairness_passed,
-                 registered_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 encrypted_at_rest, registered_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     rec.model_name,
@@ -315,6 +318,7 @@ class ModelRegistry:
                     json.dumps(rec.approved_domains),
                     rec.risk_tier,
                     None if rec.fairness_passed is None else int(rec.fairness_passed),
+                    int(rec.encrypted_at_rest),
                     rec.registered_at,
                     rec.updated_at,
                 ),
@@ -480,7 +484,7 @@ class ModelRegistry:
             chosen = versions[-1]
         if chosen is None:
             raise MLOpsError(f"No matching version found for '{model_name}' (version={version}, stage={stage}).")
-        return BaseOmniForgeModel.load(chosen.artifact_path), chosen
+        return BaseOmniForgeModel.load(chosen.artifact_path, encrypted=chosen.encrypted_at_rest), chosen
 
     def list_versions(self, model_name: str | None = None) -> list[RegisteredModelVersion]:
         """List registered model versions, optionally scoped to one model name."""
@@ -514,6 +518,7 @@ class ModelRegistry:
             approved_domains=list(json.loads(row[10] or "[]")),
             risk_tier=tier_val,  # type: ignore[arg-type]
             fairness_passed=None if row[12] is None else bool(int(row[12])),
-            registered_at=row[13],
-            updated_at=row[14],
+            encrypted_at_rest=bool(int(row[13])) if row[13] is not None else False,
+            registered_at=row[14],
+            updated_at=row[15],
         )

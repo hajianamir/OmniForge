@@ -35,16 +35,25 @@ def configure_remote_mlflow_tracking(
 class BackgroundJobQueue:
     """Thread-safe asynchronous job queue for long-running AutoML and pipeline tasks."""
 
-    def __init__(self, max_workers: int = 2) -> None:
+    def __init__(self, max_workers: int = 2, max_history: int | None = None) -> None:
         self._executor = ThreadPoolExecutor(max_workers=max(1, max_workers), thread_name_prefix="omniforge-job")
         self._jobs: dict[str, Future[Any]] = {}
         self._lock = Lock()
+        self._max_history = max_history
+        self._job_order: list[str] = []  # insertion order for LRU eviction
 
     def submit(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> str:
         job_id = uuid.uuid4().hex[:12]
         fut = self._executor.submit(fn, *args, **kwargs)
         with self._lock:
             self._jobs[job_id] = fut
+            self._job_order.append(job_id)
+            # Evict oldest jobs when max_history is exceeded
+            if self._max_history is not None and len(self._job_order) > self._max_history:
+                evict_count = len(self._job_order) - self._max_history
+                for _ in range(evict_count):
+                    old_id = self._job_order.pop(0)
+                    self._jobs.pop(old_id, None)
         return job_id
 
     def status(self, job_id: str) -> str:

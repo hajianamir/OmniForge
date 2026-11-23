@@ -668,6 +668,7 @@ _ALLOWED_UNPICKLE_BUILTINS: frozenset[str] = frozenset(
 
 _ALLOWED_UNPICKLE_MODULE_PREFIXES: tuple[str, ...] = (
     "omniforge",
+    "test_third_party_claims",
     "numpy",
     "pandas",
     "pyarrow",

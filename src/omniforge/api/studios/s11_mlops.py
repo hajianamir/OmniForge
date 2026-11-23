@@ -5,9 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 
 from omniforge.api.studios.schemas import DriftReq, PromoteModelReq, RegisterModelReq, RollbackModelReq, RootCauseReq
+from omniforge.api.auth import require_permission
 from omniforge.core.exceptions import MLOpsError
 from omniforge.core.utils import to_json_object
 from omniforge.mlops.drift import DriftDetector
@@ -68,7 +69,7 @@ def s11_register(req: RegisterModelReq, x_session_id: str | None = Header(defaul
     return payload
 
 
-@router.post("/s11/promote")
+@router.post("/s11/promote", dependencies=[Depends(require_permission("models:promote"))])
 def s11_promote(req: PromoteModelReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     state = _wb().get_session_state(_wb()._sid(x_session_id))
     reg = _wb().get_tenant_registry()
