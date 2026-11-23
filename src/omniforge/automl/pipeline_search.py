@@ -151,15 +151,13 @@ class AutoMLPipelineSearch:
         # Sort descending by primary objective for efficient sweep; then filter dominated.
         ordered = sorted(rows, key=objective, reverse=True)
         frontier: list[dict[str, Any]] = []
-        best_latency = float("inf")
-        best_carbon = float("inf")
         # Non-dominated in 3D: track the Pareto-optimal set via pairwise comparison.
         for r in ordered:
-            m, l, c = objective(r)
+            m, latency, c = objective(r)
             dominated = False
             for f in frontier:
                 fm, fl, fc = objective(f)
-                if fm >= m and fl >= l and fc >= c and (fm > m or fl > l or fc > c):
+                if fm >= m and fl >= latency and fc >= c and (fm > m or fl > latency or fc > c):
                     dominated = True
                     break
             if not dominated:
