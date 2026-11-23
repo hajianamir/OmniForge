@@ -478,7 +478,8 @@ class TestClaims15_16_FairnessEdgeCases:
     def test_fairness_empty_groups(self):
         auditor = FairnessAuditor()
         report = auditor.audit(np.array([]), np.array([]), np.array([]), attribute_name="group")
-        assert report.passed is True
+        # Empty / insufficient data is unevaluable: a resolved Claim 15 must not pass.
+        assert report.passed is False
 
 
 # ===========================================================================
@@ -544,7 +545,7 @@ class TestClaim21_DiDSingletonCells:
     """DiD handles singleton cells without NaN variance."""
 
     def test_did_singleton_cell_no_nan(self):
-        """Singleton cells (len==1) return 0 variance, not NaN — claim NOT valid."""
+        """Singleton cells (len==1) return NaN standard error — Claim 21 resolved."""
         engine = CausalInferenceEngine()
         df = pd.DataFrame({
             "group": [1, 1, 0, 0],
@@ -554,8 +555,9 @@ class TestClaim21_DiDSingletonCells:
         result = engine.difference_in_differences(
             df, group_col="group", post_col="post", outcome_col="outcome",
         )
-        assert not math.isnan(result["std_error"]), (
-            "DiD singleton cell should not produce NaN std_error."
+        # Singleton cells have no within-cell variance: SE/CI/p-value are undefined (NaN).
+        assert math.isnan(result["std_error"]), (
+            "DiD singleton cell returns NaN std_error (undefined variance)."
         )
         assert not math.isnan(result["did_estimate"])
 
