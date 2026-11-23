@@ -82,7 +82,13 @@ class DataQualityProfiler:
         Returns:
             :class:`DataQualityReport` with scores on a 0–100 scale and recommendations.
         """
-        cache_params = f"{timestamp_column}|{max_freshness_days}|{sorted(reference_rules.keys()) if reference_rules else ''}|{key_columns}"
+        import hashlib as _hashlib
+        import json as _json
+
+        rules_hash = _hashlib.sha256(
+            _json.dumps(reference_rules or {}, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+        cache_params = f"{timestamp_column}|{max_freshness_days}|rules:{rules_hash}|{key_columns}"
         hit, cached = GLOBAL_DF_CACHE.get("data_quality", df, cache_params)
         if hit and isinstance(cached, DataQualityReport):
             return cached

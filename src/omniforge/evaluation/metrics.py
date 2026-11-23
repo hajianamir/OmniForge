@@ -312,6 +312,19 @@ class MetricsEvaluator:
         if y_lower is not None and y_upper is not None:
             lo = np.asarray(y_lower, dtype=float).ravel()
             hi = np.asarray(y_upper, dtype=float).ravel()
+            if len(lo) != len(yt) or len(hi) != len(yt):
+                raise ValueError(
+                    f"y_lower and y_upper must have same length as y_true "
+                    f"({len(yt)}), got {len(lo)} and {len(hi)}."
+                )
+            inverted = lo > hi
+            if np.any(inverted):
+                n_inv = int(inverted.sum())
+                raise ValueError(
+                    f"Inverted prediction intervals: {n_inv} sample(s) have "
+                    f"y_lower > y_upper. First inverted pair: "
+                    f"y_lower={float(lo[inverted][0])}, y_upper={float(hi[inverted][0])}."
+                )
             coverage = float(np.mean((yt >= lo) & (yt <= hi)))
             width = hi - lo
             penalty = (2.0 / max(alpha, 1e-6)) * (np.maximum(lo - yt, 0.0) + np.maximum(yt - hi, 0.0))

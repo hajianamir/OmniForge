@@ -68,6 +68,21 @@ class FairnessAuditor:
         tprs: list[float] = []
         fprs: list[float] = []
 
+        # Empty input or single group cannot be meaningfully evaluated
+        if len(yt) == 0 or len(groups) == 0:
+            return FairnessReport(
+                protected_attribute=attribute_name,
+                passed=False,
+                demographic_parity_diff=0.0,
+                disparate_impact_ratio=1.0,
+                equalized_odds_diff=0.0,
+                equal_opportunity_diff=0.0,
+                violations=["Insufficient data: empty input or no groups to compare"],
+                recommendations=[
+                    "Provide non-empty predictions with at least two sensitive groups."
+                ],
+            )
+
         for grp in groups:
             mask = sf == grp
             g_yt = yt[mask]
@@ -197,7 +212,14 @@ class FairnessAuditor:
             )
             recommendations.append("Inspect group-specific ROC operating points and calibrate thresholds.")
         if not recommendations:
-            recommendations.append("Model satisfies all configured demographic and equalized odds gates.")
+            if violations:
+                recommendations.append(
+                    "Review and remediate the listed fairness violations before deployment."
+                )
+            else:
+                recommendations.append(
+                    "Model satisfies all configured demographic and equalized odds gates."
+                )
 
         return FairnessReport(
             protected_attribute=attribute_name,
