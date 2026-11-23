@@ -186,6 +186,17 @@ def s05_select_features(req: FeatureSelReq, x_session_id: str | None = Header(de
                 reason=f"Feature selection kept top {len(selected)} highest-signal predictors.",
                 sample_identifiers=dropped[:10],
             )
+        # Actually drop the unselected columns from the active dataset
+        remaining_cols = [c for c in full_df.columns if c not in set(dropped)]
+        updated_df = full_df[remaining_cols].copy()
+        _wb().update_active_dataset(
+            state,
+            updated_df,
+            stage="Feature Selection",
+            action=f"Dropped {len(dropped)} unselected columns (commit)",
+            details=", ".join(dropped[:10]),
+            preserve_stage="s05_features",
+        )
     return wb_cache_and_respond(
         state,
         sid,

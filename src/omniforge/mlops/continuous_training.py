@@ -178,7 +178,12 @@ class ContinuousTrainingOrchestrator:
                     "holdout_rows": float(len(new_holdout_df)),
                 }
             )
-            would_have_promoted = champion_score is None or (challenger_score >= champion_score + min_improvement)
+            # When no existing champion exists (champion_score is None), register challenger
+            # in STAGING for human review — do NOT auto-promote to PRODUCTION.
+            would_have_promoted = (
+                champion_score is not None
+                and challenger_score >= champion_score + min_improvement
+            )
             promoted = would_have_promoted and self.auto_promote
             if would_have_promoted and not self.auto_promote:
                 logger.warning(

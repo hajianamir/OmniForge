@@ -1053,11 +1053,17 @@ def get_active_split_frames(state: dict[str, Any], df: pd.DataFrame | None = Non
         if int(tr_mask.sum()) < 5 or int(te_mask.sum()) < 2:
             raise ValueError("Active Split Lock is invalid or corrupted (insufficient train/test row_ids).")
         return active_df.loc[tr_mask].copy(), active_df.loc[te_mask].copy(), lock
-    tr_idx = [i for i in (lock.get("train_indices") or []) if i in active_df.index]
-    te_idx = [i for i in (lock.get("test_indices") or []) if i in active_df.index]
+    # train_indices/test_indices are 0-based positional indices (from reset_index(drop=True) in
+    # lock_leakage_safe_split). Use iloc[] (position-based) not loc[] (label-based) so the lock
+    # works on DataFrames with non-RangeIndex.
+    raw_tr_idx = lock.get("train_indices") or []
+    raw_te_idx = lock.get("test_indices") or []
+    n_rows = len(active_df)
+    tr_idx = [int(i) for i in raw_tr_idx if isinstance(i, (int, np.integer)) and 0 <= int(i) < n_rows]
+    te_idx = [int(i) for i in raw_te_idx if isinstance(i, (int, np.integer)) and 0 <= int(i) < n_rows]
     if len(tr_idx) < 5 or len(te_idx) < 2:
         raise ValueError("Active Split Lock is invalid or corrupted (insufficient train/test indices).")
-    return active_df.loc[tr_idx].copy(), active_df.loc[te_idx].copy(), lock
+    return active_df.iloc[tr_idx].copy(), active_df.iloc[te_idx].copy(), lock
 
 
 def recombine_split_frames(train_df: pd.DataFrame, test_df: pd.DataFrame, original_index: pd.Index) -> pd.DataFrame:
