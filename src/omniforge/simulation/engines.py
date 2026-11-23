@@ -190,6 +190,10 @@ class DiscreteEventSimulator:
 
         while events:
             now, etype, eid = heapq.heappop(events)
+            # Hard horizon: stop processing events scheduled beyond horizon_time.
+            # Entries still in service/waiting at horizon are not counted as completed.
+            if now > horizon_time:
+                break
             dt = now - last_time
             busy_area += busy_servers * dt
             queue_area += len(waiting_queue) * dt

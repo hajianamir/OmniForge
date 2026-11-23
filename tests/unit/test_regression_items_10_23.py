@@ -6,10 +6,7 @@ verifies the fix. Tests are self-contained and deterministic.
 
 from __future__ import annotations
 
-import json
 import math
-import sqlite3
-import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -18,7 +15,6 @@ import pandas as pd
 import pytest
 
 from omniforge.causal.inference import CausalInferenceEngine
-from omniforge.core.performance import GLOBAL_DF_CACHE
 from omniforge.data.cleaning import CleaningConfig, DataCleaner
 from omniforge.data.feature_store import LocalFeatureStore
 from omniforge.data.quality import DataQualityProfiler
@@ -26,7 +22,7 @@ from omniforge.evaluation.backtesting import BacktestingEngine
 from omniforge.evaluation.fairness import FairnessAuditor
 from omniforge.evaluation.metrics import MetricsEvaluator
 from omniforge.forecasting.engine import ForecastingEngine
-from omniforge.models.baselines import BaselineBenchmarkSuite, ForecastingBaseline
+from omniforge.models.baselines import ForecastingBaseline
 from omniforge.models.time_series.statistical import StatisticalForecaster
 from omniforge.simulation.engines import DiscreteEventSimulator
 
@@ -90,7 +86,6 @@ def test_ffill_preserves_row_count_with_duplicate_index() -> None:
 # ===========================================================================
 def test_missforest_imputes_all_eligible_and_reports() -> None:
     """missforest must impute all eligible columns and report imputed columns."""
-    rng = np.random.default_rng(7)
     df = pd.DataFrame(
         {
             "a": [1.0, 2.0, np.nan, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
@@ -237,7 +232,7 @@ def test_fairness_missing_classes_returns_unevaluable() -> None:
 
     # Group A has no negative labels (FPR undefined), Group B has no positive labels (TPR undefined)
     # These undefined metrics must not cause silent pass
-    for grp, metrics in report.group_metrics.items():
+    for _, metrics in report.group_metrics.items():
         if metrics["tpr"] is None or metrics["fpr"] is None:
             # Undefined metrics are expected — report should still be valid
             pass

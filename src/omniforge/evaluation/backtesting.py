@@ -48,7 +48,9 @@ class BacktestingEngine:
                 continue
             first_valid = float(tr_raw.dropna().iloc[0])
             train_y = tr_raw.ffill().fillna(first_valid).to_numpy(dtype=float)
-            test_y = te_raw.ffill().fillna(float(train_y[-1])).to_numpy(dtype=float)
+            # Keep NaN actuals as-is — do not forward-fill test targets. Missing actuals
+            # must not be scored (otherwise rmse/mae/smape/mase would be falsely 0.0).
+            test_y = te_raw.to_numpy(dtype=float)
 
             model = forecaster_factory()
             model.fit(train_y)
@@ -61,10 +63,21 @@ class BacktestingEngine:
                 yhat = np.asarray(fc, dtype=float).ravel()[gap_n : gap_n + horizon]
                 lo, hi = None, None
 
-            m = MetricsEvaluator.forecasting_metrics(test_y, yhat, y_train=train_y, y_lower=lo, y_upper=hi)
+            # Score only positions with valid (non-NaN) actuals.
+            valid_mask = ~np.isnan(test_y)
+            if valid_mask.any():
+                test_y_valid = test_y[valid_mask]
+                yhat_valid = yhat[valid_mask]
+                lo_valid = lo[valid_mask] if lo is not None else None
+                hi_valid = hi[valid_mask] if hi is not None else None
+                m = MetricsEvaluator.forecasting_metrics(
+                    test_y_valid, yhat_valid, y_train=train_y, y_lower=lo_valid, y_upper=hi_valid
+                )
+            else:
+                m = {"rmse": float("nan"), "mae": float("nan"), "smape": float("nan"), "mase": float("nan")}
             folds.append({"cutoff_index": cursor, "train_size": len(train_y), "gap": gap_n, **m})
-            all_actuals.extend(test_y.tolist())
-            all_preds.extend(yhat.tolist())
+            all_actuals.extend(test_y[valid_mask].tolist())
+            all_preds.extend(yhat[valid_mask].tolist())
             cursor += max(1, step_size)
 
         if not folds:
