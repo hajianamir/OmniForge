@@ -15,12 +15,13 @@ from uuid import uuid4
 
 from omniforge.core.constants import SENSITIVE_KEY_PATTERNS
 
+structlog: ModuleType | None = None
 try:
-    import structlog
+    import structlog as _structlog_module
 
+    structlog = _structlog_module
     _HAS_STRUCTLOG = True
 except ImportError:
-    structlog = cast(ModuleType | None, None)
     _HAS_STRUCTLOG = False
 
 _TRACE_ID_CTX: contextvars.ContextVar[str] = contextvars.ContextVar(
