@@ -383,22 +383,44 @@ class CopilotToolRegistry:
             dt: float = 1.0,
             setpoint: list[float] | None = None,
             measurements: list[list[float]] | None = None,
+            session_key: str | None = None,
         ) -> dict[str, Any]:
-            """C7 closed-loop Digital Twin MPC control."""
+            """C7 closed-loop Digital Twin MPC control with optional session persistence.
+
+            When ``session_key`` is supplied, the twin state and controller warm-start
+            are checkpointed into the workbench session state so the closed-loop
+            session can be resumed across calls via :meth:`restore`.
+            """
             from omniforge.simulation import ClosedLoopMPCController, build_default_twin
 
             twin = build_default_twin(n_x=n_x, n_u=n_u, dt=dt)
             controller = ClosedLoopMPCController(twin, horizon=horizon, random_seed=42)
+
             if measurements is None:
                 import numpy as np
+
                 rng = np.random.default_rng(1234)
-                meas = [rng.normal(0.0, 0.5, size=n_x) for _ in range(n_steps)][:n_steps]
+                meas = [
+                    rng.normal(0.0, 0.5, size=n_x).tolist() for _ in range(n_steps)
+                ]
             else:
-                meas = [np.asarray(m, dtype=float) for m in measurements][:n_steps]
+                meas = [np.asarray(m, dtype=float).ravel() for m in measurements][:n_steps]
+
             sp = None
             if setpoint:
                 sp = np.asarray(setpoint, dtype=float).ravel()[:n_x]
-            report = controller.run_closed_loop(meas, setpoint=sp)
+
+            state_dict: dict[str, Any] = {}
+            report = controller.run_closed_loop(
+                meas, setpoint=sp, state=state_dict, state_key=session_key or "twin_control"
+            )
+
+            # Persist checkpoint into workbench memory for cross-call restoration.
+            if session_key and session_key in state_dict:
+                self.memory.working_state.setdefault("twin_sessions", {})[
+                    session_key
+                ] = state_dict[session_key]
+
             self.memory.working_state["reports"]["twin_control"] = report
             return {
                 "n_steps_applied": report.n_steps_applied,
@@ -409,6 +431,7 @@ class CopilotToolRegistry:
                 "control_history": report.control_history,
                 "setpoint": report.setpoint,
                 "stage_costs": report.stage_costs,
+                "session_key": session_key,
             }
 
         def tool_split_lock(
@@ -525,14 +548,26 @@ class CopilotToolRegistry:
             model_name: str = "omniforge_champion",
             stage: str = "Staging",
         ) -> dict[str, Any]:
-            """Register active model to the MLOps Model Registry (Studio 11)."""
+            """Register active model to the MLOps Model Registry (Studio 11).
+
+            Looks up the model by ``model_name`` in Copilot memory; falls back to
+            ``pareto_champion`` then ``automl_champion`` if not found.
+            """
             from omniforge.api import workbench as wb
             from omniforge.core.types import ModelStage
 
             state = self.memory.working_state
-            model = state["models"].get("pareto_champion") or state["models"].get("automl_champion")
+            model = (
+                state["models"].get(model_name)
+                or state["models"].get("pareto_champion")
+                or state["models"].get("automl_champion")
+            )
             if model is None:
-                raise ValueError("No trained model in Copilot memory. Run train_automl or pareto_automl first.")
+                available = ", ".join(sorted(state["models"].keys())) or "none"
+                raise ValueError(
+                    f"No trained model '{model_name}' in Copilot memory. "
+                    f"Available models: {available}. Run train_automl or pareto_automl first."
+                )
             try:
                 ms = ModelStage(stage)
             except ValueError:
@@ -552,7 +587,11 @@ class CopilotToolRegistry:
             version: int,
             stage: str = "Production",
         ) -> dict[str, Any]:
-            """Promote a registered model to a new stage (Studio 11)."""
+            """Promote a registered model to a new stage (Studio 11).
+
+            Validates that the model exists in the registry before attempting
+            promotion; returns a structured error if not found.
+            """
             from omniforge.api import workbench as wb
             from omniforge.core.types import ModelStage
 
@@ -564,6 +603,17 @@ class CopilotToolRegistry:
                     "available_stages": [s.value for s in ModelStage],
                 }
             reg = wb.get_tenant_registry()
+            # Validate model exists before promotion.
+            try:
+                versions = reg.list_versions()
+                if not any(v.model_name == model_name for v in versions):
+                    return {
+                        "error": f"Model '{model_name}' not found in registry.",
+                        "available_models": [v.model_name for v in versions],
+                    }
+            except Exception:
+                # If registry listing fails, let the promotion attempt surface its own error.
+                pass
             updated = reg.transition_stage(
                 model_name, version, ms, fairness_report=None,
             )

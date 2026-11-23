@@ -43,6 +43,7 @@ class DriftedFeature(BaseModel):
     abs_delta_prediction: float = 0.0
     is_root_cause: bool = False
     is_symptom: bool = False
+    root_cause_confidence: float = 0.0  # 0.0-1.0 confidence in root-cause classification
     upstream_ancestors: list[str] = Field(default_factory=list)
     downstream_descendants: list[str] = Field(default_factory=list)
     remediation: str = ""
@@ -128,15 +129,15 @@ class CausalDiscovery:
 
     @staticmethod
     def _rolling_window_drift_onset(
-        df: pd.DataFrame, time_col: str, col: str, n_windows: int = 5
+        df: pd.DataFrame, time_col: str, col: str, n_windows: int = 5, psi_threshold: float = 0.10
     ) -> int | None:
         """Return the earliest time-window index where ``col`` first drifts vs baseline.
 
         Splits the temporally-sorted frame into ``n_windows`` consecutive windows,
         computes PSI of each later window against the first (baseline) window, and
-        returns the index of the first window whose PSI >= 0.10. Returns ``None`` if
-        no window drifts (or if there are too few rows). Lower index = earlier shift
-        = more likely upstream root cause.
+        returns the index of the first window whose PSI >= ``psi_threshold``.
+        Returns ``None`` if no window drifts (or if there are too few rows).
+        Lower index = earlier shift = more likely upstream root cause.
         """
         sdf = df.sort_values(time_col)
         vals = pd.to_numeric(sdf[col], errors="coerce").dropna()
@@ -145,15 +146,13 @@ class CausalDiscovery:
         bounds = np.linspace(0, len(vals), n_windows + 1).astype(int)
         baseline = vals.iloc[bounds[0] : bounds[1]].to_numpy(dtype=float)
         det = DriftDetector()
+        baseline_df = pd.DataFrame({col: baseline})
         for w in range(1, n_windows):
             cur = vals.iloc[bounds[w] : bounds[w + 1]].to_numpy(dtype=float)
             if len(cur) < 3:
                 continue
-            rep = det.detect(
-                pd.DataFrame({col: baseline}),
-                pd.DataFrame({col: cur}),
-            )
-            if rep.features and rep.features[0].psi is not None and rep.features[0].psi >= 0.10:
+            rep = det.detect(baseline_df, pd.DataFrame({col: cur}))
+            if rep.features and rep.features[0].psi is not None and rep.features[0].psi >= psi_threshold:
                 return w
         return None
 
@@ -174,7 +173,6 @@ class CausalDiscovery:
         if len(numeric_cols) < 2:
             return {c: set() for c in numeric_cols}
 
-        np.random.default_rng(self.random_seed)
         cols = list(numeric_cols)
 
         # ---- PC skeleton -------------------------------------------------------
@@ -228,7 +226,7 @@ class CausalDiscovery:
             for c in cols:
                 onset[c] = self._rolling_window_drift_onset(df, time_col, c)
 
-        # Stability score: lower drift magnitude -> more likely upstream source.
+        # Drift magnitude: higher shift = more likely upstream source of change.
         drift: dict[str, float] = {}
         if not (time_col and time_col in df.columns):
             drift = {c: float(df[c].std(ddof=1)) if df[c].notna().sum() > 1 else 0.0 for c in cols}
@@ -255,18 +253,20 @@ class CausalDiscovery:
             sa, sb = upstream_score(a), upstream_score(b)
             oa, ob = onset.get(a), onset.get(b)
             da, db = drift.get(a, 0.0), drift.get(b, 0.0)
-            # 1) Earlier drift onset wins (temporal causality).
+            # 1) Temporal causality: earlier drift onset = upstream (strongest signal).
             if oa is not None and ob is not None and oa != ob:
                 parent, child = (a, b) if oa < ob else (b, a)
             elif oa is not None and ob is None:
                 parent, child = a, b  # a shifts, b does not -> a upstream
             elif ob is not None and oa is None:
                 parent, child = b, a
-            # 2) Fall back to naming heuristics / stability.
-            # Higher drift magnitude -> more likely upstream root cause (source of shift).
-            elif sa > sb or (sa == sb and da > db):
+            # 2) Fall back to drift magnitude (higher shift = more likely source).
+            elif da != db:
+                parent, child = (a, b) if da > db else (b, a)
+            # 3) Fall back to naming heuristics.
+            elif sa > sb:
                 parent, child = a, b
-            elif sb > sa or (sa == sb and db > da):
+            elif sb > sa:
                 parent, child = b, a
             else:
                 # Exact tie: deterministic by column order (lower index = upstream).
@@ -277,6 +277,73 @@ class CausalDiscovery:
                 upstream_score_a=sa, upstream_score_b=sb, onset_a=oa, onset_b=ob,
                 drift_a=round(da, 4), drift_b=round(db, 4),
             )
+
+        # ---- Cycle detection & removal -----------------------------------------
+        # Break any cycles introduced by conflicting heuristics: remove the edge
+        # with the weakest orientation signal (smallest |drift_a - drift_b|).
+        parents = self._break_cycles(parents, drift)
+        return parents
+
+    @staticmethod
+    def _break_cycles(
+        parents: dict[str, set[str]],
+        drift: dict[str, float],
+    ) -> dict[str, set[str]]:
+        """Remove edges that create cycles in the parent map.
+
+        Iteratively detects cycles via DFS and removes the edge with the weakest
+        orientation signal (smallest absolute drift difference) to break it.
+        Returns a cycle-free parent map.
+        """
+        parents = {c: set(ps) for c, ps in parents.items()}
+
+        def _find_cycle() -> list[tuple[str, str]] | None:
+            """Return a list of edges (parent, child) forming a cycle, or None."""
+            WHITE, GRAY, BLACK = 0, 1, 2
+            color = {c: WHITE for c in parents}
+            parent_edge: dict[str, str] = {}
+
+            def dfs(node: str) -> list[tuple[str, str]] | None:
+                color[node] = GRAY
+                for child in parents.get(node, set()):
+                    if color.get(child, WHITE) == GRAY:
+                        # Cycle detected: reconstruct edges from child back to node.
+                        cycle_edges: list[tuple[str, str]] = [(node, child)]
+                        cur = node
+                        while cur != child:
+                            prev = parent_edge.get(cur)
+                            if prev is None or prev not in parents:
+                                break
+                            cycle_edges.append((prev, cur))
+                            cur = prev
+                        return cycle_edges
+                    if color.get(child, WHITE) == WHITE:
+                        parent_edge[child] = node
+                        result = dfs(child)
+                        if result is not None:
+                            return result
+                color[node] = BLACK
+                return None
+
+            for start in parents:
+                if color[start] == WHITE:
+                    result = dfs(start)
+                    if result is not None:
+                        return result
+            return None
+
+        max_iterations = len(parents) * 2
+        for _ in range(max_iterations):
+            cycle = _find_cycle()
+            if cycle is None:
+                break
+            # Remove the edge with the weakest orientation signal.
+            weakest_edge = min(
+                cycle,
+                key=lambda e: abs(drift.get(e[0], 0.0) - drift.get(e[1], 0.0)),
+            )
+            p, c = weakest_edge
+            parents[c].discard(p)
         return parents
 
     # -- ancestor traversal ------------------------------------------------------
@@ -442,6 +509,10 @@ class DriftRootCauseAnalyzer:
             descendants = CausalDiscovery.downstream_descendants(parents, col)
             drifted_descendants = descendants & drifted_set
 
+            psi = fres.psi if fres.psi is not None else 0.0
+            drift_strength = min(abs(psi), 1.0)  # normalize to [0,1]
+            attribution_strength = min(abs(attributions.get(col, 0.0)), 1.0)
+
             is_root = (
                 fres.status != DriftStatus.HEALTHY
                 and len(drifted_ancestors) == 0
@@ -455,6 +526,21 @@ class DriftRootCauseAnalyzer:
             if fres.status != DriftStatus.HEALTHY and len(drifted_ancestors) == 0 and len(drifted_descendants) == 0:
                 is_root = True
 
+            # Confidence: combine drift magnitude, attribution strength, and DAG position.
+            n_ancestors = len(drifted_ancestors)
+            n_descendants = len(drifted_descendants)
+            if is_root and n_descendants > 0:
+                # Root cause with downstream effects: high confidence.
+                confidence = min(0.5 + 0.3 * drift_strength + 0.2 * attribution_strength, 1.0)
+            elif is_root and n_descendants == 0:
+                # Isolated source: moderate confidence (no downstream confirmation).
+                confidence = min(0.4 + 0.3 * drift_strength + 0.2 * attribution_strength, 1.0)
+            elif is_symptom:
+                # Symptom: confidence increases with number of drifted ancestors.
+                confidence = min(0.5 + 0.2 * min(n_ancestors, 3) / 3.0 + 0.2 * drift_strength, 1.0)
+            else:
+                confidence = 0.0
+
             d = DriftedFeature(
                 column=col,
                 status=fres.status,
@@ -465,6 +551,7 @@ class DriftRootCauseAnalyzer:
                 abs_delta_prediction=round(abs(attributions.get(col, 0.0)), 6),
                 is_root_cause=is_root,
                 is_symptom=is_symptom,
+                root_cause_confidence=round(confidence, 4),
                 upstream_ancestors=sorted(ancestors),
                 downstream_descendants=sorted(drifted_descendants),
                 remediation="",
@@ -479,6 +566,8 @@ class DriftRootCauseAnalyzer:
         if not drifted_cols:
             prescriptions.append("No material drift detected; no remediation required.")
         else:
+            # Build a lookup for confidence by column.
+            conf_lookup = {f.column: f.root_cause_confidence for f in feature_details}
             for rc in root_causes:
                 drift_result: FeatureDriftResult | None = drift_map.get(rc)
                 psi_str = (
@@ -487,18 +576,23 @@ class DriftRootCauseAnalyzer:
                     else "PSI=n/a"
                 )
                 attr = attributions.get(rc, 0.0)
+                conf = conf_lookup.get(rc, 0.0)
+                conf_str = f"confidence={conf:.2f}"
                 prescriptions.append(
-                    f"ROOT CAUSE '{rc}' ({psi_str}): investigate upstream sensor/source "
-                    f"feed for '{rc}' (attributed prediction shift {attr:+.4f}); "
-                    f"check calibration, sensor drift, or upstream ETL change."
+                    f"ROOT CAUSE '{rc}' ({psi_str}, {conf_str}): investigate upstream "
+                    f"sensor/source feed for '{rc}' (attributed prediction shift "
+                    f"{attr:+.4f}); check calibration, sensor drift, or upstream ETL change."
                 )
             for sym in symptoms:
                 anc = ", ".join(
                     sorted(CausalDiscovery.upstream_ancestors(parents, sym) & drifted_set)
                 )
+                conf = conf_lookup.get(sym, 0.0)
+                conf_str = f"confidence={conf:.2f}"
                 prescriptions.append(
-                    f"SYMPTOM '{sym}': downstream effect of drifted upstream cause(s) "
-                    f"[{anc}]; do not remediate '{sym}' directly — fix the upstream root cause(s)."
+                    f"SYMPTOM '{sym}' ({conf_str}): downstream effect of drifted upstream "
+                    f"cause(s) [{anc}]; do not remediate '{sym}' directly — fix the "
+                    f"upstream root cause(s)."
                 )
             if not root_causes and drifted_cols:
                 prescriptions.append(
