@@ -9,6 +9,7 @@ import re
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from types import ModuleType
 from typing import Any, cast
 from uuid import uuid4
 
@@ -19,7 +20,7 @@ try:
 
     _HAS_STRUCTLOG = True
 except ImportError:
-    structlog = None
+    structlog = cast(ModuleType | None, None)
     _HAS_STRUCTLOG = False
 
 _TRACE_ID_CTX: contextvars.ContextVar[str] = contextvars.ContextVar(
