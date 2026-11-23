@@ -424,7 +424,7 @@ class InterpretabilityEngine:
             "per_feature": per_feature,
             "top_shifted_features": [
                 {"feature": f, "shift": round(v["shift"], 6), "abs_shift": round(v["abs_shift"], 6)}
-                for f, v in top_shifted[:10]
+                for f, v in top_shifted
             ],
         }
 
@@ -487,6 +487,6 @@ class InterpretabilityEngine:
             "finite_sample_valid": bool(finite_sample_valid),
             "prediction": round(pred, 6),
             "interval": [lower, upper],
-            "half_width": round(float(q_hat), 6),
+            "half_width": float(upper - lower) / 2,
             "n_calibration": int(len(scores)),
         }
