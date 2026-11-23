@@ -375,9 +375,9 @@ def test_second_pass_fairness_kalman_mad_and_clustering() -> None:
     """Verify zero-selection fairness parity, Joseph Kalman PSD stability, exact rolling MAD, and clustering medians."""
     # Fairness: all-zero predictions across groups must give disparate_impact_ratio == 1.0
     rep = FairnessAuditor().audit(
-        y_true=np.array([1, 0, 1, 0, 0, 0]),
-        y_pred=np.zeros(6, dtype=int),
-        sensitive_features=np.array(["A", "A", "A", "B", "B", "B"]),
+        y_true=np.array([1, 0, 1, 0, 1, 0, 1, 0]),
+        y_pred=np.zeros(8, dtype=int),
+        sensitive_features=np.array(["A", "A", "A", "A", "B", "B", "B", "B"]),
     )
     assert rep.disparate_impact_ratio == 1.0 and rep.equal_opportunity_diff == 0.0
 

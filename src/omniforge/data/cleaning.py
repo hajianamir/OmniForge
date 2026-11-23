@@ -389,7 +389,7 @@ class DataCleaner:
                     mf_work[c] = mf_work[c].fillna(self._state.numeric_fill_values.get(c, 0.0))
                 for c in usable:
                     obs_mask = work[c].notna().to_numpy()
-                    if obs_mask.sum() < 3:
+                    if obs_mask.sum() < 2:
                         continue
                     pred_cols = [oc for oc in usable if oc != c]
                     rf = RandomForestRegressor(n_estimators=50, random_state=42, n_jobs=-1)
@@ -889,6 +889,21 @@ class DataCleaner:
                                 df[col] = df[col].cat.add_categories([val])
                         df[col] = df[col].fillna(val)
                         imputed[col] = nulls
+
+        # Safety net: ensure no numeric column leaves _impute_missing with NaNs when
+        # an imputation method is configured. Fill any stragglers with the learned
+        # per-column fill value (median by default) so missing_after is always 0.
+        if self.config.numeric_imputation != "none":
+            for col in df.select_dtypes(include=[np.number]).columns:
+                if col in excluded:
+                    continue
+                nulls = int(df[col].isna().sum())
+                if nulls > 0:
+                    fill_val = self._state.numeric_fill_values.get(
+                        str(col), self.config.constant_fill_numeric
+                    )
+                    df[col] = df[col].fillna(fill_val)
+                    imputed[str(col)] = imputed.get(str(col), 0) + nulls
 
         return df, imputed
 

@@ -197,6 +197,25 @@ class FairnessAuditor:
 
         violations: list[str] = []
         recommendations: list[str] = []
+
+        # Equalized odds requires comparable TPR and FPR across >= 2 groups.
+        # If some groups lack positives or negatives (null TPR/FPR), the metric
+        # is undefined for those groups and must be flagged as a violation rather
+        # than silently reported as 0.0 (which would falsely appear "fair").
+        if len(groups) >= 2:
+            if len(tprs) < len(groups):
+                violations.append(
+                    f"Equalized odds undefined: {len(groups) - len(tprs)} group(s) have no positive labels (TPR unavailable)."
+                )
+                eopp_diff = float("nan")
+                eodds_diff = float("nan")
+            if len(fprs) < len(groups):
+                violations.append(
+                    f"Equalized odds undefined: {len(groups) - len(fprs)} group(s) have no negative labels (FPR unavailable)."
+                )
+                fpr_diff = float("nan")
+                eodds_diff = float("nan")
+
         if di_ratio < self.disparate_impact_min:
             violations.append(
                 f"Disparate impact ratio ({di_ratio:.3f}, 95% CI [{di_ci[0]:.3f}, {di_ci[1]:.3f}]) below 4/5ths threshold ({self.disparate_impact_min:.2f})."
