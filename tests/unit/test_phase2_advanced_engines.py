@@ -9,6 +9,7 @@ import pandas as pd
 from omniforge.automl.backends import (
     AutoMLBackendHub,
     GeneticPipelineAutoML,
+    MetaFeatureWarmStartAutoML,
     MetaLearningBayesianAutoML,
     MultiLayerStackingAutoML,
     probe_automl_backends,
@@ -91,8 +92,9 @@ def test_phase2_1_multi_backend_automl_hub() -> None:
     gen_res = gen.fit(X_tr, y_tr, X_va, y_va, task_type=TaskType.BINARY_CLASSIFICATION)
     assert gen_res["best_score"] >= 0.65
 
-    # 3. Native Meta-Learning Bayesian Search
-    meta = MetaLearningBayesianAutoML(cv_folds=3)
+    # 3. Native Meta-Feature Warm-Start portfolio (formerly misnamed …Bayesian…)
+    assert MetaLearningBayesianAutoML is MetaFeatureWarmStartAutoML  # deprecated alias retained
+    meta = MetaFeatureWarmStartAutoML(cv_folds=3)
     meta_res = meta.fit(X_tr, y_tr, X_va, y_va, task_type=TaskType.BINARY_CLASSIFICATION)
     assert meta_res["best_score"] >= 0.65
 

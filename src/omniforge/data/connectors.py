@@ -28,7 +28,7 @@ import sqlite3
 import subprocess
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import numpy as np
 import pandas as pd
@@ -45,6 +45,7 @@ _ALLOWED_SQL_BACKENDS: frozenset[str] = frozenset(
 )
 
 _ALLOWED_SQLITE_SUFFIXES: frozenset[str] = frozenset({".db", ".sqlite", ".sqlite3", ".s3db"})
+_ALLOWED_DUCKDB_SUFFIXES: frozenset[str] = frozenset({".duckdb", ".ddb"})
 _ALLOWED_ACCESS_SUFFIXES: frozenset[str] = frozenset({".accdb", ".mdb"})
 _SQLITE_MAGIC_HEADER: bytes = b"SQLite format 3\x00"
 
@@ -95,11 +96,25 @@ _READONLY_INTROSPECTION_PRAGMAS: frozenset[str] = frozenset(
 _FORBIDDEN_SQL_RE = re.compile(
     r"\b("
     r"DROP|DELETE|UPDATE|INSERT|ALTER|TRUNCATE|CREATE|REPLACE|ATTACH|DETACH|PRAGMA|"
-    r"VACUUM|REINDEX|EXPLAIN|EXEC|EXECUTE|MERGE|GRANT|REVOKE|CALL|DO|COPY|"
-    r"BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE|LOAD_EXTENSION|LOAD_FILE|OUTFILE|DUMPFILE"
+    r"VACUUM|REINDEX|EXPLAIN|EXEC|EXECUTE|MERGE|GRANT|REVOKE|CALL|DO|COPY|INSTALL|LOAD|"
+    r"BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE|LOAD_EXTENSION|LOAD_FILE|OUTFILE|DUMPFILE|"
+    r"READ_CSV|READ_CSV_AUTO|READ_PARQUET|READ_JSON|READ_JSON_AUTO|READ_TEXT|READ_BLOB|"
+    r"PARQUET_SCAN|CSV_SCAN|SQLITE_SCAN|POSTGRES_SCAN|MYSQL_SCAN|ICEBERG_SCAN|DELTA_SCAN"
     r")\b",
     re.IGNORECASE,
 )
+
+
+def _quote_dialect_identifier(ident: str, dialect: str) -> str:
+    """Quote a verified table/view identifier using dialect-exact escaping (CWE-89)."""
+    if not ident or "\x00" in ident:
+        raise SecurityError("Invalid empty or NUL-containing SQL identifier.")
+    d = dialect.lower()
+    if d in {"mysql", "mariadb"}:
+        return "`" + ident.replace("`", "``") + "`"
+    if d == "mssql":
+        return "[" + ident.replace("]", "]]") + "]"
+    return '"' + ident.replace('"', '""') + '"'
 
 
 def _strip_sql_comments_and_scan(query: str) -> tuple[str, str]:
@@ -226,6 +241,23 @@ def _validate_readonly_sql(query: str) -> str:
     return cleaned
 
 
+def validate_readonly_sql(query: str) -> str:
+    """Public wrapper over the internal read-only SQL validator (single SELECT/WITH only)."""
+    return _validate_readonly_sql(query)
+
+
+def make_sqlite_authorizer(
+    *,
+    allow_introspection_pragmas: bool = False,
+    allow_read_uncommitted: bool = False,
+) -> Any:
+    """Public wrapper exposing the C-level read-only SQLite authorizer."""
+    return _make_sqlite_authorizer(
+        allow_introspection_pragmas=allow_introspection_pragmas,
+        allow_read_uncommitted=allow_read_uncommitted,
+    )
+
+
 def _allowed_local_db_roots() -> list[Path]:
     """Return canonical directories from which local SQLite / Access files may be opened."""
     settings = get_settings()
@@ -326,6 +358,49 @@ def _make_sqlite_authorizer(
     return _authorizer
 
 
+def _expand_ip_candidates(
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Expand an IP address with any embedded IPv4 transition targets (v4-mapped, 6to4, Teredo)."""
+    candidates: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = [ip]
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            candidates.append(ip.ipv4_mapped)
+        if ip.sixtofour is not None:
+            candidates.append(ip.sixtofour)
+        if ip.teredo is not None:
+            candidates.extend(ip.teredo)
+    return candidates
+
+
+def _assert_ip_not_ssrf(
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    *,
+    norm_host: str,
+    allowed_hosts: set[str],
+    allow_private: bool,
+    kind_label: str,
+    allowlist_env: str,
+    private_env: str,
+) -> None:
+    """Enforce link-local/metadata unconditional block and private/loopback policy across IP + v6 transition forms."""
+    for cand in _expand_ip_candidates(ip):
+        if (
+            cand.is_link_local
+            or cand.is_multicast
+            or cand.is_unspecified
+            or str(cand) in _BLOCKED_METADATA_HOSTS
+        ):
+            raise SecurityError(f"Blocked link-local/metadata {kind_label} target '{ip}'.")
+        if (cand.is_private or cand.is_loopback or cand.is_reserved) and (
+            norm_host not in allowed_hosts and not allow_private
+        ):
+            raise SecurityError(
+                f"Blocked private/loopback {kind_label} host '{norm_host}' ({ip}) to prevent SSRF. "
+                f"Add the host to {allowlist_env} or set {private_env}=true."
+            )
+
+
 def _validate_remote_db_host(host: str | None, port: int | None) -> None:
     """Block SSRF against cloud metadata services and unauthorized private/loopback endpoints."""
     if not host or not host.strip():
@@ -336,7 +411,7 @@ def _validate_remote_db_host(host: str | None, port: int | None) -> None:
         raise SecurityError(f"Blocked SSRF database host '{norm_host}'.")
 
     allowed_hosts = {
-        h.strip().lower()
+        h.strip().lower().rstrip(".")
         for h in os.getenv("OMNIFORGE_ALLOWED_DB_HOSTS", "").split(",")
         if h.strip()
     }
@@ -359,19 +434,83 @@ def _validate_remote_db_host(host: str | None, port: int | None) -> None:
             raise DataIngestionError(f"Unable to resolve SQL database host '{norm_host}': {exc}") from exc
 
     for ip in resolved_ips:
-        if ip.is_link_local or ip.is_multicast or ip.is_unspecified or str(ip) in _BLOCKED_METADATA_HOSTS:
-            raise SecurityError(f"Blocked link-local/metadata database target '{ip}'.")
-        if (ip.is_private or ip.is_loopback or ip.is_reserved) and (
-            norm_host not in allowed_hosts and not allow_private
-        ):
-            raise SecurityError(
-                f"Blocked private/loopback database host '{norm_host}' ({ip}) to prevent SSRF. "
-                "Add the host to OMNIFORGE_ALLOWED_DB_HOSTS or set OMNIFORGE_ALLOW_PRIVATE_DB_HOSTS=true."
-            )
+        _assert_ip_not_ssrf(
+            ip,
+            norm_host=norm_host,
+            allowed_hosts=allowed_hosts,
+            allow_private=allow_private,
+            kind_label="database",
+            allowlist_env="OMNIFORGE_ALLOWED_DB_HOSTS",
+            private_env="OMNIFORGE_ALLOW_PRIVATE_DB_HOSTS",
+        )
+
+
+def validate_outbound_http_url(url: str) -> str:
+    """Validate an outbound HTTP(S) URL against SSRF, cloud metadata, and control-char injection."""
+    if not isinstance(url, str) or not url.strip():
+        raise DataIngestionError("HTTP URL cannot be empty.")
+    cleaned = url.strip()
+    if any(ch in cleaned for ch in ("\x00", "\r", "\n")):
+        raise SecurityError("Control characters (NUL/CR/LF) are forbidden in outbound HTTP URLs.")
+
+    parsed = urlparse(cleaned)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise SecurityError(f"Unsupported outbound HTTP URL scheme '{scheme or '<none>'}'.")
+
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise SecurityError(f"Invalid port in outbound HTTP URL: {exc}") from exc
+
+    host = parsed.hostname
+    if not host or not host.strip():
+        raise SecurityError("Outbound HTTP URL must specify a valid hostname.")
+
+    norm_host = host.strip().lower().rstrip(".")
+    if norm_host in _BLOCKED_METADATA_HOSTS:
+        raise SecurityError(f"Blocked SSRF HTTP host '{norm_host}'.")
+
+    allowed_hosts = {
+        h.strip().lower().rstrip(".")
+        for h in os.getenv("OMNIFORGE_ALLOWED_HTTP_HOSTS", "").split(",")
+        if h.strip()
+    }
+    allow_private = os.getenv("OMNIFORGE_ALLOW_PRIVATE_HTTP_HOSTS", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+    resolved_ips: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    try:
+        resolved_ips.append(ipaddress.ip_address(norm_host))
+    except ValueError:
+        try:
+            default_port = 443 if scheme == "https" else 80
+            addr_info = socket.getaddrinfo(norm_host, port or default_port, type=socket.SOCK_STREAM)
+            for info in addr_info:
+                ip_str = str(info[4][0]).split("%", 1)[0]
+                resolved_ips.append(ipaddress.ip_address(ip_str))
+        except OSError as exc:
+            raise DataIngestionError(f"Unable to resolve HTTP host '{norm_host}': {exc}") from exc
+
+    for ip in resolved_ips:
+        _assert_ip_not_ssrf(
+            ip,
+            norm_host=norm_host,
+            allowed_hosts=allowed_hosts,
+            allow_private=allow_private,
+            kind_label="HTTP",
+            allowlist_env="OMNIFORGE_ALLOWED_HTTP_HOSTS",
+            private_env="OMNIFORGE_ALLOW_PRIVATE_HTTP_HOSTS",
+        )
+
+    return cleaned
 
 
 def _normalize_sql_url(connection_url: str) -> str:
-    """Normalize a raw SQLite path or SQLAlchemy URL into a validated SQLAlchemy URL."""
+    """Normalize a raw SQLite/DuckDB path or SQLAlchemy URL into a validated connection URL."""
     url = connection_url.strip()
     if not url:
         raise DataIngestionError("Database connection string cannot be empty.")
@@ -379,8 +518,33 @@ def _normalize_sql_url(connection_url: str) -> str:
         raise SecurityError("NUL bytes are forbidden in database connection strings.")
     if "://" not in url:
         p = Path(url).expanduser()
+        if p.suffix.lower() in _ALLOWED_DUCKDB_SUFFIXES:
+            return f"duckdb:///{p.as_posix()}"
         return f"sqlite:///{p.as_posix()}"
     return url
+
+
+def _resolve_duckdb_url_path(connection_url: str) -> Path | None:
+    """If ``connection_url`` targets DuckDB, enforce workspace confinement and return the resolved Path."""
+    norm = _normalize_sql_url(connection_url)
+    if not norm.lower().startswith("duckdb://"):
+        return None
+    raw_target = norm[len("duckdb://") :]
+    if raw_target.startswith("/"):
+        # duckdb:///abs/path or duckdb://rel -> preserve leading slash for absolute POSIX paths
+        db_target = raw_target[1:] if (len(raw_target) >= 3 and raw_target[2] == ":") else raw_target
+        if not Path(db_target).is_absolute() and raw_target.startswith("/") and not raw_target.startswith("//"):
+            db_target = raw_target[1:]
+    else:
+        db_target = raw_target
+    db_target = db_target.strip()
+    if not db_target or db_target == ":memory:":
+        raise SecurityError("In-memory or empty DuckDB URLs are not permitted on connector endpoints.")
+    return _resolve_allowed_local_db_path(
+        db_target,
+        allowed_suffixes=_ALLOWED_DUCKDB_SUFFIXES,
+        verify_sqlite_magic=False,
+    )
 
 
 def _create_readonly_sql_engine(
@@ -534,6 +698,42 @@ def ensure_demo_sqlite_database(workspace_dir: Path | None = None) -> Path:
 
 def sql_inspect_database(connection_url: str) -> dict[str, Any]:
     """Connect read-only to a validated SQL database and list tables/views with row counts."""
+    duck_path = _resolve_duckdb_url_path(connection_url)
+    if duck_path is not None:
+        try:
+            import duckdb
+        except ImportError as exc:
+            raise DataIngestionError("Install 'duckdb' to inspect DuckDB databases.") from exc
+        try:
+            with duckdb.connect(
+                str(duck_path), read_only=True, config={"enable_external_access": False}
+            ) as dconn:
+                rows = dconn.execute("SHOW TABLES").fetchall()
+                details_duck: list[dict[str, Any]] = []
+                for (tbl_raw,) in rows[:80]:
+                    tbl_s = str(tbl_raw)
+                    q_tbl = _quote_dialect_identifier(tbl_s, "duckdb")
+                    desc = dconn.execute(f"DESCRIBE {q_tbl}").fetchall()
+                    cols = [str(r[0]) for r in desc]
+                    cnt_row = dconn.execute(f"SELECT COUNT(*) FROM {q_tbl}").fetchone()
+                    cnt_v = int(cnt_row[0]) if cnt_row is not None else 0
+                    details_duck.append({"name": tbl_s, "columns": cols, "n_columns": len(cols), "row_count": cnt_v})
+            return cast(
+                dict[str, Any],
+                to_json_safe(
+                    {
+                        "connected": True,
+                        "dialect": "duckdb",
+                        "tables": details_duck,
+                        "table_names": [d["name"] for d in details_duck],
+                    }
+                ),
+            )
+        except (SecurityError, DataIngestionError):
+            raise
+        except Exception as exc:
+            raise DataIngestionError(f"DuckDB inspection failed ({type(exc).__name__}): {exc}") from exc
+
     from sqlalchemy import inspect, text
 
     engine, dialect_name = _create_readonly_sql_engine(
@@ -550,8 +750,8 @@ def sql_inspect_database(connection_url: str) -> dict[str, Any]:
                 cols = [c["name"] for c in insp.get_columns(tbl)]
                 row_cnt = None
                 try:
-                    safe_tbl = tbl.replace('"', '""')
-                    row_cnt = int(conn.execute(text(f'SELECT COUNT(*) FROM "{safe_tbl}"')).scalar() or 0)
+                    q_tbl = _quote_dialect_identifier(tbl, dialect_name)
+                    row_cnt = int(conn.execute(text(f"SELECT COUNT(*) FROM {q_tbl}")).scalar() or 0)
                 except Exception:
                     row_cnt = None
                 details.append(
@@ -590,6 +790,42 @@ def sql_load_dataframe(
     limit: int = 100_000,
 ) -> pd.DataFrame:
     """Load a verified table or read-only SQL query from a validated database."""
+    duck_path = _resolve_duckdb_url_path(connection_url)
+    if duck_path is not None:
+        try:
+            import duckdb
+        except ImportError as exc:
+            raise DataIngestionError("Install 'duckdb' to load DuckDB databases.") from exc
+        row_limit = int(max(1, min(limit, 500_000)))
+        if query and query.strip():
+            sql_q = _validate_readonly_sql(query)
+            try:
+                with duckdb.connect(
+                    str(duck_path), read_only=True, config={"enable_external_access": False}
+                ) as dconn:
+                    return dconn.execute(sql_q).df().head(row_limit)
+            except (SecurityError, DataIngestionError):
+                raise
+            except Exception as exc:
+                raise DataIngestionError(f"DuckDB query execution failed: {exc}") from exc
+        if not table_name or not table_name.strip():
+            raise DataIngestionError("Provide either a table name or a read-only SQL SELECT query.")
+        req_tbl = table_name.strip()
+        try:
+            with duckdb.connect(
+                str(duck_path), read_only=True, config={"enable_external_access": False}
+            ) as dconn:
+                valid_names = [str(r[0]) for r in dconn.execute("SHOW TABLES").fetchall()]
+                canonical = next((n for n in valid_names if n == req_tbl), None)
+                if canonical is None:
+                    raise DataIngestionError(f"Table or view '{req_tbl}' was not found in the target database.")
+                q_tbl = _quote_dialect_identifier(canonical, "duckdb")
+                return dconn.execute(f"SELECT * FROM {q_tbl} LIMIT {row_limit}").df()
+        except (SecurityError, DataIngestionError):
+            raise
+        except Exception as exc:
+            raise DataIngestionError(f"DuckDB query execution failed: {exc}") from exc
+
     from sqlalchemy import inspect, text
 
     if query and query.strip():
@@ -637,9 +873,9 @@ def sql_load_dataframe(
                 raise DataIngestionError(
                     f"Table or view '{requested_table}' was not found in the target database."
                 )
-            safe_tbl = requested_table.replace('"', '""')
+            q_tbl = _quote_dialect_identifier(requested_table, dialect_name)
             row_limit = int(max(1, min(limit, 500_000)))
-            sql = f'SELECT * FROM "{safe_tbl}" LIMIT {row_limit}'
+            sql = f"SELECT * FROM {q_tbl} LIMIT {row_limit}"
             if dialect_name == "postgresql":
                 conn = conn.execution_options(postgresql_readonly=True)
             df = pd.read_sql_query(text(sql), conn)

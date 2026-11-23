@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import os
+
+# The suite issues well over 300 requests/minute to the shared in-process app; the
+# SlidingWindowRateLimitMiddleware would 429 later tests. Disable the limiter for tests
+# (the limiter itself is unit-tested directly in tests/unit/test_request_limits.py).
+os.environ.setdefault("OMNIFORGE_API__RATE_LIMIT_PER_MINUTE", "0")
+
 from pathlib import Path
 
 import pandas as pd

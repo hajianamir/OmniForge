@@ -1,22 +1,20 @@
-# ruff: noqa: E402
-# mypy: ignore-errors
+"""Studio 12 (Customizable Executive Reporting & Export Center) router."""
+
 from __future__ import annotations
 
 import io
 import tempfile
 from pathlib import Path
-
-"""s12_reports router."""
-
-
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import StreamingResponse
 
-from omniforge.reporting import REPORT_PRESETS, REPORT_SECTIONS_CATALOG, ReportGenerator
+from omniforge.api.studios.schemas import ReportCompileReq, wb_cache_and_respond
 from omniforge.core.performance import downsample_table_for_plot
+from omniforge.core.utils import to_json_object
+from omniforge.reporting import REPORT_PRESETS, REPORT_SECTIONS_CATALOG, ReportGenerator
 
 router = APIRouter(tags=["workbench-s12"])
 
@@ -29,27 +27,40 @@ def _wb() -> Any:
 @router.get("/s12/catalog")
 def s12_report_catalog(x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     state = _wb().get_session_state(_wb()._sid(x_session_id))
+    has_df = isinstance(state.get("uap_df"), pd.DataFrame)
     avail_map = {
-        "executive_summary": isinstance(state.get("uap_df"), pd.DataFrame),
-        "dataset_overview": isinstance(state.get("uap_df"), pd.DataFrame),
+        "executive_summary": has_df,
+        "analyses_performed": bool(state.get("uap_lineage")) or has_df,
+        "data_exclusions": bool(
+            state.get("uap_clean_report") or state.get("uap_exclusions") or state.get("uap_deleted_data_log")
+        ),
         "intake_audit": bool(state.get("uap_intake_audit")),
-        "data_quality": isinstance(state.get("uap_df"), pd.DataFrame),
-        "cleaning_lineage": bool(state.get("uap_clean_report") or state.get("uap_exclusions") or state.get("uap_deleted_data_log")),
-        "universal_diagnostics": bool(state.get("uap_diag_report")),
-        "baseline_benchmarks": bool(state.get("uap_baseline_results") or state.get("uap_baseline_equations")),
-        "risk_assessment": bool(state.get("uap_risk_report")),
-        "clustering_anomalies": bool(state.get("uap_clustering_result") or state.get("uap_anomaly_meta") or state.get("uap_mining_result")),
-        "eda_visuals": bool(state.get("uap_eda_report") or isinstance(state.get("uap_df"), pd.DataFrame)),
+        "quality_diagnostics": bool(state.get("uap_diag_report") or state.get("uap_quality")) or has_df,
+        "clustering_anomalies": bool(
+            state.get("uap_clustering_result") or state.get("uap_anomaly_meta") or state.get("uap_mining_result")
+        ),
+        "eda_hypothesis": bool(state.get("uap_eda_report") or state.get("uap_hypothesis_battery")) or has_df,
         "feature_engineering": bool(state.get("uap_fs_scores") or state.get("uap_s05_engineered")),
-        "automl_leaderboard": bool(state.get("uap_automl") or state.get("uap_active_model")),
-        "deep_learning_bench": bool(state.get("uap_dl_benchmark_df") is not None),
-        "model_equations": bool(state.get("uap_baseline_equations") or state.get("uap_model_equations")),
-        "explainability": bool(state.get("uap_shap_result")),
-        "fairness_ethics": bool(state.get("uap_fairness_result")),
-        "forecasting_causal": bool(state.get("uap_causal_result") or state.get("uap_forecast_result")),
-        "future_predictions": bool(state.get("uap_supervisory_result") or state.get("uap_future_scores") is not None),
-        "recommendations": isinstance(state.get("uap_df"), pd.DataFrame),
-        "dataset_appendix": isinstance(state.get("uap_df"), pd.DataFrame),
+        "modeling_leaderboard": bool(
+            state.get("uap_automl") or state.get("uap_active_model") or state.get("uap_dl_benchmark_df") is not None
+        ),
+        "mathematical_equations": bool(state.get("uap_baseline_equations") or state.get("uap_model_equations")),
+        "future_predictions": bool(
+            state.get("uap_supervisory_result")
+            or state.get("uap_future_prediction_result")
+            or state.get("uap_future_scores") is not None
+        ),
+        "responsible_ai_governance": bool(state.get("uap_shap_result") or state.get("uap_fairness_result")),
+        "decision_intelligence": bool(
+            state.get("uap_causal_result")
+            or state.get("uap_forecast_report")
+            or state.get("uap_forecast_result")
+            or state.get("uap_opt_result")
+            or state.get("uap_sim_result")
+            or state.get("uap_risk_report")
+        ),
+        "recommendations": has_df,
+        "dataset_appendix": has_df,
     }
     catalog = [
         {
@@ -62,7 +73,7 @@ def s12_report_catalog(x_session_id: str | None = Header(default="default")) -> 
         }
         for spec in REPORT_SECTIONS_CATALOG
     ]
-    return _wb().to_json_object(
+    return to_json_object(
         {
             "sections": catalog,
             "presets": REPORT_PRESETS,
@@ -71,14 +82,14 @@ def s12_report_catalog(x_session_id: str | None = Header(default="default")) -> 
     )
 
 
-def _compile_report_payload(state: dict[str, Any], req: _wb().ReportCompileReq) -> dict[str, Any]:
+def _compile_report_payload(state: dict[str, Any], req: ReportCompileReq) -> dict[str, Any]:
     df = _wb()._require_df(state)
     raw_df = state.get("uap_raw_df")
     quality = state.get("uap_quality")
     if quality is None:
         quality = _wb().DataQualityProfiler().profile(df)
         state["uap_quality"] = quality
-    q_dict: dict[str, Any] = _wb().to_json_object(
+    q_dict: dict[str, Any] = to_json_object(
         quality.model_dump() if hasattr(quality, "model_dump") else quality
     )
     targets = _wb().get_selected_targets(state, df)
@@ -95,6 +106,7 @@ def _compile_report_payload(state: dict[str, Any], req: _wb().ReportCompileReq) 
         quality_report=q_dict,
         model_summary={"active_model": state.get("uap_active_model_name"), "metrics": state.get("uap_active_model_metrics")} if state.get("uap_active_model_name") else None,
         fairness_report=state.get("uap_fairness_result"),
+        analyses_performed=state.get("uap_lineage"),
         exclusions=state.get("uap_exclusions"),
         df=downsample_table_for_plot(df, max_rows=15_000),
         raw_df=downsample_table_for_plot(raw_df, max_rows=15_000) if isinstance(raw_df, pd.DataFrame) else None,
@@ -109,7 +121,9 @@ def _compile_report_payload(state: dict[str, Any], req: _wb().ReportCompileReq) 
         model_equations=state.get("uap_model_equations"),
         automl_result=state.get("uap_automl"),
         dl_benchmark_df=state.get("uap_dl_benchmark_df"),
+        future_prediction_result=state.get("uap_future_prediction_result"),
         causal_result=state.get("uap_causal_result"),
+        forecast_report=state.get("uap_forecast_report"),
     )
 
     # Enrich payload with Task 33 sections/tables when selected (Intake Audit, Data Mining, Hypothesis Battery, Supervisory Alarms)
@@ -122,17 +136,21 @@ def _compile_report_payload(state: dict[str, Any], req: _wb().ReportCompileReq) 
         defects = ia.get("defects") or []
         pre_tests = ia.get("statistical_pretests") or []
         dc = ia.get("defect_counts") or {}
+        ia_title = "Automatic Post-Ingestion Defect Audit & Statistical Pre-Screening"
+        ia_body = (
+            f"Automatic intake audit detected {dc.get('total', len(defects))} data defects "
+            f"({dc.get('critical', 0)} Critical, {dc.get('high', 0)} High, {dc.get('medium', 0)} Medium) "
+            f"with overall readiness score {ia.get('quality_score', 0):.1f}/100 (Grade {ia.get('quality_grade', 'N/A')} — {ia.get('overall_health', '')})."
+        )
         sections.insert(
             min(2, len(sections)),
             {
                 "section_id": "intake_audit",
-                "title": "Automatic Post-Ingestion Defect Audit & Statistical Pre-Screening",
+                "heading": ia_title,
+                "title": ia_title,
                 "category": "Data",
-                "narrative": (
-                    f"Automatic intake audit detected {dc.get('total', len(defects))} data defects "
-                    f"({dc.get('critical', 0)} Critical, {dc.get('high', 0)} High, {dc.get('medium', 0)} Medium) "
-                    f"with overall readiness score {ia.get('quality_score', 0):.1f}/100 (Grade {ia.get('quality_grade', 'N/A')} — {ia.get('overall_health', '')})."
-                ),
+                "body": ia_body,
+                "narrative": ia_body,
                 "bullets": [f"[{str(d.get('severity', '')).upper()}] {d.get('category', '')} ({d.get('column', '')}): {d.get('finding', '')}" for d in defects[:8]],
             },
         )
@@ -150,7 +168,11 @@ def _compile_report_payload(state: dict[str, Any], req: _wb().ReportCompileReq) 
         if req.include_tables and sg:
             tables["Subgroup Discovery"] = sg[: req.max_table_rows]
 
-    if "eda_visuals" in selected_set and isinstance(state.get("uap_hypothesis_battery"), list) and state["uap_hypothesis_battery"]:
+    if (
+        ("eda_hypothesis" in selected_set or "eda_visuals" in selected_set)
+        and isinstance(state.get("uap_hypothesis_battery"), list)
+        and state["uap_hypothesis_battery"]
+    ):
         if req.include_tables:
             tables["Hypothesis Test Battery"] = state["uap_hypothesis_battery"][: req.max_table_rows]
 
@@ -158,17 +180,21 @@ def _compile_report_payload(state: dict[str, Any], req: _wb().ReportCompileReq) 
         sr = state["uap_supervisory_result"]
         kpis = sr.get("kpis") or {}
         alarms = sr.get("alarms") or []
+        fp_title = "Live Prediction, Reality-vs-Baseline Comparison & Tolerance Alarm Audit"
+        fp_body = (
+            f"Supervisory evaluation of model '{kpis.get('model_label', 'Selected Model')}' vs baseline '{kpis.get('baseline_label', 'Baseline')}' "
+            f"across {kpis.get('n_records', 0)} live observations resulted in status {sr.get('system_status')} "
+            f"with {kpis.get('breach_count', 0)} tolerance breaches ({kpis.get('breach_rate_pct', 0):.2f}%) "
+            f"and {kpis.get('compliance_rate_pct', 100):.2f}% compliance."
+        )
         sections.append(
             {
                 "section_id": "future_predictions",
-                "title": "Live Prediction, Reality-vs-Baseline Comparison & Tolerance Alarm Audit",
+                "heading": fp_title,
+                "title": fp_title,
                 "category": "Operations",
-                "narrative": (
-                    f"Supervisory evaluation of model '{kpis.get('model_label', 'Selected Model')}' vs baseline '{kpis.get('baseline_label', 'Baseline')}' "
-                    f"across {kpis.get('n_records', 0)} live observations resulted in status {sr.get('system_status')} "
-                    f"with {kpis.get('breach_count', 0)} tolerance breaches ({kpis.get('breach_rate_pct', 0):.2f}%) "
-                    f"and {kpis.get('compliance_rate_pct', 100):.2f}% compliance."
-                ),
+                "body": fp_body,
+                "narrative": fp_body,
                 "bullets": [
                     f"System Status: {sr.get('system_status')}",
                     f"Critical Breaches: {kpis.get('breach_count', 0)} | Warnings: {kpis.get('warning_count', 0)} | Compliance: {kpis.get('compliance_rate_pct', 100):.1f}%",
@@ -181,12 +207,43 @@ def _compile_report_payload(state: dict[str, Any], req: _wb().ReportCompileReq) 
         if req.include_tables and isinstance(state.get("uap_supervisory_scored_df"), pd.DataFrame) and not state["uap_supervisory_scored_df"].empty:
             tables["Supervisory Scored Telemetry"] = state["uap_supervisory_scored_df"].head(req.max_table_rows).to_dict(orient="records")
 
+    if ("decision_intelligence" in selected_set or "forecasting_causal" in selected_set) and state.get("uap_forecast_report") is not None:
+        raw_fcr = state["uap_forecast_report"]
+        fcr: dict[str, Any] = raw_fcr if isinstance(raw_fcr, dict) else to_json_object(raw_fcr)
+        raw_cl = fcr.get("classical")
+        cl_sum: dict[str, Any] = (
+            raw_cl if isinstance(raw_cl, dict) else (to_json_object(raw_cl) if raw_cl is not None else fcr)
+        )
+        deep_fc = fcr.get("deep_forecast") or fcr.get("forecast") or []
+        if req.include_tables and isinstance(deep_fc, list) and deep_fc:
+            tables["Deep Time-Series Forecast"] = deep_fc[: req.max_table_rows]
+        if not any(s.get("section_id") in ("decision_intelligence", "forecasting_causal") for s in sections):
+            fc_title = "Time-Series Forecasting Tournament"
+            fc_body = (
+                f"Executed classical + deep ({str(fcr.get('deep_arch', 'nbeats')).upper()}) forecasting tournament "
+                f"(champion: {cl_sum.get('champion_model', 'Ensemble')}, horizon={cl_sum.get('horizon', len(deep_fc))})."
+            )
+            sections.append(
+                {
+                    "section_id": "decision_intelligence",
+                    "heading": fc_title,
+                    "title": fc_title,
+                    "category": "Decision Science",
+                    "body": fc_body,
+                    "narrative": fc_body,
+                    "bullets": [
+                        f"Classical Champion: {cl_sum.get('champion_model', 'N/A')}",
+                        f"Deep Architecture: {str(fcr.get('deep_arch', 'N/A')).upper()}",
+                    ],
+                }
+            )
+
     state["uap_report_payload"] = payload
-    return payload
+    return cast(dict[str, Any], payload)
 
 
 @router.post("/s12/compile")
-def s12_compile_report(req: _wb().ReportCompileReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
+def s12_compile_report(req: ReportCompileReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
     payload = _compile_report_payload(state, req)
@@ -222,7 +279,7 @@ def s12_compile_report(req: _wb().ReportCompileReq, x_session_id: str | None = H
                 "columns": [str(c) for c in trows.columns],
                 "preview": trows.head(15).to_dict(orient="records"),
             }
-    return _wb()._cache_and_respond(
+    return wb_cache_and_respond(
         state,
         sid,
         "s12_report",
@@ -232,9 +289,9 @@ def s12_compile_report(req: _wb().ReportCompileReq, x_session_id: str | None = H
             "sections": [
                 {
                     "id": s.get("section_id") or s.get("id"),
-                    "title": s.get("title"),
+                    "title": s.get("title") or s.get("heading"),
                     "category": s.get("category", "Report"),
-                    "narrative": s.get("narrative"),
+                    "narrative": s.get("narrative") if s.get("narrative") is not None else s.get("body"),
                     "highlights": s.get("bullets") or s.get("highlights") or [],
                 }
                 for s in payload.get("sections", [])
@@ -252,7 +309,7 @@ def s12_export_report(fmt: str, x_session_id: str | None = Header(default="defau
     state = _wb().get_session_state(_wb()._sid(x_session_id))
     payload = state.get("uap_report_payload")
     if payload is None:
-        payload = _compile_report_payload(state, _wb().ReportCompileReq())
+        payload = _compile_report_payload(state, ReportCompileReq())
     ext_map = {
         "docx": (".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
         "pdf": (".pdf", "application/pdf"),
@@ -270,7 +327,7 @@ def s12_export_report(fmt: str, x_session_id: str | None = Header(default="defau
     ext, media = ext_map[key]
     with tempfile.TemporaryDirectory() as tmpd:
         out_path = Path(tmpd) / f"omniforge_report{ext}"
-        exported = ReportGenerator().export(payload, out_path, fmt=key)
+        exported = ReportGenerator().export(payload, out_path, fmt=cast(Any, key))
         data = exported.read_bytes()
     return StreamingResponse(
         io.BytesIO(data),

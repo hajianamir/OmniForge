@@ -34,19 +34,37 @@ class ModelServingEngine:
         *,
         version: str = "1.0.0",
         canary_model: BaseOmniForgeModel | None = None,
+        canary_version: str | None = None,
         canary_traffic_ratio: float = 0.0,
     ) -> dict[str, Any]:
         """Mount a fitted model (and optional canary challenger) onto an active serving endpoint."""
+        resolved_canary_ver = (
+            canary_version
+            if canary_version is not None
+            else (f"{version}-canary" if canary_model is not None else None)
+        )
         self._endpoints[endpoint_name] = {
             "primary_model": model,
             "primary_version": version,
             "canary_model": canary_model,
+            "canary_version": resolved_canary_ver,
             "canary_ratio": float(np.clip(canary_traffic_ratio, 0.0, 1.0)),
             "requests": 0,
             "latencies_ms": [],
         }
-        logger.info("endpoint_deployed", endpoint=endpoint_name, version=version, canary_ratio=canary_traffic_ratio)
-        return {"endpoint": endpoint_name, "version": version, "status": "serving"}
+        logger.info(
+            "endpoint_deployed",
+            endpoint=endpoint_name,
+            version=version,
+            canary_version=resolved_canary_ver,
+            canary_ratio=canary_traffic_ratio,
+        )
+        return {
+            "endpoint": endpoint_name,
+            "version": version,
+            "canary_version": resolved_canary_ver,
+            "status": "serving",
+        }
 
     def deploy_from_registry(
         self, endpoint_name: str, model_name: str, stage: ModelStage = ModelStage.PRODUCTION
@@ -152,17 +170,31 @@ class ModelServingEngine:
 
         # 1. Native skl2onnx path when available and underlying sklearn estimator exists
         estimator = getattr(model, "_estimator", None) or getattr(model, "_model", None)
+        scaler = getattr(model, "_scaler", None)
         if estimator is not None:
             try:
                 from skl2onnx import convert_sklearn
                 from skl2onnx.common.data_types import FloatTensorType
+                from sklearn.pipeline import make_pipeline
 
+                export_target = make_pipeline(scaler, estimator) if scaler is not None else estimator
                 onnx_model = convert_sklearn(
-                    estimator, initial_types=[("float_input", FloatTensorType([None, n_features]))]
+                    export_target, initial_types=[("float_input", FloatTensorType([None, n_features]))]
                 )
                 dest.write_bytes(onnx_model.SerializeToString())
-                logger.info("model_exported_onnx", endpoint=endpoint_name, path=str(dest))
-                return {"endpoint": endpoint_name, "format": "onnx", "path": str(dest), "n_features": n_features}
+                logger.info(
+                    "model_exported_onnx",
+                    endpoint=endpoint_name,
+                    path=str(dest),
+                    includes_scaler=scaler is not None,
+                )
+                return {
+                    "endpoint": endpoint_name,
+                    "format": "onnx",
+                    "path": str(dest),
+                    "n_features": n_features,
+                    "includes_scaler": scaler is not None,
+                }
             except Exception as exc:
                 logger.debug("skl2onnx_export_unavailable_falling_back", endpoint=endpoint_name, error=str(exc))
 

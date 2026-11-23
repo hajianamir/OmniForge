@@ -72,7 +72,7 @@ def probe_automl_backends() -> list[dict[str, Any]]:
             "name": "OmniForge Leakage-Safe AutoML",
             "category": "Native Built-In",
             "available": True,
-            "version": "2.0.0",
+            "version": "4.0.0",
             "notes": "Stratified/Group/TimeSeries CV + ColumnTransformer + Optuna HPO + Baselines.",
             "native_equivalent": "omniforge_native",
         },
@@ -81,7 +81,7 @@ def probe_automl_backends() -> list[dict[str, Any]]:
             "name": "Multi-Layer Stack Ensemble (AutoGluon-Style Native)",
             "category": "Native Paper-Grade",
             "available": True,
-            "version": "2.0.0",
+            "version": "4.0.0",
             "notes": "K-fold OOF Layer-1 + Layer-2 stackers + Caruana greedy weighted ensemble selection.",
             "native_equivalent": "multi_layer_stacker",
         },
@@ -90,7 +90,7 @@ def probe_automl_backends() -> list[dict[str, Any]]:
             "name": "Evolutionary Genetic Pipeline Search (TPOT-Style Native)",
             "category": "Native Paper-Grade",
             "available": True,
-            "version": "2.0.0",
+            "version": "4.0.0",
             "notes": "Genetic programming over imputer/scaler/feature-transform/estimator DAGs with tournament selection & elitism.",
             "native_equivalent": "genetic_pipeline",
         },
@@ -99,7 +99,7 @@ def probe_automl_backends() -> list[dict[str, Any]]:
             "name": "Meta-Learning Bayesian AutoML (Auto-sklearn/SMAC-Style Native)",
             "category": "Native Paper-Grade",
             "available": True,
-            "version": "2.0.0",
+            "version": "4.0.0",
             "notes": "14 dataset meta-features + landmarking warm-start + budgeted search + ensemble selection.",
             "native_equivalent": "meta_bayesian",
         },
@@ -672,8 +672,18 @@ class GeneticPipelineAutoML:
         }
 
 
-class MetaLearningBayesianAutoML:
-    """Auto-sklearn/SMAC-inspired Meta-Feature Landmarking + Warm-Started Pipeline Search & Ensemble."""
+class MetaFeatureWarmStartAutoML:
+    """Meta-feature landmarking + warm-started pipeline portfolio (warm-start heuristic, NOT GP-BO).
+
+    Auto-sklearn/SMAC-inspired portfolio selection: extracts 14 dataset meta-features
+    (including a fast DecisionTree landmarking probe), then warm-starts a small portfolio
+    of strong, cheap base estimators conditioned on those features (e.g. high-skew targets
+    pick ``RobustScaler``). Despite the historical class name, there is **no Gaussian-process
+    Bayesian optimization anywhere in this engine** — real GP-BO lives in
+    ``omniforge.automl.optimizer.HyperparameterOptimizer``.
+
+    ``MetaLearningBayesianAutoML`` is kept as a deprecated alias for backward compatibility.
+    """
 
     def __init__(self, *, cv_folds: int = 3, random_seed: int = 42) -> None:
         self.cv_folds = max(2, int(cv_folds))
@@ -825,6 +835,8 @@ class AutoMLBackendHub:
         split_strategy: SplitStrategyType = "auto",
         fallback_to_native: bool = True,
         random_seed: int = 42,
+        max_carbon_grams_co2e: float | None = None,
+        max_inference_latency_ms: float | None = None,
     ) -> MultiBackendAutoMLResult:
         """Run any selected AutoML engine with baseline comparison and optional native fallback."""
         if target_col not in df.columns:
@@ -943,7 +955,7 @@ class AutoMLBackendHub:
             )
 
         if exec_backend == "meta_bayesian":
-            res = MetaLearningBayesianAutoML(cv_folds=cv_folds, random_seed=random_seed).fit(X_tr, y_tr, X_va, y_va, resolved_task)
+            res = MetaFeatureWarmStartAutoML(cv_folds=cv_folds, random_seed=random_seed).fit(X_tr, y_tr, X_va, y_va, resolved_task)
             best_sc = float(res["best_score"])
             lift = (best_sc - best_bl_score) if is_clf else (best_bl_score - best_sc)
             return MultiBackendAutoMLResult(
@@ -970,6 +982,8 @@ class AutoMLBackendHub:
             cv_folds=cv_folds,
             split_strategy=split_strategy,
             random_seed=random_seed,
+            max_carbon_grams_co2e=max_carbon_grams_co2e,
+            max_inference_latency_ms=max_inference_latency_ms,
         ).fit(X_all, y_all)
         return MultiBackendAutoMLResult(
             requested_backend=req_backend,
@@ -1115,3 +1129,5 @@ class AutoMLBackendHub:
             }
 
         return None
+# Deprecated backward-compat alias (misleading name; kept so existing imports do not break).
+MetaLearningBayesianAutoML = MetaFeatureWarmStartAutoML

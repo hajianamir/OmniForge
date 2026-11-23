@@ -341,8 +341,8 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
           <ProvenancePill ws={ws} />
           {evalRes && (
             <>
-              <button className="btn btn-sm" onClick={() => apiDownload('/api/workbench/s14/export/csv', 'omniforge_supervisory_evaluation.csv')}>Export Scored CSV</button>
-              <button className="btn btn-sm" onClick={() => apiDownload('/api/workbench/s14/export/xlsx', 'omniforge_supervisory_evaluation.xlsx')}>Export Scored XLSX</button>
+              <button className="btn btn-sm" onClick={() => { apiDownload('/api/workbench/s14/export/csv', 'omniforge_supervisory_evaluation.csv').catch((e: unknown) => setErr(toErrorMessage(e))); }}>Export Scored CSV</button>
+              <button className="btn btn-sm" onClick={() => { apiDownload('/api/workbench/s14/export/xlsx', 'omniforge_supervisory_evaluation.xlsx').catch((e: unknown) => setErr(toErrorMessage(e))); }}>Export Scored XLSX</button>
             </>
           )}
         </div>

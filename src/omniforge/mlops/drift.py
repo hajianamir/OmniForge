@@ -109,6 +109,15 @@ class DriftDetector:
                 p_ref /= p_ref.sum()
                 p_cur /= p_cur.sum()
                 psi = float(max(0.0, np.sum((p_cur - p_ref) * np.log(p_cur / p_ref))))
+                # Lin (1991, IEEE Trans. Inf. Theory 37:145-151) base-2 categorical JSD in [0, 1]
+                r_prob = r_freq / max(float(r_freq.sum()), 1e-12)
+                c_prob = c_freq / max(float(c_freq.sum()), 1e-12)
+                m_prob = 0.5 * (r_prob + c_prob)
+                r_nz = r_prob > 0.0
+                c_nz = c_prob > 0.0
+                kl_rm = float(np.sum(r_prob[r_nz] * np.log2(r_prob[r_nz] / m_prob[r_nz])))
+                kl_cm = float(np.sum(c_prob[c_nz] * np.log2(c_prob[c_nz] / m_prob[c_nz])))
+                js_cat = float(np.clip(0.5 * (kl_rm + kl_cm), 0.0, 1.0))
                 # Two-sample Chi-square test of homogeneity on observed raw counts
                 cont = np.vstack(
                     [
@@ -131,6 +140,7 @@ class DriftDetector:
                         dtype=str(ref_s.dtype),
                         status=status,
                         psi=round(psi, 6),
+                        js_divergence=round(js_cat, 6),
                         chi2_p_value=round(float(p_val), 6),
                     )
                 )
@@ -177,7 +187,7 @@ class DriftDetector:
         current: np.ndarray,
         n_bins: int = 10,
     ) -> float:
-        """Compute Jensen-Shannon Divergence (base-2, bounded in [0, 1]) between two 1-D arrays."""
+        """Compute Lin (1991) base-2 Jensen-Shannon Divergence in ``[0, 1]`` using outlier-resilient quantile bins."""
         ref = np.asarray(reference, dtype=float).ravel()
         cur = np.asarray(current, dtype=float).ravel()
         ref = ref[np.isfinite(ref)]
@@ -189,15 +199,22 @@ class DriftDetector:
         edges = np.unique(np.quantile(combined, quantiles))
         if len(edges) < 2:
             return 0.0
+        if len(edges) == 2:
+            mid = 0.5 * (float(edges[0]) + float(edges[1]))
+            edges = np.array([-np.inf, mid, np.inf], dtype=float)
+        else:
+            edges[0] = -np.inf
+            edges[-1] = np.inf
         ref_counts, _ = np.histogram(ref, bins=edges)
         cur_counts, _ = np.histogram(cur, bins=edges)
-        p = ref_counts.astype(float) + 1e-9
-        q = cur_counts.astype(float) + 1e-9
-        p /= p.sum()
-        q /= q.sum()
+        p = ref_counts.astype(float) / max(float(ref_counts.sum()), 1.0)
+        q = cur_counts.astype(float) / max(float(cur_counts.sum()), 1.0)
         m = 0.5 * (p + q)
-        jsd = 0.5 * float(np.sum(p * np.log2(p / m))) + 0.5 * float(np.sum(q * np.log2(q / m)))
-        return float(np.clip(jsd, 0.0, 1.0))
+        p_nz = p > 0.0
+        q_nz = q > 0.0
+        kl_pm = float(np.sum(p[p_nz] * np.log2(p[p_nz] / m[p_nz])))
+        kl_qm = float(np.sum(q[q_nz] * np.log2(q[q_nz] / m[q_nz])))
+        return float(np.clip(0.5 * (kl_pm + kl_qm), 0.0, 1.0))
 
     @staticmethod
     def compute_psi(reference: np.ndarray, current: np.ndarray, n_bins: int = 10) -> float:
@@ -241,26 +258,8 @@ class DriftDetector:
 
     @staticmethod
     def _compute_js_numeric(reference: np.ndarray, current: np.ndarray, n_bins: int = 10) -> float:
-        ref = np.asarray(reference, dtype=float).ravel()
-        cur = np.asarray(current, dtype=float).ravel()
-        ref = ref[np.isfinite(ref)]
-        cur = cur[np.isfinite(cur)]
-        if len(ref) == 0 or len(cur) == 0:
-            return 0.0
-        lo = min(float(np.min(ref)), float(np.min(cur)))
-        hi = max(float(np.max(ref)), float(np.max(cur)))
-        if hi <= lo:
-            return 0.0
-        bins = np.linspace(lo, hi, max(2, int(n_bins)) + 1)
-        p, _ = np.histogram(ref, bins=bins)
-        q, _ = np.histogram(cur, bins=bins)
-        p_n = np.clip(p / max(float(p.sum()), 1.0), 1e-9, 1.0)
-        q_n = np.clip(q / max(float(q.sum()), 1.0), 1e-9, 1.0)
-        p_n /= p_n.sum()
-        q_n /= q_n.sum()
-        m = 0.5 * (p_n + q_n)
-        js = float(0.5 * np.sum(p_n * np.log(p_n / m)) + 0.5 * np.sum(q_n * np.log(q_n / m)))
-        return float(np.clip(js, 0.0, np.log(2.0)))
+        """Delegate to canonical Lin (1991) base-2 quantile-binned Jensen-Shannon Divergence in [0, 1]."""
+        return DriftDetector.compute_jensen_shannon_divergence(reference, current, n_bins=n_bins)
 
     @staticmethod
     def detect_concept_drift_page_hinkley(
@@ -354,8 +353,12 @@ class DriftDetector:
             if n < min_window_length:
                 continue
             w_arr = np.asarray(window, dtype=float)
+            w_range = float(np.max(w_arr) - np.min(w_arr))
+            if w_range <= 1e-15:
+                continue
             prefix_sum = np.cumsum(w_arr)
             total_sum = float(prefix_sum[-1])
+            ddof = np.log(4.0 * n / max(delta, 1e-12))
             for cut in range(1, n):
                 n0 = cut
                 n1 = n - cut
@@ -364,8 +367,8 @@ class DriftDetector:
                 mu0 = float(prefix_sum[cut - 1]) / n0
                 mu1 = (total_sum - float(prefix_sum[cut - 1])) / n1
                 m = 1.0 / (1.0 / n0 + 1.0 / n1)
-                ddof = np.log(4.0 * n / max(delta, 1e-12))
-                eps_cut = float(np.sqrt((1.0 / (2.0 * m)) * ddof))
+                # Bifet & Gavaldà (2007, SDM Theorem 1): Hoeffding bound scales with observed range R = max(W) - min(W)
+                eps_cut = w_range * float(np.sqrt((1.0 / (2.0 * m)) * ddof))
                 if abs(mu0 - mu1) >= eps_cut:
                     drift_indices.append(idx)
                     window = window[cut:]

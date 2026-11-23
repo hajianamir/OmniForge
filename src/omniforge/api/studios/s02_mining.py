@@ -8,10 +8,17 @@ import numpy as np
 import pandas as pd
 from fastapi import APIRouter, Header, HTTPException
 
+from omniforge.core.utils import to_json_object
 from omniforge.eda.statistics import distance_correlation
 from omniforge.models.clustering.clusterer import ClusteringEngine
 from omniforge.models.mining.miner import subgroup_beam_search
 from omniforge.ui.state import get_analysis_dataframe, get_selected_targets, get_session_state
+
+
+def _wb() -> Any:
+    from omniforge.api import workbench as wb
+
+    return wb
 
 router = APIRouter(tags=["workbench-s02"])
 
@@ -23,7 +30,7 @@ def s02_advanced_mining(
     x_session_id: str | None = Header(default="default"),
 ) -> dict[str, Any]:
     """Run Subgroup Beam Search, Bootstrap ARI Cluster Stability, and Distance Correlation."""
-    sid = (x_session_id or "default").strip() or "default"
+    sid = _wb()._sid(x_session_id)
     state = get_session_state(sid)
     raw = state.get("uap_df")
     if raw is None or len(raw) == 0:
@@ -42,10 +49,12 @@ def s02_advanced_mining(
         for col in num_feats:
             dcor_results[col] = distance_correlation(df[col], df[tgt])
 
-    return {
-        "target": tgt,
-        "beam_subgroups": subgroups,
-        "cluster_stability_ari": stability,
-        "hopkins_clustering_tendency": hopkins,
-        "distance_correlation": dcor_results,
-    }
+    return to_json_object(
+        {
+            "target": tgt,
+            "beam_subgroups": subgroups,
+            "cluster_stability_ari": stability,
+            "hopkins_clustering_tendency": hopkins,
+            "distance_correlation": dcor_results,
+        }
+    )

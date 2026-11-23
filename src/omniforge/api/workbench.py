@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import math
 import os
+import re
 import tempfile
+import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Literal
 
@@ -14,7 +18,6 @@ import numpy as np
 import pandas as pd
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import Response
-from pydantic import BaseModel, Field
 
 from omniforge.api.auth import require_workbench_auth
 from omniforge.api.jobs import job_manager
@@ -22,7 +25,7 @@ from omniforge.core.logging import get_logger
 from omniforge.core.performance import (
     compact_scatter_payload,
 )
-from omniforge.core.types import TaskType
+from omniforge.core.types import ModelStage, Principal, TaskType
 from omniforge.core.utils import to_json_object, to_json_safe
 from omniforge.data.cleaning import CleaningConfig, DataCleaner
 from omniforge.data.connectors import (
@@ -85,13 +88,154 @@ router = APIRouter(
 
 _SHARED_REGISTRY = ModelRegistry()
 _SHARED_TRACKER = ExperimentTracker()
+_TENANT_STORES_LOCK = threading.RLock()
+_TENANT_REGISTRIES: OrderedDict[str, ModelRegistry] = OrderedDict()
+_TENANT_TRACKERS: OrderedDict[str, ExperimentTracker] = OrderedDict()
+_MAX_TENANT_STORES = 128
+
+
+def _current_principal() -> Principal | None:
+    try:
+        from omniforge.api.auth import get_request_principal
+
+        return get_request_principal()
+    except Exception:
+        return None
+
+
+def _tenant_slug(tenant: str) -> str:
+    return hashlib.sha256(tenant.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def get_tenant_registry(principal: Principal | None = None) -> ModelRegistry:
+    """Return a tenant-isolated ModelRegistry (defaulting to _SHARED_REGISTRY for default-tenant)."""
+    p = principal if principal is not None else _current_principal()
+    tenant = str(getattr(p, "tenant_id", "") or "default-tenant") if p is not None else "default-tenant"
+    if tenant == "default-tenant":
+        return _SHARED_REGISTRY
+    with _TENANT_STORES_LOCK:
+        if tenant in _TENANT_REGISTRIES:
+            _TENANT_REGISTRIES.move_to_end(tenant)
+            return _TENANT_REGISTRIES[tenant]
+        slug = _tenant_slug(tenant)
+        base = Path("./.omniforge_workspace/tenants") / slug
+        reg = ModelRegistry(
+            db_path=base / "model_registry.db",
+            artifact_dir=base / "artifacts" / "registry",
+        )
+        _TENANT_REGISTRIES[tenant] = reg
+        while len(_TENANT_REGISTRIES) > _MAX_TENANT_STORES:
+            _TENANT_REGISTRIES.popitem(last=False)
+        return reg
+
+
+def get_tenant_tracker(principal: Principal | None = None) -> ExperimentTracker:
+    """Return a tenant-isolated ExperimentTracker (defaulting to _SHARED_TRACKER for default-tenant)."""
+    p = principal if principal is not None else _current_principal()
+    tenant = str(getattr(p, "tenant_id", "") or "default-tenant") if p is not None else "default-tenant"
+    if tenant == "default-tenant":
+        return _SHARED_TRACKER
+    with _TENANT_STORES_LOCK:
+        if tenant in _TENANT_TRACKERS:
+            _TENANT_TRACKERS.move_to_end(tenant)
+            return _TENANT_TRACKERS[tenant]
+        slug = _tenant_slug(tenant)
+        base = Path("./.omniforge_workspace/tenants") / slug
+        trk = ExperimentTracker(
+            db_path=base / "mlops_tracking.db",
+            artifact_root=base / "artifacts",
+        )
+        _TENANT_TRACKERS[tenant] = trk
+        while len(_TENANT_TRACKERS) > _MAX_TENANT_STORES:
+            _TENANT_TRACKERS.popitem(last=False)
+        return trk
+
+
+def parse_model_stage(raw_stage: str, *, error_status: int = 400) -> ModelStage:
+    """Case-insensitively parse a ModelStage enum or raise HTTPException."""
+    lookup = {s.value.lower(): s for s in ModelStage}
+    key = str(raw_stage or "").strip().lower()
+    if key not in lookup:
+        valid = [s.value for s in ModelStage]
+        raise HTTPException(
+            status_code=error_status,
+            detail=f"Unknown model stage {raw_stage!r}. Valid stages: {valid}",
+        )
+    return lookup[key]
+
+
+def current_job_owner_key(principal: Principal | None = None, *, for_query: bool = False) -> str | None:
+    """Compute the job ownership scope for the active caller (`None` only for `platform_admin` queries)."""
+    p = principal if principal is not None else _current_principal()
+    if p is None or not getattr(p, "subject", None):
+        return "default"
+    if for_query and "platform_admin" in set(getattr(p, "roles", []) or []):
+        return None
+    tenant = str(getattr(p, "tenant_id", "") or "default-tenant")
+    return f"job:{_owner_tag(tenant, str(p.subject))}"
+
+
+async def read_upload_bounded(file: UploadFile, max_bytes: int | None = None) -> bytes:
+    """Read an UploadFile in bounded chunks, raising HTTP 413 if it exceeds max_request_body_bytes."""
+    from omniforge.config.settings import get_settings
+
+    limit = int(max_bytes) if max_bytes is not None else int(get_settings().api.max_request_body_bytes)
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if limit > 0 and total > limit:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Uploaded file exceeds maximum allowed size of {limit} bytes.",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _sid(x_session_id: str | None) -> str:
-    return (x_session_id or "default").strip() or "default"
+# Session-key namespacing (OWASP API1: Broken Object Level Authorization).
+# The raw X-Session-ID supplied by a client is never trusted as a global key: it is scoped to
+# the authenticated (tenant, subject) pair, so two callers presenting the same header value
+# always land in isolated session stores (each gets an empty, private session).
+_SESSION_KEY_RE = re.compile(r"^ws:[0-9a-f]{16}:(.*)$")
+
+
+def _display_session_id(sid: str) -> str:
+    """Return the client-facing session id (strip the internal ``ws:<owner_tag>:`` prefix).
+
+    The namespaced key is an internal storage detail; echoing it back would leak the
+    ownership-tag scheme and confuse clients that round-trip the value.
+    """
+    m = _SESSION_KEY_RE.match(sid or "")
+    return m.group(1) if m else (sid or "default")
+
+
+def _owner_tag(tenant: str, subject: str) -> str:
+    digest = hashlib.sha256(f"{tenant}\x00{subject}".encode("utf-8", errors="replace")).hexdigest()
+    return digest[:16]
+
+
+def _sid(x_session_id: str | None, principal: Principal | None = None) -> str:
+    raw = (x_session_id or "default").strip() or "default"
+    if principal is None:
+        # Fall back to the request-scoped principal stashed by the auth dependency.
+        try:
+            from omniforge.api.auth import get_request_principal
+
+            principal = get_request_principal()
+        except Exception:
+            principal = None
+    if principal is None or not getattr(principal, "subject", None):
+        # No authenticated context available (unit tests / internal tooling): legacy behavior.
+        return raw
+    tenant = str(getattr(principal, "tenant_id", "") or "default-tenant")
+    return f"ws:{_owner_tag(tenant, str(principal.subject))}:{raw}"
 
 
 def _require_df(state: dict[str, Any]) -> pd.DataFrame:
@@ -168,7 +312,7 @@ def _state_summary(state: dict[str, Any], session_id: str) -> dict[str, Any]:
 
     return to_json_object(
         {
-            "session_id": session_id,
+            "session_id": _display_session_id(session_id),
             "platform": get_version_info(),
             "has_dataset": has_df,
             "dataset_name": state.get("uap_dataset_name"),
@@ -275,91 +419,54 @@ def _prepare_xy(df: pd.DataFrame, target: str, *, raw_features: bool = False) ->
 
 
 # ---------------------------------------------------------------------------
-# Request Models
+# Request Models (shared via omniforge.api.studios.schemas)
 # ---------------------------------------------------------------------------
-class LoadSampleReq(BaseModel):
-    source_type: str = Field(default="domain", description="'benchmark' or 'domain'")
-    name: str = Field(default="finance")
-    n_samples: int = Field(default=600, ge=30, le=50000)
-
-
-class TargetsReq(BaseModel):
-    targets: list[str]
-
-
-class ExclusionsReq(BaseModel):
-    excluded_columns: list[str]
-    reason: str = "User excluded column from analysis"
-
-
-class SplitLockReq(BaseModel):
-    strategy: str = "auto"
-    test_size: float = Field(default=0.2, ge=0.05, le=0.5)
-    cv_folds: int = Field(default=5, ge=2, le=10)
-    time_col: str | None = None
-    group_col: str | None = None
-    target_col: str | None = None
-    gap: int = 0
-
-
-class CleanReq(BaseModel):
-    mode: str = Field(default="custom", description="'auto', 'complete', or 'custom'")
-    impute_numeric: str = "median"
-    impute_categorical: str = "most_frequent"
-    constant_fill_numeric: float = 0.0
-    constant_fill_categorical: str = "MISSING"
-    drop_duplicates: bool = True
-    handle_outliers: str = "clip"
-    outlier_method: str = "iqr"
-    outlier_threshold: float = 1.5
-    contamination: float = Field(default=0.05, gt=0.0, lt=0.5)
-    standardize_missing_tokens: bool = True
-    clean_strings: bool = True
-    lowercase_strings: bool = False
-    strip_html: bool = True
-    infer_types: bool = True
-    drop_high_missing_cols: bool = True
-    missing_col_threshold: float = Field(default=0.90, ge=0.2, le=1.0)
-    add_missing_indicators: bool = False
-    drop_constant_columns: bool = False
-    standardize_column_names: bool = False
-    preview_only: bool = False
-
-
-class SQLInspectReq(BaseModel):
-    connection_url: str
-
-
-class SQLLoadReq(BaseModel):
-    connection_url: str
-    table_name: str | None = None
-    query: str | None = None
-    limit: int = Field(default=50000, ge=10, le=250000)
-
-
-class AccessInspectReq(BaseModel):
-    file_path: str
-
-
-class AccessLoadReq(BaseModel):
-    file_path: str
-    table_name: str
-    limit: int = Field(default=50000, ge=10, le=250000)
-
-
-class ClusterReq(BaseModel):
-    mode: str = Field(default="custom", description="'auto', 'complete', or 'custom'")
-    algorithm: str = "kmeans"
-    algorithms: list[str] = Field(default_factory=list)
-    n_clusters: int = Field(default=4, ge=2, le=20)
-    run_auto_k: bool = True
-    k_min: int = 2
-    k_max: int = 8
-    scaler: str = "standard"
-    linkage: str = "ward"
-
-    features: list[str] | None = None
-
+from omniforge.api.studios.schemas import (  # noqa: E402, F401
+    AccessInspectReq,
+    AccessLoadReq,
+    AnomalyCommitReq,
+    AnomalyReq,
+    AutoMLRunReq,
+    CausalReq,
+    CleanReq,
+    ClusterCommitReq,
+    ClusterReq,
+    CopilotReq,
+    DAGRunReq,
+    DeepBenchReq,
+    DiagnosticsReq,
+    DriftReq,
+    ExclusionsReq,
+    ExplainReq,
+    FairnessReq,
+    FeatureEngReq,
+    FeatureSelReq,
+    ForecastReq,
+    GraphReq,
+    HypothesisReq,
+    LoadSampleReq,
+    MiningReq,
+    NLPReq,
+    NonParametricRunReq,
+    OptimizeReq,
+    PromoteModelReq,
+    RecommendReq,
+    RegisterModelReq,
+    ReportCompileReq,
+    SimulateReq,
+    SinglePredictReq,
+    SplitLockReq,
+    SQLInspectReq,
+    SQLLoadReq,
+    SupervisoryAccessReq,
+    SupervisoryDemoReq,
+    SupervisoryQuickTrainReq,
+    SupervisorySingleReq,
+    SupervisorySQLReq,
+    SupervisoryTolBase,
+    SurvivalReq,
+    TargetsReq,
+)
 
 # ClusteringEngine requires Literal-typed hyper-parameters; the HTTP layer accepts
 # free-form strings, so normalise (and defensively fall back) before construction.
@@ -375,258 +482,6 @@ _CLUSTER_LINKAGES: dict[str, Literal["ward", "complete", "average", "single"]] =
     "average": "average",
     "single": "single",
 }
-
-
-class ClusterCommitReq(BaseModel):
-    mode: str = Field(default="attach", description="'attach' or 'remove_clusters'")
-    remove_cluster_ids: list[int] = Field(default_factory=list)
-    attach_cluster_id: bool = False
-
-
-class AnomalyReq(BaseModel):
-    mode: str = Field(default="custom", description="'auto', 'complete', or 'custom'")
-    method: str = "isolation_forest"
-    methods: list[str] = Field(default_factory=list)
-    contamination: float = Field(default=0.05, ge=0.005, le=0.45)
-    features: list[str] | None = None
-
-
-class AnomalyCommitReq(BaseModel):
-    mode: str = Field(default="attach", description="'attach' or 'remove_anomalies'")
-
-
-class MiningReq(BaseModel):
-    mode: str = Field(default="complete", description="'auto', 'complete', or 'custom'")
-    tasks: list[str] = Field(default_factory=lambda: ["association_rules", "subgroups", "manifold"])
-    manifold_method: str = "pca"
-    min_support: float = Field(default=0.08, ge=0.01, le=0.9)
-    min_confidence: float = Field(default=0.55, ge=0.1, le=1.0)
-    min_lift: float = Field(default=1.1, ge=0.5, le=20.0)
-    color_col: str | None = None
-
-
-class DiagnosticsReq(BaseModel):
-    mode: str = "all"  # all | auto | custom
-    alpha: float = 0.05
-    confidence_level: float = 0.95
-    fdr_method: str = "fdr_bh"
-    parametric_mode: str = "auto"
-    normality_method: str = "auto"
-    correlation_method: str = "auto"
-    outlier_method: str = "iqr"
-    vif_threshold: float = 5.0
-    risk_tail_alpha: float = 0.05
-    holdout_ratio: float = 0.20
-    selected_modules: list[str] = Field(default_factory=list)
-
-
-class HypothesisReq(BaseModel):
-    mode: str = "custom"  # custom | auto | complete
-    test_type: str = "welch_t"
-    col_a: str | None = None
-    col_b: str | None = None
-    alpha: float = 0.05
-
-
-class FeatureEngReq(BaseModel):
-    mode: str = "custom"  # custom | auto | complete
-    polynomial_degree: int = 2
-    add_interactions: bool = True
-    add_polynomials: bool = False
-    correct_skew: bool = True
-    add_datetime_features: bool = True
-    commit: bool = True
-
-
-class FeatureSelReq(BaseModel):
-    mode: str = "custom"  # custom | auto | complete
-    method: str = "mutual_info"
-    top_k: int = 10
-    target: str | None = None
-    commit: bool = False
-
-
-class AutoMLRunReq(BaseModel):
-    target: str | None = None
-    backend: str = "omniforge_native"
-    time_budget_seconds: float = Field(default=30.0, ge=5.0, le=3600.0)
-    cv_folds: int = Field(default=3, ge=2, le=10)
-    async_job: bool = False
-
-
-class DeepBenchReq(BaseModel):
-    target: str | None = None
-    architectures: list[str] = Field(
-        default_factory=lambda: ["ft_transformer", "tabnet", "resnet_tabular", "mlp", "cnn1d", "gnn_gcn"]
-    )
-    epochs: int = Field(default=25, ge=5, le=120)
-    max_rows: int = Field(default=2500, ge=100, le=15000)
-
-
-class SinglePredictReq(BaseModel):
-    record: dict[str, Any]
-
-
-class ExplainReq(BaseModel):
-    row_index: int = 0
-    feature_for_pdp: str | None = None
-
-
-class FairnessReq(BaseModel):
-    sensitive_col: str
-
-
-class ForecastReq(BaseModel):
-    target_col: str
-    time_col: str | None = None
-    horizon: int = Field(default=14, ge=3, le=120)
-    deep_arch: str = "nbeats"  # nbeats | patchtst | tft | lstm
-    epochs: int = Field(default=30, ge=5, le=120)
-
-
-class CausalReq(BaseModel):
-    treatment_col: str
-    outcome_col: str
-    confounders: list[str] = Field(default_factory=list)
-    method: str = "aipw"
-
-
-class OptimizeReq(BaseModel):
-    asset_cols: list[str] = Field(default_factory=list)
-    risk_aversion: float = 2.0
-
-
-class SimulateReq(BaseModel):
-    target_col: str
-    n_simulations: int = Field(default=2000, ge=200, le=25000)
-    horizon_steps: int = Field(default=12, ge=1, le=120)
-
-
-class NLPReq(BaseModel):
-    task: str = "overview"
-    text_col: str | None = None
-    custom_texts: list[str] = Field(default_factory=list)
-    candidate_labels: list[str] = Field(default_factory=lambda: ["Finance", "Operations", "Risk", "Customer Support"])
-    question: str = ""
-    context: str = ""
-    query: str = ""
-    aspects: list[str] = Field(default_factory=list)
-    n_topics: int = 4
-    n_clusters: int = 3
-    use_pretrained: bool = False
-
-
-class GraphReq(BaseModel):
-    source_col: str | None = None
-    target_col: str | None = None
-    link_method: str = "ensemble_rrf"
-    run_supervised: bool = True
-    run_neural_gae: bool = True
-    edge_operator: str = "hadamard"
-    top_k: int = 12
-
-
-class RecommendReq(BaseModel):
-    user_col: str | None = None
-    item_col: str | None = None
-    rating_col: str | None = None
-    top_k: int = 8
-
-
-class SurvivalReq(BaseModel):
-    duration_col: str
-    event_col: str
-
-
-class DAGRunReq(BaseModel):
-    stages: list[str] = Field(default_factory=lambda: ["quality", "clean", "eda", "features", "automl"])
-    target: str | None = None
-
-
-class DriftReq(BaseModel):
-    split_ratio: float = Field(default=0.5, ge=0.2, le=0.8)
-
-
-class RegisterModelReq(BaseModel):
-    model_name: str = "omniforge_champion"
-    stage: str = "Staging"
-
-
-class PromoteModelReq(BaseModel):
-    model_name: str
-    version: int
-    stage: str
-
-
-class ReportCompileReq(BaseModel):
-    title: str = "OmniForge Executive Analytics Report"
-    author: str = "OmniForge Enterprise"
-    selected_sections: list[str] | None = None
-    include_charts: bool = True
-    include_tables: bool = True
-    include_dataset_appendix: bool = True
-    max_table_rows: int = Field(default=100, ge=10, le=500)
-
-
-class SupervisoryQuickTrainReq(BaseModel):
-    method: str = "ridge"  # ridge | logistic | decision_stump | random_forest | gradient_boosting | tabnet | resnet_tabular | ft_transformer | mlp
-    target: str | None = None
-    epochs: int = Field(default=15, ge=5, le=100)
-
-
-class SupervisoryTolBase(BaseModel):
-    model_id: str = "active_champion"
-    baseline_model_id: str | None = None
-    actual_col: str | None = None
-    id_col: str | None = None
-    max_pct_error: float = Field(default=10.0, ge=0.1, le=500.0)
-    max_abs_error: float | None = None
-    max_sigma_z: float = Field(default=3.0, ge=0.5, le=10.0)
-    baseline_ratio_min: float = Field(default=0.85, ge=0.01, le=2.0)
-    baseline_ratio_max: float = Field(default=1.15, ge=0.1, le=10.0)
-    warning_fraction: float = Field(default=0.75, ge=0.2, le=0.99)
-    max_batch_breach_rate_pct: float = Field(default=5.0, ge=0.0, le=100.0)
-    min_classification_accuracy_pct: float = Field(default=85.0, ge=10.0, le=100.0)
-
-
-class SupervisorySQLReq(SupervisoryTolBase):
-    connection_url: str
-    table_name: str | None = None
-    query: str | None = None
-    limit: int = Field(default=10000, ge=5, le=100000)
-
-
-class SupervisoryAccessReq(SupervisoryTolBase):
-    file_path: str
-    table_name: str
-    limit: int = Field(default=10000, ge=5, le=100000)
-
-
-class SupervisoryDemoReq(SupervisoryTolBase):
-    n_rows: int = Field(default=80, ge=15, le=500)
-    inject_fault_pct: float = Field(default=10.0, ge=0.0, le=50.0)
-    noise_scale: float = Field(default=0.04, ge=0.0, le=1.0)
-
-
-class SupervisorySingleReq(SupervisoryTolBase):
-    record: dict[str, Any]
-    actual_value: Any | None = None
-
-
-class CopilotReq(BaseModel):
-    message: str
-
-
-class NonParametricRunReq(BaseModel):
-    target: str | None = None
-    cv_folds: int = Field(default=5, ge=2, le=10)
-    models: list[str] | None = None
-    n_knots: int = Field(default=5, ge=3, le=12)
-    spline_degree: int = Field(default=3, ge=1, le=3)
-    bandwidth: float | None = Field(default=None, gt=0.0)
-    n_neighbors: int = Field(default=11, ge=3, le=51)
-    rbf_gamma: float | None = Field(default=None, gt=0.0)
-    include_parametric_ref: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -747,7 +602,7 @@ async def load_workspace_uap(
 ) -> dict[str, Any]:
     sid = _sid(x_session_id)
     state = get_session_state(sid)
-    raw = await file.read()
+    raw = await read_upload_bounded(file)
     try:
         info = restore_workspace_project_bytes(state, raw, source_label=file.filename or "Uploaded .omniforge")
     except Exception as exc:
@@ -763,12 +618,12 @@ async def load_workspace_uap(
 
 @router.get("/jobs")
 def list_jobs() -> dict[str, Any]:
-    return {"jobs": job_manager.list_recent()}
+    return {"jobs": job_manager.list_recent(owner_key=current_job_owner_key(for_query=True))}
 
 
 @router.get("/jobs/{job_id}")
 def poll_job(job_id: str) -> dict[str, Any]:
-    rec = job_manager.get(job_id)
+    rec = job_manager.get(job_id, owner_key=current_job_owner_key(for_query=True))
     if rec is None:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
     return rec.to_dict()
@@ -799,7 +654,7 @@ def delete_active_dataset(x_session_id: str | None = Header(default="default")) 
 
 @router.post("/s01/excel-sheets")
 async def s01_excel_sheets(file: UploadFile = File(...)) -> dict[str, Any]:
-    raw = await file.read()
+    raw = await read_upload_bounded(file)
     sheets = list_excel_sheets(raw)
     return to_json_object({"filename": file.filename or "workbook.xlsx", "sheets": sheets})
 
@@ -819,7 +674,7 @@ async def s01_upload_dataset(
             status_code=400,
             detail="Pickle/joblib uploads are blocked for security (CWE-502). Please upload CSV, Parquet, Excel, or JSON.",
         )
-    raw = await file.read()
+    raw = await read_upload_bounded(file)
     t0 = time.perf_counter()
     if suffix in {".xlsx", ".xls", ".xlsm"} and sheet_name:
         df = read_excel_sheet(raw, sheet_name=sheet_name)
@@ -1090,11 +945,7 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
         drop_const = req.drop_constant_columns
         std_col_names = req.standardize_column_names
 
-    # Replace +/-Inf before cleaning so every imputer works cleanly
     work_in = df.copy()
-    for nc in work_in.select_dtypes(include=[np.number]).columns:
-        work_in[nc] = work_in[nc].replace([np.inf, -np.inf], np.nan)
-
     cleaner = DataCleaner(cfg)
     train_df, test_df, lock = get_active_split_frames(state, work_in)
     split_safe_used = False
@@ -1110,10 +961,20 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
         for k_o, v_o in rep_te.outliers_detected.items():
             merged_outliers[k_o] = int(merged_outliers.get(k_o, 0) + v_o)
         rep_dict["outliers_detected"] = merged_outliers
+        merged_imputed: dict[str, int] = dict(rep_tr.imputed_columns)
+        for k_i, v_i in rep_te.imputed_columns.items():
+            merged_imputed[k_i] = int(merged_imputed.get(k_i, 0) + v_i)
+        rep_dict["imputed_columns"] = merged_imputed
+        merged_reasons: dict[str, int] = dict(rep_tr.removed_rows_by_reason)
+        for k_r, v_r in rep_te.removed_rows_by_reason.items():
+            merged_reasons[k_r] = int(merged_reasons.get(k_r, 0) + v_r)
+        rep_dict["removed_rows_by_reason"] = merged_reasons
+        executed_codes = list(dict.fromkeys([*rep_tr.steps_executed, *rep_te.steps_executed]))
         rep_dict["split_lock_leakage_safe"] = True
     else:
         cleaned, report = cleaner.fit_transform(work_in)
         rep_dict = report.model_dump() if hasattr(report, "model_dump") else dict(report)
+        executed_codes = list(report.steps_executed)
         rep_dict["split_lock_leakage_safe"] = False
 
     dropped_const_cols: list[str] = []
@@ -1129,6 +990,7 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
                 dropped_const_cols.append(str(col))
         if dropped_const_cols and len(dropped_const_cols) < cleaned.shape[1]:
             cleaned = cleaned.drop(columns=dropped_const_cols)
+            executed_codes.append("drop_constant_columns")
 
     # Compute genuinely dropped columns BEFORE optional column-name standardization
     dropped_cols = [c for c in before_cols if c not in cleaned.columns]
@@ -1149,11 +1011,15 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
             rename_map[str(c)] = cand
             new_names.append(cand)
         cleaned.columns = new_names
+        if any(k != v for k, v in rename_map.items()):
+            executed_codes.append("standardize_column_names")
 
     removed_idx = [idx for idx in df.index if idx not in set(cleaned.index)]
+    renamed_non_trivial = {k: v for k, v in rename_map.items() if k != v}
+    rep_dict["columns_dropped"] = list(dict.fromkeys([*(rep_dict.get("columns_dropped") or []), *dropped_cols]))
     rep_dict["mode_used"] = mode
     rep_dict["dropped_constant_columns"] = dropped_const_cols
-    rep_dict["renamed_columns"] = {k: v for k, v in rename_map.items() if k != v}
+    rep_dict["renamed_columns"] = renamed_non_trivial
     rep_dict["rows_before"] = int(len(df))
     rep_dict["rows_after"] = int(len(cleaned))
     rep_dict["cols_before"] = int(df.shape[1])
@@ -1161,24 +1027,56 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
     rep_dict["missing_before"] = int(df.isna().sum().sum())
     rep_dict["missing_after"] = int(cleaned.isna().sum().sum())
     rep_dict["split_safe_used"] = split_safe_used
-    steps_applied: list[str] = [
-        "1. Standardize column names & preserve protected/target columns",
-        "2. Drop constant / high-missing / excluded columns",
-        "3. Infer & coerce numeric/datetime/categorical column types",
-        "4. Remove rows exceeding missing-value threshold",
-        "5. Remove exact & fuzzy duplicate rows",
-        "6. Impute remaining missing values (numeric & categorical)",
-        "7. Detect & handle statistical outliers (clip/remove/flag)",
+    rep_dict["steps_executed"] = executed_codes
+
+    def _describe_executed_step(idx_num: int, code: str) -> str:
+        if code == "clean_strings":
+            return f"{idx_num}. Clean & normalize string columns ({len(rep_dict.get('strings_cleaned_columns') or [])} column(s))"
+        if code == "standardize_missing_tokens":
+            return f"{idx_num}. Standardize missing-value sentinel tokens to NaN"
+        if code == "infer_and_cast_types":
+            return f"{idx_num}. Infer & coerce numeric/datetime column types ({len(rep_dict.get('type_conversions') or {})} converted)"
+        if code == "replace_nonfinite_with_nan":
+            return f"{idx_num}. Replace non-finite (+/-Inf) numeric values with NaN"
+        if code.startswith("apply_domain_bounds:"):
+            detail = code.split(":", 1)[1].replace("_", " ")
+            return f"{idx_num}. Coerce out-of-bounds domain values to NaN ({detail})"
+        if code == "drop_high_missing_columns":
+            return f"{idx_num}. Drop columns exceeding missing-value threshold ({len(cleaner._state.dropped_cols)} dropped)"
+        if code == "drop_exact_duplicates":
+            return f"{idx_num}. Check & remove exact duplicate rows ({int(rep_dict.get('exact_duplicates_removed', 0))} removed)"
+        if code == "fuzzy_deduplicate":
+            return f"{idx_num}. Fuzzy-deduplicate text records ({int(rep_dict.get('fuzzy_duplicates_removed', 0))} removed)"
+        if code == "add_missing_indicators":
+            return f"{idx_num}. Add missingness indicator flag columns"
+        if code.startswith("outliers:"):
+            parts = code.split(":")
+            m_name = parts[1].upper() if len(parts) > 1 else "OUTLIER"
+            a_name = parts[2] if len(parts) > 2 else "handled"
+            tot_out = sum(int(v) for v in (rep_dict.get("outliers_detected") or {}).values())
+            return f"{idx_num}. Detect & handle statistical outliers ({m_name} -> {a_name}; {tot_out} detected)"
+        if code == "impute_missing":
+            imp_cols = rep_dict.get("imputed_columns") or {}
+            tot_imp = sum(int(v) for v in imp_cols.values())
+            return f"{idx_num}. Impute remaining missing values ({tot_imp} cell(s) across {len(imp_cols)} column(s))"
+        if code == "drop_constant_columns":
+            return f"{idx_num}. Drop zero-variance constant columns ({len(dropped_const_cols)} dropped)"
+        if code == "standardize_column_names":
+            return f"{idx_num}. Standardize column names ({len(renamed_non_trivial)} renamed)"
+        return f"{idx_num}. {code}"
+
+    rep_dict["steps_applied"] = [
+        _describe_executed_step(idx_num, step_code)
+        for idx_num, step_code in enumerate(executed_codes, start=1)
     ]
-    rep_dict["steps_applied"] = steps_applied
     deleted_records_list: list[dict[str, Any]] = []
     if isinstance(cleaner.last_removed_rows_, pd.DataFrame) and not cleaner.last_removed_rows_.empty:
         for idx_val, row_val in cleaner.last_removed_rows_.head(200).iterrows():
             deleted_records_list.append(
                 {
-                    "row_index": str(row_val.get("_orig_index", idx_val)),
-                    "stage": str(row_val.get("_removal_stage", "cleaning")),
-                    "reason": str(row_val.get("_removal_reason", "Policy threshold exceeded")),
+                    "row_index": str(row_val.get("_original_row_index", row_val.get("_orig_index", idx_val))),
+                    "stage": str(row_val.get("_deletion_stage", row_val.get("_removal_stage", "Data Cleaning"))),
+                    "reason": str(row_val.get("_deletion_reason", row_val.get("_removal_reason", "Removed during cleaning"))),
                 }
             )
     rep_dict["deleted_records"] = deleted_records_list

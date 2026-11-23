@@ -1,18 +1,17 @@
-# ruff: noqa: E402
-# mypy: ignore-errors
+"""Studio 10 (Visual DAG Pipeline Builder) router."""
+
 from __future__ import annotations
-
-import dataclasses
-
-"""s10_rai router."""
-
 
 from typing import Any
 
 import numpy as np
+import pandas as pd
 from fastapi import APIRouter, Header
 
+from omniforge.api.studios.schemas import DAGRunReq, wb_cache_and_respond
 from omniforge.automl.backends import AutoMLBackendHub
+from omniforge.core.performance import compute_df_fingerprint
+from omniforge.features.engineering import FeatureConfig, FeatureEngineeringPipeline
 from omniforge.pipelines.builder import PipelineBuilder
 from omniforge.pipelines.executor import PipelineExecutor
 
@@ -21,16 +20,33 @@ router = APIRouter(tags=["workbench-s10"])
 
 def _wb() -> Any:
     from omniforge.api import workbench as wb
+
     return wb
 
 
+def _initial_split_frames(state: dict[str, Any], df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Extract active Split-Lock train/test frames or deterministic 80/20 holdout frames for leak-free DAG execution."""
+    n = len(df)
+    if n < 5:
+        return df.copy(), pd.DataFrame(columns=df.columns)
+    if state.get("uap_split_lock_active"):
+        tr_idx = [i for i in (state.get("uap_split_train_indices") or []) if 0 <= int(i) < n]
+        te_idx = [i for i in (state.get("uap_split_test_indices") or []) if 0 <= int(i) < n]
+        if tr_idx and te_idx:
+            return df.iloc[tr_idx].reset_index(drop=True), df.iloc[te_idx].reset_index(drop=True)
+    cut = max(2, int(round(0.8 * n)))
+    return df.iloc[:cut].reset_index(drop=True), df.iloc[cut:].reset_index(drop=True)
+
+
 @router.post("/s10/run")
-def s10_run_dag(req: _wb().DAGRunReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
+def s10_run_dag(req: DAGRunReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
     df = _wb().get_analysis_dataframe(state, _wb()._require_df(state))
     targets = _wb().get_selected_targets(state, df)
     target = req.target if (req.target and req.target in df.columns) else (targets[0] if targets else None)
+
+    init_train, init_test = _initial_split_frames(state, df)
 
     builder = PipelineBuilder(name="OmniForge_DAG_Workflow")
     prev: str | None = None
@@ -39,20 +55,114 @@ def s10_run_dag(req: _wb().DAGRunReq, x_session_id: str | None = Header(default=
     for idx, stage in enumerate(req.stages):
         node_id = f"step_{idx + 1}_{stage}"
         if stage == "quality":
-            builder.add_step(node_id, lambda ctx: {"quality_score": _wb().DataQualityProfiler().profile(ctx.get("data")).overall_score}, depends_on=[prev] if prev else [])
+
+            def _step_quality(ctx: Any) -> dict[str, Any]:
+                cur_df: pd.DataFrame = ctx.get("data")
+                prof = _wb().DataQualityProfiler().profile(cur_df)
+                return {
+                    "quality_score": prof.overall_score,
+                    "grade": prof.grade,
+                    "input_fingerprint": compute_df_fingerprint(cur_df),
+                }
+
+            builder.add_step(node_id, _step_quality, depends_on=[prev] if prev else [])
         elif stage == "clean":
-            builder.add_step(node_id, lambda ctx: {"rows_after": len(_wb().DataCleaner().fit_transform(ctx.get("data"))[0])}, depends_on=[prev] if prev else [])
+
+            def _step_clean(ctx: Any) -> dict[str, Any]:
+                tr_in: pd.DataFrame = ctx.get("train_df")
+                te_in: pd.DataFrame = ctx.get("test_df")
+                cleaner = _wb().DataCleaner()
+                if len(te_in) > 0:
+                    clean_tr, clean_te, _, _ = cleaner.fit_transform_split(tr_in, te_in)
+                    combined = pd.concat([clean_tr, clean_te], ignore_index=True)
+                    ctx.set("train_df", clean_tr)
+                    ctx.set("test_df", clean_te)
+                else:
+                    combined, _ = cleaner.fit_transform(tr_in)
+                    ctx.set("train_df", combined)
+                ctx.set("data", combined)
+                return {
+                    "rows_after": int(len(combined)),
+                    "train_rows": int(len(ctx.get("train_df"))),
+                    "test_rows": int(len(ctx.get("test_df"))),
+                    "leakage_safe_split_fit": True,
+                    "output_fingerprint": compute_df_fingerprint(combined),
+                }
+
+            builder.add_step(node_id, _step_clean, depends_on=[prev] if prev else [])
         elif stage == "eda":
-            builder.add_step(node_id, lambda ctx: {"n_rows": len(ctx.get("data")), "n_cols": ctx.get("data").shape[1]}, depends_on=[prev] if prev else [])
+
+            def _step_eda(ctx: Any) -> dict[str, Any]:
+                cur_df: pd.DataFrame = ctx.get("data")
+                num_df = cur_df.select_dtypes(include=[np.number])
+                missing_cells = int(cur_df.isna().sum().sum())
+                return {
+                    "n_rows": int(len(cur_df)),
+                    "n_cols": int(cur_df.shape[1]),
+                    "numeric_cols": int(num_df.shape[1]),
+                    "missing_cells": missing_cells,
+                    "data_fingerprint": compute_df_fingerprint(cur_df),
+                }
+
+            builder.add_step(node_id, _step_eda, depends_on=[prev] if prev else [])
         elif stage == "features":
-            builder.add_step(node_id, lambda ctx: {"numeric_cols": len(ctx.get("data").select_dtypes(include=[np.number]).columns)}, depends_on=[prev] if prev else [])
+
+            def _step_features(ctx: Any, tgt: str | None = target) -> dict[str, Any]:
+                tr_df: pd.DataFrame = ctx.get("train_df")
+                te_df: pd.DataFrame = ctx.get("test_df")
+                has_tgt = bool(tgt and tgt in tr_df.columns)
+                feat_cols = [c for c in tr_df.columns if c != tgt] if has_tgt else list(tr_df.columns)
+                if not feat_cols:
+                    cur_df = ctx.get("data")
+                    return {"numeric_cols": int(len(cur_df.select_dtypes(include=[np.number]).columns))}
+                fe = FeatureEngineeringPipeline(FeatureConfig(scale_numeric="standard", create_interactions=len(feat_cols) >= 2))
+                y_tr = tr_df[tgt] if (has_tgt and tgt is not None) else None
+                X_tr_eng = fe.fit_transform(tr_df[feat_cols], y_tr)
+                if has_tgt and tgt is not None:
+                    X_tr_eng[tgt] = tr_df[tgt].to_numpy()
+                if len(te_df) > 0:
+                    X_te_eng = fe.transform(te_df[feat_cols])
+                    if has_tgt and tgt is not None and tgt in te_df.columns:
+                        X_te_eng[tgt] = te_df[tgt].to_numpy()
+                    combined = pd.concat([X_tr_eng, X_te_eng], ignore_index=True)
+                    ctx.set("train_df", X_tr_eng)
+                    ctx.set("test_df", X_te_eng)
+                else:
+                    combined = X_tr_eng
+                    ctx.set("train_df", X_tr_eng)
+                ctx.set("data", combined)
+                return {
+                    "numeric_cols": int(len(combined.select_dtypes(include=[np.number]).columns)),
+                    "engineered_feature_count": int(combined.shape[1] - (1 if has_tgt else 0)),
+                    "leakage_safe_fit_on_train": True,
+                    "output_fingerprint": compute_df_fingerprint(combined),
+                }
+
+            builder.add_step(node_id, _step_features, depends_on=[prev] if prev else [])
         elif stage == "automl" and target:
+
             def _run_fast(ctx: Any, tgt: str = target) -> dict[str, Any]:
-                X_d, y_d, t_d = _wb()._prepare_xy(ctx.get("data"), tgt)
+                cur_df: pd.DataFrame = ctx.get("data")
+                if tgt not in cur_df.columns:
+                    return {"stage": "automl", "status": "skipped_missing_target"}
+                X_d, y_d, t_d = _wb()._prepare_xy(cur_df, tgt)
                 w_df = X_d.copy()
                 w_df[tgt] = y_d.to_numpy()
-                r = AutoMLBackendHub.run(w_df, target_col=tgt, backend="multi_layer_stacker", task_type=t_d, time_budget_seconds=15.0)
-                return {"best_model": r.best_model_name, "score": r.best_score, "lift": r.lift_over_best_baseline}
+                # Cleaning/feature fitting above was already leak-safe (fit on train only),
+                # so AutoMLBackendHub's own internal leakage-safe split is sound here.
+                r = AutoMLBackendHub.run(
+                    w_df,
+                    target_col=tgt,
+                    backend="multi_layer_stacker",
+                    task_type=t_d,
+                    time_budget_seconds=15.0,
+                )
+                return {
+                    "best_model": r.best_model_name,
+                    "score": r.best_score,
+                    "lift": r.lift_over_best_baseline,
+                    "upstream_data_fingerprint": compute_df_fingerprint(w_df),
+                }
 
             builder.add_step(node_id, _run_fast, depends_on=[prev] if prev else [])
         else:
@@ -63,13 +173,16 @@ def s10_run_dag(req: _wb().DAGRunReq, x_session_id: str | None = Header(default=
         prev = node_id
 
     dag = builder.build()
-    exec_res = PipelineExecutor().execute(dag, initial_artifacts={"data": df})
+    exec_res = PipelineExecutor().execute(
+        dag,
+        initial_artifacts={"data": df.copy(), "train_df": init_train, "test_df": init_test},
+    )
     state["uap_dag_result"] = exec_res
-    dump = exec_res.model_dump() if hasattr(exec_res, "model_dump") else (dataclasses.asdict(exec_res) if dataclasses.is_dataclass(exec_res) else {"run_id": getattr(exec_res, "run_id", ""), "step_outputs": getattr(exec_res, "step_outputs", {}), "status": "completed"})
-    _wb().record_lineage(state, "Pipeline DAG", f"Executed {len(req.stages)}-stage DAG", f"Status={dump.get('status', 'completed')}")
-    return _wb()._cache_and_respond(state, sid, "s10_dag", {"execution": dump, "nodes": nodes, "edges": edges})
-
-
-# ---------------------------------------------------------------------------
-# Studio 11 — MLOps (Registry, Tracking & Drift Monitoring)
-# ---------------------------------------------------------------------------
+    dump: dict[str, Any] = {
+        **exec_res.to_dict(),
+        "step_outputs": dict(exec_res.context.step_outputs),
+    }
+    _wb().record_lineage(
+        state, "Pipeline DAG", f"Executed {len(req.stages)}-stage DAG", f"Status={dump.get('status', 'completed')}"
+    )
+    return wb_cache_and_respond(state, sid, "s10_dag", {"execution": dump, "nodes": nodes, "edges": edges})

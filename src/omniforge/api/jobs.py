@@ -27,6 +27,7 @@ class JobRecord:
     finished_at: float | None = None
     result: Any = None
     error: str | None = None
+    owner_key: str = "default"
 
     def to_dict(self) -> dict[str, Any]:
         duration = None
@@ -61,11 +62,12 @@ class BackgroundJobManager:
         name: str,
         fn: Callable[..., Any],
         *args: Any,
+        owner_key: str = "default",
         **kwargs: Any,
     ) -> JobRecord:
         """Schedule a callable onto the background thread pool and return its initial record."""
         job_id = uuid.uuid4().hex[:12]
-        rec = JobRecord(job_id=job_id, name=name)
+        rec = JobRecord(job_id=job_id, name=name, owner_key=owner_key or "default")
         with self._lock:
             self._jobs[job_id] = rec
             if len(self._jobs) > self._max_history:
@@ -95,13 +97,23 @@ class BackgroundJobManager:
         self._executor.submit(_runner)
         return rec
 
-    def get(self, job_id: str) -> JobRecord | None:
+    def get(self, job_id: str, *, owner_key: str | None = None) -> JobRecord | None:
         with self._lock:
-            return self._jobs.get(job_id)
+            rec = self._jobs.get(job_id)
+            if rec is None:
+                return None
+            if owner_key is not None and rec.owner_key != owner_key:
+                return None
+            return rec
 
-    def list_recent(self, limit: int = 20) -> list[dict[str, Any]]:
+    def list_recent(self, limit: int = 20, *, owner_key: str | None = None) -> list[dict[str, Any]]:
         with self._lock:
-            ordered = sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)[:limit]
+            candidates = (
+                [j for j in self._jobs.values() if j.owner_key == owner_key]
+                if owner_key is not None
+                else list(self._jobs.values())
+            )
+            ordered = sorted(candidates, key=lambda j: j.created_at, reverse=True)[:limit]
             return [j.to_dict() for j in ordered]
 
 

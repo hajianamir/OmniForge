@@ -243,7 +243,8 @@ export const Studio09Specialized: React.FC<StudioProps> = ({ ws, studioCache, se
       {tab === 'recsys' && (
         <div className="card">
           <button className="btn btn-primary" disabled={busy} onClick={async () => {
-            setBusy(true); try { setStudioResult('s09_recommend', await apiPost<RecommendResponse>('/api/workbench/s09/recommend', {})); } finally { setBusy(false); }
+            setBusy(true); setErr(null);
+            try { setStudioResult('s09_recommend', await apiPost<RecommendResponse>('/api/workbench/s09/recommend', {})); } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
           }}>Run Hybrid Recommender</button>
           {recRes && <div style={{ marginTop: 12 }}><SimpleTable rows={recRes.recommendations || []} /></div>}
         </div>
@@ -259,7 +260,8 @@ export const Studio09Specialized: React.FC<StudioProps> = ({ ws, studioCache, se
               <select value={evtCol} onChange={(e) => setEvtCol(e.target.value)}>{ws.numeric_columns.map((c) => <option key={c} value={c}>{c}</option>)}</select>
             </label>
             <button className="btn btn-primary" disabled={busy || !ws.has_dataset} onClick={async () => {
-              setBusy(true); try { setStudioResult('s09_survival', await apiPost<SurvivalResponse>('/api/workbench/s09/survival', { duration_col: durCol || ws.numeric_columns[0], event_col: evtCol || ws.numeric_columns[1] })); } finally { setBusy(false); }
+              setBusy(true); setErr(null);
+              try { setStudioResult('s09_survival', await apiPost<SurvivalResponse>('/api/workbench/s09/survival', { duration_col: durCol || ws.numeric_columns[0], event_col: evtCol || ws.numeric_columns[1] })); } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
             }}>Fit Kaplan-Meier &amp; CoxPH</button>
           </div>
           {survRes && <pre className="code-block">{JSON.stringify({ median_survival: survRes.median_survival, cox: survRes.cox, points: survRes.km_curve?.length }, null, 2)}</pre>}
@@ -276,16 +278,17 @@ export const Studio10DAG: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
   const [stages, setStages] = useState<string[]>(['quality', 'clean', 'eda', 'features', 'automl']);
   const dagRes = studioCache.s10_dag ?? null;
   const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
 
   const toggle = (s: string) => setStages((p) => (p.includes(s) ? p.filter((x) => x !== s) : [...p, s]));
 
   const runDag = async () => {
-    setBusy(true);
+    setBusy(true); setErr(null);
     try {
       const res = await apiPost<DAGResponse>('/api/workbench/s10/run', { stages });
       onSync(res.state);
       setStudioResult('s10_dag', res);
-    } finally { setBusy(false); }
+    } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
   return (
@@ -305,6 +308,7 @@ export const Studio10DAG: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
           </button>
         </div>
       </div>
+      {err && <div className="alert alert-error">{err}</div>}
       <div className="card">
         <div className="chip-grid" style={{ marginBottom: 14 }}>
           {['quality', 'clean', 'eda', 'features', 'automl'].map((s) => (
@@ -337,6 +341,7 @@ export const Studio11MLOps: React.FC<StudioProps> = ({ ws, studioCache, setStudi
   const [modelName, setModelName] = useState('omniforge_champion');
   const driftRes = studioCache.s11_drift?.drift_report ?? null;
   const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
 
   const refresh = () => apiGet<MLOpsOverviewResponse>('/api/workbench/s11/overview').then(setOverview).catch(() => {});
   useEffect(() => { refresh(); }, []);
@@ -353,13 +358,15 @@ export const Studio11MLOps: React.FC<StudioProps> = ({ ws, studioCache, setStudi
         </div>
         <ProvenancePill ws={ws} />
       </div>
+      {err && <div className="alert alert-error">{err}</div>}
       <div className="grid-2">
         <div className="card">
           <div className="card-title">Model Registry</div>
           <div className="row" style={{ marginBottom: 12 }}>
             <input type="text" value={modelName} onChange={(e) => setModelName(e.target.value)} />
             <button className="btn btn-primary" disabled={busy || !ws.active_model_name} onClick={async () => {
-              setBusy(true); try { const r = await apiPost<RegisterResponse>('/api/workbench/s11/register', { model_name: modelName, stage: 'Staging' }); setOverview((o) => ({ ...o, registered_models: r.registered_models ?? o.registered_models })); setStudioResult('s11_registered', r); } finally { setBusy(false); }
+              setBusy(true); setErr(null);
+              try { const r = await apiPost<RegisterResponse>('/api/workbench/s11/register', { model_name: modelName, stage: 'Staging' }); setOverview((o) => ({ ...o, registered_models: r.registered_models ?? o.registered_models })); setStudioResult('s11_registered', r); } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
             }}>Register Active Model</button>
           </div>
           <SimpleTable rows={overview.registered_models || []} />
@@ -367,7 +374,8 @@ export const Studio11MLOps: React.FC<StudioProps> = ({ ws, studioCache, setStudi
         <div className="card">
           <div className="card-title">Dataset Drift Monitor (PSI / KS-Test)</div>
           <button className="btn btn-primary" disabled={busy || !ws.has_dataset} onClick={async () => {
-            setBusy(true); try { const r = await apiPost<DriftResponse>('/api/workbench/s11/drift', { split_ratio: 0.5 }); setStudioResult('s11_drift', r); } finally { setBusy(false); }
+            setBusy(true); setErr(null);
+            try { const r = await apiPost<DriftResponse>('/api/workbench/s11/drift', { split_ratio: 0.5 }); setStudioResult('s11_drift', r); } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
           }}>Run Drift Detection</button>
           {driftRes && <pre className="code-block" style={{ marginTop: 12, maxHeight: 300 }}>{JSON.stringify(driftRes, null, 2)}</pre>}
         </div>
@@ -427,6 +435,15 @@ export const Studio12Reporting: React.FC<StudioProps> = ({ ws, onSync, studioCac
       onSync(res.state);
       setStudioResult('s12_report', res);
     } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
+  };
+
+  const downloadReport = async (fmt: string, ext: string) => {
+    setErr(null);
+    try {
+      await apiDownload(`/api/workbench/s12/export/${fmt}`, `omniforge_report.${ext}`);
+    } catch (e: unknown) {
+      setErr(toErrorMessage(e));
+    }
   };
 
   const primaryFormats = [
@@ -545,7 +562,7 @@ export const Studio12Reporting: React.FC<StudioProps> = ({ ws, onSync, studioCac
               key={fmt}
               className="btn btn-success"
               disabled={!ws.has_dataset}
-              onClick={() => apiDownload(`/api/workbench/s12/export/${fmt}`, `omniforge_report.${fmt}`)}
+              onClick={() => void downloadReport(fmt, fmt)}
             >
               {label}
             </button>
@@ -559,7 +576,7 @@ export const Studio12Reporting: React.FC<StudioProps> = ({ ws, onSync, studioCac
               key={fmt}
               className="btn btn-sm"
               disabled={!ws.has_dataset}
-              onClick={() => apiDownload(`/api/workbench/s12/export/${fmt}`, `omniforge_report.${fmt === 'csv_bundle' ? 'zip' : fmt}`)}
+              onClick={() => void downloadReport(fmt, fmt === 'csv_bundle' ? 'zip' : fmt)}
             >
               {label}
             </button>
@@ -628,13 +645,14 @@ export const Studio13Copilot: React.FC<StudioProps> = ({ ws, studioCache, setStu
     text: 'Welcome to OmniForge AI Analytics Copilot. Ask about your active dataset, statistical diagnostics, AutoML strategy, or next analytical steps.',
   };
   const cachedHistory: ChatTurn[] | undefined = studioCache.s13_chat?.history;
+  const suggestedActions: string[] = studioCache.s13_chat?.suggested_actions ?? [];
   const messages = cachedHistory && cachedHistory.length > 0 ? [defaultMsg, ...cachedHistory] : [defaultMsg];
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
 
-  const send = async () => {
-    const q = input.trim();
-    if (!q) return;
+  const sendPrompt = async (rawPrompt: string) => {
+    const q = rawPrompt.trim();
+    if (!q || busy) return;
     const prevHist = cachedHistory || [];
     setStudioResult('s13_chat', { ...(studioCache.s13_chat || {}), history: [...prevHist, { role: 'user', text: q }] });
     setInput('');
@@ -666,16 +684,25 @@ export const Studio13Copilot: React.FC<StudioProps> = ({ ws, studioCache, setStu
         <div className="chat-box">
           {messages.map((m, i) => <div key={i} className={`chat-msg ${m.role}`}>{m.text}</div>)}
         </div>
+        {suggestedActions.length > 0 && (
+          <div className="chip-grid" style={{ marginBottom: 10 }}>
+            {suggestedActions.slice(0, 5).map((act, idx) => (
+              <button key={idx} className="chip" disabled={busy} onClick={() => void sendPrompt(act)}>
+                {act}
+              </button>
+            ))}
+          </div>
+        )}
         <div className="row">
           <input
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && send()}
+            onKeyDown={(e) => e.key === 'Enter' && void sendPrompt(input)}
             placeholder="Ask OmniForge Copilot about your dataset, correlations, anomalies, or AutoML models..."
             style={{ flex: 1 }}
           />
-          <button className="btn btn-primary" disabled={busy} onClick={send}>{busy ? <span className="spinner" /> : 'Send'}</button>
+          <button className="btn btn-primary" disabled={busy} onClick={() => void sendPrompt(input)}>{busy ? <span className="spinner" /> : 'Send'}</button>
         </div>
       </div>
     </div>

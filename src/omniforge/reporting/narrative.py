@@ -194,7 +194,8 @@ class NarrativeGenerator:
                 dims = quality_report.get("dimensions") or {}
                 if isinstance(dims, dict):
                     for k, v in dims.items():
-                        bullets.append(f"Quality Dimension — {str(k).title()}: {float(v):.2f}/100")
+                        if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v:
+                            bullets.append(f"Quality Dimension — {str(k).title()}: {float(v):.2f}/100")
             if diagnostics_summary:
                 bits.append(
                     f"Universal Statistical Diagnostics executed {diagnostics_summary.get('tests_executed', 0)} "

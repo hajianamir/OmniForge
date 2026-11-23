@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import heapq
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -45,8 +45,9 @@ class MonteCarloSimulator:
         model_fn: Callable[[dict[str, np.ndarray]], np.ndarray],
         *,
         correlation_matrix: np.ndarray | None = None,
+        correlation_type: Literal["spearman", "pearson_latent"] = "spearman",
     ) -> tuple[MonteCarloResult, np.ndarray]:
-        """Sample stochastic inputs (optionally correlated via Gaussian copula) and evaluate ``model_fn``.
+        """Sample stochastic inputs (optionally correlated via Kruskal-calibrated Gaussian copula) and evaluate ``model_fn``.
 
         Supported distributions in ``input_specs``:
             ``normal`` (mean, std), ``lognormal`` (mean, sigma), ``uniform`` (low, high),
@@ -63,7 +64,13 @@ class MonteCarloSimulator:
             corr = np.asarray(correlation_matrix, dtype=float)
             if corr.shape != (d, d):
                 raise SimulationError("correlation_matrix shape must match number of input_specs.")
-            corr = 0.5 * (corr + corr.T)
+            corr = np.clip(0.5 * (corr + corr.T), -1.0, 1.0)
+            np.fill_diagonal(corr, 1.0)
+            if correlation_type == "spearman":
+                # Kruskal (1958, JASA 53:814-861) / Clemen & Reilly (1999) exact Spearman-to-Gaussian copula mapping:
+                # rho_Gaussian = 2 * sin(pi * rho_Spearman / 6), preserving rank correlation across arbitrary marginals.
+                corr = 2.0 * np.sin((np.pi / 6.0) * corr)
+                np.fill_diagonal(corr, 1.0)
             eigvals, eigvecs = np.linalg.eigh(corr)
             eigvals = np.clip(eigvals, 1e-6, None)
             corr = (eigvecs * eigvals) @ eigvecs.T

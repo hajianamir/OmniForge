@@ -71,11 +71,12 @@ CORE_RUNTIME = Pack(
         "rich>=15.0.0",
         "plotly>=7.1.0",
         "pillow>=13.0.0",
+        "defusedxml>=0.7.1",
     ),
     imports=(
         "numpy", "pandas", "scipy", "sklearn", "joblib", "dateutil", "networkx",
         "pydantic", "pydantic_settings", "yaml", "structlog", "psutil", "httpx",
-        "jinja2", "typer", "rich", "plotly", "PIL",
+        "jinja2", "typer", "rich", "plotly", "PIL", "defusedxml",
     ),
     unlocks="Data ingestion, cleaning, 6-D quality, EDA, feature engineering, clustering, "
             "baselines, classical ML and the AI Copilot (offline planner).",

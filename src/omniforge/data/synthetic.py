@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import math
+from typing import Any
+
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -10,6 +13,50 @@ from omniforge.core.constants import DEFAULT_RANDOM_SEED
 from omniforge.core.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def _project_psd_correlation(corr: np.ndarray) -> np.ndarray:
+    """Symmetrize and project a noisy matrix onto the positive semi-definite correlation cone."""
+    sym = 0.5 * (corr + corr.T)
+    np.fill_diagonal(sym, 1.0)
+    eigvals, eigvecs = np.linalg.eigh(sym)
+    eigvals = np.clip(eigvals, 1e-5, None)
+    psd = (eigvecs * eigvals) @ eigvecs.T
+    diag_std = np.sqrt(np.maximum(np.diag(psd), 1e-12))
+    psd = psd / np.outer(diag_std, diag_std)
+    psd = 0.5 * (psd + psd.T)
+    np.fill_diagonal(psd, 1.0)
+    return np.asarray(psd, dtype=float)
+
+
+def _dp_noisy_histogram_cdf(
+    values: np.ndarray,
+    low: float,
+    high: float,
+    n_bins: int,
+    eps_col: float,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute an (eps_col, 0)-DP piecewise-uniform histogram CDF via the Laplace Mechanism.
+
+    Under bounded-replacement adjacency (D ~ D', |D| = |D'| = N differing in 1 record), a disjoint
+    histogram count vector has L1 sensitivity Delta_1 = 2 (Dwork et al., 2006; Dwork & Roth, 2014,
+    Theorem 3.6; NIST SP 800-226).
+    """
+    if high <= low:
+        edges = np.array([low - 0.5, high + 0.5], dtype=float)
+        return edges, np.array([0.0, 1.0], dtype=float)
+
+    edges = np.linspace(low, high, n_bins + 1, dtype=float)
+    clipped = np.clip(values, low, high)
+    counts, _ = np.histogram(clipped, bins=edges)
+    # L1 sensitivity of a disjoint histogram under 1-record bounded replacement is Delta_1 = 2.0
+    noisy_counts = np.maximum(counts.astype(float) + rng.laplace(0.0, 2.0 / eps_col, size=n_bins), 0.0)
+    total = float(noisy_counts.sum())
+    probs = noisy_counts / total if total > 1e-12 else np.full(n_bins, 1.0 / n_bins, dtype=float)
+    cdf_knots = np.concatenate(([0.0], np.cumsum(probs)))
+    cdf_knots[-1] = 1.0
+    return edges, cdf_knots
 
 
 class SyntheticDataGenerator:
@@ -24,19 +71,37 @@ class SyntheticDataGenerator:
         n_samples: int | None = None,
         *,
         dp_epsilon: float | None = None,
+        dp_bounds: dict[str, tuple[float, float]] | None = None,
+        dp_categories: dict[str, list[Any]] | None = None,
     ) -> pd.DataFrame:
         """Synthesize tabular data preserving marginal distributions and rank correlations via Gaussian Copula.
+
+        When ``dp_epsilon`` is specified, constructs a pure ``(dp_epsilon, 0)``-differentially private
+        copula synopsis under bounded-replacement adjacency using the Laplace Mechanism (Dwork et al.,
+        2006), Sequential Composition across all marginal and pairwise correlation queries (Dwork & Roth,
+        2014, Theorem 3.14), and Post-Processing Invariance (Proposition 2.1; NIST SP 800-226) so drawing
+        any number ``n_samples`` incurs zero additional privacy loss.
 
         Args:
             reference_df: Real source DataFrame to model.
             n_samples: Number of synthetic rows to generate (defaults to ``len(reference_df)``).
-            dp_epsilon: Optional differential-privacy epsilon adding calibrated Laplace noise.
+            dp_epsilon: Optional strictly positive total privacy budget ``epsilon > 0``.
+            dp_bounds: Optional public ``(min, max)`` clipping bounds per numeric/datetime column for strict global sensitivity.
+            dp_categories: Optional public category list per categorical column for strict domain privacy.
 
         Returns:
             Synthetic DataFrame matching schema and statistical structure of ``reference_df``.
         """
+        if dp_epsilon is not None:
+            if isinstance(dp_epsilon, bool) or not math.isfinite(float(dp_epsilon)) or float(dp_epsilon) <= 0.0:
+                raise ValueError(
+                    "dp_epsilon must be a finite positive float (> 0) to guarantee epsilon-differential privacy."
+                )
+
         rng = np.random.default_rng(self.random_seed)
-        n = n_samples or len(reference_df)
+        if len(reference_df.columns) == 0:
+            return pd.DataFrame()
+        n = len(reference_df) if n_samples is None else int(n_samples)
         if n <= 0 or len(reference_df) == 0:
             return pd.DataFrame(columns=reference_df.columns)
 
@@ -48,75 +113,196 @@ class SyntheticDataGenerator:
         other_cols = [c for c in reference_df.columns if c not in num_cols]
         out = pd.DataFrame(index=range(n))
 
+        # Non-DP fast empirical Gaussian copula path
+        if dp_epsilon is None:
+            if num_cols:
+                z_cols: list[np.ndarray] = []
+                sorted_originals: dict[str, np.ndarray] = {}
+                is_int_col: dict[str, bool] = {}
+
+                for col in num_cols:
+                    series = reference_df[col]
+                    is_int_col[str(col)] = bool(pd.api.types.is_integer_dtype(series))
+                    vals = series.fillna(series.median() if series.notna().any() else 0.0).to_numpy(dtype=float)
+                    sorted_originals[str(col)] = np.sort(vals)
+                    ranks = stats.rankdata(vals, method="average")
+                    u = np.clip(ranks / (len(vals) + 1.0), 1e-6, 1.0 - 1e-6)
+                    z_cols.append(stats.norm.ppf(u))
+
+                z_matrix = np.column_stack(z_cols)
+                if z_matrix.shape[1] == 1:
+                    corr = np.array([[1.0]])
+                else:
+                    z_std = np.std(z_matrix, axis=0)
+                    non_const = z_std > 1e-12
+                    corr = np.eye(z_matrix.shape[1], dtype=float)
+                    if int(np.sum(non_const)) >= 2:
+                        sub_corr = np.corrcoef(z_matrix[:, non_const], rowvar=False)
+                        sub_corr = np.nan_to_num(sub_corr, nan=0.0)
+                        idx_nc = np.where(non_const)[0]
+                        corr[np.ix_(idx_nc, idx_nc)] = sub_corr
+                    corr = _project_psd_correlation(corr)
+
+                sampled_z = rng.multivariate_normal(mean=np.zeros(len(num_cols)), cov=corr, size=n)
+                sampled_u = stats.norm.cdf(sampled_z)
+
+                for idx, col in enumerate(num_cols):
+                    orig_sorted = sorted_originals[str(col)]
+                    synth_vals = np.quantile(orig_sorted, sampled_u[:, idx])
+                    if is_int_col[str(col)]:
+                        out[col] = np.rint(synth_vals).astype(int)
+                    else:
+                        out[col] = synth_vals
+
+            for col in other_cols:
+                series = reference_df[col]
+                if pd.api.types.is_datetime64_any_dtype(series):
+                    non_null = series.dropna()
+                    if len(non_null) == 0:
+                        out[col] = pd.NaT
+                    else:
+                        ts_int = non_null.astype("datetime64[ns]").astype("int64").to_numpy()
+                        sampled_ts = rng.uniform(float(ts_int.min()), float(ts_int.max()), size=n).astype("int64")
+                        out[col] = pd.to_datetime(sampled_ts, unit="ns")
+                else:
+                    counts = series.value_counts(dropna=False)
+                    probs = (counts / counts.sum()).to_numpy(dtype=float)
+                    choices = counts.index.to_numpy()
+                    sampled_idx = rng.choice(len(choices), size=n, p=probs)
+                    out[col] = [choices[i] for i in sampled_idx]
+
+            return out[reference_df.columns]
+
+        # Pure (dp_epsilon, 0)-DP Gaussian Copula path (Sequential Composition + Post-Processing)
+        eps_total = float(dp_epsilon)
+        n_ref = len(reference_df)
+        total_cols = max(len(reference_df.columns), 1)
+        d_num = len(num_cols)
+        n_pairs = (d_num * (d_num - 1)) // 2
+        if n_pairs >= 1:
+            eps_marginal_total = 0.7 * eps_total
+            eps_corr_total = 0.3 * eps_total
+            eps_pair = eps_corr_total / n_pairs
+        else:
+            eps_marginal_total = eps_total
+            eps_pair = 0.0
+        eps_per_col = eps_marginal_total / total_cols
+        n_bins = min(32, max(4, int(math.isqrt(max(n_ref, 1)))))
+        bounds_map = dp_bounds or {}
+        cat_domain_map = dp_categories or {}
+
         if num_cols:
-            # Map each numeric column to normal scores via empirical CDF
-            z_cols: list[np.ndarray] = []
-            sorted_originals: dict[str, np.ndarray] = {}
-            is_int_col: dict[str, bool] = {}
+            dp_edges: dict[str, np.ndarray] = {}
+            dp_cdfs: dict[str, np.ndarray] = {}
+            dp_is_int: dict[str, bool] = {}
+            z_bounded_cols: list[np.ndarray] = []
 
             for col in num_cols:
+                col_key = str(col)
                 series = reference_df[col]
-                is_int_col[str(col)] = bool(pd.api.types.is_integer_dtype(series))
-                vals = series.fillna(series.median() if series.notna().any() else 0.0).to_numpy(dtype=float)
-                sorted_originals[str(col)] = np.sort(vals)
-                ranks = stats.rankdata(vals, method="average")
-                u = np.clip(ranks / (len(vals) + 1.0), 1e-6, 1.0 - 1e-6)
-                z_cols.append(stats.norm.ppf(u))
+                dp_is_int[col_key] = bool(pd.api.types.is_integer_dtype(series))
+                if col_key in bounds_map:
+                    lo, hi = float(bounds_map[col_key][0]), float(bounds_map[col_key][1])
+                    if lo > hi:
+                        raise ValueError(f"dp_bounds for column '{col_key}' requires low <= high, got ({lo}, {hi}).")
+                else:
+                    non_na = pd.to_numeric(series, errors="coerce").dropna()
+                    lo = float(non_na.min()) if len(non_na) > 0 else 0.0
+                    hi = float(non_na.max()) if len(non_na) > 0 else 1.0
+                    logger.warning(
+                        "dp_copula_empirical_bounds_used",
+                        column=col_key,
+                        note="Pass public dp_bounds for strict global-sensitivity guarantees without empirical bound estimation.",
+                    )
+                mid = 0.5 * (lo + hi)
+                vals = np.clip(pd.to_numeric(series, errors="coerce").fillna(mid).to_numpy(dtype=float), lo, hi)
+                edges, cdf_knots = _dp_noisy_histogram_cdf(vals, lo, hi, n_bins, eps_per_col, rng)
+                dp_edges[col_key] = edges
+                dp_cdfs[col_key] = cdf_knots
 
-            z_matrix = np.column_stack(z_cols)
-            if z_matrix.shape[1] == 1:
-                corr = np.array([[1.0]])
+                u_scores = np.clip(np.interp(vals, edges, cdf_knots), 1e-6, 1.0 - 1e-6)
+                z_bounded = np.clip(stats.norm.ppf(u_scores), -3.0, 3.0)
+                z_bounded_cols.append(z_bounded)
+
+            if d_num == 1:
+                corr = np.array([[1.0]], dtype=float)
             else:
-                z_std = np.std(z_matrix, axis=0)
-                non_const = z_std > 1e-12
-                corr = np.eye(z_matrix.shape[1], dtype=float)
-                if int(np.sum(non_const)) >= 2:
-                    sub_corr = np.corrcoef(z_matrix[:, non_const], rowvar=False)
-                    sub_corr = np.nan_to_num(sub_corr, nan=0.0)
-                    idx_nc = np.where(non_const)[0]
-                    corr[np.ix_(idx_nc, idx_nc)] = sub_corr
-                corr = 0.5 * (corr + corr.T)
-                np.fill_diagonal(corr, 1.0)
-                # Ensure positive semi-definiteness via eigenvalue clipping
-                eigvals, eigvecs = np.linalg.eigh(corr)
-                eigvals = np.clip(eigvals, 1e-5, None)
-                corr = (eigvecs * eigvals) @ eigvecs.T
-                d = np.sqrt(np.diag(corr))
-                corr = corr / np.outer(d, d)
+                z_mat = np.column_stack(z_bounded_cols)
+                corr = np.eye(d_num, dtype=float)
+                # Since each z_{ia} in [-3, 3], z_{ia}*z_{ib} in [-9, 9]; under 1-record replacement,
+                # L1 sensitivity of (1/N) * sum_i z_{ia}*z_{ib} is exactly Delta_1 = 18 / N.
+                pair_scale = 18.0 / (max(n_ref, 1) * eps_pair)
+                for a_idx in range(d_num):
+                    for b_idx in range(a_idx + 1, d_num):
+                        raw_cov = float(np.mean(z_mat[:, a_idx] * z_mat[:, b_idx]))
+                        noisy_cov = float(np.clip(raw_cov + rng.laplace(0.0, pair_scale), -1.0, 1.0))
+                        corr[a_idx, b_idx] = noisy_cov
+                        corr[b_idx, a_idx] = noisy_cov
+                corr = _project_psd_correlation(corr)
 
-            sampled_z = rng.multivariate_normal(
-                mean=np.zeros(len(num_cols)), cov=corr, size=n
-            )
-            sampled_u = stats.norm.cdf(sampled_z)
+            sampled_z = rng.multivariate_normal(mean=np.zeros(d_num), cov=corr, size=n)
+            sampled_u = np.clip(stats.norm.cdf(sampled_z), 0.0, 1.0)
 
             for idx, col in enumerate(num_cols):
-                orig_sorted = sorted_originals[str(col)]
-                synth_vals = np.quantile(orig_sorted, sampled_u[:, idx])
-                if dp_epsilon is not None and dp_epsilon > 0:
-                    sensitivity = float(np.ptp(orig_sorted)) / max(len(orig_sorted), 1)
-                    noise_scale = max(sensitivity / dp_epsilon, 1e-9)
-                    synth_vals = synth_vals + rng.laplace(0.0, noise_scale, size=n)
-                if is_int_col[str(col)]:
+                col_key = str(col)
+                synth_vals = np.interp(sampled_u[:, idx], dp_cdfs[col_key], dp_edges[col_key])
+                if dp_is_int[col_key]:
                     out[col] = np.rint(synth_vals).astype(int)
                 else:
                     out[col] = synth_vals
 
         for col in other_cols:
+            col_key = str(col)
             series = reference_df[col]
             if pd.api.types.is_datetime64_any_dtype(series):
                 non_null = series.dropna()
-                if len(non_null) == 0:
+                if len(non_null) == 0 and col_key not in bounds_map:
                     out[col] = pd.NaT
+                    continue
+                if col_key in bounds_map:
+                    lo_ts, hi_ts = float(bounds_map[col_key][0]), float(bounds_map[col_key][1])
                 else:
-                    ts_int = non_null.astype("datetime64[ns]").astype("int64").to_numpy()
-                    sampled_ts = rng.uniform(float(ts_int.min()), float(ts_int.max()), size=n).astype("int64")
-                    out[col] = pd.to_datetime(sampled_ts, unit="ns")
+                    ts_obs = non_null.astype("datetime64[ns]").astype("int64").to_numpy(dtype=float)
+                    lo_ts, hi_ts = float(ts_obs.min()), float(ts_obs.max())
+                    logger.warning("dp_copula_empirical_datetime_bounds_used", column=col_key)
+                mid_ts = 0.5 * (lo_ts + hi_ts)
+                raw_ts = (
+                    series.astype("datetime64[ns]")
+                    .astype("int64")
+                    .where(series.notna(), int(mid_ts))
+                    .to_numpy(dtype=float)
+                )
+                edges_ts, cdf_ts = _dp_noisy_histogram_cdf(raw_ts, lo_ts, hi_ts, n_bins, eps_per_col, rng)
+                u_draw = rng.uniform(0.0, 1.0, size=n)
+                synth_ts = np.interp(u_draw, cdf_ts, edges_ts).astype("int64")
+                out[col] = pd.to_datetime(synth_ts, unit="ns")
             else:
-                counts = series.value_counts(dropna=False)
-                probs = (counts / counts.sum()).to_numpy(dtype=float)
-                choices = counts.index.to_numpy()
-                sampled_idx = rng.choice(len(choices), size=n, p=probs)
-                out[col] = [choices[i] for i in sampled_idx]
+                if col_key in cat_domain_map and len(cat_domain_map[col_key]) > 0:
+                    domain_vals = list(cat_domain_map[col_key])
+                elif pd.api.types.is_bool_dtype(series):
+                    domain_vals = [False, True]
+                else:
+                    domain_vals = series.value_counts(dropna=False).index.tolist() or ["MISSING"]
+                    logger.warning("dp_copula_empirical_categories_used", column=col_key)
+                val_to_idx = {v: i for i, v in enumerate(domain_vals)}
+                cat_counts = np.zeros(len(domain_vals), dtype=float)
+                for item in series.tolist():
+                    if item in val_to_idx:
+                        cat_counts[val_to_idx[item]] += 1.0
+                    elif pd.isna(item):
+                        na_matches = [i for i, dv in enumerate(domain_vals) if pd.isna(dv)]
+                        cat_counts[na_matches[0] if na_matches else 0] += 1.0
+                    else:
+                        cat_counts[0] += 1.0
+                # Disjoint category count histogram has L1 sensitivity Delta_1 = 2.0 under replacement
+                noisy_cat = np.maximum(
+                    cat_counts + rng.laplace(0.0, 2.0 / eps_per_col, size=len(domain_vals)),
+                    0.0,
+                )
+                cat_sum = float(noisy_cat.sum())
+                probs = noisy_cat / cat_sum if cat_sum > 1e-12 else np.full(len(domain_vals), 1.0 / len(domain_vals))
+                sampled_idx = rng.choice(len(domain_vals), size=n, p=probs)
+                out[col] = [domain_vals[i] for i in sampled_idx]
 
         return out[reference_df.columns]
 

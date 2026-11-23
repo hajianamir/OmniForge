@@ -5,6 +5,7 @@ from omniforge.mlops.drift import DriftDetector, DriftReport, FeatureDriftResult
 from omniforge.mlops.future_scoring import FuturePredictionResult, FutureTargetPredictor
 from omniforge.mlops.monitoring import AlertEvent, ModelMonitor
 from omniforge.mlops.registry import ModelRegistry, RegisteredModelVersion
+from omniforge.mlops.root_cause import DriftRootCauseAnalyzer, RootCauseReport
 from omniforge.mlops.serving import ModelServingEngine
 from omniforge.mlops.supervisory_monitor import SupervisoryPredictionMonitor
 from omniforge.mlops.tracking import ExperimentTracker, RunRecord
@@ -14,6 +15,7 @@ __all__ = [
     "ContinuousTrainingOrchestrator",
     "DriftDetector",
     "DriftReport",
+    "DriftRootCauseAnalyzer",
     "ExperimentTracker",
     "FeatureDriftResult",
     "FuturePredictionResult",
@@ -22,6 +24,7 @@ __all__ = [
     "ModelRegistry",
     "ModelServingEngine",
     "RegisteredModelVersion",
+    "RootCauseReport",
     "RunRecord",
     "SupervisoryPredictionMonitor",
 ]

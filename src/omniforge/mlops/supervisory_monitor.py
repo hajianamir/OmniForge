@@ -182,6 +182,8 @@ class SupervisoryPredictionMonitor:
                         fill_v = float(vals.median())
                     out[col] = vals.fillna(fill_v if math.isfinite(fill_v) else 0.0)
                 else:
+                    if isinstance(ser.dtype, pd.CategoricalDtype) and "MISSING" not in ser.cat.categories:
+                        ser = ser.cat.add_categories(["MISSING"])
                     out[col] = ser.fillna("MISSING").astype(str)
             else:
                 fill_v = 0.0

@@ -1,16 +1,14 @@
-# ruff: noqa: E402
-# mypy: ignore-errors
+"""Studio 03 (Universal Statistical Diagnostics) router."""
+
 from __future__ import annotations
 
 import dataclasses
-
-"""s03_eda router."""
-
-
-from typing import Any
+from typing import Any, cast
 
 from fastapi import APIRouter, Header
 
+from omniforge.api.studios.schemas import DiagnosticsReq, wb_cache_and_respond
+from omniforge.core.utils import to_json_object
 from omniforge.eda.diagnostics import (
     DIAGNOSTIC_TEST_CATALOG,
     DOWNSTREAM_MODULE_CATALOG,
@@ -23,12 +21,13 @@ router = APIRouter(tags=["workbench-s03"])
 
 def _wb() -> Any:
     from omniforge.api import workbench as wb
+
     return wb
 
 
 @router.get("/s03/catalog")
 def s03_catalog() -> dict[str, Any]:
-    return _wb().to_json_object(
+    return to_json_object(
         {
             "diagnostic_tests": DIAGNOSTIC_TEST_CATALOG,
             "downstream_modules": DOWNSTREAM_MODULE_CATALOG,
@@ -37,7 +36,7 @@ def s03_catalog() -> dict[str, Any]:
 
 
 @router.post("/s03/run")
-def s03_run_diagnostics(req: _wb().DiagnosticsReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
+def s03_run_diagnostics(req: DiagnosticsReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
     df = _wb().get_analysis_dataframe(state, _wb()._require_df(state))
@@ -45,11 +44,11 @@ def s03_run_diagnostics(req: _wb().DiagnosticsReq, x_session_id: str | None = He
     criteria = StatisticalCriteriaConfig(
         alpha=req.alpha,
         confidence_level=req.confidence_level,
-        multiple_testing_correction=req.fdr_method,  # type: ignore[arg-type]
-        parametric_mode=req.parametric_mode,  # type: ignore[arg-type]
-        normality_method=req.normality_method,  # type: ignore[arg-type]
-        correlation_method=req.correlation_method,  # type: ignore[arg-type]
-        outlier_method=req.outlier_method,  # type: ignore[arg-type]
+        multiple_testing_correction=cast(Any, req.fdr_method),
+        parametric_mode=cast(Any, req.parametric_mode),
+        normality_method=cast(Any, req.normality_method),
+        correlation_method=cast(Any, req.correlation_method),
+        outlier_method=cast(Any, req.outlier_method),
         vif_threshold=req.vif_threshold,
         risk_tail_alpha=req.risk_tail_alpha,
         holdout_ratio=req.holdout_ratio,
@@ -69,13 +68,13 @@ def s03_run_diagnostics(req: _wb().DiagnosticsReq, x_session_id: str | None = He
     state["uap_baseline_equations"] = report.baseline_equations
     state["uap_baseline_models"] = dict(getattr(suite, "last_baseline_models_", {}) or {})
     state["uap_risk_report"] = report.risk_assessment
-    _wb().record_lineage(state, "Diagnostics", f"Ran Universal Diagnostics ({req.mode})", f"Tests={len(report.hypothesis_ledger)} | Targets={len(targets)}")
+    _wb().record_lineage(
+        state,
+        "Diagnostics",
+        f"Ran Universal Diagnostics ({req.mode})",
+        f"Tests={len(report.hypothesis_ledger)} | Targets={len(targets)}",
+    )
     rep_dict = report.model_dump() if hasattr(report, "model_dump") else dataclasses.asdict(report)
     rep_dict["total_tests"] = report.total_tests
     rep_dict["significant_tests"] = report.significant_tests
-    return _wb()._cache_and_respond(state, sid, "s03_diagnostics", {"report": rep_dict})
-
-
-# ---------------------------------------------------------------------------
-# Studio 04 — Automated EDA & Expanded 17-Test Hypothesis Lab
-# ---------------------------------------------------------------------------
+    return wb_cache_and_respond(state, sid, "s03_diagnostics", {"report": rep_dict})

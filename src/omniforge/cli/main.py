@@ -37,8 +37,16 @@ def cmd_domains(
     from omniforge.domains import default_domain_registry
 
     if export_sample:
-        plugin = default_domain_registry.get(export_sample)
+        if rows < 10:
+            console.print("[red]Error: --rows must be at least 10.[/red]")
+            raise typer.Exit(code=1)
+        try:
+            plugin = default_domain_registry.get(export_sample)
+        except Exception as exc:
+            console.print(f"[red]Unknown domain plugin '{export_sample}': {exc}[/red]")
+            raise typer.Exit(code=1) from exc
         df = plugin.generate_sample_dataset(n_samples=rows)
+        out.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(out, index=False)
         console.print(f"[green]Generated {len(df)} rows for domain '{export_sample}' -> {out}[/green]")
         return
@@ -103,6 +111,11 @@ def cmd_eda(
     from omniforge.eda.automated_eda import AutomatedEDA
 
     ing = DataIngestionEngine().ingest(source)
+    if target is not None and target not in ing.data.columns:
+        console.print(
+            f"[red]Target column '{target}' not found in dataset. Available columns: {list(ing.data.columns)}[/red]"
+        )
+        raise typer.Exit(code=1)
     rep = AutomatedEDA().run(ing.data, target_column=target, generate_figures=True)
     rep.export_html(html_out)
     console.print(f"[green]EDA report written to {html_out}[/green]\n\n{rep.narrative}")
@@ -119,8 +132,17 @@ def cmd_automl(
     from omniforge.automl.pipeline_search import AutoMLPipelineSearch
     from omniforge.data.ingestion import DataIngestionEngine
 
+    if budget <= 0:
+        console.print("[red]Error: --budget must be positive (seconds).[/red]")
+        raise typer.Exit(code=1)
+
     ing = DataIngestionEngine().ingest(source)
     df = ing.data
+    if target not in df.columns:
+        console.print(
+            f"[red]Target column '{target}' not found in dataset. Available columns: {list(df.columns)}[/red]"
+        )
+        raise typer.Exit(code=1)
     X = df.drop(columns=[target])
     y = df[target]
     res = AutoMLPipelineSearch(time_budget_seconds=budget).fit(X, y)
@@ -218,6 +240,10 @@ def cmd_monitor(
     from omniforge.domains import default_domain_registry
     from omniforge.mlops.drift import DriftDetector
 
+    if (reference is None) != (current is None):
+        console.print("[red]Error: Provide both --reference and --current together, or omit both for synthetic demo check.[/red]")
+        raise typer.Exit(code=1)
+
     detector = DriftDetector()
     cycles = max(1, max_cycles) if interval > 0 else 1
 
@@ -237,6 +263,30 @@ def cmd_monitor(
         )
         if interval > 0 and cycle < cycles:
             time.sleep(interval)
+
+
+@cli.command("sbom")
+def cmd_sbom(
+    out: Path = typer.Option(Path("omniforge.sbom.cdx.json"), "--out", help="Output CycloneDX 1.5 JSON path."),
+    tier: str = typer.Option("everything", "--tier", help="Lockfile tier (simple, advanced, everything, dev)."),
+    verify_only: bool = typer.Option(False, "--verify", help="Verify SHA-256 hash pinning across all lockfiles."),
+) -> None:
+    """Generate a CycloneDX 1.5 Software Bill of Materials (SBOM) or verify lockfile SHA-256 provenance."""
+    from omniforge.core.sbom import verify_lockfiles_provenance, write_cyclonedx_sbom
+
+    if verify_only:
+        rep = verify_lockfiles_provenance()
+        status_str = "[green]VERIFIED[/green]" if rep["verified"] else "[red]FAILED[/red]"
+        console.print(
+            f"Lockfile Provenance: {status_str} | Lockfiles: {rep['lockfile_count']} | "
+            f"Unpinned Packages: {len(rep['unpinned_packages'])}"
+        )
+        if not rep["verified"]:
+            raise typer.Exit(code=1)
+        return
+
+    written = write_cyclonedx_sbom(out, tier=tier)
+    console.print(f"[green]CycloneDX 1.5 SBOM written to {written}[/green]")
 
 
 @cli.command("serve")

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
 import pandas as pd
 from sklearn.dummy import DummyClassifier, DummyRegressor
-from sklearn.linear_model import LassoCV, LogisticRegression
+from sklearn.linear_model import Lasso, LassoCV, LogisticRegression, Ridge
 from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, root_mean_squared_error
 from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
@@ -60,7 +61,22 @@ class LogisticBaseline(BaseOmniForgeModel):
             **kwargs,
         )
         self._scaler = StandardScaler()
-        self._model = LogisticRegression(C=C, penalty="l1", solver="liblinear", max_iter=1000, random_state=self.random_seed)
+        try:
+            self._model = LogisticRegression(
+                C=C,
+                l1_ratio=1.0,
+                solver="saga",
+                max_iter=2000,
+                random_state=self.random_seed,
+            )
+        except TypeError:
+            self._model = LogisticRegression(
+                C=C,
+                penalty="l1",
+                solver="liblinear",
+                max_iter=2000,
+                random_state=self.random_seed,
+            )
 
     def _fit(self, X: np.ndarray, y: np.ndarray | None, **kwargs: Any) -> None:
         assert y is not None
@@ -122,23 +138,94 @@ class DummyRegressorBaseline(BaseOmniForgeModel):
 
 
 class RidgeLinearBaseline(BaseOmniForgeModel):
-    """Standardized Ridge linear regression strong baseline."""
+    """Standardized L2 Tikhonov / Hoerl-Kennard Ridge linear regression strong baseline.
+
+    Standardizes features via :class:`~sklearn.preprocessing.StandardScaler` and minimizes the
+    scikit-learn L2-penalized residual sum of squares (Hoerl & Kennard, 1970, *Technometrics*
+    12(1):55-67):
+
+    .. math::
+        \\min_{w, w_0} \\|\\tilde{X} w + w_0 \\mathbf{1} - y\\|_2^2 + \\alpha \\|w\\|_2^2, \\quad \\alpha \\ge 0
+    """
 
     model_family = "baseline_regression"
 
     def __init__(self, alpha: float = 1.0, **kwargs: Any) -> None:
+        if isinstance(alpha, bool) or not math.isfinite(float(alpha)) or float(alpha) < 0.0:
+            raise ValueError("RidgeLinearBaseline requires a finite regularization parameter alpha >= 0.0.")
+        self.alpha = float(alpha)
         super().__init__(
             name="Baseline_RidgeLinear",
             task_type=TaskType.REGRESSION,
-            alpha=alpha,
+            alpha=self.alpha,
             **kwargs,
         )
         self._scaler = StandardScaler()
-        self._model = LassoCV(cv=3, max_iter=2000, random_state=self.random_seed)
+        self._model = Ridge(alpha=self.alpha, random_state=self.random_seed)
 
     def _fit(self, X: np.ndarray, y: np.ndarray | None, **kwargs: Any) -> None:
         assert y is not None
         self._model.fit(self._scaler.fit_transform(X), y)
+
+    def _predict(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
+        return np.asarray(self._model.predict(self._scaler.transform(X)), dtype=float)
+
+
+class LassoLinearBaseline(BaseOmniForgeModel):
+    """Standardized L1 sparse Lasso linear regression strong baseline.
+
+    Standardizes features via :class:`~sklearn.preprocessing.StandardScaler` and minimizes the
+    L1-penalized least-squares objective (Tibshirani, 1996, *JRSS-B* 58(1):267-288):
+
+    .. math::
+        \\min_{w, w_0} \\frac{1}{2 n_{\\text{samples}}} \\|\\tilde{X} w + w_0 \\mathbf{1} - y\\|_2^2 + \\alpha \\|w\\|_1
+
+    Uses cross-validated :class:`~sklearn.linear_model.LassoCV` when ``alpha is None`` (with safe
+    small-sample fallback) or fixed-regularization :class:`~sklearn.linear_model.Lasso` when
+    ``alpha`` is provided explicitly.
+    """
+
+    model_family = "baseline_regression"
+
+    def __init__(
+        self,
+        alpha: float | None = None,
+        cv: int = 3,
+        max_iter: int = 2000,
+        **kwargs: Any,
+    ) -> None:
+        if alpha is not None and (isinstance(alpha, bool) or not math.isfinite(float(alpha)) or float(alpha) <= 0.0):
+            raise ValueError("LassoLinearBaseline requires alpha > 0.0 when explicitly specified.")
+        if isinstance(cv, bool) or int(cv) < 2:
+            raise ValueError("LassoLinearBaseline requires cv >= 2.")
+        self.alpha = float(alpha) if alpha is not None else None
+        self.cv = int(cv)
+        self.max_iter = max(100, int(max_iter))
+        super().__init__(
+            name="Baseline_LassoLinear",
+            task_type=TaskType.REGRESSION,
+            alpha=self.alpha,
+            cv=self.cv,
+            max_iter=self.max_iter,
+            **kwargs,
+        )
+        self._scaler = StandardScaler()
+        self._model: Lasso | LassoCV = (
+            Lasso(alpha=self.alpha, max_iter=self.max_iter, random_state=self.random_seed)
+            if self.alpha is not None
+            else LassoCV(cv=self.cv, max_iter=self.max_iter, random_state=self.random_seed)
+        )
+
+    def _fit(self, X: np.ndarray, y: np.ndarray | None, **kwargs: Any) -> None:
+        assert y is not None
+        X_scaled = self._scaler.fit_transform(X)
+        if self.alpha is not None or len(X_scaled) < 3:
+            eff_alpha = self.alpha if self.alpha is not None else 0.1
+            self._model = Lasso(alpha=eff_alpha, max_iter=self.max_iter, random_state=self.random_seed)
+        else:
+            eff_cv = max(2, min(self.cv, len(X_scaled)))
+            self._model = LassoCV(cv=eff_cv, max_iter=self.max_iter, random_state=self.random_seed)
+        self._model.fit(X_scaled, y)
 
     def _predict(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
         return np.asarray(self._model.predict(self._scaler.transform(X)), dtype=float)
@@ -278,6 +365,7 @@ class BaselineBenchmarkSuite:
             DummyRegressorBaseline(strategy="median", random_seed=random_seed),
             DecisionStumpRegressorBaseline(max_depth=2, random_seed=random_seed),
             RidgeLinearBaseline(random_seed=random_seed),
+            LassoLinearBaseline(random_seed=random_seed),
             PenalizedSplineGAMModel(task_type=TaskType.REGRESSION, random_seed=random_seed),
             NadarayaWatsonKernelModel(task_type=TaskType.REGRESSION, random_seed=random_seed),
             DistanceWeightedKNNModel(task_type=TaskType.REGRESSION, random_seed=random_seed),

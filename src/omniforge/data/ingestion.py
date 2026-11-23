@@ -5,13 +5,13 @@ from __future__ import annotations
 import io
 import json
 import sqlite3
+import tempfile
 import tomllib
-import xml.etree.ElementTree as ET
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
 import numpy as np
@@ -19,7 +19,7 @@ import pandas as pd
 import yaml
 
 from omniforge.core.constants import SUPPORTED_CLOUD_SCHEMES, SUPPORTED_DB_SCHEMES, SUPPORTED_FILE_FORMATS
-from omniforge.core.exceptions import DataIngestionError, DependencyMissingError
+from omniforge.core.exceptions import DataIngestionError, DependencyMissingError, SecurityError
 from omniforge.core.logging import get_logger
 from omniforge.core.types import ColumnSchema, DataModality, DatasetMetadata
 from omniforge.core.utils import (
@@ -30,6 +30,64 @@ from omniforge.core.utils import (
 )
 
 logger = get_logger(__name__)
+
+_MAX_HTTP_RESPONSE_BYTES: int = 256 * 1024 * 1024  # 256 MiB ceiling per HTTP response
+_MAX_HTTP_REDIRECTS: int = 5
+_SENSITIVE_QUERY_KEYS: frozenset[str] = frozenset(
+    {"password", "passwd", "pwd", "token", "api_key", "apikey", "access_token", "secret", "auth"}
+)
+_CROSS_ORIGIN_SENSITIVE_HEADERS: frozenset[str] = frozenset(
+    {"authorization", "cookie", "proxy-authorization", "x-api-key"}
+)
+
+def _quote_sql_identifier(identifier: str) -> str:
+    """Quote a SQL identifier (ANSI double-quoting with embedded-quote doubling).
+
+    Rejects empty/NUL-containing/absurdly long identifiers. Doubling makes any
+    identifier value safe to interpolate into a double-quoted position, so the
+    caller still chooses the canonical table name explicitly.
+    """
+    if not isinstance(identifier, str):
+        raise SecurityError("SQL identifier must be a string.")
+    name = identifier.strip()
+    if not name:
+        raise SecurityError("SQL identifier cannot be empty.")
+    if "\x00" in name:
+        raise SecurityError("NUL bytes are forbidden in SQL identifiers.")
+    if len(name) > 128:
+        raise SecurityError("SQL identifier exceeds 128 characters.")
+    if "." in name:
+        parts = [p for p in name.split(".")]
+        return ".".join(_quote_sql_identifier(part) for part in parts)
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _sqlite_canonical_table_name(conn: sqlite3.Connection, requested: str) -> str:
+    """Allowlist check: return the canonical sqlite_master table/view name matching ``requested``."""
+    wanted = requested.strip()
+    if not wanted or "\x00" in wanted:
+        raise DataIngestionError("Table name cannot be empty.")
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name = ? COLLATE NOCASE",
+        (wanted,),
+    ).fetchone()
+    if row is None:
+        raise DataIngestionError(f"Table or view '{wanted}' was not found in the SQLite database.")
+    return str(row[0])
+
+
+def _duckdb_canonical_table_name(conn: Any, requested: str) -> str:
+    """Allowlist check: return the canonical table/view name reported by DuckDB matching ``requested``."""
+    wanted = requested.strip()
+    if not wanted or "\x00" in wanted:
+        raise DataIngestionError("Table name cannot be empty.")
+    rows = conn.execute("SHOW TABLES").fetchall()
+    names = [str(r[0]) for r in rows]
+    match = next((n for n in names if n.lower() == wanted.lower()), None)
+    if match is None:
+        raise DataIngestionError(f"Table or view '{wanted}' was not found in the DuckDB database.")
+    return match
+
 
 
 @dataclass
@@ -125,7 +183,7 @@ class DataIngestionEngine:
                     source_str, headers=headers, params=params, source_format=source_format, **kwargs
                 )
                 resolved_fmt = source_format or "api_json"
-                source_label = source_str
+                source_label = self._sanitize_uri(source_str)
             elif any(scheme.startswith(db_s) for db_s in SUPPORTED_DB_SCHEMES) or (
                 scheme == "" and source_str.lower().endswith((".db", ".sqlite", ".sqlite3", ".duckdb"))
             ):
@@ -133,14 +191,24 @@ class DataIngestionEngine:
                 source_label = self._sanitize_uri(source_str)
             elif scheme in SUPPORTED_CLOUD_SCHEMES:
                 fmt = source_format or self._detect_format_from_path(parsed.path)
-                df = self._ingest_file(
-                    source_str,
-                    fmt=fmt,
-                    storage_options=storage_options,
-                    **kwargs,
-                )
+                if scheme in ("http", "https"):
+                    df = self._ingest_http_file(
+                        source_str,
+                        fmt=fmt,
+                        headers=headers,
+                        params=params,
+                        **kwargs,
+                    )
+                    source_label = self._sanitize_uri(source_str)
+                else:
+                    df = self._ingest_file(
+                        source_str,
+                        fmt=fmt,
+                        storage_options=storage_options,
+                        **kwargs,
+                    )
+                    source_label = self._sanitize_uri(source_str)
                 resolved_fmt = f"{scheme}:{fmt}"
-                source_label = source_str
             else:
                 path = Path(source_str)
                 if not path.exists():
@@ -541,12 +609,16 @@ class DataIngestionEngine:
                 try:
                     return pd.read_xml(io.StringIO(raw_xml), **kwargs)
                 except Exception:
+                    # Audit B314: never fall back to stdlib ET.fromstring (unsafe). Defusedxml
+                    # is a declared core dependency; if it is absent, fail closed.
                     try:
                         import defusedxml.ElementTree as safe_et
-
-                        root = safe_et.fromstring(raw_xml)
-                    except ImportError:
-                        root = ET.fromstring(raw_xml)
+                    except ImportError as exc:
+                        raise DependencyMissingError(
+                            "Install 'defusedxml' to parse XML without pandas' XML reader.",
+                            suggestions=["pip install defusedxml  (or reinstall omniforge: pip install omniforge)"],
+                        ) from exc
+                    root = safe_et.fromstring(raw_xml)
                     rows = [{child.tag: child.text for child in elem} for elem in root]
                     return pd.DataFrame(rows)
             if fmt == "yaml":
@@ -588,14 +660,24 @@ class DataIngestionEngine:
 
         try:
             if scheme == "sqlite" or uri.lower().endswith((".db", ".sqlite", ".sqlite3")):
+                from omniforge.data.connectors import make_sqlite_authorizer, validate_readonly_sql
+
                 db_path = uri.replace("sqlite:///", "") if scheme == "sqlite" else uri
-                sqlite_conn = sqlite3.connect(db_path)
+                sqlite_conn = self._open_sqlite_readonly(db_path)
                 try:
-                    sql = query or (
-                        f"SELECT * FROM {table_name}"
-                        if table_name
-                        else self._first_sqlite_table_query(sqlite_conn)
+                    sqlite_conn.set_authorizer(
+                        make_sqlite_authorizer(
+                            allow_introspection_pragmas=False,
+                            allow_read_uncommitted=False,
+                        )
                     )
+                    if query:
+                        sql = validate_readonly_sql(query)
+                    elif table_name:
+                        canonical = _sqlite_canonical_table_name(sqlite_conn, table_name)
+                        sql = f"SELECT * FROM {_quote_sql_identifier(canonical)}"
+                    else:
+                        sql = self._first_sqlite_table_query(sqlite_conn)
                     return pd.read_sql_query(sql, sqlite_conn, **kwargs), "sqlite"
                 finally:
                     sqlite_conn.close()
@@ -605,16 +687,22 @@ class DataIngestionEngine:
                     raise DependencyMissingError("Install 'duckdb' to ingest from DuckDB.")
                 import duckdb
 
+                from omniforge.data.connectors import validate_readonly_sql
+
                 db_path = uri.replace("duckdb:///", "") if scheme == "duckdb" else uri
-                with duckdb.connect(db_path, read_only=True) as conn:
+                with duckdb.connect(
+                    db_path, read_only=True, config={"enable_external_access": False}
+                ) as conn:
                     if query:
-                        return conn.execute(query).df(), "duckdb"
+                        return conn.execute(validate_readonly_sql(query)).df(), "duckdb"
                     if table_name:
-                        return conn.execute(f"SELECT * FROM {table_name}").df(), "duckdb"
+                        canonical = _duckdb_canonical_table_name(conn, table_name)
+                        return conn.execute(f"SELECT * FROM {_quote_sql_identifier(canonical)}").df(), "duckdb"
                     tables = conn.execute("SHOW TABLES").fetchall()
                     if not tables:
                         return pd.DataFrame(), "duckdb"
-                    return conn.execute(f"SELECT * FROM {tables[0][0]}").df(), "duckdb"
+                    first = str(tables[0][0])
+                    return conn.execute(f"SELECT * FROM {_quote_sql_identifier(first)}").df(), "duckdb"
 
             if scheme.startswith("mongodb"):
                 if not is_package_available("pymongo"):
@@ -645,7 +733,9 @@ class DataIngestionEngine:
             engine = create_engine(uri)
             try:
                 if query:
-                    return pd.read_sql_query(query, engine, **kwargs), scheme
+                    from omniforge.data.connectors import validate_readonly_sql
+
+                    return pd.read_sql_query(validate_readonly_sql(query), engine, **kwargs), scheme
                 if table_name:
                     return pd.read_sql_table(table_name, engine, **kwargs), scheme
                 sa_tables = inspect(engine).get_table_names()
@@ -654,13 +744,132 @@ class DataIngestionEngine:
                 return pd.read_sql_table(sa_tables[0], engine, **kwargs), scheme
             finally:
                 engine.dispose()
-        except (DataIngestionError, DependencyMissingError):
+        except (SecurityError, DataIngestionError, DependencyMissingError):
             raise
         except Exception as exc:
             raise DataIngestionError(
                 f"Database ingestion failed for scheme '{scheme or 'sqlite'}'.",
                 cause=exc,
                 suggestions=["Verify connection URI, credentials, and SQL query syntax."],
+            ) from exc
+
+    @classmethod
+    def _fetch_http_safe(
+        cls,
+        client: httpx.Client,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        max_redirects: int = _MAX_HTTP_REDIRECTS,
+        max_bytes: int = _MAX_HTTP_RESPONSE_BYTES,
+    ) -> tuple[bytes, str]:
+        """Fetch an HTTP(S) resource enforcing SSRF validation on every redirect hop and response size bounds."""
+        from omniforge.data.connectors import validate_outbound_http_url
+
+        current_url = validate_outbound_http_url(url)
+        orig_parsed = urlparse(current_url)
+        orig_scheme = orig_parsed.scheme.lower()
+        orig_origin = (
+            orig_scheme,
+            (orig_parsed.hostname or "").lower(),
+            orig_parsed.port or (443 if orig_scheme == "https" else 80),
+        )
+        cur_headers = dict(headers or {})
+        cur_params: dict[str, Any] | None = dict(params) if params else None
+
+        for _hop in range(max_redirects + 1):
+            with client.stream("GET", current_url, headers=cur_headers, params=cur_params) as resp:
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    location = resp.headers.get("location", "").strip()
+                    if not location:
+                        raise DataIngestionError(
+                            f"HTTP redirect ({resp.status_code}) missing Location header for '{cls._sanitize_uri(url)}'."
+                        )
+                    next_url = validate_outbound_http_url(urljoin(str(resp.request.url), location))
+                    next_parsed = urlparse(next_url)
+                    next_scheme = next_parsed.scheme.lower()
+                    next_origin = (
+                        next_scheme,
+                        (next_parsed.hostname or "").lower(),
+                        next_parsed.port or (443 if next_scheme == "https" else 80),
+                    )
+                    if next_origin != orig_origin and cur_headers:
+                        cur_headers = {
+                            k: v
+                            for k, v in cur_headers.items()
+                            if k.lower() not in _CROSS_ORIGIN_SENSITIVE_HEADERS
+                        }
+                    current_url = next_url
+                    cur_params = None
+                    continue
+
+                resp.raise_for_status()
+                content_length = resp.headers.get("content-length")
+                if content_length is not None:
+                    try:
+                        declared_len = int(content_length)
+                    except ValueError:
+                        declared_len = -1
+                    if declared_len > max_bytes:
+                        raise DataIngestionError(
+                            f"HTTP response Content-Length ({declared_len} bytes) exceeds safety limit ({max_bytes} bytes)."
+                        )
+
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in resp.iter_bytes():
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise DataIngestionError(
+                            f"HTTP response body exceeded safety limit ({max_bytes} bytes)."
+                        )
+                    chunks.append(chunk)
+                content_type = resp.headers.get("content-type", "").lower()
+                return b"".join(chunks), content_type
+
+        raise DataIngestionError(
+            f"Exceeded maximum HTTP redirects ({max_redirects}) for '{cls._sanitize_uri(url)}'."
+        )
+
+    def _ingest_http_file(
+        self,
+        url: str,
+        *,
+        fmt: str,
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        timeout: float = 30.0,
+        max_redirects: int = _MAX_HTTP_REDIRECTS,
+        max_bytes: int = _MAX_HTTP_RESPONSE_BYTES,
+        _transport: httpx.BaseTransport | None = None,
+        **kwargs: Any,
+    ) -> pd.DataFrame:
+        """Download a validated HTTP(S) file into an isolated temp directory and parse via ``_ingest_file``."""
+        try:
+            with httpx.Client(timeout=timeout, follow_redirects=False, transport=_transport) as client:
+                body, _ = self._fetch_http_safe(
+                    client,
+                    url,
+                    headers=headers,
+                    params=params,
+                    max_redirects=max_redirects,
+                    max_bytes=max_bytes,
+                )
+            raw_suffix = Path(urlparse(url).path).suffix or f".{fmt}"
+            clean_chars = "".join(ch for ch in raw_suffix if ch.isalnum() or ch == ".")[:16]
+            suffix = clean_chars if clean_chars.startswith(".") and len(clean_chars) > 1 else f".{fmt}"
+            with tempfile.TemporaryDirectory(prefix="omniforge_http_") as tmp_dir:
+                tmp_file = Path(tmp_dir) / f"payload{suffix}"
+                tmp_file.write_bytes(body)
+                return self._ingest_file(str(tmp_file), fmt=fmt, **kwargs)
+        except (SecurityError, DataIngestionError, DependencyMissingError):
+            raise
+        except Exception as exc:
+            raise DataIngestionError(
+                f"HTTP file ingestion failed for '{self._sanitize_uri(url)}'.",
+                cause=exc,
+                suggestions=["Verify the remote file URL, format, and network reachability."],
             ) from exc
 
     def _ingest_api(
@@ -674,24 +883,32 @@ class DataIngestionEngine:
         records_key: str | None = None,
         max_pages: int = 1,
         page_param: str = "page",
+        max_redirects: int = _MAX_HTTP_REDIRECTS,
+        max_bytes: int = _MAX_HTTP_RESPONSE_BYTES,
+        _transport: httpx.BaseTransport | None = None,
         **kwargs: Any,
     ) -> pd.DataFrame:
         all_frames: list[pd.DataFrame] = []
         base_params = dict(params or {})
         try:
-            with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+            with httpx.Client(timeout=timeout, follow_redirects=False, transport=_transport) as client:
                 for page in range(1, max_pages + 1):
                     req_params = dict(base_params)
                     if max_pages > 1:
                         req_params[page_param] = page
-                    resp = client.get(url, headers=headers, params=req_params)
-                    resp.raise_for_status()
-                    content_type = resp.headers.get("content-type", "").lower()
+                    body, content_type = self._fetch_http_safe(
+                        client,
+                        url,
+                        headers=headers,
+                        params=req_params,
+                        max_redirects=max_redirects,
+                        max_bytes=max_bytes,
+                    )
 
                     if source_format == "csv" or "text/csv" in content_type:
-                        frame = pd.read_csv(io.StringIO(resp.text))
+                        frame = pd.read_csv(io.StringIO(body.decode(self.default_encoding, errors="replace")))
                     else:
-                        payload = resp.json()
+                        payload = json.loads(body.decode(self.default_encoding))
                         if records_key and isinstance(payload, dict):
                             payload = payload.get(records_key, [])
                         elif isinstance(payload, dict):
@@ -708,9 +925,11 @@ class DataIngestionEngine:
                         break
                     all_frames.append(frame)
             return pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame()
+        except (SecurityError, DataIngestionError, DependencyMissingError):
+            raise
         except Exception as exc:
             raise DataIngestionError(
-                f"REST API ingestion failed for '{url}'.",
+                f"REST API ingestion failed for '{self._sanitize_uri(url)}'.",
                 cause=exc,
                 suggestions=["Verify endpoint URL, authentication headers, and response schema."],
             ) from exc
@@ -775,6 +994,22 @@ class DataIngestionEngine:
         return suffix not in SUPPORTED_FILE_FORMATS
 
     @staticmethod
+    def _open_sqlite_readonly(db_path: str) -> sqlite3.Connection:
+        """Open a SQLite file read-only at the OS/file-URI level (falls back for ':memory:')."""
+        if db_path == ":memory:":
+            return sqlite3.connect(":memory:")
+        from urllib.parse import quote as _urlquote
+
+        try:
+            uri = f"file:{_urlquote(str(Path(db_path).expanduser().resolve()), safe='/')}?mode=ro"
+            return sqlite3.connect(uri, uri=True)
+        except sqlite3.OperationalError:
+            # Fallback: open normally — the C-level authorizer installed by the caller still
+            # enforces read-only semantics even if the URI form is unavailable on this platform.
+            logger.warning("sqlite_readonly_uri_open_failed", path=db_path)
+            return sqlite3.connect(db_path)
+
+    @staticmethod
     def _first_sqlite_table_query(conn: sqlite3.Connection) -> str:
         cursor = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1"
@@ -782,13 +1017,30 @@ class DataIngestionEngine:
         row = cursor.fetchone()
         if row is None:
             raise DataIngestionError("SQLite database contains no user tables.")
-        return f'SELECT * FROM "{row[0]}"'
+        return f'SELECT * FROM {_quote_sql_identifier(str(row[0]))}'
 
     @staticmethod
     def _sanitize_uri(uri: str) -> str:
-        parsed = urlparse(uri)
-        if parsed.password:
-            return uri.replace(parsed.password, "***")
+        try:
+            parsed = urlparse(uri)
+        except ValueError:
+            return "<invalid-uri>"
+        netloc = parsed.netloc
+        if "@" in netloc:
+            userinfo, hostinfo = netloc.rsplit("@", 1)
+            if ":" in userinfo:
+                user, _ = userinfo.split(":", 1)
+                netloc = f"{user}:***@{hostinfo}"
+        query = parsed.query
+        if query:
+            pairs = parse_qsl(query, keep_blank_values=True)
+            redacted = [
+                (k, "***" if k.lower() in _SENSITIVE_QUERY_KEYS else v)
+                for k, v in pairs
+            ]
+            query = urlencode(redacted)
+        if netloc != parsed.netloc or query != parsed.query:
+            return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, query, parsed.fragment))
         return uri
 
     @staticmethod
@@ -842,13 +1094,11 @@ def fast_read_tabular(path: str | Path, *, backend: str = "auto") -> tuple[pd.Da
         import duckdb
 
         if ext == ".parquet":
-            rel = duckdb.query(f"SELECT * FROM read_parquet('{p.as_posix()}')")
-            if rel is not None:
-                return rel.df(), "duckdb"
+            return duckdb.read_parquet(str(p)).df(), "duckdb"
         if ext in (".csv", ".tsv"):
-            rel = duckdb.query(f"SELECT * FROM read_csv_auto('{p.as_posix()}')")
-            if rel is not None:
-                return rel.df(), "duckdb"
+            sep_opt = "\t" if ext == ".tsv" else None
+            rel = duckdb.read_csv(str(p), sep=sep_opt) if sep_opt else duckdb.read_csv(str(p))
+            return rel.df(), "duckdb"
 
     if ext == ".parquet":
         return pd.read_parquet(p), "pandas"

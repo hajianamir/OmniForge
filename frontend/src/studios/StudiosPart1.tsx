@@ -1610,10 +1610,15 @@ export const Studio05Features: React.FC<StudioProps> = ({ ws, onSync, bumpGrid, 
               <label className="field">Method
                 <select value={method} onChange={(e) => setMethod(e.target.value)}>
                   <option value="mutual_info">Mutual Information</option>
-                  <option value="f_test">Statistical F-Test</option>
+                  <option value="f_test">Statistical F-Test (ANOVA)</option>
+                  <option value="chi2">Chi-Square (Classification)</option>
+                  <option value="mrmr">mRMR (Min Redundancy Max Relevance)</option>
                   <option value="importance">Tree Feature Importance</option>
+                  <option value="rfe">Recursive Feature Elimination (RFE)</option>
+                  <option value="boruta_shadow">Boruta Shadow Permutation</option>
                   <option value="l1">L1 Lasso / Sparse Regularization</option>
                   <option value="variance">Variance Threshold</option>
+                  <option value="correlation">Correlation Filter</option>
                 </select>
               </label>
             )}

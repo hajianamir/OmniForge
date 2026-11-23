@@ -1,13 +1,9 @@
-# ruff: noqa: E402
-# mypy: ignore-errors
+"""Studio 06 (Multi-Backend AutoML, Non-Parametric Analytical & Deep Learning) router."""
+
 from __future__ import annotations
 
 import io
 import math
-
-"""s06_automl router."""
-
-
 from typing import Any
 
 import numpy as np
@@ -15,7 +11,16 @@ import pandas as pd
 from fastapi import APIRouter, File, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
+from omniforge.api.studios.schemas import (
+    AutoMLRunReq,
+    DeepBenchReq,
+    NonParametricRunReq,
+    SinglePredictReq,
+    wb_cache_and_respond,
+)
 from omniforge.automl.backends import AutoMLBackendHub, probe_automl_backends
+from omniforge.core.utils import to_json_object
+from omniforge.evaluation.equations import ModelEquationExtractor
 from omniforge.models.baselines import BaselineBenchmarkSuite
 from omniforge.models.deep import (
     CNN1DModel,
@@ -25,7 +30,6 @@ from omniforge.models.deep import (
     ResNetTabularModel,
     TabNetModel,
 )
-from omniforge.evaluation.equations import ModelEquationExtractor
 from omniforge.models.nonparametric import NonParametricAnalyticalSuite
 
 router = APIRouter(tags=["workbench-s06"])
@@ -38,11 +42,11 @@ def _wb() -> Any:
 
 @router.get("/s06/backends")
 def s06_list_backends() -> dict[str, Any]:
-    return _wb().to_json_object({"automl_backends": probe_automl_backends()})
+    return to_json_object({"automl_backends": probe_automl_backends()})
 
 
 @router.post("/s06/automl")
-def s06_run_automl(req: _wb().AutoMLRunReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
+def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
     df = _wb().get_analysis_dataframe(state, _wb()._require_df(state))
@@ -67,6 +71,8 @@ def s06_run_automl(req: _wb().AutoMLRunReq, x_session_id: str | None = Header(de
                         task_type=tt,
                         time_budget_seconds=max(5, req.time_budget_seconds // len(active_targets)),
                         cv_folds=req.cv_folds,
+                        max_carbon_grams_co2e=req.max_carbon_grams_co2e,
+                        max_inference_latency_ms=req.max_inference_latency_ms,
                     )
                     multi_target_summary.append(
                         {
@@ -88,6 +94,8 @@ def s06_run_automl(req: _wb().AutoMLRunReq, x_session_id: str | None = Header(de
             task_type=task,
             time_budget_seconds=req.time_budget_seconds,
             cv_folds=req.cv_folds,
+            max_carbon_grams_co2e=req.max_carbon_grams_co2e,
+            max_inference_latency_ms=req.max_inference_latency_ms,
         )
         eq_dict: dict[str, Any] = {}
         try:
@@ -140,7 +148,7 @@ def s06_run_automl(req: _wb().AutoMLRunReq, x_session_id: str | None = Header(de
             f"Trained {res.executed_backend} ({res.best_model_name})",
             f"{res.primary_metric}={res.best_score:.4f} (Lift {res.lift_over_best_baseline:+.4f})",
         )
-        return _wb()._cache_and_respond(
+        return wb_cache_and_respond(
             state,
             sid,
             "s06_automl",
@@ -162,7 +170,8 @@ def s06_run_automl(req: _wb().AutoMLRunReq, x_session_id: str | None = Header(de
         )
 
     if req.async_job:
-        rec = _wb().job_manager.submit(f"AutoML ({req.backend})", _execute)
+        owner = _wb().current_job_owner_key() or "default"
+        rec = _wb().job_manager.submit(f"AutoML ({req.backend})", _execute, owner_key=owner)
         return {"job": rec.to_dict()}
     return _execute()
 
@@ -242,7 +251,7 @@ def s06_export_external_formula(
 
 @router.post("/s06/nonparametric")
 def s06_run_nonparametric_analytical(
-    req: _wb().NonParametricRunReq, x_session_id: str | None = Header(default="default")
+    req: NonParametricRunReq, x_session_id: str | None = Header(default="default")
 ) -> dict[str, Any]:
     """Benchmark all Non-Parametric Analytical Models (Spline GAM, Nadaraya-Watson, RBF Kernel Ridge, Weighted k-NN, Isotonic) vs. Parametric Linear."""
     sid = _wb()._sid(x_session_id)
@@ -309,11 +318,11 @@ def s06_run_nonparametric_analytical(
         f"Evaluated {len(tgt_map)} Non-Parametric Analytical Models vs. Parametric Linear",
         f"Champion={champ_name} ({res.get('champion_score', 0.0):.4f})",
     )
-    return _wb()._cache_and_respond(state, sid, "s06_nonparametric", dict(res))
+    return wb_cache_and_respond(state, sid, "s06_nonparametric", dict(res))
 
 
 @router.post("/s06/deep-learning")
-def s06_run_deep_benchmark(req: _wb().DeepBenchReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
+def s06_run_deep_benchmark(req: DeepBenchReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     """Benchmark Paper-Grade Deep Learning Architectures (FT-Transformer, TabNet, ResNet-Tabular, MLP, 1D-CNN, GNN) vs. Baselines."""
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
@@ -323,11 +332,13 @@ def s06_run_deep_benchmark(req: _wb().DeepBenchReq, x_session_id: str | None = H
     if not target:
         raise HTTPException(status_code=400, detail="Select a target column first.")
     X_full, y_full, task = _wb()._prepare_xy(df, target)
+    if len(X_full) < 6:
+        raise HTTPException(status_code=400, detail="Deep learning benchmark requires at least 6 rows.")
     if len(X_full) > req.max_rows:
         idx = np.random.default_rng(42).choice(len(X_full), size=req.max_rows, replace=False)
         X_full = X_full.iloc[idx].reset_index(drop=True)
         y_full = y_full.iloc[idx].reset_index(drop=True)
-    split = max(10, int(len(X_full) * 0.8))
+    split = min(len(X_full) - 2, max(2, int(len(X_full) * 0.8)))
     X_tr, X_te = X_full.iloc[:split], X_full.iloc[split:]
     y_tr, y_te = y_full.iloc[:split], y_full.iloc[split:]
     is_clf = task in (_wb().TaskType.BINARY_CLASSIFICATION, _wb().TaskType.MULTICLASS_CLASSIFICATION)
@@ -390,7 +401,7 @@ def s06_run_deep_benchmark(req: _wb().DeepBenchReq, x_session_id: str | None = H
     state["uap_dl_benchmark_df"] = pd.DataFrame([{k: v for k, v in r.items() if k != "loss_curve"} for r in rows])
     state["uap_dl_models"] = fitted_dl
     _wb().record_lineage(state, "Deep Learning", f"Benchmarked {len(fitted_dl)} paper-grade architectures", f"Top={rows[0]['model']} ({rows[0]['score']:.4f})")
-    return _wb()._cache_and_respond(
+    return wb_cache_and_respond(
         state,
         sid,
         "s06_dl",
@@ -403,7 +414,7 @@ def s06_run_deep_benchmark(req: _wb().DeepBenchReq, x_session_id: str | None = H
 
 
 @router.post("/s06/predict-single")
-def s06_predict_single(req: _wb().SinglePredictReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
+def s06_predict_single(req: SinglePredictReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
     model = state.get("uap_active_model")
@@ -429,7 +440,7 @@ def s06_predict_single(req: _wb().SinglePredictReq, x_session_id: str | None = H
             proba = model.predict_proba(row_df)[0].tolist()
         except Exception:
             proba = None
-    return _wb()._cache_and_respond(
+    return wb_cache_and_respond(
         state,
         sid,
         "s06_predict_single",
@@ -449,7 +460,7 @@ async def s06_predict_batch(
     feat_cols = state.get("uap_active_feature_cols") or []
     if model is None or not feat_cols:
         raise HTTPException(status_code=400, detail="Train a model in Studio 06 before batch scoring.")
-    raw = await file.read()
+    raw = await _wb().read_upload_bounded(file)
     inc_df = pd.read_csv(io.BytesIO(raw))
     ref_df = state.get("uap_df")
     target = (_wb().get_selected_targets(state, ref_df) or ["target"])[0]
@@ -465,7 +476,7 @@ async def s06_predict_batch(
     scored = inc_df.copy()
     scored[f"predicted_{target}"] = preds
     state["uap_future_prediction_result"] = {"n_rows": len(scored), "preview": scored.head(100).to_dict(orient="records"), "scored_df": scored}
-    return _wb()._cache_and_respond(
+    return wb_cache_and_respond(
         state,
         sid,
         "s06_predict_batch",

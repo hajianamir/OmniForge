@@ -4,16 +4,44 @@ from __future__ import annotations
 
 import base64
 import io
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import matplotlib
 import numpy as np
 import pandas as pd
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
+from omniforge.core.exceptions import DependencyMissingError
 from omniforge.reporting.sections import ReportChartArtifact
+
+if TYPE_CHECKING:
+    import matplotlib.pyplot as _plt_types
+
+
+class _LazyPyplot:
+    """Lazy ``matplotlib.pyplot`` proxy configuring ``Agg`` backend on first draw."""
+
+    def __init__(self) -> None:
+        self._mod: Any = None
+
+    def _load(self) -> Any:
+        if self._mod is None:
+            try:
+                import matplotlib
+
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as _pyplot
+            except ImportError as exc:
+                raise DependencyMissingError(
+                    "Install 'matplotlib' (or 'omniforge[reporting]') to render report charts.",
+                    suggestions=["pip install 'omniforge[reporting]'"],
+                ) from exc
+            self._mod = _pyplot
+        return self._mod
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._load(), name)
+
+
+plt: Any = _LazyPyplot()
 
 # Crisp executive palette
 _NAVY = "#0F172A"
@@ -27,7 +55,7 @@ _SLATE = "#64748B"
 
 
 def _fig_to_artifact(
-    fig: plt.Figure,
+    fig: _plt_types.Figure,
     *,
     chart_id: str,
     section_id: str,
@@ -53,7 +81,7 @@ def _fig_to_artifact(
     )
 
 
-def _apply_clean_style(ax: plt.Axes) -> None:
+def _apply_clean_style(ax: _plt_types.Axes) -> None:
     """Apply clean publication styling to a Matplotlib axis."""
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -259,6 +287,9 @@ class ReportChartBuilder:
         if not dims:
             return None
 
+        dims = {k: v for k, v in dims.items() if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v}
+        if not dims:
+            return None
         names = [str(k).replace("_", " ").title() for k in dims]
         scores = [float(v) for v in dims.values()]
         bar_colors = [_EMERALD if s >= 90 else (_BLUE if s >= 80 else (_AMBER if s >= 70 else _RED)) for s in scores]

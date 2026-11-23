@@ -165,18 +165,43 @@ class OptimizationEngine:
     def optimize_portfolio(
         self,
         expected_returns: list[float] | np.ndarray,
-        cov_matrix: list[list[float]] | np.ndarray,
+        cov_matrix: list[list[float]] | np.ndarray | None = None,
         *,
+        returns_history: list[list[float]] | np.ndarray | None = None,
+        covariance_estimator: str = "ledoit_wolf",
+        shrinkage_alpha: float | None = None,
         risk_aversion: float = 2.0,
         risk_free_rate: float = 0.0,
         min_weight: float = 0.0,
         max_weight: float = 1.0,
         asset_names: list[str] | None = None,
     ) -> OptimizationResult:
-        """Solve Markowitz Mean-Variance portfolio optimization with analytical gradients and box constraints."""
+        """Solve Markowitz Mean-Variance portfolio optimization with Ledoit-Wolf (2004) shrinkage & box constraints."""
         mu = np.asarray(expected_returns, dtype=float).ravel()
-        cov = np.asarray(cov_matrix, dtype=float)
         n = len(mu)
+        shrinkage_used: float = 0.0
+        cov_method = "supplied_matrix"
+        if returns_history is not None:
+            ret_mat = np.asarray(returns_history, dtype=float)
+            if ret_mat.ndim != 2 or ret_mat.shape[1] != n or ret_mat.shape[0] < 2:
+                raise OptimizationError(
+                    "returns_history must be a 2D (T >= 2, n_assets) array aligned with expected_returns."
+                )
+            if covariance_estimator.lower() == "ledoit_wolf":
+                from sklearn.covariance import LedoitWolf
+
+                lw = LedoitWolf().fit(ret_mat)
+                cov = np.asarray(lw.covariance_, dtype=float)
+                shrinkage_used = float(lw.shrinkage_)
+                cov_method = "ledoit_wolf_2004"
+            else:
+                cov = np.cov(ret_mat, rowvar=False, ddof=1)
+                cov_method = "sample_covariance"
+        else:
+            if cov_matrix is None:
+                raise OptimizationError("Provide either cov_matrix or returns_history.")
+            cov = np.asarray(cov_matrix, dtype=float)
+
         if n == 0 or cov.shape != (n, n):
             raise OptimizationError("Covariance matrix must be non-empty, square, and aligned with expected_returns.")
         if risk_aversion < 0.0:
@@ -186,6 +211,19 @@ class OptimizationEngine:
                 f"Infeasible portfolio weight bounds [{min_weight}, {max_weight}] for {n} assets summing to 1."
             )
         cov_sym = 0.5 * (cov + cov.T)
+        if shrinkage_alpha is not None:
+            alpha_s = float(np.clip(shrinkage_alpha, 0.0, 1.0))
+            mu_trace = float(np.trace(cov_sym)) / max(n, 1)
+            cov_sym = (1.0 - alpha_s) * cov_sym + alpha_s * mu_trace * np.eye(n, dtype=float)
+            shrinkage_used = alpha_s
+            cov_method = "linear_identity_shrinkage"
+        # Project any slight numerical negative eigenvalues to PSD cone for strict convexity
+        eigvals, eigvecs = np.linalg.eigh(cov_sym)
+        if float(np.min(eigvals)) < -1e-8:
+            raise OptimizationError("Covariance matrix is not positive semi-definite.")
+        if float(np.min(eigvals)) < 0.0:
+            cov_sym = (eigvecs * np.maximum(eigvals, 0.0)) @ eigvecs.T
+            cov_sym = 0.5 * (cov_sym + cov_sym.T)
 
         def objective(w: np.ndarray) -> float:
             port_ret = float(w @ mu)
@@ -231,6 +269,8 @@ class OptimizationEngine:
                 "expected_return": round(port_ret, 6),
                 "volatility": round(port_vol, 6),
                 "sharpe_ratio": round(sharpe, 4),
+                "covariance_estimator": cov_method,
+                "shrinkage_intensity": round(shrinkage_used, 6),
             },
         )
 

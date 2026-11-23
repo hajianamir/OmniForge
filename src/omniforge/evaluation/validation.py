@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import itertools
+import math
 from collections.abc import Iterator
 from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import GroupKFold, KFold, StratifiedKFold, TimeSeriesSplit
+from scipy import stats
+from sklearn.model_selection import GroupKFold, KFold, StratifiedGroupKFold, StratifiedKFold, TimeSeriesSplit
 
 from omniforge.core.exceptions import EvaluationError
 from omniforge.core.types import TaskType
@@ -66,33 +68,149 @@ class CombinatorialPurgedKFold:
         purge_gap: int = 2,
         embargo_gap: int = 2,
         embargo_pct: float | None = None,
+        eval_times: np.ndarray | pd.Series | None = None,
     ) -> None:
         self.n_splits = max(3, int(n_splits))
         self.n_test_groups = min(max(1, int(n_test_groups)), self.n_splits - 1)
         self.purge_gap = max(0, int(purge_gap))
         self.embargo_gap = max(0, int(embargo_gap))
         self.embargo_pct = float(np.clip(embargo_pct, 0.0, 0.45)) if embargo_pct is not None else None
+        self.eval_times = eval_times
+
+    def get_n_splits(self, X: Any = None, y: Any = None, groups: Any = None) -> int:
+        """Return exact combinatorial fold count C(n_splits, n_test_groups)."""
+        return int(math.comb(self.n_splits, self.n_test_groups))
 
     def split(
-        self, X: np.ndarray | pd.DataFrame, y: Any = None, groups: Any = None
+        self,
+        X: np.ndarray | pd.DataFrame,
+        y: Any = None,
+        groups: Any = None,
+        *,
+        eval_times: np.ndarray | pd.Series | None = None,
     ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
-        """Yield all C(n_splits, n_test_groups) purged & embargoed train/test index pairs."""
+        """Yield all C(n_splits, n_test_groups) purged & embargoed train/test index pairs.
+
+        When ``eval_times`` (or ``self.eval_times``) is supplied, observation ``i`` spans the
+        evaluation interval ``[t0_i, t1_i]`` (where ``t0_i`` is ``X.index[i]`` if comparable or ``i``),
+        and any training sample whose label interval overlaps a test block's span ``[t0_start, max(t1_test)]``
+        is purged strictly per López de Prado (2018, §7.4.1).
+        """
         n = len(X)
         blocks = np.array_split(np.arange(n), self.n_splits)
         embargo_from_pct = int(np.ceil(n * self.embargo_pct)) if (self.embargo_pct is not None and self.embargo_pct > 0.0) else 0
         effective_embargo = max(self.embargo_gap, embargo_from_pct)
+
+        ev_src = eval_times if eval_times is not None else self.eval_times
+        t0_num: np.ndarray | None = None
+        t1_num: np.ndarray | None = None
+        if ev_src is not None:
+            if len(ev_src) != n:
+                raise EvaluationError(f"eval_times length ({len(ev_src)}) must match X length ({n}).")
+            ev_ser = pd.Series(ev_src)
+            if pd.api.types.is_datetime64_any_dtype(ev_ser):
+                t1_num = ev_ser.astype("int64").to_numpy(dtype=float)
+                if isinstance(X, pd.DataFrame) and isinstance(X.index, pd.DatetimeIndex):
+                    t0_num = X.index.asi8.astype(float)
+                else:
+                    t0_num = t1_num.copy()
+            else:
+                t1_num = np.asarray(ev_ser, dtype=float)
+                if isinstance(X, pd.DataFrame) and pd.api.types.is_numeric_dtype(X.index.dtype):
+                    t0_num = np.asarray(X.index, dtype=float)
+                else:
+                    t0_num = np.arange(n, dtype=float)
+
+        all_indices = np.arange(n, dtype=int)
         for test_combo in itertools.combinations(range(self.n_splits), self.n_test_groups):
             test_idx = np.concatenate([blocks[g] for g in test_combo])
-            excluded = set(test_idx.tolist())
+            keep_mask = np.ones(n, dtype=bool)
+            keep_mask[test_idx] = False
             for g in test_combo:
-                b_start, b_end = int(blocks[g][0]), int(blocks[g][-1])
-                for p in range(max(0, b_start - self.purge_gap), b_start):
-                    excluded.add(p)
-                for e in range(b_end + 1, min(n, b_end + 1 + effective_embargo)):
-                    excluded.add(e)
-            train_idx = np.array([i for i in range(n) if i not in excluded], dtype=int)
+                blk = blocks[g]
+                if len(blk) == 0:
+                    continue
+                b_start, b_end = int(blk[0]), int(blk[-1])
+                keep_mask[max(0, b_start - self.purge_gap) : b_start] = False
+                keep_mask[b_end + 1 : min(n, b_end + 1 + effective_embargo)] = False
+                if t0_num is not None and t1_num is not None:
+                    test_t0 = float(np.min(t0_num[blk]))
+                    test_t1 = float(np.max(t1_num[blk]))
+                    # Overlap condition: [t0_i, t1_i] intersects [test_t0, test_t1] <=> t0_i <= test_t1 and t1_i >= test_t0
+                    overlap = (t0_num <= test_t1) & (t1_num >= test_t0)
+                    keep_mask[overlap] = False
+            train_idx = all_indices[keep_mask]
             if len(train_idx) > 0 and len(test_idx) > 0:
                 yield train_idx, test_idx
+
+    @staticmethod
+    def compute_pbo(
+        strategy_returns: np.ndarray | pd.DataFrame,
+        *,
+        n_partitions: int = 8,
+    ) -> dict[str, Any]:
+        """Compute Bailey et al. (2017) CSCV Probability of Backtest Overfitting (PBO).
+
+        Partitions a ``(T, M)`` matrix of ``M >= 2`` candidate strategy return series into an even
+        number ``S = n_partitions`` of contiguous sub-matrices, evaluates all ``C(S, S/2)``
+        in-sample (IS) / out-of-sample (OOS) splits, selects the IS-optimal strategy ``m*``, and
+        computes its relative OOS rank ``omega_bar`` and logit ``lambda = ln(omega_bar / (1 - omega_bar))``.
+        """
+        mat = np.asarray(strategy_returns, dtype=float)
+        if mat.ndim != 2 or mat.shape[1] < 2:
+            raise EvaluationError("strategy_returns must be a 2D array of shape (T, M) with M >= 2 strategies.")
+        s_parts = max(4, int(n_partitions))
+        if s_parts % 2 != 0:
+            s_parts += 1
+        if mat.shape[0] < s_parts * 2:
+            raise EvaluationError(f"Insufficient observations ({mat.shape[0]}) for {s_parts} CSCV partitions.")
+
+        sub_mats = np.array_split(mat, s_parts, axis=0)
+        n_strats = mat.shape[1]
+        half = s_parts // 2
+        logits: list[float] = []
+        oos_selected_sharpes: list[float] = []
+        is_selected_sharpes: list[float] = []
+
+        def _col_sharpes(arr: np.ndarray) -> np.ndarray:
+            means = np.mean(arr, axis=0)
+            stds = np.std(arr, axis=0, ddof=1)
+            return np.where(stds > 1e-12, means / np.where(stds > 1e-12, stds, 1.0), 0.0)
+
+        all_parts = set(range(s_parts))
+        for is_combo in itertools.combinations(range(s_parts), half):
+            oos_combo = sorted(all_parts - set(is_combo))
+            j_is = np.vstack([sub_mats[i] for i in is_combo])
+            j_oos = np.vstack([sub_mats[i] for i in oos_combo])
+
+            r_is = _col_sharpes(j_is)
+            r_oos = _col_sharpes(j_oos)
+            best_m = int(np.argmax(r_is))
+            is_selected_sharpes.append(float(r_is[best_m]))
+            oos_selected_sharpes.append(float(r_oos[best_m]))
+
+            # Relative OOS rank in (0, 1): rank 1 = worst, rank M = best => omega_bar = rank / (M + 1)
+            ranks = stats.rankdata(r_oos, method="average")
+            omega_bar = float(ranks[best_m]) / float(n_strats + 1)
+            omega_clamped = float(np.clip(omega_bar, 1e-6, 1.0 - 1e-6))
+            logits.append(float(np.log(omega_clamped / (1.0 - omega_clamped))))
+
+        logits_arr = np.asarray(logits, dtype=float)
+        pbo = float(np.mean(logits_arr <= 0.0))
+        prob_oos_loss = float(np.mean(np.asarray(oos_selected_sharpes) < 0.0))
+        slope, intercept, _, _, _ = (
+            stats.linregress(is_selected_sharpes, oos_selected_sharpes)
+            if len(is_selected_sharpes) >= 2 and np.std(is_selected_sharpes) > 1e-12
+            else (0.0, 0.0, 0.0, 1.0, 0.0)
+        )
+        return {
+            "pbo": round(pbo, 6),
+            "probability_of_oos_loss": round(prob_oos_loss, 6),
+            "median_rank_logit": round(float(np.median(logits_arr)), 6),
+            "degradation_slope": round(float(slope), 6),
+            "degradation_intercept": round(float(intercept), 6),
+            "n_combinations": len(logits),
+        }
 
 
 class CrossValidator:
@@ -111,6 +229,8 @@ class CrossValidator:
             return StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=self.random_seed)
         if self.strategy == "group_kfold":
             return GroupKFold(n_splits=self.n_splits)
+        if self.strategy == "stratified_group_kfold":
+            return StratifiedGroupKFold(n_splits=self.n_splits, shuffle=True, random_state=self.random_seed)
         if self.strategy == "time_series_split":
             return TimeSeriesSplit(n_splits=self.n_splits)
         if self.strategy == "purged_time_series":
@@ -134,11 +254,12 @@ class CrossValidator:
         y_arr = np.asarray(y)
         fold_metrics: list[dict[str, float]] = []
 
-        split_iter = (
-            splitter.split(X, y_arr, groups)
-            if self.strategy == "group_kfold"
-            else splitter.split(X, y_arr)
-        )
+        if self.strategy in ("group_kfold", "stratified_group_kfold"):
+            if groups is None:
+                raise EvaluationError(f"CV strategy '{self.strategy}' requires a non-null groups array.")
+            split_iter = splitter.split(X, y_arr, groups)
+        else:
+            split_iter = splitter.split(X, y_arr)
 
         for fold_idx, (tr_idx, va_idx) in enumerate(split_iter):
             model: BaseOmniForgeModel = model_factory()
@@ -159,13 +280,17 @@ class CrossValidator:
         if not fold_metrics:
             raise EvaluationError(f"Cross-validation strategy '{self.strategy}' yielded zero valid folds.")
 
-        metric_keys = [k for k in fold_metrics[0].keys() if k != "fold"]
+        metric_keys = list(dict.fromkeys(k for fm in fold_metrics for k in fm if k != "fold"))
         summary: dict[str, dict[str, float]] = {}
         for k in metric_keys:
-            vals = [fm[k] for fm in fold_metrics if k in fm]
+            vals = [
+                float(fm[k])
+                for fm in fold_metrics
+                if k in fm and fm[k] is not None and np.isfinite(float(fm[k]))
+            ]
             summary[k] = {
-                "mean": round(float(np.mean(vals)), 6),
-                "std": round(float(np.std(vals, ddof=1) if len(vals) > 1 else 0.0), 6),
+                "mean": round(float(np.mean(vals)), 6) if vals else float("nan"),
+                "std": round(float(np.std(vals, ddof=1) if len(vals) > 1 else 0.0), 6) if vals else float("nan"),
             }
 
         return {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -60,6 +61,10 @@ class AutoMLResult:
     leakage_audit: LeakageAuditReport | None = None
     cv_summary: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # C3 Green-AI: budget constraints & Pareto frontier.
+    max_carbon_grams_co2e: float | None = None
+    max_inference_latency_ms: float | None = None
+    pareto_frontier: list[dict[str, Any]] = field(default_factory=list)
 
 
 class AutoMLPipelineSearch:
@@ -82,6 +87,8 @@ class AutoMLPipelineSearch:
         use_cv_pipeline: bool = True,
         select_k_features: int | None = None,
         random_seed: int = 42,
+        max_carbon_grams_co2e: float | None = None,
+        max_inference_latency_ms: float | None = None,
     ) -> None:
         self.task_type = task_type
         self.time_budget_seconds = float(time_budget_seconds)
@@ -97,6 +104,13 @@ class AutoMLPipelineSearch:
         self.use_cv_pipeline = use_cv_pipeline
         self.select_k_features = select_k_features
         self.random_seed = random_seed
+        # Green-AI budgets (C3): None means unconstrained.
+        self.max_carbon_grams_co2e = (
+            None if max_carbon_grams_co2e is None else float(max_carbon_grams_co2e)
+        )
+        self.max_inference_latency_ms = (
+            None if max_inference_latency_ms is None else float(max_inference_latency_ms)
+        )
 
     @staticmethod
     def infer_task_type(y: pd.Series | np.ndarray) -> TaskType:
@@ -108,27 +122,139 @@ class AutoMLPipelineSearch:
             return TaskType.BINARY_CLASSIFICATION if s.nunique() <= 2 else TaskType.MULTICLASS_CLASSIFICATION
         return TaskType.REGRESSION
 
-    def _sklearn_estimator_for_cv(self, alg: str, is_clf: bool, n_rows: int = 0) -> Any:
+    @staticmethod
+    def pareto_frontier(
+        rows: list[dict[str, Any]],
+        primary_metric: str,
+        *,
+        higher_is_better: bool,
+    ) -> list[dict[str, Any]]:
+        """Compute the non-dominated 3D Pareto frontier (metric × latency × carbon).
+
+        A row dominates another when it is at least as good on all three objectives and
+        strictly better on at least one. Metric is maximized when ``higher_is_better``;
+        latency (ms per 1k) and carbon (grams CO2eq) are always minimized.
+        Rows missing latency/carbon are treated as unconstrained (infinite objective)
+        and never dominate fully-measured rows unless they also tie on the available axes.
+        """
+        if not rows:
+            return []
+
+        def objective(r: dict[str, Any]) -> tuple[float, float, float]:
+            metric = float(r.get(primary_metric, float("-inf")))
+            if not higher_is_better:
+                metric = -metric
+            latency = float(r.get("inference_latency_ms_per_1k", float("inf")))
+            carbon = float(r.get("carbon_gco2e", float("inf")))
+            return (metric, -latency, -carbon)  # negate so all-maximize = non-dominated sort
+
+        # Sort descending by primary objective for efficient sweep; then filter dominated.
+        ordered = sorted(rows, key=objective, reverse=True)
+        frontier: list[dict[str, Any]] = []
+        # Non-dominated in 3D: track the Pareto-optimal set via pairwise comparison.
+        for r in ordered:
+            m, latency, c = objective(r)
+            dominated = False
+            for f in frontier:
+                fm, fl, fc = objective(f)
+                if fm >= m and fl >= latency and fc >= c and (fm > m or fl > latency or fc > c):
+                    dominated = True
+                    break
+            if not dominated:
+                frontier.append(r)
+        # Stable, deterministic order by metric desc.
+        frontier.sort(key=objective, reverse=True)
+        return frontier
+
+    def _fit_measured(self, model: BaseOmniForgeModel, X_tr: pd.DataFrame, y_tr: pd.Series | np.ndarray) -> float:
+        """Fit ``model`` under a CarbonTracker and return emissions in grams CO2eq."""
+        tracker = CarbonTracker(f"automl_candidate_{getattr(model, 'name', 'candidate')}", enabled=True)
+        with tracker:
+            model.fit(X_tr, y_tr)
+        return float(tracker.report.emissions_g_co2eq) if tracker.report is not None else 0.0
+
+    def _inference_latency_ms_per_1k(self, model: BaseOmniForgeModel, X_va: pd.DataFrame | np.ndarray) -> float:
+        """Measure predict latency on up to 1k validation rows, scaled to ms per 1k rows."""
+        bench = X_va[:1000] if hasattr(X_va, "__getitem__") else X_va
+        n = max(1, len(bench))
+        t0 = time.perf_counter()
+        model.predict(bench)
+        elapsed_s = time.perf_counter() - t0
+        return (elapsed_s / n) * 1000.0
+
+    def _budget_rejected(self, reason: str, carbon_g: float, latency_ms: float) -> bool:
+        if self.max_carbon_grams_co2e is not None and carbon_g > self.max_carbon_grams_co2e:
+            logger.warning(
+                "automl_budget_rejected", reason=reason, budget="carbon",
+                carbon_g=round(carbon_g, 4), limit=self.max_carbon_grams_co2e,
+            )
+            return True
+        if self.max_inference_latency_ms is not None and latency_ms > self.max_inference_latency_ms:
+            logger.warning(
+                "automl_budget_rejected", reason=reason, budget="inference_latency",
+                latency_ms=round(latency_ms, 2), limit=self.max_inference_latency_ms,
+            )
+            return True
+        return False
+
+    def _sklearn_estimator_for_cv(
+        self,
+        alg: str,
+        is_clf: bool,
+        n_rows: int = 0,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
         """Return a fresh scikit-learn estimator for fold-isolated ColumnTransformer Pipeline CV."""
+        hp = dict(params or {})
         if is_clf:
             if alg == "random_forest":
-                return RandomForestClassifier(n_estimators=100, random_state=self.random_seed, n_jobs=-1)
+                return RandomForestClassifier(
+                    n_estimators=int(hp.get("n_estimators", 100)),
+                    max_depth=hp.get("max_depth"),
+                    random_state=self.random_seed,
+                    n_jobs=-1,
+                )
             if alg == "extra_trees":
-                return ExtraTreesClassifier(n_estimators=100, random_state=self.random_seed, n_jobs=-1)
+                return ExtraTreesClassifier(
+                    n_estimators=int(hp.get("n_estimators", 100)),
+                    max_depth=hp.get("max_depth"),
+                    random_state=self.random_seed,
+                    n_jobs=-1,
+                )
             if alg == "gradient_boosting":
-                if n_rows > 3000:
+                if n_rows > 3000 and not hp:
                     return HistGradientBoostingClassifier(max_iter=100, random_state=self.random_seed)
-                return GradientBoostingClassifier(n_estimators=80, random_state=self.random_seed)
+                return GradientBoostingClassifier(
+                    n_estimators=int(hp.get("n_estimators", 80)),
+                    learning_rate=float(hp.get("learning_rate", 0.1)),
+                    max_depth=int(hp.get("max_depth", 3)),
+                    random_state=self.random_seed,
+                )
             return LogisticRegression(max_iter=500, random_state=self.random_seed)
         if alg == "random_forest":
-            return RandomForestRegressor(n_estimators=100, random_state=self.random_seed, n_jobs=-1)
+            return RandomForestRegressor(
+                n_estimators=int(hp.get("n_estimators", 100)),
+                max_depth=hp.get("max_depth"),
+                random_state=self.random_seed,
+                n_jobs=-1,
+            )
         if alg == "extra_trees":
-            return ExtraTreesRegressor(n_estimators=100, random_state=self.random_seed, n_jobs=-1)
+            return ExtraTreesRegressor(
+                n_estimators=int(hp.get("n_estimators", 100)),
+                max_depth=hp.get("max_depth"),
+                random_state=self.random_seed,
+                n_jobs=-1,
+            )
         if alg == "gradient_boosting":
-            if n_rows > 3000:
+            if n_rows > 3000 and not hp:
                 return HistGradientBoostingRegressor(max_iter=100, random_state=self.random_seed)
-            return GradientBoostingRegressor(n_estimators=80, random_state=self.random_seed)
-        return Ridge(alpha=1.0)
+            return GradientBoostingRegressor(
+                n_estimators=int(hp.get("n_estimators", 80)),
+                learning_rate=float(hp.get("learning_rate", 0.1)),
+                max_depth=int(hp.get("max_depth", 3)),
+                random_state=self.random_seed,
+            )
+        return Ridge(alpha=float(hp.get("alpha", 1.0)))
 
     def fit(
         self,
@@ -179,22 +305,26 @@ class AutoMLPipelineSearch:
         y_tr = y_arr[tr_idx]
         y_va = y_arr[va_idx]
 
-        # Extract group vector aligned to X_work for fold-isolated GroupKFold CV
-        groups_arr: np.ndarray | None = None
+        # Extract group vector strictly on the TRAINING partition (tr_idx) so CV & HPO never touch X_va
+        groups_tr: np.ndarray | None = None
         if split_cfg.group_col and split_cfg.group_col in split_frame.columns:
-            groups_arr = split_frame[split_cfg.group_col].astype(str).to_numpy()
+            groups_tr = split_frame.iloc[tr_idx][split_cfg.group_col].astype(str).to_numpy()
 
-        # Sort X_work chronologically if time_series CV is active
-        cv_X = X_work
-        cv_y = y_arr
-        cv_groups = groups_arr
+        # Sort X_tr chronologically if time_series CV is active (keeping X_va strictly isolated as outer holdout)
+        cv_X = X_tr
+        cv_y = y_tr
+        cv_groups = groups_tr
         if split_res.strategy_used == "time_series" and split_cfg.time_col and split_cfg.time_col in split_frame.columns:
-            order = pd.to_datetime(split_frame[split_cfg.time_col], errors="coerce", format="mixed")
-            sort_idx = np.argsort(order.to_numpy() if order.notna().sum() >= len(order) * 0.8 else split_frame[split_cfg.time_col].to_numpy(), kind="mergesort")
-            cv_X = X_work.iloc[sort_idx].reset_index(drop=True)
-            cv_y = y_arr[sort_idx]
-            if groups_arr is not None:
-                cv_groups = groups_arr[sort_idx]
+            tr_time_col = split_frame.iloc[tr_idx][split_cfg.time_col]
+            order = pd.to_datetime(tr_time_col, errors="coerce", format="mixed")
+            sort_idx = np.argsort(
+                order.to_numpy() if order.notna().sum() >= len(order) * 0.8 else tr_time_col.to_numpy(),
+                kind="mergesort",
+            )
+            cv_X = X_tr.iloc[sort_idx].reset_index(drop=True)
+            cv_y = y_tr[sort_idx]
+            if groups_tr is not None:
+                cv_groups = groups_tr[sort_idx]
 
         def _score_model(model: BaseOmniForgeModel) -> float:
             preds = model.predict(X_va)
@@ -244,14 +374,20 @@ class AutoMLPipelineSearch:
                 try:
                     m = ClassicalMLModel(alg, task_type=task, random_seed=self.random_seed, track_carbon=False)
                     ts = time.perf_counter()
-                    m.fit(X_tr, y_tr)
+                    carbon_g = self._fit_measured(m, X_tr, y_tr)
+                    latency_ms = self._inference_latency_ms_per_1k(m, X_va)
                     sc = _score_model(m)
+                    # C3: enforce Green-AI budgets (carbon / inference latency) before accepting candidate.
+                    if self._budget_rejected(alg, carbon_g, latency_ms):
+                        continue
                     row_entry: dict[str, Any] = {
                         "model": alg,
                         "family": "classical_ml",
                         primary_metric: round(sc, 6),
                         "split_strategy": split_res.strategy_used,
                         "fit_time_s": round(time.perf_counter() - ts, 4),
+                        "inference_latency_ms_per_1k": round(latency_ms, 4),
+                        "carbon_gco2e": round(carbon_g, 6),
                     }
                     # Fold-isolated Pipeline + ColumnTransformer CV (StratifiedKFold / GroupKFold / TimeSeriesSplit)
                     if (
@@ -346,11 +482,36 @@ class AutoMLPipelineSearch:
                     except Exception as exc:
                         logger.warning("automl_deep_candidate_failed", model=d_name, error=str(exc))
 
-            # 3. Bayesian Hyperparameter Tuning of top tree candidates
+            # 3. Bayesian Hyperparameter Tuning of top tree candidates via Inner CV on (cv_X, cv_y)
+            # Per Cawley & Talbot (2010, JMLR), HPO never evaluates on outer holdout (X_va, y_va).
             fitted_candidates.sort(key=lambda t: t[1], reverse=is_clf)
             top_tunable = [
                 name for name, _, _ in fitted_candidates if name in ("random_forest", "gradient_boosting", "extra_trees")
             ][: self.tune_top_k]
+            tuned_params_map: dict[str, dict[str, Any]] = {}
+
+            inner_folds: list[tuple[np.ndarray, np.ndarray]] = []
+            if top_tunable and len(cv_X) >= 6:
+                try:
+                    inner_cfg = SplitConfig(
+                        strategy=split_cfg.strategy,
+                        test_size=0.20,
+                        cv_folds=max(2, min(3, self.cv_folds)),
+                        group_col=split_cfg.group_col,
+                        time_col=split_cfg.time_col,
+                        gap=split_cfg.gap,
+                        random_seed=self.random_seed,
+                    )
+                    inner_cv_obj, inner_cv_groups = LeakageSafeSplitter(inner_cfg).build_cv_splitter(
+                        cv_X, cv_y, is_classification=is_clf, groups=cv_groups
+                    )
+                    inner_folds = [
+                        (np.asarray(f_tr, dtype=int), np.asarray(f_va, dtype=int))
+                        for f_tr, f_va in inner_cv_obj.split(cv_X, cv_y, inner_cv_groups)
+                        if len(f_tr) > 0 and len(f_va) > 0
+                    ]
+                except Exception as exc:
+                    logger.debug("inner_hpo_cv_fallback", error=str(exc))
 
             for alg in top_tunable:
                 if time.perf_counter() - t0 > self.time_budget_seconds * 0.85:
@@ -376,9 +537,32 @@ class AutoMLPipelineSearch:
                 )
 
                 def _trial_obj(params: dict[str, Any], _alg: str = alg) -> float:
-                    cand = ClassicalMLModel(_alg, task_type=task, random_seed=self.random_seed, track_carbon=False, **params)
-                    cand.fit(X_tr, y_tr)
-                    return _score_model(cand)
+                    if inner_folds:
+                        fold_scores: list[float] = []
+                        for f_tr, f_va in inner_folds:
+                            cand = ClassicalMLModel(
+                                _alg, task_type=task, random_seed=self.random_seed, track_carbon=False, **params
+                            )
+                            cand.fit(cv_X.iloc[f_tr].reset_index(drop=True), cv_y[f_tr])
+                            f_preds = cand.predict(cv_X.iloc[f_va].reset_index(drop=True))
+                            f_sc = (
+                                float(f1_score(cv_y[f_va], f_preds, average="weighted", zero_division=0))
+                                if is_clf
+                                else float(root_mean_squared_error(cv_y[f_va], f_preds))
+                            )
+                            fold_scores.append(f_sc)
+                        return float(np.mean(fold_scores))
+                    cut = max(2, int(len(cv_X) * 0.8))
+                    cand = ClassicalMLModel(
+                        _alg, task_type=task, random_seed=self.random_seed, track_carbon=False, **params
+                    )
+                    cand.fit(cv_X.iloc[:cut].reset_index(drop=True), cv_y[:cut])
+                    sub_preds = cand.predict(cv_X.iloc[cut:].reset_index(drop=True))
+                    return (
+                        float(f1_score(cv_y[cut:], sub_preds, average="weighted", zero_division=0))
+                        if is_clf
+                        else float(root_mean_squared_error(cv_y[cut:], sub_preds))
+                    )
 
                 hpo_res = hpo.optimize(space, _trial_obj)
                 tuned = ClassicalMLModel(
@@ -388,6 +572,7 @@ class AutoMLPipelineSearch:
                 tuned.fit(X_tr, y_tr)
                 sc = _score_model(tuned)
                 t_name = f"{alg}_tuned"
+                tuned_params_map[t_name] = dict(hpo_res.best_params)
                 leaderboard.append(
                     {
                         "model": t_name,
@@ -399,10 +584,10 @@ class AutoMLPipelineSearch:
                 )
                 fitted_candidates.append((t_name, sc, tuned))
 
-            # 4. Automatic Top-3 Voting Ensemble
+            # 4. Automatic Top-3 Voting Ensemble (deep-clone candidates so all_fitted_models stay unmutated)
             fitted_candidates.sort(key=lambda t: t[1], reverse=is_clf)
             if self.enable_ensembling and len(fitted_candidates) >= 2:
-                top_models = [m for _, _, m in fitted_candidates[:3]]
+                top_models = [copy.deepcopy(m) for _, _, m in fitted_candidates[:3]]
                 ens = VotingEnsembleModel(
                     estimators=top_models, task_type=task, random_seed=self.random_seed, track_carbon=False
                 )
@@ -424,18 +609,21 @@ class AutoMLPipelineSearch:
             for cand_name, _, cand_model in fitted_candidates:
                 all_fitted_models[cand_name] = cand_model
             fitted_candidates.sort(key=lambda t: t[1], reverse=is_clf)
-            best_name, best_val_score, best_model = fitted_candidates[0]
+            best_name, best_val_score, best_cand_model = fitted_candidates[0]
+            best_model = copy.deepcopy(best_cand_model)
             best_model.fit(X_work, y_arr)
             all_fitted_models[best_name] = best_model
             best_model.metadata_.baseline_comparison = baselines
             best_model.metadata_.metrics[primary_metric] = round(best_val_score, 6)
 
-            # Build and fit a clean deployable sklearn ColumnTransformer Pipeline alongside champion
+            # Build and fit a clean deployable sklearn ColumnTransformer Pipeline preserving tuned HPO params
             try:
                 base_alg = best_name.replace("_tuned", "")
                 sk_est = self._sklearn_estimator_for_cv(
                     base_alg if base_alg in cv_supported else ("random_forest" if is_clf else "ridge"),
                     is_clf,
+                    n_rows=len(X_work),
+                    params=tuned_params_map.get(best_name),
                 )
                 best_sklearn_pipeline = LeakageSafePipelineBuilder.build_ml_pipeline(
                     X_work,
@@ -466,6 +654,13 @@ class AutoMLPipelineSearch:
             leaderboard.sort(key=lambda row: row[primary_metric], reverse=is_clf)
             lift = (best_val_score - best_bl_score) if is_clf else (best_bl_score - best_val_score)
 
+        # C3 Green-AI: Pareto frontier over accepted candidates (metric × latency × carbon).
+        pareto_rows = self.pareto_frontier(
+            leaderboard,
+            primary_metric,
+            higher_is_better=is_clf,
+        )
+
         elapsed = round(time.perf_counter() - t0, 4)
         logger.info(
             "automl_completed",
@@ -488,6 +683,9 @@ class AutoMLPipelineSearch:
             elapsed_seconds=elapsed,
             leakage_audit=split_res.audit_report,
             cv_summary=cv_summary,
+            max_carbon_grams_co2e=self.max_carbon_grams_co2e,
+            max_inference_latency_ms=self.max_inference_latency_ms,
+            pareto_frontier=pareto_rows,
             metadata={
                 "fitted_models": all_fitted_models,
                 "equations": equations_map,

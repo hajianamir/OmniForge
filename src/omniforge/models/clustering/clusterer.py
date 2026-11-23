@@ -195,10 +195,10 @@ class ClusteringEngine(BaseOmniForgeModel):
         return np.asarray(self._scaler.transform(arr), dtype=float) if self._scaler is not None else arr
 
     def _estimate_dbscan_eps(self, X_s: np.ndarray) -> float:
-        """Heuristic k-distance elbow estimate for DBSCAN eps (sampled on >15k rows for O(N) speed)."""
+        """Estimate DBSCAN eps via Kneedle curvature knee on the sorted k-NN distance curve (Ester et al. 1996; Satopää et al. 2011)."""
         n = len(X_s)
         k = min(max(self.min_samples, 2), max(n - 1, 1))
-        if n <= 2:
+        if n <= 3:
             return 0.5
         fit_X = X_s
         if n > 15_000:
@@ -207,7 +207,19 @@ class ClusteringEngine(BaseOmniForgeModel):
         nn = NearestNeighbors(n_neighbors=k, n_jobs=parallel_n_jobs()).fit(fit_X)
         dists, _ = nn.kneighbors(fit_X)
         k_dists = np.sort(dists[:, -1])
-        est = float(np.quantile(k_dists, 0.85))
+        # Trim extreme top 1% outlier tail so single isolated points do not skew chord geometry
+        m_trim = max(3, int(np.ceil(0.99 * len(k_dists))))
+        curve = k_dists[:m_trim]
+        span = float(curve[-1] - curve[0])
+        if span <= 1e-12:
+            return max(float(curve[-1]), 1e-3)
+        x_norm = np.linspace(0.0, 1.0, len(curve))
+        y_norm = (curve - curve[0]) / span
+        # Maximum perpendicular distance below chord from (0, 0) to (1, 1)
+        knee_idx = int(np.argmax(x_norm - y_norm))
+        est = float(curve[knee_idx])
+        if est <= 1e-6:
+            est = float(np.quantile(k_dists, 0.85))
         return max(est, 1e-3)
 
     def _build_and_fit(self, X_s: np.ndarray) -> tuple[Any, np.ndarray]:
@@ -375,6 +387,76 @@ class ClusteringEngine(BaseOmniForgeModel):
             "best_silhouette": round(float(best_row["silhouette"]), 4),
             "curve": curve,
         }
+
+    @staticmethod
+    def compute_gap_statistic(
+        df: pd.DataFrame | np.ndarray,
+        *,
+        feature_cols: list[str] | None = None,
+        k_max: int = 8,
+        n_refs: int = 15,
+        scaler: Literal["standard", "robust", "minmax", "none"] = "standard",
+        random_seed: int = 42,
+    ) -> dict[str, Any]:
+        """Compute Tibshirani, Walther & Hastie (2001, JRSS-B) PCA-aligned Gap Statistic & 1-SE optimal K (including K=1)."""
+        X_in = df[feature_cols].copy() if (isinstance(df, pd.DataFrame) and feature_cols) else df
+        n_rows = len(X_in)
+        if n_rows < 4:
+            return {"optimal_k": 1, "curve": []}
+
+        helper = ClusteringEngine(algorithm="kmeans", n_clusters=2, scaler=scaler, random_seed=random_seed)
+        X_s = helper._prepare_matrix(X_in, fit_scaler=True)
+        upper_k = min(max(1, int(k_max)), n_rows - 1)
+        b_refs = max(3, int(n_refs))
+        rng = np.random.default_rng(random_seed)
+
+        # PCA-aligned uniform bounding box ("Gap/pc", Tibshirani et al. 2001 §3.2) for rotation invariance
+        mean_vec = np.mean(X_s, axis=0, keepdims=True)
+        X_centered = X_s - mean_vec
+        _, _, vt = np.linalg.svd(X_centered, full_matrices=False)
+        X_proj = X_centered @ vt.T
+        mins = np.min(X_proj, axis=0)
+        maxs = np.max(X_proj, axis=0)
+
+        def _within_ss(mat: np.ndarray, k_val: int, seed_val: int) -> float:
+            if k_val <= 1:
+                centered = mat - np.mean(mat, axis=0, keepdims=True)
+                return float(np.sum(centered * centered))
+            km = KMeans(n_clusters=k_val, n_init=5, random_state=seed_val)
+            km.fit(mat)
+            return float(km.inertia_)
+
+        curve: list[dict[str, float | int]] = []
+        for k_val in range(1, upper_k + 1):
+            wk = max(_within_ss(X_s, k_val, random_seed), 1e-12)
+            ref_logs: list[float] = []
+            for b in range(b_refs):
+                z_unif = rng.uniform(mins, maxs, size=X_proj.shape)
+                x_ref = z_unif @ vt + mean_vec
+                w_ref = max(_within_ss(x_ref, k_val, random_seed + b + 1), 1e-12)
+                ref_logs.append(float(np.log(w_ref)))
+            ref_arr = np.asarray(ref_logs, dtype=float)
+            gap_k = float(np.mean(ref_arr) - np.log(wk))
+            sdk = float(np.std(ref_arr, ddof=0))
+            sk = float(np.sqrt(1.0 + 1.0 / b_refs) * sdk)
+            curve.append(
+                {
+                    "k": int(k_val),
+                    "log_wk": round(float(np.log(wk)), 6),
+                    "expected_log_wk_null": round(float(np.mean(ref_arr)), 6),
+                    "gap": round(gap_k, 6),
+                    "s_k": round(sk, 6),
+                }
+            )
+
+        # Tibshirani 1-SE selection rule: smallest k such that Gap(k) >= Gap(k+1) - s_{k+1}
+        opt_k = int(curve[-1]["k"])
+        for idx in range(len(curve) - 1):
+            if float(curve[idx]["gap"]) >= float(curve[idx + 1]["gap"]) - float(curve[idx + 1]["s_k"]):
+                opt_k = int(curve[idx]["k"])
+                break
+
+        return {"optimal_k": opt_k, "n_refs": b_refs, "curve": curve}
 
     @staticmethod
     def compare_algorithms(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import hmac
 import secrets
@@ -15,7 +16,45 @@ from omniforge.core.security import AccessController, JWTManager, _is_production
 from omniforge.core.types import Principal
 
 jwt_manager = JWTManager()
-access_controller = AccessController()
+
+
+def _build_access_controller() -> AccessController:
+    """Wire the shared policy engine with the mandatory cross-tenant audit trail (P1-12).
+
+    Constructed eagerly so the audit sink exists from app startup; cross-tenant decisions
+    (only reachable with ``resource_tenant_id=``) are always recorded in the tamper-evident
+    log, fail-closed. No audit records are written unless a cross-tenant decision is made.
+    """
+    from omniforge.config.settings import get_settings
+    from omniforge.core.security import AuditLogger
+
+    settings = get_settings()
+    try:
+        return AccessController(audit_logger=AuditLogger(log_path=settings.paths.audit_log_path))
+    except Exception as exc:
+        # Mandatory audit for cross-tenant decisions: refuse to boot unaudited rather than
+        # degrade to silent cross-tenant access. Fix the audit path or directory permissions.
+        raise RuntimeError(
+            f"OmniForge could not initialize the mandatory audit trail at '{settings.paths.audit_log_path}'. "
+            "Cross-tenant authorization is fail-closed by design; fix the path or permissions. "
+            f"Cause: {exc}"
+        ) from exc
+
+
+access_controller = _build_access_controller()
+
+# Request-scoped authenticated principal. Set once per request inside ``get_current_principal``.
+# anyio propagates contextvars into the threadpool copies used for sync path operations, so the
+# workbench session registry (``omniforge.api.workbench._sid``) can bind the caller's tenant and
+# subject to the ``X-Session-ID`` without threading the principal through every call site.
+_request_principal_ctx: contextvars.ContextVar[Principal | None] = contextvars.ContextVar(
+    "omniforge_request_principal", default=None
+)
+
+
+def get_request_principal() -> Principal | None:
+    """Return the authenticated principal for the current request context, if any."""
+    return _request_principal_ctx.get(None)
 
 WORKBENCH_AUTH_COOKIE = "omniforge_wb_auth"
 WORKBENCH_CSRF_COOKIE = "omniforge_csrf"
@@ -105,7 +144,12 @@ def _authenticate_from_cookie(request: Request) -> Principal | None:
     )
 
 
-def get_current_principal(
+# NOTE: ``async def`` on purpose. Sync dependencies execute in a worker threadpool with a
+# copied context, so a contextvar set there would be invisible to the request task and to the
+# sync path operation's own context copy. As an async dependency this runs in the request task
+# itself; contextvars set here are then visible to sync path operations (anyio copies the
+# current context into the worker thread) and to async ones directly.
+async def get_current_principal(
     request: Request,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -114,8 +158,22 @@ def get_current_principal(
     """Authenticate callers via Bearer JWT, X-API-Key, or CSRF-verified local workbench cookie.
 
     Never falls back to an unauthenticated admin principal. Missing or invalid credentials always
-    result in HTTP 401 Unauthorized.
+    result in HTTP 401 Unauthorized. The resolved principal is stashed in a request-scoped
+    contextvar so downstream consumers (e.g. the workbench session registry) can enforce
+    ownership binding without route-signature changes.
     """
+    principal = _resolve_current_principal(request, authorization=authorization, x_api_key=x_api_key, x_workbench_token=x_workbench_token)
+    _request_principal_ctx.set(principal)
+    return principal
+
+
+def _resolve_current_principal(
+    request: Request,
+    *,
+    authorization: str | None,
+    x_api_key: str | None,
+    x_workbench_token: str | None,
+) -> Principal:
     # 1. Bearer JWT authentication
     if authorization:
         parts = authorization.split()

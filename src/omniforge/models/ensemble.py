@@ -163,13 +163,18 @@ class StackingEnsembleModel(BaseOmniForgeModel):
             full_est.fit(X, y)
             self._fitted_estimators.append(full_est)
 
-        meta_X = np.hstack(oof_blocks)
+        meta_X = np.hstack(
+            [blk[:, 1:] if (is_clf and blk.shape[1] >= 2) else blk for blk in oof_blocks]
+        )
         if is_clf:
             self._meta_learner = LogisticRegression(C=1.0, max_iter=1000, random_state=self.random_seed)
             self._meta_learner.fit(meta_X, y)
+            self.meta_weights_: np.ndarray = np.asarray(self._meta_learner.coef_, dtype=float)
         else:
-            self._meta_learner = Ridge(alpha=1.0, random_state=self.random_seed)
+            # Breiman (1996, Machine Learning 24(1): 49-64) non-negative stacked regression prevents collinear weight blow-up
+            self._meta_learner = Ridge(alpha=1.0, positive=True)
             self._meta_learner.fit(meta_X, y.astype(float))
+            self.meta_weights_ = np.asarray(self._meta_learner.coef_, dtype=float)
 
     def _build_meta_features(self, X: np.ndarray) -> np.ndarray:
         is_clf = self.task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION)
@@ -184,9 +189,9 @@ class StackingEnsembleModel(BaseOmniForgeModel):
                     for j, c in enumerate(est.classes_):
                         if c in cls_to_col:
                             aligned[:, cls_to_col[c]] = p[:, j]
-                    blocks.append(aligned)
+                    blocks.append(aligned[:, 1:] if aligned.shape[1] >= 2 else aligned)
                 else:
-                    blocks.append(p)
+                    blocks.append(p[:, 1:] if p.shape[1] >= 2 else p)
             else:
                 blocks.append(np.asarray(est.predict(X), dtype=float).reshape(-1, 1))
         return np.hstack(blocks)

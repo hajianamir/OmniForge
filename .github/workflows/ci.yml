@@ -10,6 +10,7 @@ jobs:
   quality-and-tests:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.12", "3.13"]
     steps:
@@ -26,4 +27,86 @@ jobs:
       - name: Mypy type check
         run: mypy src/omniforge
       - name: Run pytest with coverage
-        run: pytest -q tests/unit/test_audit_regressions.py tests/unit/test_anti_leakage_and_pipeline.py --cov=omniforge --cov-report=term-missing
+        run: |
+          set +e
+          pytest -q tests --cov=omniforge --cov-report=term-missing --tb=short > /tmp/pytest-output.log 2>&1
+          status=$?
+          set -e
+          cat /tmp/pytest-output.log
+          if [ "$status" -ne 0 ]; then
+            {
+              echo '## pytest output (exit code' "$status" ')'
+              echo '<details><summary>full log</summary>'
+              echo '```'
+              tail -c 60000 /tmp/pytest-output.log
+              echo '```'
+              echo '</details>'
+            } >> "$GITHUB_STEP_SUMMARY"
+            grep -E "^(FAILED|ERROR)|failed, .*passed|error" /tmp/pytest-output.log | tail -40 | while IFS= read -r line; do
+              clean=$(printf '%s' "$line" | tr -d '\r' | cut -c1-500)
+              echo "::error title=pytest::$clean"
+            done
+            tail -c 3000 /tmp/pytest-output.log | tr '\n' ' ' | sed 's/%/%25/g' | cut -c1-2800 | while IFS= read -r line; do echo "::error title=pytest-tail::$line"; done
+          fi
+          exit "$status"
+  lock-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify hash-pinned runtime lock installs cleanly
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r requirements.lock
+          pip install -e . --no-deps
+      - name: Smoke-import the locked dependency set
+        run: |
+          python -c "import omniforge, fastapi, pandas, sklearn, numpy, duckdb, cryptography, pydantic; print('requirements.lock installs and imports cleanly')"
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies (locked)
+        working-directory: frontend
+        run: npm ci
+      - name: Type-check & build SPA (tsc + vite) into src/omniforge/ui/static_app
+        working-directory: frontend
+        run: npm run build
+      - name: Fail if committed static_app is stale vs frontend source
+        run: |
+          if ! git diff --quiet -- src/omniforge/ui/static_app; then
+            git --no-pager diff --stat -- src/omniforge/ui/static_app
+            echo "::error title=static_app stale::Committed src/omniforge/ui/static_app does not match frontend/ source. Run 'cd frontend && npm ci && npm run build' and commit the rebuilt assets."
+            exit 1
+          fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,api,ui,reporting,data,forecasting]"
+      # tests/e2e also runs inside the main pytest matrix; this job additionally verifies
+      # the SPA builds from lock-pinned sources and that the served assets are fresh.
+      - name: Run e2e suite (API, CLI, workbench SPA)
+        run: pytest -q tests/e2e --tb=short
+  latency-budget:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,api,ui,reporting,data,forecasting]"
+      - name: Enforce latency & memory budgets (p95)
+        run: python scripts/latency_budget_benchmark.py

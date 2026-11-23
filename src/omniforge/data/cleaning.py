@@ -200,22 +200,29 @@ class DataCleaner:
         self._state = _FittedCleanerState()
         excluded = set(self.config.exclude_columns)
 
+        # Canonical Stage 1 & 2: Clean strings BEFORE standardizing missing sentinel tokens
+        # so HTML/control-char/whitespace-wrapped sentinels (e.g. "<span>N/A</span>", " null ") become NaN.
         if self.config.clean_strings:
             work, _ = self._clean_strings(work, excluded)
         if self.config.standardize_missing_tokens:
             work = self._standardize_missing(work, excluded)
+
+        # Canonical Stage 3: Infer and cast numeric/datetime column types strictly from Train
         if self.config.infer_types:
             work, _ = self._infer_and_cast_types(work, excluded, fit_mode=True)
+
+        # Canonical Stage 4: Replace non-finite +/-inf values in numeric columns with NaN
         for col in work.select_dtypes(include=[np.number]).columns:
             if col not in excluded:
                 arr_vals = work[col].to_numpy(dtype=float, na_value=np.nan)
                 if np.isinf(arr_vals).any():
                     work[col] = work[col].replace([np.inf, -np.inf], np.nan)
+
+        # Canonical Stage 5: Apply explicit physical/domain bounds
         if self.config.domain_bounds:
             work, _ = self.apply_domain_bounds(work, self.config.domain_bounds)
-        if self.config.drop_exact_duplicates and len(work) > 0:
-            work = work.drop_duplicates()
 
+        # Canonical Stage 6: Drop columns exceeding missing-value threshold BEFORE row deduplication
         if self.config.drop_high_missing_cols and len(work) > 0:
             for col in work.columns:
                 if col in excluded:
@@ -224,21 +231,119 @@ class DataCleaner:
                     self._state.dropped_cols.append(str(col))
             work = work.drop(columns=self._state.dropped_cols, errors="ignore")
 
+        # Canonical Stage 7 & 8: Exact and fuzzy deduplication matching transform() stage order
+        if self.config.drop_exact_duplicates and len(work) > 0:
+            work = work.drop_duplicates()
+        if (
+            self.config.fuzzy_dedup_column
+            and self.config.fuzzy_dedup_column in work.columns
+            and len(work) > 1
+        ):
+            work, _, _ = self._fuzzy_deduplicate(
+                work, self.config.fuzzy_dedup_column, self.config.fuzzy_dedup_threshold
+            )
+
+        # Canonical Stage 9: Record pre-outlier missingness indicator columns
         if self.config.add_missing_indicators:
             for col in work.columns:
                 if col not in excluded and work[col].isna().any():
                     self._state.missing_indicator_cols.append(str(col))
 
+        base_cols = list(work.columns)
         num_cols = [
             c for c in work.select_dtypes(include=[np.number]).columns if c not in excluded
         ]
         cat_cols = [
             c
-            for c in work.columns
+            for c in base_cols
             if c not in num_cols
             and c not in excluded
             and not pd.api.types.is_datetime64_any_dtype(work[c])
         ]
+
+        # Canonical Stage 10: Learn univariate & multivariate outlier detectors strictly on Train,
+        # then apply outlier treatment BEFORE fitting Stage 11 imputers (matching transform() order
+        # so removed/clipped/NaN'd training outliers never contaminate learned imputation statistics).
+        for col in num_cols:
+            vals = work[col].dropna().astype(float)
+            if len(vals) < 4:
+                continue
+            if self.config.outlier_method == "iqr":
+                q1, q3 = float(vals.quantile(0.25)), float(vals.quantile(0.75))
+                iqr = q3 - q1
+                if iqr > 0:
+                    self._state.outlier_bounds[str(col)] = (
+                        q1 - self.config.outlier_threshold * iqr,
+                        q3 + self.config.outlier_threshold * iqr,
+                    )
+            elif self.config.outlier_method == "zscore":
+                mean, std = float(vals.mean()), float(vals.std(ddof=0))
+                if std > 0:
+                    self._state.outlier_bounds[str(col)] = (
+                        mean - self.config.outlier_threshold * std,
+                        mean + self.config.outlier_threshold * std,
+                    )
+            elif self.config.outlier_method == "mad":
+                med = float(vals.median())
+                mad = float(np.median(np.abs(vals - med)))
+                if mad > 0:
+                    scaled = 1.4826 * mad
+                    self._state.outlier_bounds[str(col)] = (
+                        med - self.config.outlier_threshold * scaled,
+                        med + self.config.outlier_threshold * scaled,
+                    )
+            elif self.config.outlier_method == "percentile":
+                lo_q = float(vals.quantile(self.config.lower_percentile))
+                hi_q = float(vals.quantile(self.config.upper_percentile))
+                self._state.outlier_bounds[str(col)] = (lo_q, hi_q)
+
+        if self.config.outlier_method in ("isolation_forest", "lof", "elliptic", "elliptic_envelope") and num_cols and len(work) >= 10:
+            mat = work[num_cols].copy()
+            mv_meds: dict[str, float] = {}
+            for c in num_cols:
+                med = float(mat[c].median()) if mat[c].notna().any() else 0.0
+                mv_meds[str(c)] = med
+                mat[c] = mat[c].fillna(med)
+            arr = mat.to_numpy(dtype=float)
+            if self.config.outlier_method == "isolation_forest":
+                det: Any = IsolationForest(
+                    contamination=self.config.contamination,
+                    random_state=42,
+                    n_estimators=120,
+                    n_jobs=parallel_n_jobs(),
+                ).fit(arr)
+            elif self.config.outlier_method in ("elliptic", "elliptic_envelope"):
+                det = EllipticEnvelope(
+                    contamination=self.config.contamination,
+                    random_state=42,
+                ).fit(arr)
+            else:
+                n_neighbors = min(20, max(2, len(work) - 1))
+                det = LocalOutlierFactor(
+                    n_neighbors=n_neighbors,
+                    contamination=self.config.contamination,
+                    novelty=True,
+                    n_jobs=parallel_n_jobs(),
+                ).fit(arr)
+            self._state.multivariate_detector = det
+            self._state.multivariate_columns = list(num_cols)
+            self._state.multivariate_medians = mv_meds
+
+        if self.config.outlier_method != "none" and self.config.outlier_action != "none" and len(work) > 0:
+            work, _, outlier_flag_cols, _, _, _ = self._handle_outliers(work, excluded)
+            if outlier_flag_cols:
+                work = work.drop(columns=outlier_flag_cols, errors="ignore")
+
+        # Canonical Stage 11: Fit causal anchors & univariate/multivariate imputers on post-outlier Train data
+        ts_work = (
+            work.sort_values(self.config.time_column, kind="mergesort")
+            if (self.config.time_column and self.config.time_column in work.columns)
+            else work
+        )
+        for c in num_cols:
+            valid_c = ts_work[c].dropna()
+            if len(valid_c) > 0:
+                self._state.causal_last_values[str(c)] = float(valid_c.iloc[-1])
 
         # Always store fallback per-column numeric fill values (needed for leading NaNs in causal ffill too)
         for col in num_cols:
@@ -301,84 +406,6 @@ class DataCleaner:
                     mode_series.iloc[0] if len(mode_series) > 0 else self.config.constant_fill_categorical
                 )
 
-        # Learn univariate outlier bounds strictly on training data
-        for col in num_cols:
-            vals = work[col].dropna().astype(float)
-            if len(vals) < 4:
-                continue
-            if self.config.outlier_method == "iqr":
-                q1, q3 = float(vals.quantile(0.25)), float(vals.quantile(0.75))
-                iqr = q3 - q1
-                if iqr > 0:
-                    self._state.outlier_bounds[str(col)] = (
-                        q1 - self.config.outlier_threshold * iqr,
-                        q3 + self.config.outlier_threshold * iqr,
-                    )
-            elif self.config.outlier_method == "zscore":
-                mean, std = float(vals.mean()), float(vals.std(ddof=0))
-                if std > 0:
-                    self._state.outlier_bounds[str(col)] = (
-                        mean - self.config.outlier_threshold * std,
-                        mean + self.config.outlier_threshold * std,
-                    )
-            elif self.config.outlier_method == "mad":
-                med = float(vals.median())
-                mad = float(np.median(np.abs(vals - med)))
-                if mad > 0:
-                    scaled = 1.4826 * mad
-                    self._state.outlier_bounds[str(col)] = (
-                        med - self.config.outlier_threshold * scaled,
-                        med + self.config.outlier_threshold * scaled,
-                    )
-            elif self.config.outlier_method == "percentile":
-                lo_q = float(vals.quantile(self.config.lower_percentile))
-                hi_q = float(vals.quantile(self.config.upper_percentile))
-                self._state.outlier_bounds[str(col)] = (lo_q, hi_q)
-
-        # Fit leakage-safe multivariate outlier detector strictly on training data
-        # Also record last valid chronological Train observation per numeric column for causal ffill continuity
-        ts_work = (
-            work.sort_values(self.config.time_column, kind="mergesort")
-            if (self.config.time_column and self.config.time_column in work.columns)
-            else work
-        )
-        for c in num_cols:
-            valid_c = ts_work[c].dropna()
-            if len(valid_c) > 0:
-                self._state.causal_last_values[str(c)] = float(valid_c.iloc[-1])
-
-        if self.config.outlier_method in ("isolation_forest", "lof", "elliptic", "elliptic_envelope") and num_cols and len(work) >= 10:
-            mat = work[num_cols].copy()
-            mv_meds: dict[str, float] = {}
-            for c in num_cols:
-                med = float(mat[c].median()) if mat[c].notna().any() else 0.0
-                mv_meds[str(c)] = med
-                mat[c] = mat[c].fillna(med)
-            arr = mat.to_numpy(dtype=float)
-            if self.config.outlier_method == "isolation_forest":
-                det: Any = IsolationForest(
-                    contamination=self.config.contamination,
-                    random_state=42,
-                    n_estimators=120,
-                    n_jobs=parallel_n_jobs(),
-                ).fit(arr)
-            elif self.config.outlier_method in ("elliptic", "elliptic_envelope"):
-                det = EllipticEnvelope(
-                    contamination=self.config.contamination,
-                    random_state=42,
-                ).fit(arr)
-            else:
-                n_neighbors = min(20, max(2, len(work) - 1))
-                det = LocalOutlierFactor(
-                    n_neighbors=n_neighbors,
-                    contamination=self.config.contamination,
-                    novelty=True,
-                    n_jobs=parallel_n_jobs(),
-                ).fit(arr)
-            self._state.multivariate_detector = det
-            self._state.multivariate_columns = list(num_cols)
-            self._state.multivariate_medians = mv_meds
-
         self._is_fitted = True
         return self
 
@@ -400,60 +427,82 @@ class DataCleaner:
         removed_chunks: list[pd.DataFrame] = []
         removed_by_reason: dict[str, int] = {}
 
-        def _capture_removed(sub_df: pd.DataFrame, orig_ids: np.ndarray, reasons: list[str] | str) -> None:
+        def _capture_removed(
+            sub_df: pd.DataFrame,
+            orig_ids: np.ndarray,
+            reasons: list[str] | str,
+            *,
+            stage: str = "Data Cleaning",
+        ) -> None:
             if sub_df.empty:
                 return
             rec = sub_df.copy().reset_index(drop=True)
             reason_list = [reasons] * len(rec) if isinstance(reasons, str) else list(reasons)
             rec.insert(0, "_deletion_reason", reason_list)
-            rec.insert(0, "_deletion_stage", "Data Cleaning")
+            rec.insert(0, "_deletion_stage", stage)
             rec.insert(0, "_original_row_index", list(orig_ids))
             removed_chunks.append(rec)
             for r in reason_list:
                 removed_by_reason[r] = removed_by_reason.get(r, 0) + 1
 
-        if self.config.standardize_missing_tokens:
-            work = self._standardize_missing(work, excluded)
-            steps.append("standardize_missing_tokens")
-
+        # Canonical Stage 1 & 2: Clean strings BEFORE standardizing missing tokens (identical to fit())
         cleaned_str_cols: list[str] = []
         if self.config.clean_strings:
             work, cleaned_str_cols = self._clean_strings(work, excluded)
             steps.append("clean_strings")
 
+        if self.config.standardize_missing_tokens:
+            work = self._standardize_missing(work, excluded)
+            steps.append("standardize_missing_tokens")
+
+        # Canonical Stage 3: Infer and cast types
         type_conversions: dict[str, dict[str, str]] = {}
         if self.config.infer_types:
             work, type_conversions = self._infer_and_cast_types(work, excluded, fit_mode=False)
             steps.append("infer_and_cast_types")
 
-        # Replace non-finite +/-inf values in numeric columns with NaN so downstream imputation repairs them
+        # Canonical Stage 4: Replace non-finite +/-inf values in numeric columns with NaN
+        nonfinite_replaced = 0
         for col in work.select_dtypes(include=[np.number]).columns:
             if col not in excluded:
                 arr_vals = work[col].to_numpy(dtype=float, na_value=np.nan)
-                if np.isinf(arr_vals).any():
+                inf_mask = np.isinf(arr_vals)
+                if inf_mask.any():
+                    nonfinite_replaced += int(inf_mask.sum())
                     work[col] = work[col].replace([np.inf, -np.inf], np.nan)
+        if nonfinite_replaced > 0:
+            steps.append("replace_nonfinite_with_nan")
 
+        # Canonical Stage 5: Apply explicit physical/domain bounds
         if self.config.domain_bounds:
             work, domain_invalids = self.apply_domain_bounds(work, self.config.domain_bounds)
             if domain_invalids:
                 steps.append(f"apply_domain_bounds:{sum(domain_invalids.values())}_coerced_to_nan")
 
+        # Canonical Stage 6: Drop high-missing columns learned during fit()
         dropped_present = [c for c in self._state.dropped_cols if c in work.columns]
         if dropped_present:
             work = work.drop(columns=dropped_present)
             steps.append("drop_high_missing_columns")
 
+        # Canonical Stage 7: Exact deduplication
         exact_dups_removed = 0
         if self.config.drop_exact_duplicates and len(work) > 0:
             dup_mask = work.duplicated()
             if dup_mask.any():
                 dup_arr = dup_mask.to_numpy(dtype=bool)
-                _capture_removed(work.loc[dup_arr], orig_row_ids[dup_arr], "Exact Duplicate Row")
+                _capture_removed(
+                    work.loc[dup_arr],
+                    orig_row_ids[dup_arr],
+                    "Exact Duplicate Row",
+                    stage="Exact Deduplication",
+                )
                 work = work.loc[~dup_arr].copy()
                 orig_row_ids = orig_row_ids[~dup_arr]
                 exact_dups_removed = int(dup_arr.sum())
             steps.append("drop_exact_duplicates")
 
+        # Canonical Stage 8: Fuzzy deduplication
         fuzzy_dups_removed = 0
         if (
             self.config.fuzzy_dedup_column
@@ -470,10 +519,12 @@ class DataCleaner:
                     pre_fuzzy.loc[rem_mask],
                     orig_row_ids[rem_mask],
                     f"Fuzzy Duplicate ({self.config.fuzzy_dedup_column})",
+                    stage="Fuzzy Deduplication",
                 )
                 orig_row_ids = orig_row_ids[~rem_mask]
             steps.append("fuzzy_deduplicate")
 
+        # Canonical Stage 9: Add missingness indicator columns
         added_cols: list[str] = []
         if self.config.add_missing_indicators:
             for col in self._state.missing_indicator_cols:
@@ -484,19 +535,26 @@ class DataCleaner:
             if added_cols:
                 steps.append("add_missing_indicators")
 
+        # Canonical Stage 10: Outlier detection & handling (before imputation)
         outliers_detected: dict[str, int] = {}
         if self.config.outlier_method != "none" and self.config.outlier_action != "none":
             work, outliers_detected, outlier_flags, out_rem_df, out_rem_pos, out_rem_reasons = self._handle_outliers(
                 work, excluded
             )
             if not out_rem_df.empty and len(out_rem_pos) == len(out_rem_df):
-                _capture_removed(out_rem_df, orig_row_ids[out_rem_pos], out_rem_reasons)
+                _capture_removed(
+                    out_rem_df,
+                    orig_row_ids[out_rem_pos],
+                    out_rem_reasons,
+                    stage="Outlier Removal",
+                )
                 keep_pos = np.ones(len(orig_row_ids), dtype=bool)
                 keep_pos[out_rem_pos] = False
                 orig_row_ids = orig_row_ids[keep_pos]
             added_cols.extend(outlier_flags)
             steps.append(f"outliers:{self.config.outlier_method}:{self.config.outlier_action}")
 
+        # Canonical Stage 11: Impute remaining missing values using post-outlier Train statistics
         imputed_counts: dict[str, int] = {}
         work, imputed_counts = self._impute_missing(work, excluded)
         if imputed_counts:
@@ -927,7 +985,10 @@ class DataCleaner:
         for c in cat_cols:
             if work[c].isna().any():
                 mode_s = work[c].mode(dropna=True)
-                work[c] = work[c].fillna("MISSING" if mode_s.empty else mode_s.iloc[0])
+                _fv = "MISSING" if mode_s.empty else mode_s.iloc[0]
+                if isinstance(work[c].dtype, pd.CategoricalDtype) and _fv not in work[c].cat.categories:
+                    work[c] = work[c].cat.add_categories([_fv])
+                work[c] = work[c].fillna(_fv)
 
         # Encode categoricals numerically for predictor matrix
         for _ in range(max_iter):

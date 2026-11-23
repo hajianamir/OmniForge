@@ -13,6 +13,7 @@ from omniforge.models.baselines import (
     DecisionStumpRegressorBaseline,
     DummyClassifierBaseline,
     DummyRegressorBaseline,
+    LassoLinearBaseline,
     LogisticBaseline,
     RidgeLinearBaseline,
 )
@@ -55,6 +56,7 @@ class ModelCatalog:
         self.register("baseline_mean", lambda **kw: DummyRegressorBaseline(strategy="mean", **kw))
         self.register("baseline_median", lambda **kw: DummyRegressorBaseline(strategy="median", **kw))
         self.register("baseline_ridge", lambda **kw: RidgeLinearBaseline(**kw))
+        self.register("baseline_lasso", lambda **kw: LassoLinearBaseline(**kw))
         self.register("baseline_stump_reg", lambda **kw: DecisionStumpRegressorBaseline(**kw))
 
         # Classical ML

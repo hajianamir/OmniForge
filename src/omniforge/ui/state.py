@@ -12,10 +12,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from omniforge.core.logging import get_logger
 from omniforge.core.types import TaskType
 from omniforge.data.format_audit import DataFormatAuditor
 from omniforge.data.intake_audit import InitialIntakeAuditor
 from omniforge.data.splitting import LeakageSafeSplitter, SplitConfig
+
+logger = get_logger(__name__)
 
 _DOWNSTREAM_KEYS: tuple[str, ...] = (
     "uap_quality",
@@ -785,8 +788,9 @@ def update_active_dataset(
     run_format_audit(state, updated)
     try:
         state["uap_intake_audit"] = InitialIntakeAuditor().audit(updated, target_col=state.get("uap_target"))
-    except Exception:
-        pass
+    except Exception as exc:
+        state["uap_intake_audit"] = None
+        logger.warning("intake_audit_refresh_failed", stage=stage, error=str(exc))
     request_studio_remount(state)
     record_lineage(state, stage, action, details)
 
@@ -807,8 +811,9 @@ def undo_last_dataset_change(state: dict[str, Any]) -> bool:
     run_format_audit(state, state["uap_df"])
     try:
         state["uap_intake_audit"] = InitialIntakeAuditor().audit(state["uap_df"], target_col=state.get("uap_target"))
-    except Exception:
-        pass
+    except Exception as exc:
+        state["uap_intake_audit"] = None
+        logger.warning("intake_audit_refresh_failed", stage="Undo", error=str(exc))
     request_studio_remount(state)
     record_lineage(state, "Undo", "Reverted last dataset transformation")
     return True
@@ -839,8 +844,9 @@ def revert_to_raw_dataset(state: dict[str, Any]) -> bool:
     run_format_audit(state, state["uap_df"])
     try:
         state["uap_intake_audit"] = InitialIntakeAuditor().audit(state["uap_df"], target_col=state.get("uap_target"))
-    except Exception:
-        pass
+    except Exception as exc:
+        state["uap_intake_audit"] = None
+        logger.warning("intake_audit_refresh_failed", stage="Reset", error=str(exc))
     request_studio_remount(state)
     record_lineage(state, "Reset", "Restored original raw dataset")
     return True

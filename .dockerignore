@@ -1,0 +1,23 @@
+# Prevent credentials, local workspaces, virtualenvs, and build caches from entering Docker context
+.git
+.github
+.env
+.env.*
+!.env.example
+.venv*
+.audit
+.omniforge_workspace
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.coverage
+htmlcov
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+frontend/node_modules/
+frontend/dist/
+notebooks/
+tests/

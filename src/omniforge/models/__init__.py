@@ -9,6 +9,7 @@ from omniforge.models.baselines import (
     DummyClassifierBaseline,
     DummyRegressorBaseline,
     ForecastingBaseline,
+    LassoLinearBaseline,
     LogisticBaseline,
     RidgeLinearBaseline,
 )
@@ -95,6 +96,7 @@ __all__ = [
     "HybridRecommender",
     "IsotonicMonotonicModel",
     "KaplanMeierEstimator",
+    "LassoLinearBaseline",
     "LogisticBaseline",
     "MLForecaster",
     "MLPModel",

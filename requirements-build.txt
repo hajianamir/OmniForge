@@ -1,12 +1,10 @@
-# ==============================================================================
-# OmniForge v2.0.0 — Latest 2026 .exe Build Requirements
-# Used by install.bat, build_exe.bat, and packaging/build_exe.py
-# Verified against live PyPI JSON API as of November 15, 2026
-# ==============================================================================
-
-pyinstaller>=6.22.3
-pyinstaller-hooks-contrib>=2026.10
-pillow>=13.0.0
-setuptools>=84.2.1
-wheel>=0.48.0
-build>=1.6.1
+# =============================================================================
+# OmniForge v3.0.1 — .exe build toolchain (hash-checked install)
+# =============================================================================
+# Floating minimums: requirements-build.in. Hash-pinned lock generated via:
+#
+#     uv pip compile requirements-build.in --generate-hashes --python-version 3.12 --universal -o requirements-build.lock
+#
+# Equivalent: pip install --require-hashes -r requirements-build.lock
+# =============================================================================
+-r requirements-build.lock

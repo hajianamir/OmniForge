@@ -66,10 +66,16 @@ def compile_lock(requirements: list[str], target: Path, *, check: bool = False) 
     """Compile one requirement set into a hash-pinned lock file."""
     if not requirements:
         return {"target": target.name, "skipped": True}
+    prior_digest = (
+        hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else None
+    )
     # A *stable* input filename keeps the generated locks byte-identical between runs
     # (uv records the input path in provenance comments, so a random temp name would make
     # every build look like a diff). It also makes `--check` meaningful in CI.
     req_path = LOCKS_DIR / f".requirements.{target.stem}.txt"
+    out_path = LOCKS_DIR / f".check.{target.name}" if check else target
+    if check and target.is_file():
+        shutil.copyfile(target, out_path)
     req_path.write_text("\n".join(requirements) + "\n", encoding="utf-8")
 
     cmd = [
@@ -78,23 +84,28 @@ def compile_lock(requirements: list[str], target: Path, *, check: bool = False) 
         "--python-platform", PYTHON_PLATFORM,
         "--python-version", PYTHON_VERSION,
         "--no-header", "--quiet",
-        "-o", str(target),
+        "-o", str(out_path),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     req_path.unlink(missing_ok=True)
     if result.returncode != 0:
+        out_path.unlink(missing_ok=True)
         raise SystemExit(f"lock generation failed for {target.name}:\n{result.stderr[-2000:]}")
 
-    text = target.read_text(encoding="utf-8")
+    text = out_path.read_text(encoding="utf-8")
     # Replace the build-machine input path with a stable marker (keeps diffs reviewable).
     text = text.replace(str(req_path), "(requirements)")
     text = text.replace(f"-r locks/.requirements.{target.stem}.txt", "-r requirements.txt")
-    target.write_text(text, encoding="utf-8")
+    if check:
+        out_path.unlink(missing_ok=True)
+    else:
+        target.write_text(text, encoding="utf-8")
     pins = sum(1 for line in text.splitlines() if "==" in line and not line.startswith("    "))
     hashes = text.count("--hash=sha256:")
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    is_stale = check and (prior_digest != digest or pins == 0)
     print(f"  {target.name:26s} {pins:4d} pins  {hashes:5d} hashes  sha256:{digest[:16]}>")
-    return {"target": target.name, "pins": pins, "hashes": hashes, "sha256": digest}
+    return {"target": target.name, "pins": pins, "hashes": hashes, "sha256": digest, "stale": is_stale}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -130,7 +141,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check:
         # A lock is stale when recompiling produces a different digest.
-        stale = [s["target"] for s in summary if s.get("pins") == 0]
+        stale = [s["target"] for s in summary if s.get("stale")]
         if stale:
             raise SystemExit(f"stale locks: {stale}")
     total = len(ALL_PACKS)

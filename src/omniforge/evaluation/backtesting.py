@@ -97,8 +97,9 @@ class BacktestingEngine:
         slippage_bps: float = 2.0,
         risk_free_rate_annual: float = 0.0,
         periods_per_year: int = 252,
+        n_trials: int = 1,
     ) -> dict[str, Any]:
-        """Backtest directional trading signals (-1, 0, +1) with realistic transaction costs, slippage, drawdown duration & Buy-and-Hold baseline."""
+        """Backtest directional trading signals (-1, 0, +1) with realistic transaction costs, slippage, drawdown duration, DSR & Buy-and-Hold baseline."""
         p = np.asarray(prices, dtype=float).ravel()
         sig = np.asarray(signals, dtype=float).ravel()
         if len(p) != len(sig) or len(p) < 3:
@@ -114,6 +115,10 @@ class BacktestingEngine:
         fin = MetricsEvaluator.financial_metrics(
             strat_returns, periods_per_year=periods_per_year, mar=rf_per_period
         )
+        dsr_info = MetricsEvaluator.deflated_sharpe_ratio(
+            strat_returns, benchmark_sr=0.0, n_trials=max(1, int(n_trials)), mar=rf_per_period
+        )
+        fin["deflated_sharpe_ratio"] = dsr_info["deflated_sharpe_ratio"]
         safe_strat = np.clip(strat_returns, -0.999999, 10.0)
         safe_asset = np.clip(asset_returns, -0.999999, 10.0)
         equity = np.concatenate(([1.0], np.exp(np.clip(np.cumsum(np.log1p(safe_strat)), -50.0, 50.0))))

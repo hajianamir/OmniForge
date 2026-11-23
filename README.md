@@ -1,4 +1,4 @@
-# OmniForge — Enterprise Analytics & AI Workbench v2.0.0
+# OmniForge — Enterprise Analytics & AI Workbench v4.0.0
 
 **OmniForge** is a production-grade, enterprise-scale, modular Python 3.12+ (3.12–3.15) platform that unifies the complete data-to-decision lifecycle — from multi-source ingestion and 6-dimensional data quality profiling to automated EDA, leakage-safe feature engineering, baseline-first modeling, deep learning, time-series forecasting, causal inference, mathematical optimization, simulation, responsible AI, AutoML, DAG orchestration, MLOps, an AI Copilot, 18 industry domain plugins, a FastAPI backend, a **FastAPI + React/Vite TypeScript Enterprise Workbench** (pre-compiled, code-split SPA — ~63 KB gzipped for the initial entry graph, with vendor libraries and each studio group lazy-loaded on demand — featuring 60fps Canvas plots, a server-side paginated grid, GZip compression & zero Node.js at runtime), a Typer CLI, and one-click executive reporting.
 
@@ -134,9 +134,34 @@ omniforge ui --port 8501
 pytest -v
 ```
 
+## Reproducible & hardened installs
+
+For production/deployments, install the hash-pinned runtime lock instead of the floating
+`requirements.txt` ranges (target: Python 3.12, generated with
+`uv pip compile requirements.txt --generate-hashes --python-version 3.12 --universal`):
+
+```bash
+pip install --require-hashes -r requirements.lock
+pip install -e . --no-deps
+```
+
+`requirements.in` (floating minimums) is the source of truth for intent; `requirements.lock`
+(89 pinned distributions, sha256 hashes) and `requirements-build.lock` (build toolchain) are the
+generated, committed deployment artifacts — `requirements.txt` / `requirements-build.txt` are thin
+compatibility shims that include the locks, so `pip install -r requirements.txt` is now
+hash-checked too. CI verifies the lock on every PR (`lock-verify` job). Regenerate after touching
+the `.in` files — do not edit locks by hand:
+
+```bash
+uv pip compile requirements.in --generate-hashes --python-version 3.12 --universal -o requirements.lock
+uv pip compile requirements-build.in --generate-hashes --python-version 3.12 --universal -o requirements-build.lock
+```
+
 ## Documentation
 
 - [`docs/architecture.md`](docs/architecture.md) — layered architecture, directory map, guarantees.
+- [`docs/AUDIT_ANCHOR_REPLICATION.md`](docs/AUDIT_ANCHOR_REPLICATION.md) — what the audit anchor proves and does not, plus off-host replication and witness patterns (runbook + rotation).
+- [`docs/RISK_REGISTER.md`](docs/RISK_REGISTER.md) — NIST AI RMF (AI 100-1) risk register: 18 risks across GOVERN/MAP/MEASURE/MANAGE with controls, residuals and owners.
 - [`docs/user_guide.md`](docs/user_guide.md) — end-to-end user and operator guide.
 - [`docs/P2_REMEDIATION_REPORT.md`](docs/P2_REMEDIATION_REPORT.md) — P2 hardening report: every gate, item
   and measured before/after number (ruff, mypy, pytest, `tsc`, bundle split, correlation checks).

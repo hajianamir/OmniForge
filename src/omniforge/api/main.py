@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
+import threading
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +45,7 @@ from omniforge.copilot.agent import OmniForgeCopilotAgent
 from omniforge.core.constants import RBAC_ROLE_PERMISSIONS
 from omniforge.core.exceptions import OmniForgeError, SecurityError
 from omniforge.core.logging import get_logger
+from omniforge.core.security import RequestBodySizeLimitMiddleware, SlidingWindowRateLimitMiddleware
 from omniforge.core.types import ModelStage, Principal
 from omniforge.core.utils import to_json_object, to_json_safe
 from omniforge.data.cleaning import DataCleaner
@@ -89,6 +93,17 @@ def create_app() -> FastAPI:
         ],
     )
     app.add_middleware(GZipMiddleware, minimum_size=500)
+    # Hard request-body cap (413) — prevents memory-exhaustion via huge uploads.
+    app.add_middleware(RequestBodySizeLimitMiddleware, max_body_bytes=settings.api.max_request_body_bytes)
+    # Enforce the declared `api.rate_limit_per_minute` policy (429 + Retry-After).
+    # 0 disables (used by the test-suite to avoid cross-test throttling).
+    from omniforge.core.rate_limit import build_rate_limiter
+
+    app.add_middleware(
+        SlidingWindowRateLimitMiddleware,
+        max_requests_per_minute=settings.api.rate_limit_per_minute,
+        limiter=build_rate_limiter(settings.api, max_requests_per_minute=settings.api.rate_limit_per_minute),
+    )
 
     @app.middleware("http")
     async def security_headers_middleware(request: Request, call_next: Any) -> Any:
@@ -96,15 +111,65 @@ def create_app() -> FastAPI:
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
         response.headers.setdefault("Referrer-Policy", "same-origin")
+        # Browser-hardening headers (audit P1-11). CSP ships in Report-Only mode first:
+        # violations are surfaced to the browser console/report endpoint without blocking
+        # the self-hosted SPA, so it can be enforced later once report traffic is clean.
+        if settings.api.csp_report_only_enabled and settings.api.csp_report_only_policy.strip():
+            response.headers.setdefault(
+                "Content-Security-Policy-Report-Only",
+                settings.api.csp_report_only_policy.strip(),
+            )
+        if settings.api.hsts_enabled and settings.api.hsts_max_age > 0:
+            hsts = f"max-age={int(settings.api.hsts_max_age)}"
+            if settings.api.hsts_include_subdomains:
+                hsts += "; includeSubDomains"
+            response.headers.setdefault("Strict-Transport-Security", hsts)
         return response
 
+    from omniforge.api.workbench import parse_model_stage, read_upload_bounded
     from omniforge.api.workbench import router as workbench_router
 
     app.include_router(workbench_router)
 
-    registry = ModelRegistry()
-    serving = ModelServingEngine(registry=registry)
-    copilot = OmniForgeCopilotAgent(provider="local")
+    default_registry = ModelRegistry()
+    default_serving = ModelServingEngine(registry=default_registry)
+    tenant_lock = threading.RLock()
+    tenant_mlops: OrderedDict[str, tuple[ModelRegistry, ModelServingEngine]] = OrderedDict()
+    copilot_sessions: OrderedDict[str, tuple[threading.RLock, OmniForgeCopilotAgent]] = OrderedDict()
+
+    def _get_api_mlops(principal: Principal) -> tuple[ModelRegistry, ModelServingEngine]:
+        tenant = str(getattr(principal, "tenant_id", "") or "default-tenant")
+        if tenant == "default-tenant":
+            return default_registry, default_serving
+        with tenant_lock:
+            if tenant in tenant_mlops:
+                tenant_mlops.move_to_end(tenant)
+                return tenant_mlops[tenant]
+            slug = hashlib.sha256(tenant.encode("utf-8", errors="replace")).hexdigest()[:16]
+            base = Path("./.omniforge_workspace/tenants") / slug / "api_v1"
+            reg = ModelRegistry(
+                db_path=base / "model_registry.db",
+                artifact_dir=base / "artifacts" / "registry",
+            )
+            srv = ModelServingEngine(registry=reg)
+            tenant_mlops[tenant] = (reg, srv)
+            while len(tenant_mlops) > 128:
+                tenant_mlops.popitem(last=False)
+            return reg, srv
+
+    def _get_api_copilot(principal: Principal) -> tuple[threading.RLock, OmniForgeCopilotAgent]:
+        tenant = str(getattr(principal, "tenant_id", "") or "default-tenant")
+        subj = str(getattr(principal, "subject", "") or "anonymous")
+        key = f"{tenant}\x00{subj}"
+        with tenant_lock:
+            if key in copilot_sessions:
+                copilot_sessions.move_to_end(key)
+                return copilot_sessions[key]
+            pair = (threading.RLock(), OmniForgeCopilotAgent(provider="local"))
+            copilot_sessions[key] = pair
+            while len(copilot_sessions) > 128:
+                copilot_sessions.popitem(last=False)
+            return pair
 
     @app.exception_handler(OmniForgeError)
     async def uap_error_handler(request: Request, exc: OmniForgeError) -> JSONResponse:
@@ -172,13 +237,17 @@ def create_app() -> FastAPI:
     ) -> TokenResponse:
         # Require valid API key (header or body) or existing admin Bearer JWT before minting any token.
         authenticated = False
+        auth_via_api_key = False
+        caller: Principal | None = None
         if verify_api_key(x_api_key) or verify_api_key(req.api_key):
             authenticated = True
+            auth_via_api_key = True
         elif authorization and authorization.lower().startswith("bearer "):
             try:
-                caller = jwt_manager.verify_token(authorization.split(None, 1)[1])
-                if "admin" in caller.roles:
+                candidate_caller = jwt_manager.verify_token(authorization.split(None, 1)[1])
+                if {"admin", "platform_admin"} & set(candidate_caller.roles):
                     authenticated = True
+                    caller = candidate_caller
             except Exception:
                 authenticated = False
 
@@ -193,6 +262,18 @@ def create_app() -> FastAPI:
                 status_code=422,
                 detail=f"Unknown role '{req.role}'. Valid roles: {sorted(RBAC_ROLE_PERMISSIONS.keys())}",
             )
+        # Enforce P1-12 tenant isolation & prevent CWE-269 privilege escalation for tenant-scoped admins
+        if not auth_via_api_key and caller is not None and "platform_admin" not in set(caller.roles):
+            if req.role == "platform_admin":
+                raise HTTPException(
+                    status_code=403,
+                    detail="Tenant-scoped admin cannot mint platform_admin tokens.",
+                )
+            if req.tenant_id != caller.tenant_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Tenant-scoped admin for '{caller.tenant_id}' cannot mint tokens for tenant '{req.tenant_id}'.",
+                )
         principal = Principal(subject=req.username, roles=[req.role], tenant_id=req.tenant_id)
         token = jwt_manager.create_token(principal)
         return TokenResponse(access_token=token, role=req.role, tenant_id=req.tenant_id)
@@ -228,7 +309,7 @@ def create_app() -> FastAPI:
         file: UploadFile = File(...),
         _principal: Principal = Depends(require_permission("data:write")),
     ) -> dict[str, Any]:
-        raw = await file.read()
+        raw = await read_upload_bounded(file)
         fname = (file.filename or "upload.csv").lower()
         if fname.endswith((".pkl", ".pickle", ".joblib", ".dill")):
             raise HTTPException(
@@ -241,7 +322,9 @@ def create_app() -> FastAPI:
             df = pd.read_json(io.BytesIO(raw))
         else:
             df = pd.read_csv(io.BytesIO(raw))
-        copilot.load_dataframe(df, name=fname)
+        cop_lock, cop_agent = _get_api_copilot(_principal)
+        with cop_lock:
+            cop_agent.load_dataframe(df, name=fname)
         quality = DataQualityProfiler().profile(df)
         return to_json_object(
             {
@@ -304,9 +387,10 @@ def create_app() -> FastAPI:
             time_budget_seconds=req.time_budget_seconds, tune_trials=4, include_deep=True
         ).fit(X, y)
 
+        reg, srv = _get_api_mlops(_principal)
         reg_info = None
         if req.register_as:
-            ver = registry.register_model(
+            ver = reg.register_model(
                 res.best_model,
                 req.register_as,
                 metrics={res.primary_metric: res.best_score},
@@ -314,7 +398,7 @@ def create_app() -> FastAPI:
             )
             reg_info = ver.model_dump()
         if req.deploy_endpoint:
-            serving.deploy_model(req.deploy_endpoint, res.best_model, version="v1")
+            srv.deploy_model(req.deploy_endpoint, res.best_model, version="v1")
 
         return to_json_object(
             {
@@ -382,7 +466,8 @@ def create_app() -> FastAPI:
     def list_endpoints(
         _principal: Principal = Depends(require_permission("data:read")),
     ) -> dict[str, Any]:
-        return {"endpoints": serving.list_endpoints()}
+        _, srv = _get_api_mlops(_principal)
+        return {"endpoints": srv.list_endpoints()}
 
     @app.post("/api/v1/serving/{endpoint}/predict", tags=["MLOps"])
     def serve_predict(
@@ -390,8 +475,9 @@ def create_app() -> FastAPI:
         req: PredictRequest,
         _principal: Principal = Depends(require_permission("data:read")),
     ) -> dict[str, Any]:
+        _, srv = _get_api_mlops(_principal)
         return to_json_object(
-            serving.predict(endpoint, req.records, return_probabilities=req.return_probabilities)
+            srv.predict(endpoint, req.records, return_probabilities=req.return_probabilities)
         )
 
     @app.get("/api/v1/registry/models", tags=["MLOps"])
@@ -399,7 +485,8 @@ def create_app() -> FastAPI:
         model_name: str | None = None,
         _principal: Principal = Depends(require_permission("data:read")),
     ) -> dict[str, Any]:
-        return {"versions": [v.model_dump() for v in registry.list_versions(model_name)]}
+        reg, _ = _get_api_mlops(_principal)
+        return {"versions": [v.model_dump() for v in reg.list_versions(model_name)]}
 
     @app.post("/api/v1/registry/{model_name}/v{version}/stage", tags=["MLOps"])
     def transition_model_stage(
@@ -408,7 +495,9 @@ def create_app() -> FastAPI:
         req: StageTransitionRequest,
         _principal: Principal = Depends(require_permission("model:deploy")),
     ) -> dict[str, Any]:
-        ver = registry.transition_stage(model_name, version, ModelStage(req.target_stage))
+        reg, _ = _get_api_mlops(_principal)
+        stage = parse_model_stage(req.target_stage, error_status=422)
+        ver = reg.transition_stage(model_name, version, stage)
         return to_json_object(ver.model_dump())
 
     @app.post("/api/v1/mlops/drift", tags=["MLOps"])
@@ -425,10 +514,12 @@ def create_app() -> FastAPI:
         req: CopilotChatRequest,
         _principal: Principal = Depends(require_permission("data:read")),
     ) -> dict[str, Any]:
-        if req.records:
-            copilot.load_dataframe(pd.DataFrame(req.records), name="api_chat_dataset")
-        copilot.provider = req.provider
-        resp = copilot.chat(req.message)
+        cop_lock, cop_agent = _get_api_copilot(_principal)
+        with cop_lock:
+            if req.records:
+                cop_agent.load_dataframe(pd.DataFrame(req.records), name="api_chat_dataset")
+            cop_agent.provider = str(req.provider or "local").lower()
+            resp = cop_agent.chat(req.message)
         return to_json_object(resp.model_dump())
 
     @app.post("/api/v1/pipelines/execute", tags=["Pipelines"])

@@ -156,38 +156,13 @@ class StatisticalAnalyzer:
                     p_val = float(np.clip(p_val, 0.0, 1.0))
             name = "lilliefors_ks"
         else:
-            try:
-                ad = stats.anderson(vals, dist="norm", method="interpolate")
-                stat = float(ad.statistic)
-                p_val = float(np.clip(ad.pvalue, 0.0, 1.0))
-                reject = bool(p_val < alpha)
-                extra_det: dict[str, Any] = {
-                    "skewness": round(float(stats.skew(vals)), 4),
-                    "kurtosis": round(float(stats.kurtosis(vals)), 4),
-                }
-            except TypeError:
-                ad = stats.anderson(vals, dist="norm")
-                stat = float(ad.statistic)
-                sig_levels = np.asarray(ad.significance_level, dtype=float) / 100.0
-                crit_vals = np.asarray(ad.critical_values, dtype=float)
-                idx = int(np.argmin(np.abs(sig_levels - alpha)))
-                crit = float(crit_vals[idx])
-                reject = bool(stat > crit)
-                a_star = stat * (1.0 + 0.75 / len(vals) + 2.25 / (len(vals) ** 2))
-                if a_star >= 0.6:
-                    p_val = float(np.exp(1.2937 - 5.709 * a_star + 0.0186 * (a_star**2)))
-                elif a_star >= 0.34:
-                    p_val = float(np.exp(0.9177 - 4.279 * a_star - 1.38 * (a_star**2)))
-                elif a_star >= 0.2:
-                    p_val = float(1.0 - np.exp(-8.318 + 42.796 * a_star - 59.938 * (a_star**2)))
-                else:
-                    p_val = float(1.0 - np.exp(-13.436 + 101.14 * a_star - 223.73 * (a_star**2)))
-                p_val = float(np.clip(p_val, 0.0, 1.0))
-                extra_det = {
-                    "critical_value": round(crit, 4),
-                    "skewness": round(float(stats.skew(vals)), 4),
-                    "kurtosis": round(float(stats.kurtosis(vals)), 4),
-                }
+            stat, p_val, a_star = StatisticalAnalyzer._anderson_darling_norm_stat_and_pvalue(vals)
+            reject = bool(p_val < alpha)
+            extra_det: dict[str, Any] = {
+                "a_star": round(a_star, 6),
+                "skewness": round(float(stats.skew(vals)), 4),
+                "kurtosis": round(float(stats.kurtosis(vals)), 4),
+            }
             return HypothesisTestResult(
                 test_name="anderson_darling",
                 statistic=round(stat, 6),
@@ -240,9 +215,19 @@ class StatisticalAnalyzer:
         mean_val = float(np.mean(vals))
         sd = float(np.std(vals, ddof=1))
         se = sd / np.sqrt(len(vals))
-        t_crit = float(stats.t.ppf(1.0 - alpha / 2.0, df=len(vals) - 1))
-        ci_low = mean_val - t_crit * se
-        ci_high = mean_val + t_crit * se
+        df_1 = len(vals) - 1
+        if alternative == "greater":
+            t_crit = float(stats.t.ppf(1.0 - alpha, df=df_1))
+            ci_low = mean_val - t_crit * se
+            ci_high = float("inf")
+        elif alternative == "less":
+            t_crit = float(stats.t.ppf(1.0 - alpha, df=df_1))
+            ci_low = float("-inf")
+            ci_high = mean_val + t_crit * se
+        else:
+            t_crit = float(stats.t.ppf(1.0 - alpha / 2.0, df=df_1))
+            ci_low = mean_val - t_crit * se
+            ci_high = mean_val + t_crit * se
         cohens_d = float((mean_val - popmean) / sd) if sd > 1e-12 else 0.0
         reject = bool(p_val < alpha)
         return HypothesisTestResult(
@@ -253,8 +238,8 @@ class StatisticalAnalyzer:
             reject_null=reject,
             effect_size=round(cohens_d, 4),
             effect_size_name="cohens_d",
-            ci_low=round(ci_low, 4),
-            ci_high=round(ci_high, 4),
+            ci_low=round(ci_low, 4) if np.isfinite(ci_low) else ci_low,
+            ci_high=round(ci_high, 4) if np.isfinite(ci_high) else ci_high,
             interpretation=(
                 f"Sample mean ({mean_val:.4g}) differs significantly from {popmean:.4g} (p={p_val:.4g}, d={cohens_d:.2f})."
                 if reject
@@ -348,9 +333,18 @@ class StatisticalAnalyzer:
                 # Exact Welch-Satterthwaite effective degrees of freedom
                 ws_denom = (se_a2**2) / max(n_a - 1, 1) + (se_b2**2) / max(n_b - 1, 1)
                 df_t = float(((se_a2 + se_b2) ** 2) / ws_denom) if ws_denom > 1e-18 else float(max(n_a + n_b - 2, 1))
-            t_crit = float(stats.t.ppf(1.0 - alpha / 2.0, df=max(df_t, 1.0)))
-            ci_low = diff_mean - t_crit * se_diff
-            ci_high = diff_mean + t_crit * se_diff
+            if alternative == "greater":
+                t_crit = float(stats.t.ppf(1.0 - alpha, df=max(df_t, 1.0)))
+                ci_low = diff_mean - t_crit * se_diff
+                ci_high = float("inf")
+            elif alternative == "less":
+                t_crit = float(stats.t.ppf(1.0 - alpha, df=max(df_t, 1.0)))
+                ci_low = float("-inf")
+                ci_high = diff_mean + t_crit * se_diff
+            else:
+                t_crit = float(stats.t.ppf(1.0 - alpha / 2.0, df=max(df_t, 1.0)))
+                ci_low = diff_mean - t_crit * se_diff
+                ci_high = diff_mean + t_crit * se_diff
             extra_details: dict[str, Any] = {
                 "mean_a": mean_a,
                 "mean_b": mean_b,
@@ -417,8 +411,8 @@ class StatisticalAnalyzer:
             reject_null=reject,
             effect_size=round(effect_val, 4),
             effect_size_name=es_name,
-            ci_low=round(ci_low, 4),
-            ci_high=round(ci_high, 4),
+            ci_low=round(ci_low, 4) if np.isfinite(ci_low) else ci_low,
+            ci_high=round(ci_high, 4) if np.isfinite(ci_high) else ci_high,
             interpretation=(
                 f"Statistically significant difference between groups (p={p_val:.4g}, {es_name}={effect_val:.2f})."
                 if reject
@@ -852,6 +846,16 @@ class StatisticalAnalyzer:
         arr = arr[np.isfinite(arr)]
         if len(arr) < 3:
             raise ValueError("Jarque-Bera test requires at least 3 finite observations.")
+        if float(np.std(arr)) <= 1e-12:
+            return HypothesisTestResult(
+                test_name="jarque_bera",
+                statistic=0.0,
+                p_value=0.0,
+                alpha=alpha,
+                reject_null=True,
+                interpretation="Constant column (zero variance); strictly non-normal.",
+                details={"n": int(len(arr))},
+            )
         stat, p_val = stats.jarque_bera(arr)
         reject = bool(p_val < alpha)
         return HypothesisTestResult(
@@ -869,31 +873,58 @@ class StatisticalAnalyzer:
         )
 
     @staticmethod
+    def _anderson_darling_norm_stat_and_pvalue(arr: np.ndarray) -> tuple[float, float, float]:
+        """Compute A² statistic (SciPy 1.17+ FutureWarning-free) and Stephens (1986) analytical p-value."""
+        try:
+            res = stats.anderson(arr, dist="norm", method="interpolate")
+        except TypeError:
+            res = stats.anderson(arr, dist="norm")
+        stat = float(res.statistic)
+        n = len(arr)
+        a_star = stat * (1.0 + 0.75 / n + 2.25 / (n**2))
+        if a_star >= 13.0:
+            p_val = 0.0
+        elif a_star >= 0.6:
+            p_val = float(np.exp(1.2937 - 5.709 * a_star + 0.0186 * (a_star**2)))
+        elif a_star >= 0.34:
+            p_val = float(np.exp(0.9177 - 4.279 * a_star - 1.38 * (a_star**2)))
+        elif a_star >= 0.2:
+            p_val = float(1.0 - np.exp(-8.318 + 42.796 * a_star - 59.938 * (a_star**2)))
+        else:
+            p_val = float(1.0 - np.exp(-13.436 + 101.14 * a_star - 223.73 * (a_star**2)))
+        return stat, float(np.clip(p_val, 0.0, 1.0)), float(a_star)
+
+    @staticmethod
     def anderson_darling_test(values: np.ndarray | pd.Series, alpha: float = 0.05) -> HypothesisTestResult:
         """Anderson-Darling test for normality (sensitive to distribution tails)."""
         arr = np.asarray(values, dtype=float)
         arr = arr[np.isfinite(arr)]
         if len(arr) < 5:
             raise ValueError("Anderson-Darling test requires at least 5 finite observations.")
-        res = stats.anderson(arr, dist="norm")
-        stat = float(res.statistic)
-        # Map alpha to closest standard significance level (15%, 10%, 5%, 2.5%, 1%)
-        levels = np.asarray(res.significance_level, dtype=float) / 100.0
-        idx = int(np.argmin(np.abs(levels - alpha)))
-        crit = float(res.critical_values[idx])
-        reject = bool(stat > crit)
+        if float(np.std(arr)) <= 1e-12:
+            return HypothesisTestResult(
+                test_name="anderson_darling",
+                statistic=0.0,
+                p_value=0.0,
+                alpha=alpha,
+                reject_null=True,
+                interpretation="Constant column (zero variance); strictly non-normal.",
+                details={"n": int(len(arr)), "method": "zero_variance"},
+            )
+        stat, p_val, a_star = StatisticalAnalyzer._anderson_darling_norm_stat_and_pvalue(arr)
+        reject = bool(p_val < alpha)
         return HypothesisTestResult(
             test_name="anderson_darling",
             statistic=round(stat, 6),
-            p_value=round(float(levels[idx]) if reject else 1.0, 6),
+            p_value=round(p_val, 6),
             alpha=alpha,
             reject_null=reject,
             interpretation=(
-                f"Reject normality at alpha={levels[idx]:.3f} (A2={stat:.3f} > crit={crit:.3f})."
+                f"Reject normality at alpha={alpha:.3f} (A2={stat:.3f}, p={p_val:.4g})."
                 if reject
-                else f"Consistent with normality at alpha={levels[idx]:.3f} (A2={stat:.3f} <= crit={crit:.3f})."
+                else f"Consistent with normality at alpha={alpha:.3f} (A2={stat:.3f}, p={p_val:.4g})."
             ),
-            details={"critical_value": crit, "matched_alpha": float(levels[idx])},
+            details={"n": int(len(arr)), "a_star": round(a_star, 6), "method": "stephens_1986"},
         )
 
     @staticmethod
@@ -902,6 +933,8 @@ class StatisticalAnalyzer:
         tbl = np.asarray(table_2x2, dtype=int)
         if tbl.shape != (2, 2):
             raise ValueError("McNemar test requires a 2x2 contingency table.")
+        if np.any(tbl < 0):
+            raise ValueError("McNemar contingency table counts cannot be negative.")
         b, c = int(tbl[0, 1]), int(tbl[1, 0])
         n_disc = b + c
         if n_disc == 0:
@@ -909,7 +942,7 @@ class StatisticalAnalyzer:
             stat = 0.0
         else:
             p_val = float(stats.binomtest(min(b, c), n=n_disc, p=0.5, alternative="two-sided").pvalue)
-            stat = float(((abs(b - c) - 1.0) ** 2) / n_disc) if n_disc > 0 else 0.0
+            stat = float((max(0.0, abs(b - c) - 1.0) ** 2) / n_disc)
         reject = bool(p_val < alpha)
         return HypothesisTestResult(
             test_name="mcnemar_exact",
@@ -969,7 +1002,12 @@ class StatisticalAnalyzer:
         alpha: float = 0.05,
         power: float = 0.80,
     ) -> dict[str, float | int]:
-        """Normal-approximation sample size per group for two-sided two-sample test."""
+        """Exact non-central Student-t sample size per group for a two-sided two-sample t-test (Cohen 1988).
+
+        Finds the smallest integer ``n >= 2`` satisfying exact non-central t power
+        ``P(|T_{2n-2, delta}| > t_{1 - alpha/2, 2n-2}) >= power`` with ``delta = d * sqrt(n / 2)``,
+        eliminating the systematic under-sizing of the asymptotic normal approximation at moderate/large ``d``.
+        """
         d = abs(float(effect_size))
         if d <= 0.0:
             raise ValueError("effect_size must be non-zero.")
@@ -977,18 +1015,46 @@ class StatisticalAnalyzer:
             raise ValueError("alpha and power must be in (0, 1).")
         z_alpha = float(stats.norm.ppf(1.0 - alpha / 2.0))
         z_beta = float(stats.norm.ppf(power))
-        n_per_group = int(np.ceil(2.0 * ((z_alpha + z_beta) / d) ** 2))
+        normal_n = max(2, int(np.ceil(2.0 * ((z_alpha + z_beta) / d) ** 2)))
+
+        n_per_group = max(2, normal_n - 1)
+        achieved_power = 0.0
+        for _ in range(500):
+            df_t = 2 * n_per_group - 2
+            t_crit = float(stats.t.ppf(1.0 - alpha / 2.0, df=df_t))
+            ncp = float(d * np.sqrt(n_per_group / 2.0))
+            achieved_power = float(
+                (1.0 - stats.nct.cdf(t_crit, df=df_t, nc=ncp)) + stats.nct.cdf(-t_crit, df=df_t, nc=ncp)
+            )
+            if achieved_power >= power:
+                break
+            n_per_group += 1
+
         return {
             "effect_size": round(d, 6),
             "alpha": float(alpha),
             "target_power": float(power),
+            "achieved_power": round(achieved_power, 6),
             "n_per_group": n_per_group,
             "total_n": int(2 * n_per_group),
+            "normal_approx_n_per_group": normal_n,
         }
 
 
-def distance_correlation(x: np.ndarray | pd.Series, y: np.ndarray | pd.Series) -> dict[str, float]:
-    """Compute Székely-Rizzo-Bakirov (2007) distance correlation (dCor) for linear & nonlinear dependence."""
+def distance_correlation(
+    x: np.ndarray | pd.Series,
+    y: np.ndarray | pd.Series,
+    *,
+    n_permutations: int = 0,
+    random_seed: int = 42,
+) -> dict[str, float | None]:
+    """Compute Székely-Rizzo-Bakirov (2007) V-statistic & Székely-Rizzo (2013, 2014) U-centered unbiased dCor + t-test.
+
+    Reports both empirical ``dcor`` / ``dcov`` and U-centered ``unbiased_dcor_sq`` / ``unbiased_dcor``
+    (strictly unbiased zero expectation under independence for ``n >= 4``), plus the exact Székely & Rizzo
+    (2013, JMVA 117:193-213) Student-t test of independence (for ``n >= 5``) and optional Phipson & Smyth
+    (2010) Monte Carlo permutation p-value when ``n_permutations > 0``.
+    """
     xa = np.asarray(x, dtype=float)
     ya = np.asarray(y, dtype=float)
     mask = np.isfinite(xa) & np.isfinite(ya)
@@ -996,7 +1062,16 @@ def distance_correlation(x: np.ndarray | pd.Series, y: np.ndarray | pd.Series) -
     ya = ya[mask]
     n = len(xa)
     if n < 4:
-        return {"dcor": 0.0, "dcov": 0.0, "n": float(n)}
+        return {
+            "dcor": 0.0,
+            "dcov": 0.0,
+            "unbiased_dcor_sq": 0.0,
+            "unbiased_dcor": 0.0,
+            "t_statistic": 0.0,
+            "p_value": 1.0,
+            "permutation_p_value": None,
+            "n": float(n),
+        }
     a = np.abs(xa[:, None] - xa[None, :])
     b = np.abs(ya[:, None] - ya[None, :])
     a_cent = a - a.mean(axis=0, keepdims=True) - a.mean(axis=1, keepdims=True) + a.mean()
@@ -1006,40 +1081,136 @@ def distance_correlation(x: np.ndarray | pd.Series, y: np.ndarray | pd.Series) -
     dcov2_yy = float(np.mean(b_cent * b_cent))
     denom_sq = float(np.sqrt(max(dcov2_xx, 0.0) * max(dcov2_yy, 0.0)))
     if denom_sq <= 1e-12:
-        return {"dcor": 0.0, "dcov": 0.0, "n": float(n)}
-    dcor = float(np.sqrt(max(dcov2_xy, 0.0) / denom_sq))
-    dcor = float(np.clip(dcor, 0.0, 1.0))
+        return {
+            "dcor": 0.0,
+            "dcov": 0.0,
+            "unbiased_dcor_sq": 0.0,
+            "unbiased_dcor": 0.0,
+            "t_statistic": 0.0,
+            "p_value": 1.0,
+            "permutation_p_value": 1.0 if n_permutations > 0 else None,
+            "n": float(n),
+        }
+    dcor = float(np.clip(np.sqrt(max(dcov2_xy, 0.0) / denom_sq), 0.0, 1.0))
+
+    # Székely & Rizzo (2014, Annals of Statistics 42(6):2382-2412) U-centered matrices:
+    row_a = a.sum(axis=1, keepdims=True)
+    row_b = b.sum(axis=1, keepdims=True)
+    tot_a = float(a.sum())
+    tot_b = float(b.sum())
+    a_u = a - row_a / (n - 2.0) - row_a.T / (n - 2.0) + tot_a / ((n - 1.0) * (n - 2.0))
+    b_u = b - row_b / (n - 2.0) - row_b.T / (n - 2.0) + tot_b / ((n - 1.0) * (n - 2.0))
+    np.fill_diagonal(a_u, 0.0)
+    np.fill_diagonal(b_u, 0.0)
+    u_denom = float(n * (n - 3))
+    u_xy = float(np.sum(a_u * b_u) / u_denom)
+    u_xx = float(np.sum(a_u * a_u) / u_denom)
+    u_yy = float(np.sum(b_u * b_u) / u_denom)
+    u_scale = float(np.sqrt(max(u_xx, 0.0) * max(u_yy, 0.0)))
+    r_star = float(np.clip(u_xy / u_scale, -1.0, 1.0)) if u_scale > 1e-15 else 0.0
+    unbiased_dcor = float(np.sqrt(max(r_star, 0.0)))
+
+    # Székely & Rizzo (2013, JMVA 117:193-213, Theorem 1) closed-form t-test of independence (valid for n >= 5)
+    if n >= 5 and u_scale > 1e-15:
+        nu = float(n * (n - 3)) / 2.0
+        if r_star >= 1.0 - 1e-12:
+            t_stat = float("inf")
+            p_val = 0.0
+        else:
+            t_stat = float(np.sqrt(nu - 1.0) * r_star / np.sqrt(max(1.0 - r_star * r_star, 1e-15)))
+            p_val = float(np.clip(stats.t.sf(t_stat, df=nu - 1.0), 0.0, 1.0))
+    else:
+        t_stat = 0.0
+        p_val = 1.0
+
+    perm_p: float | None = None
+    if n_permutations > 0:
+        rng = np.random.default_rng(random_seed)
+        exceed = 0
+        for _ in range(int(n_permutations)):
+            perm_idx = rng.permutation(n)
+            b_perm = b_cent[np.ix_(perm_idx, perm_idx)]
+            if float(np.mean(a_cent * b_perm)) >= dcov2_xy - 1e-15:
+                exceed += 1
+        # Phipson & Smyth (2010) exact Monte Carlo p-value: (1 + exceed) / (B + 1)
+        perm_p = round(float((exceed + 1) / (int(n_permutations) + 1)), 6)
+
     return {
         "dcor": round(dcor, 6),
         "dcov": round(float(np.sqrt(max(dcov2_xy, 0.0))), 6),
+        "unbiased_dcor_sq": round(r_star, 6),
+        "unbiased_dcor": round(unbiased_dcor, 6),
+        "t_statistic": round(t_stat, 6) if np.isfinite(t_stat) else t_stat,
+        "p_value": round(p_val, 6),
+        "permutation_p_value": perm_p,
         "n": float(n),
     }
 
 
 def friedman_nemenyi_test(score_matrix: np.ndarray | pd.DataFrame, *, alpha: float = 0.05) -> dict[str, Any]:
-    """Demšar (2006) Friedman test with Nemenyi post-hoc Critical Difference (CD) for multi-model comparison."""
-    from scipy import stats
-
+    """Demšar (2006, JMLR 7:1-30) Friedman + Iman-Davenport (1980) F-test + exact Studentized-Range Nemenyi CD."""
     mat = np.asarray(score_matrix, dtype=float)
     if mat.ndim != 2 or mat.shape[0] < 3 or mat.shape[1] < 2:
         return {"evaluable": False, "reason": "Requires >= 3 datasets/folds and >= 2 models."}
+    if not (0.0 < alpha < 1.0):
+        raise ValueError("alpha must be in (0, 1).")
     n_datasets, k_models = mat.shape
     stat, p_val = stats.friedmanchisquare(*[mat[:, j] for j in range(k_models)])
-    # Average ranks (higher score = rank 1)
+    chi2_f = float(stat)
+
+    # Iman & Davenport (1980, Commun. Stat. Theory Methods A9:571-577) less-conservative omnibus F-statistic:
+    # F_F = ((N - 1) * chi2_F) / (N * (k - 1) - chi2_F) ~ F(k - 1, (k - 1) * (N - 1))
+    df1 = k_models - 1
+    df2 = (k_models - 1) * (n_datasets - 1)
+    id_denom = float(n_datasets * (k_models - 1)) - chi2_f
+    if id_denom <= 1e-12:
+        f_stat = float("inf")
+        f_pval = 0.0
+    else:
+        f_stat = float(((n_datasets - 1) * chi2_f) / id_denom)
+        f_pval = float(np.clip(stats.f.sf(f_stat, df1, df2), 0.0, 1.0))
+
+    # Average ranks across datasets (higher score = rank 1)
     ranks = np.array([stats.rankdata(-row) for row in mat])
     avg_ranks = np.mean(ranks, axis=0)
-    # Approximate Nemenyi q_alpha via studentized range / normal critical value
-    q_alpha = float(stats.norm.ppf(1.0 - alpha / (k_models * (k_models - 1)))) if k_models > 2 else 1.96
-    cd = float(q_alpha * np.sqrt(k_models * (k_models + 1) / (6.0 * n_datasets)))
+
+    # Exact Demšar (2006, Section 3.2.1 & Table 5a) Nemenyi critical value:
+    # q_alpha = Q_{1 - alpha}(k, inf) / sqrt(2), where Q is the Studentized range quantile.
+    q_alpha = float(stats.studentized_range.ppf(1.0 - alpha, k_models, np.inf) / np.sqrt(2.0))
+    se_rank = float(np.sqrt(k_models * (k_models + 1.0) / (6.0 * n_datasets)))
+    cd = float(q_alpha * se_rank)
+
+    col_names = (
+        [str(c) for c in score_matrix.columns]
+        if isinstance(score_matrix, pd.DataFrame)
+        else [f"model_{j}" for j in range(k_models)]
+    )
+    pairwise: list[dict[str, Any]] = []
+    for i in range(k_models):
+        for j in range(i + 1, k_models):
+            diff = abs(float(avg_ranks[i] - avg_ranks[j]))
+            pairwise.append(
+                {
+                    "model_a": col_names[i],
+                    "model_b": col_names[j],
+                    "rank_diff": round(diff, 4),
+                    "significant": bool(diff > cd),
+                }
+            )
+
     return {
         "evaluable": True,
         "n_datasets": int(n_datasets),
         "k_models": int(k_models),
-        "friedman_stat": round(float(stat), 6),
+        "friedman_stat": round(chi2_f, 6),
         "p_value": round(float(p_val), 6),
-        "significant": bool(p_val < alpha),
+        "iman_davenport_f": round(f_stat, 6) if np.isfinite(f_stat) else f_stat,
+        "iman_davenport_p_value": round(f_pval, 6),
+        "significant": bool(p_val < alpha or f_pval < alpha),
         "avg_ranks": [round(float(r), 4) for r in avg_ranks],
+        "q_alpha": round(q_alpha, 6),
         "critical_difference": round(cd, 4),
+        "pairwise_differences": pairwise,
     }
 
 

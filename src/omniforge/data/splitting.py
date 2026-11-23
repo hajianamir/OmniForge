@@ -43,6 +43,7 @@ class SplitConfig(BaseModel):
     time_col: str | None = None
     gap: int = Field(default=0, ge=0)
     regression_stratify_bins: int = Field(default=5, ge=2, le=20)
+    strict_duplicates: bool = False
     random_seed: int = 42
 
 
@@ -268,6 +269,7 @@ class LeakageSafeSplitter:
         test_idx: np.ndarray,
         val_idx: np.ndarray | None = None,
         strategy_used: str = "random",
+        strict_duplicates: bool | None = None,
     ) -> LeakageAuditReport:
         """Run 4 formal anti-leakage audits across Train, Validation, and Test partitions."""
         tr_set = set(int(i) for i in train_idx)
@@ -336,27 +338,48 @@ class LeakageSafeSplitter:
                 if not temporal_valid:
                     warnings.append(f"Temporal look-ahead leakage: {temporal_boundary}.")
 
-        # Cross-boundary exact duplicate row check (using row hashes)
+        # Cross-boundary exact duplicate row check across ALL split pairs (train∩val, train∩test, val∩test)
         dup_leaks = 0
         try:
             tr_hashes = set(pd.util.hash_pandas_object(df.iloc[train_idx], index=False).tolist())
-            te_hashes = pd.util.hash_pandas_object(df.iloc[test_idx], index=False).tolist()
-            dup_leaks = sum(1 for h in te_hashes if h in tr_hashes)
+            va_list = (
+                pd.util.hash_pandas_object(df.iloc[val_idx], index=False).tolist()
+                if (val_idx is not None and len(val_idx) > 0)
+                else []
+            )
+            va_hashes = set(va_list)
+            te_list = pd.util.hash_pandas_object(df.iloc[test_idx], index=False).tolist()
+
+            dup_tr_va = sum(1 for h in va_list if h in tr_hashes)
+            dup_tr_te = sum(1 for h in te_list if h in tr_hashes)
+            dup_va_te = sum(1 for h in te_list if h in va_hashes)
+            dup_leaks = int(dup_tr_va + dup_tr_te + dup_va_te)
             checks.append(
                 {
                     "check": "Zero Cross-Split Exact Duplicate Rows",
                     "passed": dup_leaks == 0,
-                    "details": f"Test rows identical to a Train row: {dup_leaks}",
+                    "details": (
+                        f"Cross-split identical rows: total={dup_leaks} "
+                        f"(train∩val={dup_tr_va}, train∩test={dup_tr_te}, val∩test={dup_va_te})"
+                    ),
                 }
             )
             if dup_leaks > 0:
                 warnings.append(
-                    f"{dup_leaks} test row(s) are exact duplicates of training rows; run deduplication before splitting."
+                    f"{dup_leaks} cross-split duplicate row(s) detected "
+                    f"(train∩val={dup_tr_va}, train∩test={dup_tr_te}, val∩test={dup_va_te}); "
+                    "run deduplication before splitting."
                 )
         except Exception as exc:
             logger.debug("duplicate_hash_audit_skipped", error=str(exc))
 
-        passed = (idx_overlap == 0) and (group_overlap == 0) and temporal_valid
+        enforce_strict_dups = self.config.strict_duplicates if strict_duplicates is None else bool(strict_duplicates)
+        passed = (
+            (idx_overlap == 0)
+            and (group_overlap == 0)
+            and temporal_valid
+            and (dup_leaks == 0 if enforce_strict_dups else True)
+        )
         return LeakageAuditReport(
             passed=passed,
             strategy_used=strategy_used,

@@ -308,3 +308,56 @@ class BaseOmniForgeModel(ABC):
         for idx, cls_val in enumerate(classes):
             proba[:, idx] = (preds == cls_val).astype(float)
         return proba
+
+
+class SklearnEstimatorAdapter(BaseOmniForgeModel):
+    """BaseOmniForgeModel wrapper for fitted scikit-learn estimators (enabling signed Registry & Serving)."""
+
+    model_family = "sklearn_adapter"
+    framework = "sklearn"
+
+    def __init__(
+        self,
+        estimator: Any,
+        *,
+        name: str | None = None,
+        task_type: TaskType | None = None,
+    ) -> None:
+        classes = getattr(estimator, "classes_", None)
+        if task_type is None:
+            if classes is not None:
+                task_type = TaskType.BINARY_CLASSIFICATION if len(classes) <= 2 else TaskType.MULTICLASS_CLASSIFICATION
+            else:
+                task_type = TaskType.REGRESSION
+        super().__init__(
+            name=name or type(estimator).__name__,
+            task_type=task_type,
+            track_carbon=False,
+        )
+        self._estimator = estimator
+        self.is_fitted_ = True
+        self._cat_columns_ = []
+        self._cat_mappings_ = {}
+        feat_in = getattr(estimator, "feature_names_in_", None)
+        if feat_in is not None:
+            self.feature_names_ = [str(c) for c in feat_in]
+            self.metadata_.feature_names = list(self.feature_names_)
+        if classes is not None:
+            self.classes_ = np.asarray(classes)
+
+    def _to_est_input(self, X: np.ndarray) -> pd.DataFrame | np.ndarray:
+        if self.feature_names_ and X.ndim == 2 and X.shape[1] == len(self.feature_names_):
+            return pd.DataFrame(X, columns=self.feature_names_)
+        return X
+
+    def _fit(self, X: np.ndarray, y: np.ndarray | None, **kwargs: Any) -> None:
+        self._estimator.fit(X, y)
+
+    def _predict(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
+        return np.asarray(self._estimator.predict(self._to_est_input(X)))
+
+    def _predict_proba(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
+        if hasattr(self._estimator, "predict_proba"):
+            return np.asarray(self._estimator.predict_proba(self._to_est_input(X)), dtype=float)
+        return super()._predict_proba(X, **kwargs)
+

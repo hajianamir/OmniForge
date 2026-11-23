@@ -154,6 +154,37 @@ class APISettings(BaseModel):
     )
     cors_allow_credentials: bool = True
     rate_limit_per_minute: int = 300
+    # 'auto' (default): Redis when OMNIFORGE_API__RATE_LIMIT_REDIS_URL is set and the
+    # optional 'redis' package is installed, otherwise the per-process in-memory window.
+    # 'memory' / 'redis' force the backend. 'redis' fails fast at boot when misconfigured.
+    rate_limit_backend: str = "auto"
+    rate_limit_redis_url: str | None = None
+    # Whole-request body cap (bytes). Enforced by RequestBodySizeLimitMiddleware before any
+    # byte is read (Content-Length) and while streaming (chunked uploads). 256 MB default is
+    # generous for local data-science workloads while still bounding memory exhaustion.
+    max_request_body_bytes: int = 268_435_456
+    # Browser-security headers (audit P1-11). The SPA is self-hosted and talks only to this
+    # origin, so a strict-but-report-only CSP is safe to ship enabled by default. Flip
+    # ``csp_report_only_enabled`` off (or blank the policy) to silence the header during
+    # development; promote to an enforced Content-Security-Policy once report traffic is clean.
+    csp_report_only_enabled: bool = True
+    csp_report_only_policy: str = (
+        "default-src 'self'; "
+        "script-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob:; "
+        "font-src 'self' data:; "
+        "connect-src 'self'; "
+        "object-src 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'; "
+        "frame-ancestors 'self'"
+    )
+    # HSTS is only honoured by browsers over TLS (RFC 6797 §8.1); emitting it on plain-HTTP
+    # responses is harmless. Disable when testing over HTTP-only internal networks if you prefer.
+    hsts_enabled: bool = True
+    hsts_max_age: int = 31536000
+    hsts_include_subdomains: bool = True
 
     @model_validator(mode="after")
     def _prevent_wildcard_credentials(self) -> APISettings:

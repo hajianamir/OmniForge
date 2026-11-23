@@ -174,15 +174,20 @@ class ExperimentTracker:
     def log_artifact(self, source_path: str | Path, run_id: str | None = None) -> Path:
         """Copy an artifact file into the run's managed artifact store."""
         rid = self._resolve_run(run_id)
-        src = Path(source_path)
-        if not src.exists():
-            raise MLOpsError(f"Artifact file does not exist: {src}")
-        dest_dir = self.artifact_root / rid
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = dest_dir / src.name
-        shutil.copy2(src, dest)
         rec = self.get_run(rid)
-        arts = list(dict.fromkeys([*rec.artifacts, str(dest.resolve())]))
+        src = Path(source_path)
+        if not src.exists() or not src.is_file():
+            raise MLOpsError(f"Artifact file does not exist: {src}")
+        root_resolved = self.artifact_root.resolve()
+        dest_dir = (self.artifact_root / rid).resolve()
+        if not dest_dir.is_relative_to(root_resolved):
+            raise MLOpsError(f"Run artifact directory escapes tracker root for run '{rid}'.")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = (dest_dir / src.name).resolve()
+        if not dest.is_relative_to(dest_dir):
+            raise MLOpsError(f"Artifact destination escapes run directory: {src.name!r}")
+        shutil.copy2(src, dest)
+        arts = list(dict.fromkeys([*rec.artifacts, str(dest)]))
         with _sqlite_conn(self.db_path) as conn:
             conn.execute("UPDATE runs SET artifacts_json = ? WHERE run_id = ?", (json.dumps(arts), rid))
             conn.commit()
