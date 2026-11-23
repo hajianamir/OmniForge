@@ -132,6 +132,7 @@ class _FittedCleanerState:
     missing_indicator_cols: list[str] = field(default_factory=list)
     outlier_bounds: dict[str, tuple[float, float]] = field(default_factory=dict)
     multivariate_detector: Any | None = None
+    detector_fitted: bool = False
     multivariate_columns: list[str] = field(default_factory=list)
     multivariate_medians: dict[str, float] = field(default_factory=dict)
     inferred_numeric_cols: list[str] = field(default_factory=list)
@@ -276,6 +277,7 @@ class DataCleaner:
                         q1 - self.config.outlier_threshold * iqr,
                         q3 + self.config.outlier_threshold * iqr,
                     )
+                    self._state.detector_fitted = True
             elif self.config.outlier_method == "zscore":
                 mean, std = float(vals.mean()), float(vals.std(ddof=0))
                 if std > 0:
@@ -283,6 +285,7 @@ class DataCleaner:
                         mean - self.config.outlier_threshold * std,
                         mean + self.config.outlier_threshold * std,
                     )
+                    self._state.detector_fitted = True
             elif self.config.outlier_method == "mad":
                 med = float(vals.median())
                 mad = float(np.median(np.abs(vals - med)))
@@ -292,10 +295,12 @@ class DataCleaner:
                         med - self.config.outlier_threshold * scaled,
                         med + self.config.outlier_threshold * scaled,
                     )
+                    self._state.detector_fitted = True
             elif self.config.outlier_method == "percentile":
                 lo_q = float(vals.quantile(self.config.lower_percentile))
                 hi_q = float(vals.quantile(self.config.upper_percentile))
                 self._state.outlier_bounds[str(col)] = (lo_q, hi_q)
+                self._state.detector_fitted = True
 
         if self.config.outlier_method in ("isolation_forest", "lof", "elliptic", "elliptic_envelope") and num_cols and len(work) >= 10:
             mat = work[num_cols].copy()
@@ -328,6 +333,7 @@ class DataCleaner:
             self._state.multivariate_detector = det
             self._state.multivariate_columns = list(num_cols)
             self._state.multivariate_medians = mv_meds
+            self._state.detector_fitted = True
 
         if self.config.outlier_method != "none" and self.config.outlier_action != "none" and len(work) > 0:
             work, _, outlier_flag_cols, _, _, _ = self._handle_outliers(work, excluded)

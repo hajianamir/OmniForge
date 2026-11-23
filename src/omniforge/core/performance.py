@@ -7,7 +7,9 @@ import os
 import threading
 import time
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Generic, TypeVar
+
+T = TypeVar("T")
 
 import numpy as np
 import pandas as pd
@@ -294,7 +296,7 @@ def paginate_dataframe(
 dataframe_fingerprint = compute_df_fingerprint
 
 
-class TTLCache[T]:
+class TTLCache(Generic[T]):
     """Lightweight thread-safe LRU + TTL cache supporting arbitrary keyed values."""
 
     def __init__(self, max_entries: int = 128, ttl_seconds: float = 300.0) -> None:

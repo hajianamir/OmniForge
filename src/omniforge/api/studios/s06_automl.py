@@ -56,6 +56,10 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
         raise HTTPException(status_code=400, detail="Select a target column first.")
     target = active_targets[0]
 
+    # Honor Split Lock: train only on train partition when lock is active
+    train_df, _test_df, _lock = _wb().get_active_split_frames(state, df)
+    automl_source = train_df if (train_df is not None and not train_df.empty and _lock is not None) else df
+
     def _execute() -> dict[str, Any]:
         multi_target_summary: list[dict[str, Any]] = []
         if len(active_targets) > 1:
@@ -84,9 +88,6 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
                     )
                 except Exception:
                     multi_target_summary.append({"target": extra_t, "task_type": "error", "best_model": None, "best_score": None})
-        # Honor Split Lock: train only on train partition when lock is active
-        train_df, _test_df, _lock = _wb().get_active_split_frames(state, df)
-        automl_source = train_df if (train_df is not None and not train_df.empty and _lock is not None) else df
         X, y, task = _wb()._prepare_xy(automl_source, target, raw_features=True)
         work_df = X.copy()
         work_df[target] = y.to_numpy()

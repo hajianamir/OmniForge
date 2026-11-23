@@ -198,11 +198,30 @@ class CausalInferenceEngine:
         y00 = df.loc[(df[group_col] == 0) & (df[post_col] == 0), outcome_col].dropna().to_numpy(dtype=float)
         if min(len(y11), len(y10), len(y01), len(y00)) < 1:
             raise CausalInferenceError("All four 2x2 group x post cells must contain at least one observation.")
+
+        # Singleton cells (1 observation per cell) have zero degrees of freedom
+        _any_singleton = min(len(y11), len(y10), len(y01), len(y00)) < 2
         g1_post, g1_pre = float(np.mean(y11)), float(np.mean(y10))
         g0_post, g0_pre = float(np.mean(y01)), float(np.mean(y00))
         did = (g1_post - g1_pre) - (g0_post - g0_pre)
         def _var_cell(arr: np.ndarray) -> float:
             return float(np.var(arr, ddof=1) / len(arr)) if len(arr) > 1 else 0.0
+
+        if _any_singleton:
+            # Zero degrees of freedom: SE, CI, and p-value are undefined
+            return {
+                "did_estimate": round(did, 6),
+                "std_error": float("nan"),
+                "ci_lower": float("nan"),
+                "ci_upper": float("nan"),
+                "p_value": float("nan"),
+                "treated_change": round(g1_post - g1_pre, 6),
+                "control_change": round(g0_post - g0_pre, 6),
+                "treated_pre": round(g1_pre, 6),
+                "treated_post": round(g1_post, 6),
+                "control_pre": round(g0_pre, 6),
+                "control_post": round(g0_post, 6),
+            }
 
         se = float(np.sqrt(_var_cell(y11) + _var_cell(y10) + _var_cell(y01) + _var_cell(y00)))
         z_crit = float(norm.ppf(0.975))

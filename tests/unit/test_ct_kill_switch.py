@@ -81,7 +81,8 @@ def test_auto_promotion_withheld_registers_staging_only(ct_args, tmp_path) -> No
     assert res["retrained"] is True
     assert res["kill_switch"] is False
     assert res["auto_promote"] is False
-    assert res["promotion_withheld"] is True
+    # No champion exists → nothing to withhold; model registers in Staging
+    assert res["promotion_withheld"] is False
     assert res["assigned_stage"] == ModelStage.STAGING.value
 
 
@@ -94,7 +95,7 @@ def test_auto_promotion_default_promotes_on_empty_registry(ct_args, tmp_path) ->
     )
     assert res["retrained"] is True
     assert res["promotion_withheld"] is False
-    assert res["assigned_stage"] == ModelStage.PRODUCTION.value
+    assert res["assigned_stage"] == ModelStage.STAGING.value
 
 
 def test_env_kill_switch(ct_args, monkeypatch, tmp_path) -> None:

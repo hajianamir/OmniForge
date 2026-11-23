@@ -399,7 +399,7 @@ class ForecastingEngine:
             return model.predict(horizon)
         from omniforge.models.baselines import ForecastingBaseline
 
-        bl = ForecastingBaseline(method="seasonal_naive", seasonal_period=self.seasonal_period).fit(full_series)
+        bl = ForecastingBaseline(method="naive", seasonal_period=self.seasonal_period).fit(full_series)
         res = bl.predict(horizon, return_intervals=True)
         assert isinstance(res, dict)
         return pd.DataFrame({"step": np.arange(1, horizon + 1), **res})

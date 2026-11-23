@@ -145,6 +145,7 @@ class ModelRegistry:
                 ("approved_domains_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("risk_tier", "TEXT NOT NULL DEFAULT 'medium'"),
                 ("fairness_passed", "INTEGER DEFAULT NULL"),
+                ("encrypted_at_rest", "INTEGER DEFAULT 0"),
             ]
             for col_name, col_ddl in migrations:
                 if col_name not in existing_cols:

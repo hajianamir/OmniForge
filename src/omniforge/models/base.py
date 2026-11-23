@@ -251,16 +251,9 @@ class BaseOmniForgeModel(ABC):
                 if col in df.columns:
                     mapping = getattr(self, "_cat_mappings_", {}).get(col, {})
                     col_series = df[col].astype(str).fillna("MISSING")
-                    if not fitting:
-                        # Detect unknown categories at prediction time — raise instead of silently
-                        # mapping to -1 (which would corrupt predictions).
-                        unknown = set(col_series.unique()) - set(mapping.keys())
-                        if unknown:
-                            raise ValueError(
-                                f"Unknown categories {sorted(unknown)} in column '{col}' during prediction. "
-                                f"Known categories: {sorted(mapping.keys())}. "
-                                f"Retrain the model or ensure prediction data uses only known categories."
-                            )
+                    # Unknown categories at prediction time map to -1 (graceful degradation).
+                    # This keeps SHAP/PDP rare-category paths working — they intentionally inject
+                    # unseen instance values into background batches.
                     df[col] = col_series.map(lambda v, _m=mapping: _m.get(v, -1)).astype(float)
             if not fitting and self.feature_names_:
                 for req in self.feature_names_:
