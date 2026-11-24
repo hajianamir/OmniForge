@@ -52,6 +52,10 @@ class LeakageGuardReport(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     seed: int = 42
     checked_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
+    # Target-leakage checks (new in Fix #8)
+    target_leakage_detected: bool = False
+    target_leakage_columns: list[str] = Field(default_factory=list)
+    target_leakage_details: list[str] = Field(default_factory=list)
 
 
 class LeakageGuard:
@@ -64,6 +68,7 @@ class LeakageGuard:
         *,
         group_col: str | None = None,
         time_col: str | None = None,
+        target_col: str | None = None,
         seed: int = 42,
     ) -> LeakageGuardReport:
         warnings: list[str] = []
@@ -90,7 +95,91 @@ class LeakageGuard:
                         f"Temporal leakage on '{time_col}': max(train)={tr_t.max()} > min(test)={te_t.min()}."
                     )
 
-        passed = (row_overlap == 0) and (group_overlap == 0) and temporal_valid
+        # Target-leakage detection: flag features that are copies of, or near-perfect
+        # predictors of, the target column. A feature identical to the target gives
+        # a trivial score of 1.0 and must be caught before modeling.
+        target_leakage_detected = False
+        target_leakage_columns: list[str] = []
+        target_leakage_details: list[str] = []
+
+        if target_col and target_col in train_df.columns and target_col in test_df.columns:
+            y_train = train_df[target_col]
+            y_test = test_df[target_col]
+            feature_cols = [
+                c
+                for c in train_df.columns
+                if c != target_col and c in test_df.columns
+            ]
+            for col in feature_cols:
+                x_train = train_df[col]
+                x_test = test_df[col]
+
+                # 1. Exact copy: feature values equal target values (dtype-agnostic compare)
+                if x_train.dtype == y_train.dtype:
+                    train_copy = (x_train == y_train).all()
+                    test_copy = (x_test == y_test).all()
+                else:
+                    train_copy = (x_train.astype(str) == y_train.astype(str)).all()
+                    test_copy = (x_test.astype(str) == y_test.astype(str)).all()
+                if train_copy and test_copy:
+                    target_leakage_detected = True
+                    target_leakage_columns.append(col)
+                    target_leakage_details.append(
+                        f"Column '{col}' is an exact copy of target '{target_col}' in both train and test."
+                    )
+                    continue
+
+                # 2. Near-perfect numeric correlation (|r| > 0.999)
+                if (
+                    pd.api.types.is_numeric_dtype(x_train)
+                    and pd.api.types.is_numeric_dtype(y_train)
+                    and len(x_train.dropna()) > 2
+                    and len(x_test.dropna()) > 2
+                ):
+                    try:
+                        corr_tr = float(x_train.corr(y_train))
+                        corr_te = float(x_test.corr(y_test))
+                        if abs(corr_tr) > 0.999 and abs(corr_te) > 0.999:
+                            target_leakage_detected = True
+                            target_leakage_columns.append(col)
+                            target_leakage_details.append(
+                                f"Column '{col}' has near-perfect correlation with target '{target_col}' "
+                                f"(train r={corr_tr:.6f}, test r={corr_te:.6f})."
+                            )
+                            continue
+                    except Exception:
+                        pass
+
+                # 3. Near-perfect categorical prediction: each feature value maps to
+                #    exactly one target value (one-to-one) in both splits
+                if (
+                    not pd.api.types.is_numeric_dtype(x_train)
+                    or not pd.api.types.is_numeric_dtype(y_train)
+                ):
+                    try:
+                        tr_groups = train_df.groupby(x_train.astype(str))[y_train.name].nunique()
+                        te_groups = test_df.groupby(x_test.astype(str))[y_test.name].nunique()
+                        if (tr_groups == 1).all() and (te_groups == 1).all():
+                            target_leakage_detected = True
+                            target_leakage_columns.append(col)
+                            target_leakage_details.append(
+                                f"Column '{col}' perfectly predicts target '{target_col}' "
+                                f"(one-to-one mapping in both train and test)."
+                            )
+                            continue
+                    except Exception:
+                        pass
+
+        # Any target leakage makes the split fail
+        if target_leakage_detected:
+            warnings.extend(target_leakage_details)
+
+        passed = (
+            (row_overlap == 0)
+            and (group_overlap == 0)
+            and temporal_valid
+            and not target_leakage_detected
+        )
         return LeakageGuardReport(
             passed=passed,
             row_overlap_count=int(row_overlap),
@@ -98,6 +187,9 @@ class LeakageGuard:
             temporal_order_valid=temporal_valid,
             train_size=int(len(train_df)),
             test_size=int(len(test_df)),
+            target_leakage_detected=target_leakage_detected,
+            target_leakage_columns=target_leakage_columns,
+            target_leakage_details=target_leakage_details,
             warnings=warnings,
             seed=seed,
         )

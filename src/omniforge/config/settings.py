@@ -118,7 +118,7 @@ class SecuritySettings(BaseModel):
     encryption_key: str = ""
     artifact_signing_key: str = ""
     api_key: str = ""
-    auto_bootstrap_local_ui: bool = True
+    auto_bootstrap_local_ui: bool = False
     encrypt_artifacts_at_rest: bool = False
     pii_detection_enabled: bool = True
     compliance_profiles: list[str] = Field(default_factory=lambda: ["GDPR", "SOX"])
@@ -140,7 +140,7 @@ class CopilotSettings(BaseModel):
 class APISettings(BaseModel):
     """FastAPI server settings."""
 
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 8000
     cors_origins: list[str] = Field(
         default_factory=lambda: [
@@ -199,7 +199,7 @@ class APISettings(BaseModel):
 class UISettings(BaseModel):
     """OmniForge FastAPI + React enterprise workbench UI settings."""
 
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 8501
     default_theme: str = "dark"
     locale: str = "en"

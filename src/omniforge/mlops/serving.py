@@ -73,6 +73,61 @@ class ModelServingEngine:
         model, rec = self.registry.load_model(model_name, stage=stage)
         return self.deploy_model(endpoint_name, model, version=f"v{rec.version}")
 
+    def _validate_input_schema(
+        self, model: BaseOmniForgeModel, X_df: pd.DataFrame
+    ) -> None:
+        """Validate inference input against the model's fitted schema.
+
+        Rejects missing required features and unexpected/unknown columns, and
+        warns about unseen categorical categories. This prevents silent median
+        imputation of missing features and silent dropping of extra columns that
+        would otherwise produce confident predictions on garbage input.
+        """
+        expected_features = getattr(model, "feature_names_", None)
+        if not expected_features:
+            # Model has no fitted schema information; cannot validate.
+            return
+
+        expected_set = set(expected_features)
+        input_set = set(X_df.columns)
+
+        missing = expected_set - input_set
+        if missing:
+            raise MLOpsError(
+                f"Missing required feature(s) for model '{model.name}': "
+                f"{sorted(missing)}. Provide all {len(expected_features)} "
+                f"expected features: {sorted(expected_set)}."
+            )
+
+        extra = input_set - expected_set
+        if extra:
+            raise MLOpsError(
+                f"Unexpected feature(s) for model '{model.name}': "
+                f"{sorted(extra)}. Model expects exactly: {sorted(expected_set)}."
+            )
+
+        # Warn about unseen categories in categorical columns learned during fit.
+        cat_columns = getattr(model, "_cat_columns_", None)
+        cat_mappings = getattr(model, "_cat_mappings_", None)
+        if cat_columns and cat_mappings:
+            for col in cat_columns:
+                if col not in X_df.columns:
+                    continue
+                mapping = cat_mappings.get(col, {})
+                if not mapping:
+                    continue
+                input_cats = set(X_df[col].astype(str).fillna("MISSING").unique().tolist())
+                known_cats = set(mapping.keys())
+                unseen = input_cats - known_cats
+                if unseen:
+                    logger.warning(
+                        "unseen_categories",
+                        model=model.name,
+                        column=col,
+                        unseen=sorted(unseen),
+                        note="Unseen categories will map to -1 (unknown) at prediction time.",
+                    )
+
     def predict(
         self,
         endpoint_name: str,
@@ -89,6 +144,7 @@ class ModelServingEngine:
         routed_variant = "canary" if use_canary else "primary"
 
         X_df = pd.DataFrame(records) if isinstance(records, list) else records
+        self._validate_input_schema(model, X_df)
         t0 = time.perf_counter()
         preds = model.predict(X_df)
         probas = None

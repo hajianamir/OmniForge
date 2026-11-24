@@ -35,7 +35,7 @@ import omniforge
 from omniforge.api.studios.s04_stats import _run_single_stat_test
 from omniforge.automl.backends import probe_automl_backends
 from omniforge.causal.inference import CausalInferenceEngine
-from omniforge.core.exceptions import DataIngestionError, MLOpsError, SecurityError
+from omniforge.core.exceptions import MLOpsError, SecurityError
 from omniforge.core.types import ModelStage, TaskType
 from omniforge.data.connectors import sql_inspect_database, sql_load_dataframe
 from omniforge.data.ingestion import DataIngestionEngine, fast_read_tabular
@@ -409,12 +409,11 @@ def test_duckdb_confinement_and_sql_free_tabular_reads(tmp_path: Path, monkeypat
             f"duckdb:///{db_file.as_posix()}",
             query=f"SELECT * FROM read_csv_auto('{csv_secret.as_posix()}')",
         )
-    with pytest.raises(DataIngestionError) as duck_exc:
+    with pytest.raises(SecurityError):
         DataIngestionEngine().ingest(
             f"duckdb:///{db_file.as_posix()}",
             query=f"SELECT * FROM '{csv_secret.as_posix()}'",
         )
-    assert "disabled by configuration" in str(duck_exc.value.__cause__)
 
     # 4. fast_read_tabular handles paths with embedded single quotes without SQL injection
     tricky_csv = ws_dir / "client's_quotes.csv"

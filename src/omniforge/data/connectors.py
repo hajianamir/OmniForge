@@ -99,7 +99,8 @@ _FORBIDDEN_SQL_RE = re.compile(
     r"VACUUM|REINDEX|EXPLAIN|EXEC|EXECUTE|MERGE|GRANT|REVOKE|CALL|DO|COPY|INSTALL|LOAD|"
     r"BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE|LOAD_EXTENSION|LOAD_FILE|OUTFILE|DUMPFILE|"
     r"READ_CSV|READ_CSV_AUTO|READ_PARQUET|READ_JSON|READ_JSON_AUTO|READ_TEXT|READ_BLOB|"
-    r"PARQUET_SCAN|CSV_SCAN|SQLITE_SCAN|POSTGRES_SCAN|MYSQL_SCAN|ICEBERG_SCAN|DELTA_SCAN"
+    r"PARQUET_SCAN|CSV_SCAN|SQLITE_SCAN|POSTGRES_SCAN|MYSQL_SCAN|ICEBERG_SCAN|DELTA_SCAN|"
+    r"INTO|OPENROWSET|SLEEP|BENCHMARK|PG_READ_FILE|GLOB"
     r")\b",
     re.IGNORECASE,
 )
@@ -218,6 +219,11 @@ def _strip_sql_comments_and_scan(query: str) -> tuple[str, str]:
     return cleaned, code_only
 
 
+_FILE_PATH_LITERAL_RE = re.compile(
+    r"['\"](?:[^'\"]*[\\/][^'\"]*|[^'\"]*\.\w{2,4})['\"]",
+)
+
+
 def _validate_readonly_sql(query: str) -> str:
     """Ensure user-supplied SQL queries are strictly single read-only ``SELECT`` / ``WITH`` statements."""
     if not isinstance(query, str) or not query.strip():
@@ -237,6 +243,13 @@ def _validate_readonly_sql(query: str) -> str:
         raise SecurityError(
             "Write, DDL, PRAGMA, ATTACH, or file-access SQL statements are blocked for security. "
             "Provide a read-only SELECT query."
+        )
+    # Defense in depth: block string-literal file paths (e.g. DuckDB FROM 'file.csv').
+    # Check ``cleaned`` because ``code_only`` has string literals replaced with `` '' ``.
+    if _FILE_PATH_LITERAL_RE.search(cleaned):
+        raise SecurityError(
+            "File path string literals are forbidden in SQL queries. "
+            "Provide a read-only SELECT query referencing tables, not files."
         )
     return cleaned
 

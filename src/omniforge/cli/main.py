@@ -291,10 +291,10 @@ def cmd_sbom(
 
 @cli.command("serve")
 def cmd_serve(
-    host: str = typer.Option("0.0.0.0", "--host"),
+    host: str = typer.Option("127.0.0.1", "--host"),
     port: int = typer.Option(8000, "--port"),
 ) -> None:
-    """Start the FastAPI enterprise REST API server."""
+    """Start the FastAPI enterprise REST API server (defaults to loopback-only binding)."""
     from omniforge.launcher import launch_api
 
     launch_api(host=host, port=port)
@@ -303,10 +303,10 @@ def cmd_serve(
 @cli.command("ui")
 def cmd_ui(
     port: int = typer.Option(8501, "--port"),
-    host: str = typer.Option("0.0.0.0", "--host"),
+    host: str = typer.Option("127.0.0.1", "--host"),
     no_browser: bool = typer.Option(False, "--no-browser", help="Disable automatic browser launch."),
 ) -> None:
-    """Launch the OmniForge FastAPI + React Enterprise Analytics Workbench."""
+    """Launch the OmniForge FastAPI + React Enterprise Analytics Workbench (defaults to loopback-only binding)."""
     from omniforge.launcher import launch_ui
 
     launch_ui(host=host, port=port, open_browser=not no_browser)
