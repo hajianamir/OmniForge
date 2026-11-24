@@ -121,7 +121,14 @@ export const App: React.FC = () => {
   const [helpOpen, setHelpOpen] = useState(false);
   const [helpSection, setHelpSection] = useState<HandbookSectionId>('workflow');
   const [toast, setToast] = useState<string | null>(null);
+  const [cacheError, setCacheError] = useState<string | null>(null);
   const [studioCache, setStudioCache] = useState<StudioCache>({});
+  // Keep the current cache synchronously available to event handlers. React
+  // state updater functions may run later (or more than once in StrictMode).
+  const studioCacheRef = useRef<StudioCache>({});
+  const cacheGeneration = useRef(0);
+  const cacheRequest = useRef(0);
+  const keyRevisions = useRef<Partial<Record<StudioResultKey, number>>>({});
 
   const openHelp = useCallback((section: HandbookSectionId = 'workflow') => {
     setHelpSection(section);
@@ -147,71 +154,80 @@ export const App: React.FC = () => {
   const [projName, setProjName] = useState('omniforge_project');
   const [projNotes, setProjNotes] = useState('');
 
+  const updateCache = useCallback((next: StudioCache) => {
+    studioCacheRef.current = next;
+    setStudioCache(next);
+  }, []);
+
   const fetchServerCache = useCallback(() => {
+    const generation = cacheGeneration.current;
+    const request = ++cacheRequest.current;
+    const revisions = { ...keyRevisions.current };
     apiGet<{ results?: Partial<StudioCache> }>('/api/workbench/results')
       .then((res) => {
+        // A response from an old workspace/scope, or an older refresh, cannot
+        // resurrect charts that have since been invalidated or replaced.
+        if (generation !== cacheGeneration.current || request !== cacheRequest.current) return;
         const results = res?.results;
-        if (results && typeof results === 'object') {
-          // Server-side cache is trusted to match StudioCache (same backend that
-          // produced it); unknown extra keys are simply never read by studios.
-          setStudioCache((prev) => ({ ...prev, ...results }));
+        if (!results || typeof results !== 'object') throw new Error('The server returned no results.');
+        setCacheError(null);
+        const merged: Record<string, unknown> = { ...studioCacheRef.current };
+        for (const [key, value] of Object.entries(results)) {
+          const k = key as StudioResultKey;
+          // Do not overwrite a result edited locally while this GET was in flight.
+          if ((revisions[k] ?? 0) === (keyRevisions.current[k] ?? 0)) merged[key] = value;
         }
+        updateCache(merged as StudioCache);
       })
-      .catch(() => {});
-  }, []);
+      .catch((err: unknown) => {
+        if (generation === cacheGeneration.current && request === cacheRequest.current) {
+          setCacheError(`Could not restore studio results: ${toErrorMessage(err)}`);
+        }
+      });
+  }, [updateCache]);
 
   const setStudioResult = useCallback((key: StudioResultKey, val: StudioPayload) => {
-    setStudioCache((prev) => {
-      const next: StudioCache = { ...prev };
-      if (val === undefined || val === null) {
-        delete next[key];
-        return next;
-      }
-      (next as Record<string, StudioPayload | undefined>)[key] = val;
-      return next;
-    });
-  }, []);
+    keyRevisions.current[key] = (keyRevisions.current[key] ?? 0) + 1;
+    const next: StudioCache = { ...studioCacheRef.current };
+    if (val === undefined || val === null) delete next[key];
+    else (next as Record<string, StudioPayload | undefined>)[key] = val;
+    updateCache(next);
+  }, [updateCache]);
 
-  const syncState = useCallback((next?: WorkspaceState) => {
+  const syncState = useCallback((next?: WorkspaceState, replaceCache = false) => {
     if (next) {
+      cacheGeneration.current += 1;
       setWs(next);
       document.documentElement.setAttribute('data-theme', next.theme === 'light' ? 'light' : 'dark');
-      if (!next.has_dataset) {
-        setStudioCache({});
-        return;
-      }
-      // Prune local keys only when the server explicitly removed them on dataset reset/upstream mutation,
-      // and hydrate any server keys missing locally (e.g. after .omniforge restore).
+
+      // The server's key list is authoritative even without an active dataset:
+      // e.g. standalone NLP and image analyses can still be valid.
+      let filtered = replaceCache ? {} : studioCacheRef.current;
       if (Array.isArray(next.cached_result_keys)) {
         const allowed = new Set(next.cached_result_keys);
-        let missingOnClient = false;
-        setStudioCache((prev) => {
-          const filtered: Record<string, unknown> = {};
-          for (const [k, v] of Object.entries(prev)) {
-            if (allowed.has(k)) filtered[k] = v;
-          }
-          for (const k of allowed) {
-            if (!(k in filtered)) {
-              missingOnClient = true;
-              break;
-            }
-          }
-          return filtered;
-        });
-        if (missingOnClient) {
-          fetchServerCache();
-        }
+        filtered = Object.fromEntries(Object.entries(filtered).filter(([key]) => allowed.has(key))) as StudioCache;
+      } else if (!next.has_dataset) {
+        filtered = {};
+      }
+      updateCache(filtered);
+      if (replaceCache || !Array.isArray(next.cached_result_keys) || next.cached_result_keys.some((key) => !(key in filtered))) {
+        fetchServerCache();
+      } else {
+        setCacheError(null);
       }
       return;
     }
+    const generation = cacheGeneration.current;
     apiGet<WorkspaceState>('/api/workbench/state')
       .then((s) => {
-        setWs(s);
-        document.documentElement.setAttribute('data-theme', s.theme === 'light' ? 'light' : 'dark');
-        fetchServerCache();
+        // Initial state can arrive after a user has already replaced the workspace.
+        if (generation !== cacheGeneration.current) return;
+        syncState(s);
       })
-      .catch(() => {});
-  }, [fetchServerCache]);
+      .catch((err: unknown) => {
+        if (generation === cacheGeneration.current) setCacheError(`Could not load workspace: ${toErrorMessage(err)}`);
+      });
+  }, [fetchServerCache, updateCache]);
 
   useEffect(() => { syncState(); }, [syncState]);
 
@@ -263,8 +279,8 @@ export const App: React.FC = () => {
       const fd = new FormData();
       fd.append('file', file);
       const res = await apiUpload<{ state: WorkspaceState }>('/api/workbench/workspace/load', fd);
-      syncState(res.state);
-      fetchServerCache();
+      // A restored project can contain different values under the same keys.
+      syncState(res.state, true);
       bumpGrid();
       flash(`Restored OmniForge project '${file.name}'.`);
       setModal('none');
@@ -273,7 +289,7 @@ export const App: React.FC = () => {
     } finally {
       e.target.value = '';
     }
-  }, [syncState, fetchServerCache, bumpGrid, flash]);
+  }, [syncState, bumpGrid, flash]);
 
   // Memoized so keep-alive studios (display:none) do not re-render on every
   // App-level state change (toast, modal, theme flash). Studios receive a
@@ -409,6 +425,11 @@ export const App: React.FC = () => {
       {/* Main Studio Workspace — Keep visited studios mounted so returning NEVER resets tabs, forms, or results */}
       <main ref={mainPaneRef} className="main-pane">
         {toast && <div className="alert alert-success">{toast}</div>}
+        {cacheError && (
+          <div className="alert alert-error" role="alert">
+            {cacheError} <button className="btn btn-sm" onClick={() => syncState()}>Retry workspace results</button>
+          </div>
+        )}
         <React.Suspense fallback={<StudioLoadingFallback />}>
           {visitedStudios.includes('00') && <div style={{ display: studio === '00' ? 'block' : 'none' }}><Studio00Ingestion {...commonProps} /></div>}
           {visitedStudios.includes('01') && <div style={{ display: studio === '01' ? 'block' : 'none' }}><Studio01Data {...commonProps} /></div>}

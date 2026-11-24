@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from fastapi import APIRouter, Header, HTTPException
 
-from omniforge.core.utils import to_json_object
+from omniforge.api.studios.schemas import wb_cache_and_respond
 from omniforge.eda.statistics import distance_correlation
 from omniforge.models.clustering.clusterer import ClusteringEngine
 from omniforge.models.mining.miner import subgroup_beam_search
@@ -49,7 +49,10 @@ def s02_advanced_mining(
         for col in num_feats:
             dcor_results[col] = distance_correlation(df[col], df[tgt])
 
-    return to_json_object(
+    return wb_cache_and_respond(
+        state,
+        sid,
+        "s02_advanced_mining",
         {
             "target": tgt,
             "beam_subgroups": subgroups,

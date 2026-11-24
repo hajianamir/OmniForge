@@ -4,22 +4,26 @@ import { InspectableBox } from './InspectModal';
 
 const PALETTE = ['#38bdf8', '#a78bfa', '#34d399', '#fbbf24', '#f87171', '#fb7185', '#2dd4bf', '#818cf8', '#f97316', '#c084fc'];
 
-export const CanvasScatter: React.FC<{
-  data: ScatterPayload;
-  xLabel?: string;
-  yLabel?: string;
-  height?: number;
-  title?: string;
-}> = ({ data, xLabel = 'Component 1', yLabel = 'Component 2', height = 340, title = '2D Scatter Projection' }) => {
+// InspectableBox renders its children once in the studio and again in its
+// zoom dialog. Each plot must own its own canvas, observer and drawing effect.
+const isFiniteNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
+
+type ScatterPlotProps = { data: ScatterPayload; xLabel: string; yLabel: string; height: number };
+
+const ScatterPlot: React.FC<ScatterPlotProps> = ({ data, xLabel, yLabel, height }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const rafRef = useRef<number>(0);
+  const hasPoints = data.x.some((x, i) => isFiniteNumber(x) && isFiniteNumber(data.y[i]));
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
-    if (!canvas || !data.x?.length) return;
+    if (!canvas) return;
+    const width = canvas.clientWidth;
+    // A keep-alive studio can be hidden. Wait for ResizeObserver to report a
+    // real width when it becomes visible instead of painting at a fake size.
+    if (!width) return;
     const dpr = window.devicePixelRatio || 1;
-    const width = canvas.clientWidth || 640;
     canvas.width = Math.round(width * dpr);
     canvas.height = Math.round(height * dpr);
     const ctx = canvas.getContext('2d');
@@ -27,26 +31,20 @@ export const CanvasScatter: React.FC<{
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, width, height);
 
-    const pad = { l: 48, r: 18, t: 16, b: 36 };
-    const pw = width - pad.l - pad.r;
-    const ph = height - pad.t - pad.b;
-
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
     for (let i = 0; i < data.x.length; i++) {
-      const xv = Number(data.x[i]);
-      const yv = Number(data.y[i]);
-      if (Number.isFinite(xv)) {
-        if (xv < minX) minX = xv;
-        if (xv > maxX) maxX = xv;
-      }
-      if (Number.isFinite(yv)) {
-        if (yv < minY) minY = yv;
-        if (yv > maxY) maxY = yv;
-      }
+      const x = data.x[i], y = data.y[i];
+      if (!isFiniteNumber(x) || !isFiniteNumber(y)) continue;
+      minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+      minY = Math.min(minY, y); maxY = Math.max(maxY, y);
     }
-    if (!Number.isFinite(minX) || minX === maxX) { minX -= 1; maxX += 1; }
-    if (!Number.isFinite(minY) || minY === maxY) { minY -= 1; maxY += 1; }
+    if (!Number.isFinite(minX)) return;
+    if (minX === maxX) { minX -= 1; maxX += 1; }
+    if (minY === maxY) { minY -= 1; maxY += 1; }
 
+    const pad = { l: 48, r: 18, t: 16, b: 36 };
+    const pw = Math.max(1, width - pad.l - pad.r);
+    const ph = Math.max(1, height - pad.t - pad.b);
     ctx.strokeStyle = 'rgba(148, 163, 184, 0.18)';
     ctx.lineWidth = 1;
     for (let k = 0; k <= 4; k++) {
@@ -59,13 +57,11 @@ export const CanvasScatter: React.FC<{
     const uniqGroups = Array.from(new Set((data.groups || []).map(String)));
     const groupColor = new Map<string, string>();
     uniqGroups.forEach((g, idx) => groupColor.set(g, g === '-1' ? '#f87171' : PALETTE[idx % PALETTE.length]));
-
     for (let i = 0; i < data.x.length; i++) {
-      const xv = Number(data.x[i]);
-      const yv = Number(data.y[i]);
-      if (!Number.isFinite(xv) || !Number.isFinite(yv)) continue;
-      const cx = pad.l + ((xv - minX) / (maxX - minX)) * pw;
-      const cy = pad.t + ph - ((yv - minY) / (maxY - minY)) * ph;
+      const x = data.x[i], y = data.y[i];
+      if (!isFiniteNumber(x) || !isFiniteNumber(y)) continue;
+      const cx = pad.l + ((x - minX) / (maxX - minX)) * pw;
+      const cy = pad.t + ph - ((y - minY) / (maxY - minY)) * ph;
       const gKey = data.groups ? String(data.groups[i]) : '0';
       ctx.fillStyle = groupColor.get(gKey) || PALETTE[0];
       ctx.globalAlpha = 0.8;
@@ -86,52 +82,57 @@ export const CanvasScatter: React.FC<{
 
   useEffect(() => {
     draw();
-  }, [draw]);
-
-  // Redraw crisply when the container resizes (sidebar collapse, window drag,
-  // monitor change). Coalesced through requestAnimationFrame so a drag does
-  // not queue a redraw per ResizeObserver notification.
-  useEffect(() => {
-    const container = containerRef.current;
-    if (!container || typeof ResizeObserver === 'undefined') return;
-    const observer = new ResizeObserver(() => {
+    const scheduleDraw = () => {
       cancelAnimationFrame(rafRef.current);
-      rafRef.current = requestAnimationFrame(() => draw());
-    });
-    observer.observe(container);
+      rafRef.current = requestAnimationFrame(draw);
+    };
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(scheduleDraw);
+    if (containerRef.current) observer?.observe(containerRef.current);
+    window.addEventListener('resize', scheduleDraw);
     return () => {
-      observer.disconnect();
+      observer?.disconnect();
+      window.removeEventListener('resize', scheduleDraw);
       cancelAnimationFrame(rafRef.current);
     };
   }, [draw]);
 
   const uniqGroups = Array.from(new Set((data.groups || []).map(String))).slice(0, 12);
-
   return (
-    <InspectableBox
-      title={title}
-      subtitle={`${xLabel} vs ${yLabel} · ${data.rendered_points.toLocaleString()} / ${data.total_points.toLocaleString()} pts`}
-      compact
-    >
-      <div ref={containerRef}>
-        <canvas ref={canvasRef} style={{ width: '100%', height, display: 'block', borderRadius: 10, background: 'var(--bg)' }} />
-        <div className="row" style={{ marginTop: 8, justifyContent: 'space-between' }}>
-          <div className="row" style={{ gap: 6 }}>
-            {uniqGroups.map((g, idx) => (
-              <span key={g} className="badge" style={{ gap: 5 }}>
-                <span style={{ width: 8, height: 8, borderRadius: 99, background: g === '-1' ? '#f87171' : PALETTE[idx % PALETTE.length], display: 'inline-block' }} />
-                {g === '-1' ? 'Noise (-1)' : `Group ${g}`}
-              </span>
-            ))}
-          </div>
-          <span style={{ fontSize: 11.5, color: 'var(--text-dim)' }}>
-            Canvas 60fps · Rendered {data.rendered_points.toLocaleString()} / {data.total_points.toLocaleString()} points
-          </span>
+    <div ref={containerRef}>
+      <canvas ref={canvasRef} style={{ width: '100%', height, display: 'block', borderRadius: 10, background: 'var(--bg)' }} />
+      {!hasPoints && <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>No finite scatter points available.</div>}
+      <div className="row" style={{ marginTop: 8, justifyContent: 'space-between' }}>
+        <div className="row" style={{ gap: 6 }}>
+          {uniqGroups.map((g, idx) => (
+            <span key={g} className="badge" style={{ gap: 5 }}>
+              <span style={{ width: 8, height: 8, borderRadius: 99, background: g === '-1' ? '#f87171' : PALETTE[idx % PALETTE.length], display: 'inline-block' }} />
+              {g === '-1' ? 'Noise (-1)' : `Group ${g}`}
+            </span>
+          ))}
         </div>
+        <span style={{ fontSize: 11.5, color: 'var(--text-dim)' }}>
+          Rendered {data.rendered_points.toLocaleString()} / {data.total_points.toLocaleString()} points
+        </span>
       </div>
-    </InspectableBox>
+    </div>
   );
 };
+
+export const CanvasScatter: React.FC<{
+  data: ScatterPayload;
+  xLabel?: string;
+  yLabel?: string;
+  height?: number;
+  title?: string;
+}> = ({ data, xLabel = 'Component 1', yLabel = 'Component 2', height = 340, title = '2D Scatter Projection' }) => (
+  <InspectableBox
+    title={title}
+    subtitle={`${xLabel} vs ${yLabel} · ${data.rendered_points.toLocaleString()} / ${data.total_points.toLocaleString()} pts`}
+    compact
+  >
+    <ScatterPlot data={data} xLabel={xLabel} yLabel={yLabel} height={height} />
+  </InspectableBox>
+);
 
 export const BarChartSVG: React.FC<{
   items: { label: string; value: number; color?: string }[];
@@ -139,22 +140,26 @@ export const BarChartSVG: React.FC<{
   horizontal?: boolean;
   title?: string;
 }> = ({ items, height = 220, horizontal = false, title = 'Bar Chart' }) => {
-  if (!items.length) return <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>No data to display.</div>;
-  const maxVal = Math.max(...items.map((i) => Math.abs(i.value)), 1e-9);
+  const validItems = items.filter((item) => isFiniteNumber(item.value));
+  if (!validItems.length) return <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>No data to display.</div>;
+  const maxAbs = validItems.reduce((max, item) => Math.max(max, Math.abs(item.value)), 1e-9);
+  const hasNegative = validItems.some((item) => item.value < 0);
 
   if (horizontal) {
     return (
       <InspectableBox title={title} compact>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
-          {items.slice(0, 16).map((item, idx) => {
-            const pct = Math.min(100, (Math.abs(item.value) / maxVal) * 100);
+          {validItems.slice(0, 16).map((item, idx) => {
+            const pct = (Math.abs(item.value) / maxAbs) * (hasNegative ? 50 : 100);
+            const left = hasNegative ? (item.value < 0 ? 50 - pct : 50) : 0;
             return (
               <div key={`${item.label}-${idx}`} style={{ display: 'grid', gridTemplateColumns: '160px 1fr 74px', alignItems: 'center', gap: 10, fontSize: 12 }}>
                 <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--text-muted)' }} title={item.label}>
                   {item.label}
                 </span>
-                <div style={{ height: 11, background: 'var(--bg-subtle)', borderRadius: 99, overflow: 'hidden' }}>
-                  <div style={{ width: `${pct}%`, height: '100%', background: item.color || PALETTE[idx % PALETTE.length], borderRadius: 99 }} />
+                <div style={{ height: 11, background: 'var(--bg-subtle)', borderRadius: 99, overflow: 'hidden', position: 'relative' }}>
+                  {hasNegative && <div style={{ position: 'absolute', left: '50%', height: '100%', width: 1, background: 'var(--text-dim)' }} />}
+                  <div style={{ position: 'absolute', left: `${left}%`, width: `${pct}%`, height: '100%', background: item.color || PALETTE[idx % PALETTE.length], borderRadius: 99 }} />
                 </div>
                 <span className="mono" style={{ textAlign: 'right', fontSize: 11.5 }}>{Number(item.value).toFixed(4)}</span>
               </div>
@@ -168,21 +173,28 @@ export const BarChartSVG: React.FC<{
   const w = 520;
   const h = height;
   const pad = { l: 38, r: 10, t: 14, b: 32 };
-  const bw = (w - pad.l - pad.r) / Math.max(items.length, 1);
+  const bw = (w - pad.l - pad.r) / validItems.length;
+  const minVal = validItems.reduce((min, item) => Math.min(min, item.value), 0);
+  const maxVal = validItems.reduce((max, item) => Math.max(max, item.value), 0);
+  const span = maxVal - minVal || 1;
+  const sy = (value: number) => h - pad.b - ((value - minVal) / span) * (h - pad.t - pad.b);
+  const zero = sy(0);
 
   return (
     <InspectableBox title={title} compact>
       <svg viewBox={`0 0 ${w} ${h}`} style={{ width: '100%', height }}>
-        {items.map((it, i) => {
-          const bh = (Math.max(0, it.value) / maxVal) * (h - pad.t - pad.b);
+        {hasNegative && <line x1={pad.l} y1={zero} x2={w - pad.r} y2={zero} stroke="#94a3b8" />}
+        {validItems.map((it, i) => {
+          const yValue = sy(it.value);
+          const bh = Math.abs(yValue - zero);
           const x = pad.l + i * bw + 2;
-          const y = h - pad.b - bh;
+          const y = Math.min(yValue, zero);
           return (
             <g key={`${it.label}-${i}`}>
               <rect x={x} y={y} width={Math.max(3, bw - 4)} height={bh} rx={3} fill={it.color || '#38bdf8'} opacity={0.88}>
                 <title>{`${it.label}: ${it.value}`}</title>
               </rect>
-              {items.length <= 24 && i % Math.max(1, Math.ceil(items.length / 8)) === 0 && (
+              {validItems.length <= 24 && i % Math.max(1, Math.ceil(validItems.length / 8)) === 0 && (
                 <text x={x + bw / 2} y={h - 10} textAnchor="middle" fill="#94a3b8" fontSize={9.5}>
                   {it.label.slice(0, 9)}
                 </text>
@@ -196,21 +208,26 @@ export const BarChartSVG: React.FC<{
 };
 
 export const ForecastFanSVG: React.FC<{
-  history: { step: number; actual: number }[];
-  forecast: { step: number; yhat: number; yhat_lower?: number; yhat_upper?: number }[];
+  history: { step: number | null; actual: number | null }[];
+  forecast: { step: number | null; yhat: number | null; yhat_lower?: number | null; yhat_upper?: number | null }[];
   height?: number;
   title?: string;
 }> = ({ history, forecast, height = 270, title = 'Forecast & Prediction Intervals' }) => {
+  const validHistory = history.filter((p) => isFiniteNumber(p.step) && isFiniteNumber(p.actual));
+  const validForecast = forecast.filter((p) => isFiniteNumber(p.step) && isFiniteNumber(p.yhat));
+  const hasBand = forecast.length >= 2 && forecast.every((p) =>
+    isFiniteNumber(p.step) && isFiniteNumber(p.yhat_lower) && isFiniteNumber(p.yhat_upper),
+  );
   const allVals = [
-    ...history.map((h) => h.actual),
-    ...forecast.flatMap((f) => [f.yhat, f.yhat_lower ?? f.yhat, f.yhat_upper ?? f.yhat]),
-  ].filter(Number.isFinite);
-  if (!allVals.length) return null;
+    ...validHistory.map((p) => p.actual), ...validForecast.map((p) => p.yhat),
+    ...(hasBand ? forecast.flatMap((p) => [p.yhat_lower, p.yhat_upper]) : []),
+  ].filter(isFiniteNumber);
+  const allSteps = [...validHistory.map((p) => p.step), ...validForecast.map((p) => p.step)].filter(isFiniteNumber);
+  if (!allVals.length || !allSteps.length) return <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>No finite forecast points available.</div>;
 
   const minV = Math.min(...allVals);
   const maxV = Math.max(...allVals);
   const spanV = maxV - minV || 1;
-  const allSteps = [...history.map((h) => h.step), ...forecast.map((f) => f.step)];
   const minS = Math.min(...allSteps);
   const maxS = Math.max(...allSteps);
   const spanS = maxS - minS || 1;
@@ -221,12 +238,21 @@ export const ForecastFanSVG: React.FC<{
   const sx = (s: number) => pad.l + ((s - minS) / spanS) * (W - pad.l - pad.r);
   const sy = (v: number) => pad.t + (H - pad.t - pad.b) - ((v - minV) / spanV) * (H - pad.t - pad.b);
 
-  const histPath = history.map((p, i) => `${i === 0 ? 'M' : 'L'} ${sx(p.step).toFixed(1)} ${sy(p.actual).toFixed(1)}`).join(' ');
-  const forePath = forecast.map((p, i) => `${i === 0 ? 'M' : 'L'} ${sx(p.step).toFixed(1)} ${sy(p.yhat).toFixed(1)}`).join(' ');
-  const bandPts = [
-    ...forecast.map((p) => `${sx(p.step).toFixed(1)},${sy(p.yhat_upper ?? p.yhat).toFixed(1)}`),
-    ...[...forecast].reverse().map((p) => `${sx(p.step).toFixed(1)},${sy(p.yhat_lower ?? p.yhat).toFixed(1)}`),
-  ].join(' ');
+  const buildPath = (points: { step: number | null; value: number | null }[]) => {
+    let started = false;
+    return points.map((p) => {
+      if (!isFiniteNumber(p.step) || !isFiniteNumber(p.value)) { started = false; return ''; }
+      const command = started ? 'L' : 'M';
+      started = true;
+      return `${command} ${sx(p.step).toFixed(1)} ${sy(p.value).toFixed(1)}`;
+    }).join(' ');
+  };
+  const histPath = buildPath(history.map((p) => ({ step: p.step, value: p.actual })));
+  const forePath = buildPath(forecast.map((p) => ({ step: p.step, value: p.yhat })));
+  const bandPts = hasBand ? [
+    ...forecast.map((p) => `${sx(p.step!).toFixed(1)},${sy(p.yhat_upper!).toFixed(1)}`),
+    ...[...forecast].reverse().map((p) => `${sx(p.step!).toFixed(1)},${sy(p.yhat_lower!).toFixed(1)}`),
+  ].join(' ') : '';
 
   return (
     <InspectableBox title={title} compact>
@@ -234,7 +260,7 @@ export const ForecastFanSVG: React.FC<{
         {bandPts && <polygon points={bandPts} fill="rgba(56, 189, 248, 0.22)" />}
         <path d={histPath} fill="none" stroke="#94a3b8" strokeWidth={2} />
         <path d={forePath} fill="none" stroke="#38bdf8" strokeWidth={2.5} />
-        <text x={pad.l} y={14} fill="#94a3b8" fontSize={10}>History (gray) · Deep Forecast &amp; Quantile Band (cyan)</text>
+        <text x={pad.l} y={14} fill="#94a3b8" fontSize={10}>History (gray) · Deep Forecast{hasBand ? ' & Quantile Band' : ''} (cyan)</text>
         <text x={6} y={pad.t + 6} fill="#64748b" fontSize={10}>{maxV.toFixed(2)}</text>
         <text x={6} y={H - pad.b} fill="#64748b" fontSize={10}>{minV.toFixed(2)}</text>
       </svg>
@@ -242,7 +268,7 @@ export const ForecastFanSVG: React.FC<{
   );
 };
 
-export const HeatmapGrid: React.FC<{ columns: string[]; values: number[][]; title?: string }> = ({
+export const HeatmapGrid: React.FC<{ columns: string[]; values: (number | null)[][]; title?: string }> = ({
   columns,
   values,
   title = 'Correlation Matrix Heatmap',
@@ -268,10 +294,10 @@ export const HeatmapGrid: React.FC<{ columns: string[]; values: number[][]; titl
               <tr key={rowC}>
                 <td style={{ fontWeight: 700 }}>{rowC.slice(0, 16)}</td>
                 {columns.map((colC, c) => {
-                  const v = values[r]?.[c] ?? 0;
+                  const v = values[r]?.[c];
                   return (
-                    <td key={colC} className="mono" style={{ background: colorFor(v), textAlign: 'center', fontWeight: 600 }}>
-                      {v.toFixed(2)}
+                    <td key={colC} className="mono" title={isFiniteNumber(v) ? undefined : 'Correlation unavailable'} style={{ background: isFiniteNumber(v) ? colorFor(v) : undefined, textAlign: 'center', fontWeight: 600 }}>
+                      {isFiniteNumber(v) ? v.toFixed(2) : '—'}
                     </td>
                   );
                 })}
@@ -475,16 +501,21 @@ export const SupervisoryTrendSVG: React.FC<{
  * Shewhart Statistical Process Control (SPC) Residual / Z-Score Chart with UCL / LCL & Warning Zones.
  */
 export const SPCControlSVG: React.FC<{
-  points: { index?: number; label?: string; record_id?: string; residual: number; ucl?: number | null; lcl?: number | null; z_score?: number; status?: string; severity?: string }[];
-  limits?: { center_line?: number; ucl?: number; lcl?: number; uwl?: number; lwl?: number };
+  points: { index?: number; label?: string; record_id?: string; residual?: number | null; ucl?: number | null; lcl?: number | null; z_score?: number; status?: string; severity?: string }[];
+  limits?: { center?: number; warn_upper?: number; warn_lower?: number; center_line?: number; ucl?: number; lcl?: number; uwl?: number; lwl?: number };
   height?: number;
   title?: string;
-}> = ({ points, limits, height = 270, title = 'Shewhart SPC Residual Control Chart (±3σ Limits)' }) => {
-  if (!points?.length) return <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>No SPC residuals available.</div>;
+}> = ({ points, limits, height = 270, title = 'Shewhart SPC Residual Control Chart' }) => {
+  const vals = (points || []).map((p) => p.residual).filter(isFiniteNumber);
+  if (!vals.length) return <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>No SPC residuals available.</div>;
 
-  const vals = points.map((p) => p.residual).filter(Number.isFinite);
-  if (limits?.ucl !== undefined) vals.push(limits.ucl);
-  if (limits?.lcl !== undefined) vals.push(limits.lcl);
+  // Current backend names, with aliases for previously saved workspaces.
+  const center = limits?.center ?? limits?.center_line;
+  const upperWarning = limits?.warn_upper ?? limits?.uwl;
+  const lowerWarning = limits?.warn_lower ?? limits?.lwl;
+  const ucl = limits?.ucl;
+  const lcl = limits?.lcl;
+  [center, upperWarning, lowerWarning, ucl, lcl].forEach((v) => { if (isFiniteNumber(v)) vals.push(v); });
   const minV = Math.min(...vals);
   const maxV = Math.max(...vals);
   const span = (maxV - minV) || 1;
@@ -499,34 +530,45 @@ export const SPCControlSVG: React.FC<{
   const sx = (i: number) => pad.l + (points.length === 1 ? pw / 2 : (i / (points.length - 1)) * pw);
   const sy = (v: number) => pad.t + ph - ((v - lo) / (hi - lo)) * ph;
 
-  const path = points.map((p, i) => `${i === 0 ? 'M' : 'L'} ${sx(i).toFixed(1)} ${sy(p.residual).toFixed(1)}`).join(' ');
+  let started = false;
+  const path = points.map((p, i) => {
+    if (!isFiniteNumber(p.residual)) { started = false; return ''; }
+    const command = started ? 'L' : 'M';
+    started = true;
+    return `${command} ${sx(i).toFixed(1)} ${sy(p.residual).toFixed(1)}`;
+  }).join(' ');
 
   return (
     <InspectableBox title={title} subtitle="Center Line (CL), Warning Limits (±W), Control Limits (UCL/LCL)" compact>
       <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height, background: 'var(--bg)', borderRadius: 10 }}>
-        {limits?.ucl !== undefined && (
+        {isFiniteNumber(ucl) && (
           <>
-            <line x1={pad.l} y1={sy(limits.ucl)} x2={W - pad.r} y2={sy(limits.ucl)} stroke="#ef4444" strokeWidth={1.6} strokeDasharray="6 4" />
-            <text x={W - pad.r + 5} y={sy(limits.ucl) + 3} fill="#ef4444" fontSize={9.5}>UCL {limits.ucl.toFixed(1)}</text>
+            <line x1={pad.l} y1={sy(ucl)} x2={W - pad.r} y2={sy(ucl)} stroke="#ef4444" strokeWidth={1.6} strokeDasharray="6 4" />
+            <text x={W - pad.r + 5} y={sy(ucl) + 3} fill="#ef4444" fontSize={9.5}>UCL {ucl.toFixed(1)}</text>
           </>
         )}
-        {limits?.lcl !== undefined && (
+        {isFiniteNumber(lcl) && (
           <>
-            <line x1={pad.l} y1={sy(limits.lcl)} x2={W - pad.r} y2={sy(limits.lcl)} stroke="#ef4444" strokeWidth={1.6} strokeDasharray="6 4" />
-            <text x={W - pad.r + 5} y={sy(limits.lcl) + 3} fill="#ef4444" fontSize={9.5}>LCL {limits.lcl.toFixed(1)}</text>
+            <line x1={pad.l} y1={sy(lcl)} x2={W - pad.r} y2={sy(lcl)} stroke="#ef4444" strokeWidth={1.6} strokeDasharray="6 4" />
+            <text x={W - pad.r + 5} y={sy(lcl) + 3} fill="#ef4444" fontSize={9.5}>LCL {lcl.toFixed(1)}</text>
           </>
         )}
-        {limits?.uwl !== undefined && (
-          <line x1={pad.l} y1={sy(limits.uwl)} x2={W - pad.r} y2={sy(limits.uwl)} stroke="#fbbf24" strokeWidth={1.1} strokeDasharray="3 3" />
+        {isFiniteNumber(upperWarning) && (
+          <line x1={pad.l} y1={sy(upperWarning)} x2={W - pad.r} y2={sy(upperWarning)} stroke="#fbbf24" strokeWidth={1.1} strokeDasharray="3 3" />
         )}
-        {limits?.lwl !== undefined && (
-          <line x1={pad.l} y1={sy(limits.lwl)} x2={W - pad.r} y2={sy(limits.lwl)} stroke="#fbbf24" strokeWidth={1.1} strokeDasharray="3 3" />
+        {isFiniteNumber(lowerWarning) && (
+          <line x1={pad.l} y1={sy(lowerWarning)} x2={W - pad.r} y2={sy(lowerWarning)} stroke="#fbbf24" strokeWidth={1.1} strokeDasharray="3 3" />
         )}
-        <line x1={pad.l} y1={sy(limits?.center_line ?? 0)} x2={W - pad.r} y2={sy(limits?.center_line ?? 0)} stroke="#34d399" strokeWidth={1.3} />
-        <text x={W - pad.r + 5} y={sy(limits?.center_line ?? 0) + 3} fill="#34d399" fontSize={9.5}>CL {(limits?.center_line ?? 0).toFixed(1)}</text>
+        {isFiniteNumber(center) && (
+          <>
+            <line x1={pad.l} y1={sy(center)} x2={W - pad.r} y2={sy(center)} stroke="#34d399" strokeWidth={1.3} />
+            <text x={W - pad.r + 5} y={sy(center) + 3} fill="#34d399" fontSize={9.5}>CL {center.toFixed(1)}</text>
+          </>
+        )}
 
         <path d={path} fill="none" stroke="#38bdf8" strokeWidth={1.8} />
         {points.map((p, i) => {
+          if (!isFiniteNumber(p.residual)) return null;
           const sev = (p.severity || p.status || '').toUpperCase();
           const col = sev === 'CRITICAL' || sev === 'BREACH' ? '#ef4444' : sev === 'WARNING' ? '#fbbf24' : '#38bdf8';
           const r = sev === 'CRITICAL' || sev === 'BREACH' ? 4.8 : sev === 'WARNING' ? 3.8 : 2.5;

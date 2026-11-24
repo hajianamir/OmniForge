@@ -262,6 +262,9 @@ def test_cleaning_clustering_provenance_and_stage_persistence() -> None:
     assert r_ex.status_code == 200
     assert r_ex.json()["state"]["s02_cluster_committed"] is True
     assert r_ex.json()["state"]["studio_completed"]["02"] is True
+    # The committed stage remains historical provenance, but the old scatter
+    # preview was computed using a different study scope and must be discarded.
+    assert "s02_clustering" not in r_ex.json()["state"]["cached_result_keys"]
     # Restore exclusion
     client.post("/api/workbench/exclusions", headers=hdr, json={"excluded_columns": []})
 
@@ -316,14 +319,15 @@ def test_cleaning_clustering_provenance_and_stage_persistence() -> None:
     assert int(internal["uap_df"].isna().sum().sum()) == 0
     assert int(internal["uap_raw_df"].isna().sum().sum()) > 0
 
-    # Verify ALL completed studio results are persisted in GET /api/workbench/results
+    # Verify all still-valid studio results are persisted in GET /api/workbench/results.
     r_all_res = client.get("/api/workbench/results", headers=hdr)
     assert r_all_res.status_code == 200
     cached = r_all_res.json()["results"]
-    for key in ("s01_clean", "s02_clustering", "s03_diagnostics", "s04_eda", "s06_nonparametric", "s14_supervisory"):
+    assert "s02_clustering" not in cached  # invalidated when the study scope changed
+    for key in ("s01_clean", "s03_diagnostics", "s04_eda", "s06_nonparametric", "s14_supervisory"):
         assert key in cached, f"Missing persisted result key: {key}"
 
-    # Verify .omniforge Save & Restore preserves ALL studio results across sessions!
+    # Verify .omniforge Save & Restore preserves valid results and committed provenance across sessions.
     r_save = client.post(
         "/api/workbench/workspace/save",
         headers=hdr,
@@ -341,10 +345,12 @@ def test_cleaning_clustering_provenance_and_stage_persistence() -> None:
         files={"file": ("task34_test.omniforge", io.BytesIO(archive_bytes), "application/octet-stream")},
     )
     assert r_load.status_code == 200, r_load.text
+    assert r_load.json()["state"]["s02_cluster_committed"] is True
     r_res2 = client.get("/api/workbench/results", headers={"X-Session-Id": sid2})
     assert r_res2.status_code == 200
     cached2 = r_res2.json()["results"]
-    for key in ("s01_clean", "s02_clustering", "s03_diagnostics", "s04_eda", "s06_nonparametric", "s14_supervisory"):
+    assert "s02_clustering" not in cached2
+    for key in ("s01_clean", "s03_diagnostics", "s04_eda", "s06_nonparametric", "s14_supervisory"):
         assert key in cached2, f"Restored .omniforge session missing persisted key: {key}"
 
 

@@ -119,9 +119,10 @@ export interface ClusteringResponse extends StateEnvelope {
   cluster_profiles?: JsonRow[];
   algorithm_benchmark?: ClusterAlgorithmScore[];
   auto_k_curve?: JsonRow[];
-  scatter?: ScatterPayload;
+  scatter?: ScatterPayload | null;
+  scatter_error?: string | null;
   committed_action?: string;
-  provenance?: JsonRow;
+  provenance?: string | JsonRow;
 }
 
 export interface ClusteringCommitResponse extends StateEnvelope {
@@ -130,6 +131,7 @@ export interface ClusteringCommitResponse extends StateEnvelope {
   rows_after?: number;
   rows_removed?: number;
   remaining_cluster_choices?: ClusterChoice[];
+  result?: Omit<ClusteringResponse, 'state'> | null;
 }
 
 export interface AnomalyResponse extends StateEnvelope {
@@ -144,7 +146,8 @@ export interface AnomalyResponse extends StateEnvelope {
   x_axis?: string;
   y_axis?: string;
   committed_action?: string;
-  provenance?: JsonRow;
+  committed_mode?: string;
+  provenance?: string | JsonRow;
 }
 
 export interface AnomalyCommitResponse extends StateEnvelope {
@@ -152,11 +155,18 @@ export interface AnomalyCommitResponse extends StateEnvelope {
   rows_before?: number;
   rows_after?: number;
   rows_removed?: number;
+  result?: Omit<AnomalyResponse, 'state'> | null;
 }
 
 export interface ManifoldPayload {
   method?: string;
   scatter?: ScatterPayload;
+  total_explained_pct?: number | null;
+  explained_variance_pct?: number[];
+  x_label?: string;
+  y_label?: string;
+  error?: string;
+  // Older project archives may contain ratios instead of percentages.
   explained_variance_ratio?: number[];
   [key: string]: unknown;
 }
@@ -167,6 +177,16 @@ export interface MiningResponse extends StateEnvelope {
   subgroups?: { subgroups?: JsonRow[] } | null;
   manifold?: ManifoldPayload | null;
 }
+
+export interface AdvancedMiningResult {
+  target?: string | null;
+  beam_subgroups?: unknown;
+  cluster_stability_ari?: unknown;
+  hopkins_clustering_tendency?: unknown;
+  distance_correlation?: unknown;
+}
+
+export interface AdvancedMiningResponse extends AdvancedMiningResult, StateEnvelope {}
 
 // ---------------------------------------------------------------------------
 // Studio 03 — Universal diagnostics & risk
@@ -201,7 +221,7 @@ export interface EDAResponse extends StateEnvelope {
   insights?: string[];
   distributions?: { column?: unknown; mean?: unknown; std?: unknown; bins?: { label?: unknown; count?: unknown }[] }[];
   missing_bars?: JsonRow[];
-  correlation_matrix?: { columns?: string[]; values?: number[][] } | null;
+  correlation_matrix?: { columns?: string[]; values?: (number | null)[][] } | null;
   extra_table?: JsonRow[] | null;
   sampled?: boolean;
 }
@@ -328,7 +348,7 @@ export interface BatchPredictionResponse {
 // ---------------------------------------------------------------------------
 
 export interface ExplainResponse {
-  global_importance?: Record<string, number>;
+  global_importance?: Record<string, number | { importance_mean?: number | null; importance_std?: number | null }>;
   local_explanation?: JsonRow | JsonRow[] | null;
   pdp?: JsonRow[] | null;
   pdp_feature?: string | null;
@@ -355,16 +375,16 @@ export interface FairnessResponse {
 // ---------------------------------------------------------------------------
 
 export interface ForecastPoint {
-  step: number;
-  yhat: number;
-  yhat_lower?: number;
-  yhat_upper?: number;
+  step: number | null;
+  yhat: number | null;
+  yhat_lower?: number | null;
+  yhat_upper?: number | null;
   [key: string]: unknown;
 }
 
 export interface ForecastHistoryPoint {
-  step: number;
-  actual: number;
+  step: number | null;
+  actual: number | null;
   [key: string]: unknown;
 }
 
@@ -605,7 +625,7 @@ export interface TrendPoint {
 
 export interface SPCPoint {
   label?: string;
-  residual?: number;
+  residual?: number | null;
   ucl?: number | null;
   lcl?: number | null;
   status?: string;
@@ -634,6 +654,10 @@ export interface SPCPointXY {
 }
 
 export interface SPCLimits {
+  center?: number;
+  warn_upper?: number;
+  warn_lower?: number;
+  // Aliases accepted for older persisted projects.
   center_line?: number;
   ucl?: number;
   lcl?: number;
@@ -761,6 +785,7 @@ export interface StudioCache {
   s02_clustering?: ClusteringResponse | null;
   s02_anomaly?: AnomalyResponse | null;
   s02_mining?: MiningResponse | null;
+  s02_advanced_mining?: AdvancedMiningResult | null;
   s03_diagnostics?: DiagnosticsResponse | null;
   s04_eda?: EDAResponse | null;
   s04_hypothesis?: HypothesisResponse | null;

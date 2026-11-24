@@ -1232,6 +1232,7 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
         action=f"Applied DataCleaner ({mode})",
         details=f"Rows {len(df):,} -> {len(cleaned):,} | Cols {df.shape[1]} -> {cleaned.shape[1]}",
         preserve_stage="s01",
+        row_index_preserved=True,  # DataCleaner and recombine_split_frames retain surviving row labels.
     )
     return _cache_and_respond(
         state,
@@ -1441,13 +1442,14 @@ def s02_run_clustering(req: ClusterReq, x_session_id: str | None = Header(defaul
         for cid, cnt in vc.items()
     ]
 
+    scatter = None
+    scatter_error = None
     if isinstance(res.pca_2d, pd.DataFrame) and res.pca_2d.shape[1] >= 2:
         xs = res.pca_2d.iloc[:, 0].to_numpy(dtype=float)
         ys = res.pca_2d.iloc[:, 1].to_numpy(dtype=float)
+        scatter = compact_scatter_payload(xs, ys, groups=res.labels, max_points=5000)
     else:
-        xs = np.zeros(len(res.labels))
-        ys = np.zeros(len(res.labels))
-    scatter = compact_scatter_payload(xs, ys, groups=res.labels, max_points=5000)
+        scatter_error = "The clustering result did not include a two-dimensional PCA projection."
 
     return _cache_and_respond(
         state,
@@ -1465,6 +1467,7 @@ def s02_run_clustering(req: ClusterReq, x_session_id: str | None = Header(defaul
             "cluster_choices": cluster_choices,
             "algorithm_benchmark": comparison_rows,
             "scatter": scatter,
+            "scatter_error": scatter_error,
             "features_used": num_cols,
         },
     )
@@ -1555,6 +1558,7 @@ def s02_commit_clustering(req: ClusterCommitReq, x_session_id: str | None = Head
         action=action,
         details=f"Rows {rows_before:,} -> {len(work):,}",
         preserve_stage="s02_cluster",
+        row_index_preserved=True,  # work is filtered from df without resetting its index.
     )
     # Keep preview_df synchronized with remaining rows so repeated operations stay accurate
     synced_preview = preview_df.loc[preview_df.index.intersection(work.index)].copy()
@@ -1578,7 +1582,8 @@ def s02_commit_clustering(req: ClusterCommitReq, x_session_id: str | None = Head
         updated_cached["provenance"] = "COMMITTED"
         updated_cached["committed_action"] = action
         updated_cached["cluster_choices"] = remaining_choices
-        updated_cached["n_clusters"] = int(sum(1 for c in remaining_choices if not c["is_noise"]))
+        # The scatter, benchmark and metrics describe the original preview.
+        # Keep their original counts rather than mixing them with post-commit rows.
         save_studio_result(state, "s02_clustering", updated_cached)
 
     return to_json_object(
@@ -1590,6 +1595,7 @@ def s02_commit_clustering(req: ClusterCommitReq, x_session_id: str | None = Head
             "rows_removed": removed,
             "action": action,
             "remaining_cluster_choices": remaining_choices,
+            "result": get_studio_results(state).get("s02_clustering"),
             "state": _state_summary(state, sid),
         }
     )
@@ -1759,6 +1765,7 @@ def s02_commit_anomaly(req: AnomalyCommitReq, x_session_id: str | None = Header(
         action=action,
         details=f"Rows {rows_before:,} -> {len(work):,}",
         preserve_stage="s02_anomaly",
+        row_index_preserved=True,  # work is filtered from df without resetting its index.
     )
     state["uap_anomaly_df"] = anom_df.loc[anom_df.index.intersection(work.index)].copy()
     cached_a = (state.get("uap_studio_results") or {}).get("s02_anomaly")
@@ -1766,6 +1773,7 @@ def s02_commit_anomaly(req: AnomalyCommitReq, x_session_id: str | None = Header(
         updated_a = dict(cached_a)
         updated_a["provenance"] = "COMMITTED"
         updated_a["committed_action"] = action
+        updated_a["committed_mode"] = req.mode
         save_studio_result(state, "s02_anomaly", updated_a)
     return to_json_object(
         {
@@ -1774,6 +1782,7 @@ def s02_commit_anomaly(req: AnomalyCommitReq, x_session_id: str | None = Header(
             "rows_after": int(len(work)),
             "rows_removed": removed,
             "action": action,
+            "result": get_studio_results(state).get("s02_anomaly"),
             "state": _state_summary(state, sid),
         }
     )

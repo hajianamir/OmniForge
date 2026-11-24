@@ -86,6 +86,12 @@ jobs:
             echo "::error title=static_app stale::Committed src/omniforge/ui/static_app does not match frontend/ source. Run 'cd frontend && npm ci && npm run build' and commit the rebuilt assets."
             exit 1
           fi
+      - name: Install Chromium for browser regressions
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+      - name: Run browser chart regressions
+        working-directory: frontend
+        run: npm run test:browser -- tests/browser/studio-charts.spec.ts --workers=2
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

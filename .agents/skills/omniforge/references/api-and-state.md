@@ -1,8 +1,9 @@
 # OmniForge API, state and frontend reference
 
-> Reverified at the code revision in [SKILL.md](../SKILL.md). Source paths
-> below are relative to the repository root. Verify schemas and permissions in
-> the actual handler before changing a route.
+> The baseline revision reviewed is pinned in [SKILL.md](../SKILL.md).
+> The workspace lifecycle and Split Lock notes below also include partial
+> working-tree updates; the full skill has not been re-reviewed. Source paths
+> are relative to the repository root. Verify actual handlers before use.
 
 ## Application and route map
 
@@ -68,16 +69,19 @@ unsaved state; multiple API processes do not automatically share it.
 State keys and caches are not governed by one universal invalidation rule:
 
 1. `default_workspace_dict()` supplies the initial `uap_*` keys.
-   `load_new_dataset()` clears downstream keys and cached studio results;
-   `update_active_dataset()` and `set_excluded_columns()` reset/prune selected
-   downstream state, with stage-preservation rules in
-   `_STUDIO_RESULT_KEEP_PREFIXES`.
-2. **`set_selected_targets()`, `lock_leakage_safe_split()` and
-   `clear_split_lock()` do not call `_reset_downstream_state` or prune cached
-   results.** Changing a target or split can leave an active model and prior
-   studio result in place. Do not assume stale results disappear or represent
-   the new target/split; invalidate affected outputs and retrain, preserving
-   needed user data, and test any fix.
+   `load_new_dataset()` and `clear_workspace_dataset()` prune dataset-dependent
+   results while retaining standalone NLP and vision results. Dataset updates
+   reset/prune downstream state using `_STUDIO_RESULT_KEEP_PREFIXES`; committed
+   clustering/anomaly charts are labelled as historical previews.
+2. `set_selected_targets()`, `set_excluded_columns()`,
+   `lock_leakage_safe_split()` and `clear_split_lock()` invalidate affected
+   caches and models. Full-data analyses and historical provenance may be
+   retained when still applicable. Dataset updates re-align locked positions
+   using explicit unique row IDs or row labels from a transformation whose
+   caller attests it preserves those labels. Ambiguous identity, invalid
+   membership or a failed re-audit unlocks the split; initial lock creation can
+   still report an audit warning. Verify each producer's dependencies rather
+   than assuming every cached result is valid after every mutation.
 3. `save_studio_result()` and `wb_cache_and_respond()` support frontend
    hydration. Routers also directly mutate state; inspect their write paths,
    lineage and exclusions rather than assuming all writes use a single helper.
@@ -102,12 +106,11 @@ differs by route:
 
 - Studio 01 cleaning uses `DataCleaner.fit_transform_split` when a locked
   train/test pair is available; inspect the chosen cleaning mode and row
-  mutations (`src/omniforge/api/workbench.py`). Studio 05 engineering fits the returned
-  train frame, but its `split_locked` flag only checks that frame and its
-  columns, not whether a lock exists. With no lock, that frame is the full
-  dataset and the handler can report `split_locked=True` with no leakage
-  warning. Verify the actual lock and fix/test this path before trusting its
-  flag. Feature selection also has a separate full-data preparation path.
+  mutations (`src/omniforge/api/workbench.py`). Studio 05 engineering fits the
+  locked train frame when available; without a lock it fits the full dataset
+  and reports a leakage warning. Feature selection also has a separate
+  full-data preparation path; do not infer that its entire evaluation pipeline
+  is leakage-free from the lock alone.
 - Studio 06 AutoML uses locked train as its input when a valid lock exists,
   otherwise the full analysis dataframe
   (`src/omniforge/api/studios/s06_automl.py::s06_run_automl`).
