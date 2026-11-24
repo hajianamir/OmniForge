@@ -1,5 +1,5 @@
 # =============================================================================
-# OmniForge v3.0.1 — runtime dependencies (hash-checked install)
+# OmniForge v4.0.0 — runtime dependencies (hash-checked install)
 # =============================================================================
 # Floating minimum versions live in requirements.in (source of truth for intent).
 # This file installs the hash-pinned lock produced from it (source of truth for

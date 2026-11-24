@@ -69,7 +69,7 @@ class RegisteredModelVersion(BaseModel):
     stage: ModelStage
     artifact_path: str
     checksum_sha256: str
-    metrics: dict[str, float] = Field(default_factory=dict)
+    metrics: dict[str, float | None] = Field(default_factory=dict)
     tags: dict[str, str] = Field(default_factory=dict)
     description: str = ""
     owner: str = ""
@@ -230,12 +230,13 @@ class ModelRegistry:
         if norm_tier not in _VALID_RISK_TIERS:
             raise MLOpsError(f"Invalid risk_tier '{risk_tier}'. Choose one of: {sorted(_VALID_RISK_TIERS)}.")
         eff_fairness: bool | None = fairness_passed
-        extra_fair_metrics: dict[str, float] = {}
+        extra_fair_metrics: dict[str, float | None] = {}
         if fairness_report is not None:
             if hasattr(fairness_report, "passed"):
                 eff_fairness = bool(fairness_report.passed)
                 extra_fair_metrics["disparate_impact_ratio"] = float(fairness_report.disparate_impact_ratio)
-                extra_fair_metrics["equalized_odds_diff"] = float(fairness_report.equalized_odds_diff)
+                eod = fairness_report.equalized_odds_diff
+                extra_fair_metrics["equalized_odds_diff"] = float(eod) if eod is not None else None
             elif isinstance(fairness_report, dict) and "passed" in fairness_report:
                 eff_fairness = bool(fairness_report["passed"])
 

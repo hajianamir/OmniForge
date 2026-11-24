@@ -1,7 +1,7 @@
 platform:
   name: OmniForge
   short_name: OmniForge
-  version: "2.0.0"
+  version: "4.0.0"
   edition: Enterprise Analytics & AI Workbench
   environment: development
   debug: false

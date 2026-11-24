@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
 import pandas as pd
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from scipy import stats
 
 from omniforge.core.exceptions import EvaluationError
@@ -19,8 +20,8 @@ class FairnessReport(BaseModel):
     passed: bool
     demographic_parity_diff: float
     disparate_impact_ratio: float
-    equalized_odds_diff: float
-    equal_opportunity_diff: float
+    equalized_odds_diff: float | None
+    equal_opportunity_diff: float | None
     disparate_impact_ci_95: tuple[float, float] = (0.0, 1.0)
     demographic_parity_ci_95: tuple[float, float] = (0.0, 1.0)
     statistical_parity_p_value: float = 1.0
@@ -32,6 +33,18 @@ class FairnessReport(BaseModel):
     group_metrics: dict[str, dict[str, float | None]] = Field(default_factory=dict)
     violations: list[str] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
+
+    @field_validator(
+        "equalized_odds_diff",
+        "equal_opportunity_diff",
+        mode="before",
+    )
+    @classmethod
+    def _nan_to_none(cls, v: Any) -> Any:
+        """Convert NaN floats to None for valid JSON serialization."""
+        if isinstance(v, float) and math.isnan(v):
+            return None
+        return v
 
 
 class FairnessAuditor:

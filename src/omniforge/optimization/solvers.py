@@ -262,7 +262,7 @@ class OptimizationEngine:
             )
         if len(set(names)) != len(names):
             raise OptimizationError("asset_names must contain unique names.")
-        weights_map = {name: round(float(val), 6) for name, val in zip(names, w_opt)}
+        weights_map = {name: round(float(val), 6) for name, val in zip(names, w_opt, strict=False)}
         return OptimizationResult(
             problem_type="portfolio_mean_variance",
             status="optimal",

@@ -161,7 +161,7 @@ Follow this CRISP-DM sequence to guarantee zero data leakage, reproducible data 
 | **10** | **Studio 07 · Responsible AI** | Recommended | Run Global Permutation Importance, Local SHAP, Partial Dependence Plots (PDP), Fairness Audit, Model Card generation. | Verifies explainability, domain plausibility, and fairness compliance (Disparate Impact ≥ 0.80). |
 | **11** | **Studios 08–11 · Decision AI, Specialized AI, DAG & MLOps** | Conditional | Run Forecasting / Causal ATE / Markowitz / Monte Carlo (S08), NLP / Vision / Graph / RecSys / Survival + **C7 Twin MPC** (S09), DAG Pipeline (S10), or **Model Registry & PSI/KS Drift Monitor** + **C5 Root-Cause** (S11). | Extends analysis to forecasting, causal policy impact, unstructured modalities, and production governance. |
 | **12** | **Studio 12 · Executive Reporting & Export** | Mandatory | Select desired sections from 14 available chapters, preview narratives/tables/charts, export **PDF, XLSX, DOCX, HTML, Markdown, CSV, JSON, LaTeX**. | Compiles full end-to-end audit evidence into publication-ready deliverables. |
-| **13** | **Studio 13 · AI Copilot** | Operational | Ask the air-gapped deterministic Copilot in plain English: "profile data quality", "train automl", "root cause diagnosis", "twin control", "pii audit", "pareto automl", "register model", etc. | Executes real OmniForge analytics end-to-end offline via 26+ deterministic tools. |
+| **13** | **Studio 13 · AI Copilot** | Operational | Ask the air-gapped deterministic Copilot in plain English: "profile data quality", "train automl", "root cause diagnosis", "twin control", "pii audit", "pareto automl", "register model", etc. | Executes real OmniForge analytics end-to-end offline via 24 deterministic tools. |
 | **14** | **Studio 14 · Live Supervisory Control Room** | Operational | Choose Champion + Baseline models, set Tolerance Rules (`% Error`, `Abs Error`, `σ-Z`, `Baseline Ratio`, `Batch Breach %`), connect live CSV/XLSX/SQL/MS Access or Probe input, evaluate. | Monitors real-time operational accuracy, plots Actual vs Predicted vs Baseline SPC limits, triggers `HEALTHY` / `WARNING` / `CRITICAL_ALARM` LEDs, exports scored audit logs. **C5 Root-Cause** available at `/s14/root-cause`. |
 
 ### 4.1 Split Lock — Mandatory Before Cleaning for Predictive Modeling
@@ -453,7 +453,7 @@ Connects `DriftDetector` feature shifts → Delta-attribution per drifted featur
 
 **✅ C4 — Air-Gapped Deterministic Copilot Tools (Phase 6):**
 
-12 new deterministic offline tools:
+10 new deterministic offline tools:
 
 | Tool | Purpose | Key Parameters |
 |---|---|---|
@@ -714,11 +714,11 @@ Accepts `TwinControlReq`. Builds or reuses a cached Digital Twin, runs closed-lo
 
 ### 8.1 Overview
 
-The C4 Copilot (`src/omniforge/copilot/tools.py`) extends `CopilotToolRegistry` with 12 new deterministic offline tools. All tools execute without network access or third-party LLM dependency. The `OmniForgeCopilotAgent._chat_local_planner()` maps English natural-language keywords to these tools.
+The C4 Copilot (`src/omniforge/copilot/tools.py`) extends `CopilotToolRegistry` with 10 new deterministic offline tools. All tools execute without network access or third-party LLM dependency. The `OmniForgeCopilotAgent._chat_local_planner()` maps English natural-language keywords to these tools.
 
-### 8.2 All Copilot Tools (26+ total)
+### 8.2 All Copilot Tools (24 total)
 
-**Pre-Phase 6 Tools (16):**
+**Pre-Phase 6 Tools (14):**
 `ingest_data`, `generate_demo_data`, `profile_quality`, `clean_data`, `run_eda`, `train_automl`, `run_forecast`, `explain_model`, `audit_fairness`, `check_drift`, `run_causal`, `generate_pipeline_code`, `list_domains`, `workspace_status`
 
 **Phase 6 C4 Tools (10):**

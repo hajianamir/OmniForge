@@ -3,7 +3,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: omniforge-enterprise:3.0.1
+    image: omniforge-enterprise:4.0.0
     container_name: omniforge-api
     command: ["api"]
     environment:
@@ -36,7 +36,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: omniforge-enterprise:3.0.1
+    image: omniforge-enterprise:4.0.0
     container_name: omniforge-ui
     command: ["ui"]
     depends_on:

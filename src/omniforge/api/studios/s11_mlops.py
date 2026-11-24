@@ -7,8 +7,8 @@ from typing import Any
 import numpy as np
 from fastapi import APIRouter, Depends, Header, HTTPException
 
-from omniforge.api.studios.schemas import DriftReq, PromoteModelReq, RegisterModelReq, RollbackModelReq, RootCauseReq
 from omniforge.api.auth import require_permission
+from omniforge.api.studios.schemas import DriftReq, PromoteModelReq, RegisterModelReq, RollbackModelReq, RootCauseReq
 from omniforge.core.exceptions import MLOpsError
 from omniforge.core.utils import to_json_object
 from omniforge.mlops.drift import DriftDetector

@@ -220,6 +220,14 @@ class DiscreteEventSimulator:
                 else:
                     busy_servers -= 1
 
+        # Account for the trailing interval from the last event to the horizon,
+        # so utilization and queue length are computed over the full window.
+        if horizon_time > last_time:
+            dt = horizon_time - last_time
+            busy_area += busy_servers * dt
+            queue_area += len(waiting_queue) * dt
+            last_time = horizon_time
+
         total_t = max(last_time, 1e-9)
         return {
             "total_arrivals": entity_id,

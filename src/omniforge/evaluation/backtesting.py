@@ -63,8 +63,8 @@ class BacktestingEngine:
                 yhat = np.asarray(fc, dtype=float).ravel()[gap_n : gap_n + horizon]
                 lo, hi = None, None
 
-            # Score only positions with valid (non-NaN) actuals.
-            valid_mask = ~np.isnan(test_y)
+            # Score only positions with valid (non-NaN, non-inf) actuals.
+            valid_mask = ~np.isnan(test_y) & ~np.isinf(test_y)
             if valid_mask.any():
                 test_y_valid = test_y[valid_mask]
                 yhat_valid = yhat[valid_mask]

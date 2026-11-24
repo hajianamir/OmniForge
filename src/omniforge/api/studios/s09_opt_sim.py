@@ -352,7 +352,13 @@ async def s09_vision(
 # Graph link prediction & structure
 # ---------------------------------------------------------------------------
 def _pick_edge_columns(df: pd.DataFrame) -> tuple[str, str, str]:
-    """Choose two node columns for an edge list. Returns (col_a, col_b, strategy)."""
+    """Choose two node columns for an edge list. Returns (col_a, col_b, strategy).
+
+    If the low-cardinality pair would produce a complete graph (every possible
+    edge already present, so there are no non-edges to score for link
+    prediction), raise ``ValueError`` so the caller falls back to the
+    correlation-graph strategy instead of returning an empty link list.
+    """
     low_card: list[str] = []
     for c in df.columns:
         nun = int(df[c].nunique(dropna=True))
@@ -360,7 +366,18 @@ def _pick_edge_columns(df: pd.DataFrame) -> tuple[str, str, str]:
         if 1 < nun <= 50 and (is_texty or nun <= 20):
             low_card.append(c)
     if len(low_card) >= 2:
-        return low_card[0], low_card[1], "low_cardinality_columns"
+        col_a, col_b = low_card[0], low_card[1]
+        edges = df[[col_a, col_b]].dropna()
+        g = nx.Graph()
+        for _, row in edges.iterrows():
+            u, v = str(row[col_a]).strip(), str(row[col_b]).strip()
+            if u and v and u != v:
+                g.add_edge(u, v)
+        if g.number_of_nodes() >= 2:
+            max_edges = g.number_of_nodes() * (g.number_of_nodes() - 1) // 2
+            if g.number_of_edges() >= max_edges:
+                raise ValueError("complete_graph_no_nonedges")
+        return col_a, col_b, "low_cardinality_columns"
     raise ValueError("no_low_cardinality_pair")
 
 

@@ -27,20 +27,20 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-from fastapi.testclient import TestClient
 
 # ---------------------------------------------------------------------------
 # Imports (patched copy for Python 3.11)
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from omniforge.api.studios import s11_mlops, s05_features, s06_automl  # noqa: E402
 from omniforge.api import workbench as wb_module  # noqa: E402
-from omniforge.core.types import ModelStage, Principal  # noqa: E402
-from omniforge.data.cleaning import CleaningConfig, DataCleaner  # noqa: E402
+from omniforge.api.studios import s05_features, s06_automl, s11_mlops  # noqa: E402
+from omniforge.causal.inference import CausalInferenceEngine  # noqa: E402
+from omniforge.core.exceptions import CausalInferenceError  # noqa: E402
+from omniforge.core.types import Principal  # noqa: E402
+from omniforge.data.cleaning import CleaningConfig  # noqa: E402
 from omniforge.data.feature_store import LocalFeatureStore  # noqa: E402
 from omniforge.data.quality import DataQualityProfiler  # noqa: E402
-from omniforge.data.splitting import LeakageSafeSplitter, SplitConfig  # noqa: E402
 from omniforge.evaluation.backtesting import BacktestingEngine  # noqa: E402
 from omniforge.evaluation.fairness import FairnessAuditor  # noqa: E402
 from omniforge.mlops.continuous_training import ContinuousTrainingOrchestrator  # noqa: E402
@@ -55,7 +55,6 @@ from omniforge.ui.state import (  # noqa: E402
     get_session_state,
     lock_leakage_safe_split,
 )
-from omniforge.causal.inference import CausalInferenceEngine  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -120,7 +119,6 @@ class TestClaim1_PromotePermission:
 
     def test_promote_route_dependencies_include_permission(self):
         """Integration: route's FastAPI dependencies include require_permission (FIXED)."""
-        from omniforge.api.auth import require_permission
 
         found = False
         for route in s11_mlops.router.routes:
@@ -152,7 +150,7 @@ class TestClaim2_EncryptionRoundTrip:
 
         model = _DummyOmniForgeModel(name="enc-test", score_val=0.5)
 
-        model_id = reg.register_model(
+        _model_id = reg.register_model(
             model=model,
             model_name="enc-test-model",
             encrypt=True,
@@ -161,7 +159,9 @@ class TestClaim2_EncryptionRoundTrip:
         # The stored artifact file should be encrypted
         artifact_path = reg.artifact_dir / "enc-test-model" / "v1" / "model.joblib"
         assert artifact_path.exists(), "Artifact file should exist"
-        import io, joblib
+        import io
+
+        import joblib
         buf = io.BytesIO()
         joblib.dump(model, buf)
         plaintext_joblib = buf.getvalue()
@@ -360,8 +360,8 @@ class TestClaim9_ClusteringTargetExclusion:
         clust_func = source[clust_start:clust_end]
 
         # Targets should now be excluded from clustering features
-        helper_line = [l for l in clust_func.split('\n') if 'helper_cols' in l]
-        assert any('| targets' in l for l in helper_line), (
+        helper_line = [line for line in clust_func.split('\n') if 'helper_cols' in line]
+        assert any('| targets' in line for line in helper_line), (
             "FIX NOT APPLIED: Clustering still does not exclude targets from features."
         )
 
@@ -568,7 +568,7 @@ class TestClaim21_DiDSingletonCells:
             "post": [1, 0, 1],
             "outcome": [10.0, 8.0, 9.0],
         })
-        with pytest.raises(Exception):
+        with pytest.raises(CausalInferenceError):
             engine.difference_in_differences(
                 df, group_col="group", post_col="post", outcome_col="outcome",
             )
