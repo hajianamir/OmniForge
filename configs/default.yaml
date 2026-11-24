@@ -79,6 +79,13 @@ mlops:
   drift_ks_alpha: 0.05
   retrain_on_critical_drift: true
 
+jobs:
+  max_workers: 4
+  max_queue_depth: 128
+  max_history: 128
+  worker_timeout_seconds: 120.0
+  db_path: null  # defaults to paths.workspace_dir/workbench_jobs.db
+
 security:
   enable_rbac: true
   jwt_algorithm: HS256

@@ -308,7 +308,11 @@ Follow this CRISP-DM sequence to guarantee zero data leakage, reproducible data 
 
 **3. Paper-Grade Deep Learning:** FT-Transformer, TabNet, ResNet-Tabular, MLP, 1D-CNN, GCN, GAT, GraphSAGE with loss curves & feature importances.
 
-**4. Single-Row & Batch CSV Scoring.**
+**4. Single-Row & Batch CSV Scoring.** Models trained by Studio 06 retain a fitted input schema with the workspace. Both scoring endpoints accept the original columns, including categorical values and datetime-typed features, and apply the same input preparation and model-fitted encoding used in training. Blank or omitted inputs follow the model's missing-value handling; unknown categories follow the trained encoder's policy. Numeric-only workbench models retain fitted medians and category encodings. Invalid numeric/datetime values return a 422 error rather than silently becoming zero. Older saved workspaces without a fitted schema retain their legacy numeric scoring behavior until retrained.
+
+**Background AutoML jobs:** Set `async_job: true` on `POST /api/workbench/s06/automl`, then poll `GET /api/workbench/jobs/{job_id}` or list `GET /api/workbench/jobs`. Cancel via `POST /api/workbench/jobs/{job_id}/cancel`. Queued jobs cancel immediately; running AutoML jobs return 202 (`cancelling`) and stop at the next checkpoint before the model is published. A training step already in progress cannot be forcibly interrupted. Once publication begins, or for running jobs that do not opt into cooperative cancellation, the endpoint returns 409. A full queue returns 429 with `Retry-After`.
+
+Job status and JSON results are stored in SQLite (default `paths.workspace_dir/workbench_jobs.db`). Configure `OMNIFORGE_JOBS__MAX_WORKERS` (per process), `OMNIFORGE_JOBS__MAX_QUEUE_DEPTH` (shared waiting-job limit), `OMNIFORGE_JOBS__MAX_HISTORY` (terminal records), `OMNIFORGE_JOBS__WORKER_TIMEOUT_SECONDS`, and optionally `OMNIFORGE_JOBS__DB_PATH`. API workers must use the same settings and a shared filesystem with reliable SQLite locking. A vanished worker's queued/running jobs are marked failed after the lease expires; Python callables are **not** persisted or automatically resumed. Workspace datasets and active models remain process-local, so multi-worker workspace operations still require sticky routing or a separate shared workspace implementation. The separate `omniforge.mlops.job_queue.BackgroundJobQueue` helper remains in-memory.
 
 **External Deployment Formula Kit:** After AutoML completes, OmniForge extracts governing mathematical relationships and exposes:
 - Standalone Python (`.py`) — zero-dependency scoring function
@@ -411,6 +415,8 @@ subject to u_min ≤ u ≤ u_max
 **Model Registry Stages:** None → Staging → Production → Archived. Semantic versioning. SQLite MLflow-compatible.
 
 **Drift Detection:** PSI, KS, Wasserstein, JS, Chi², Page-Hinkley. PSI thresholds: < 0.10 stable, 0.10–0.25 moderate, ≥ 0.25 major drift.
+
+**Feature-store freshness:** Studios 11 and 14 show a tenant-scoped snapshot from `GET /api/workbench/feature-store/freshness`, refreshed every minute. It reports online vector counts, currently expired vectors and per-view stale alerts. Timestamp parsing falls back from event time to materialization time, matching online TTL retrieval; unknown timestamps are counted separately and nonpositive TTL disables expiry. Counts are snapshots of records still in the online store, not cumulative expiration events, and exclude purged records. The default tenant uses `paths.feature_store_dir`; other tenants use their workspace-isolated feature-store directory.
 
 **✅ C5 — Causal Drift Root-Cause Attribution (Phase 6):**
 

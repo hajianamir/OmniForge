@@ -334,6 +334,65 @@ class LocalFeatureStore:
                 output.append(item)
         return output
 
+    def freshness_report(self, *, as_of: datetime | str | None = None) -> dict[str, Any]:
+        """Snapshot online TTL freshness without exposing entity keys or feature values.
+
+        Counts describe rows currently in the online store, not a cumulative
+        count of historical expirations or purged rows. Unknown timestamps are
+        reported separately; TTL-disabled views never mark rows expired.
+        """
+        ref_ts = self._parse_utc_timestamp(as_of) if as_of is not None else pd.Timestamp.now(tz="UTC")
+        if ref_ts is None:
+            raise FeatureEngineeringError("Invalid as_of timestamp for feature freshness report.")
+        specs = self.list_feature_views()
+        views: dict[str, dict[str, Any]] = {
+            spec.name: {
+                "view_name": spec.name,
+                "ttl_seconds": spec.ttl_seconds,
+                "feature_columns": list(spec.feature_columns),
+                "online_rows": 0,
+                "fresh_rows": 0,
+                "expired_rows": 0,
+                "unknown_timestamp_rows": 0,
+            }
+            for spec in specs
+        }
+        with _sqlite_conn(self._online_db) as conn:
+            cursor = conn.execute("SELECT view_name, event_timestamp, updated_at FROM online_features")
+            for view_name, event_raw, updated_raw in cursor:
+                view = views.get(view_name)
+                if view is None:
+                    continue  # unregistered orphan rows are not exposed
+                view["online_rows"] += 1
+                if view["ttl_seconds"] <= 0:
+                    view["fresh_rows"] += 1
+                    continue
+                timestamp = self._parse_utc_timestamp(event_raw) or self._parse_utc_timestamp(updated_raw)
+                if timestamp is None:
+                    view["unknown_timestamp_rows"] += 1
+                elif (ref_ts - timestamp).total_seconds() > view["ttl_seconds"]:
+                    view["expired_rows"] += 1
+                else:
+                    view["fresh_rows"] += 1
+        view_list = sorted(views.values(), key=lambda view: view["view_name"])
+        alerts = [
+            {
+                "view_name": view["view_name"],
+                "expired_rows": view["expired_rows"],
+                "message": f"{view['expired_rows']} online feature vector(s) in '{view['view_name']}' have expired.",
+            }
+            for view in view_list if view["expired_rows"] > 0
+        ]
+        return {
+            "as_of": ref_ts.isoformat(),
+            "total_views": len(view_list),
+            "online_rows": sum(view["online_rows"] for view in view_list),
+            "expired_rows": sum(view["expired_rows"] for view in view_list),
+            "unknown_timestamp_rows": sum(view["unknown_timestamp_rows"] for view in view_list),
+            "views": view_list,
+            "alerts": alerts,
+        }
+
     def purge_expired_features(
         self,
         view_name: str | None = None,

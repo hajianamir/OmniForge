@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { apiDownload, apiGet, apiPost, apiUpload, toErrorMessage } from '../api';
 import { BarChartSVG, NetworkGraphSVG } from '../components/Charts';
 import { SimpleTable } from '../components/DataGrid';
+import { FeatureFreshnessPanel } from '../components/FeatureFreshnessPanel';
 import { StudioHelpButton } from '../components/HelpGuideModal';
 import { InspectableBox } from '../components/InspectModal';
 import type {
@@ -380,6 +381,7 @@ export const Studio11MLOps: React.FC<StudioProps> = ({ ws, studioCache, setStudi
           {driftRes && <pre className="code-block" style={{ marginTop: 12, maxHeight: 300 }}>{JSON.stringify(driftRes, null, 2)}</pre>}
         </div>
       </div>
+      <FeatureFreshnessPanel />
     </div>
   );
 };
