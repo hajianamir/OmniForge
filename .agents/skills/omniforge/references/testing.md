@@ -1,82 +1,106 @@
-# OmniForge Testing Reference
+# OmniForge testing reference
 
-> Verified against commit `b7dc7ae` (2026-11-24); see `../SKILL.md` for provenance and authority policy.
+> Reverified at the code revision in [SKILL.md](../SKILL.md). A test proves
+> the exercised path and fixtures, not every route or deployment configuration.
 
-## Commands
+## Local commands
+
+Use a supported Python (package metadata requires **3.12+**), with the
+repository root as the current directory:
 
 ```bash
-pip install -e ".[dev,api,ui,reporting,data,forecasting]"   # CI parity
-pytest -q tests --cov=omniforge --cov-report=term-missing --tb=short  # CI command
-pytest -v tests/unit            # fast unit only
-pytest -v tests/integration     # cross-module
-pytest -v tests/e2e             # API + CLI + SPA
-ruff check src tests            # line-length 120, py312, E/F/I/W/B/UP (E501/B008 off)
-mypy src/omniforge              # disallow_untyped_defs, warn_return_any, … (api/cli/ui decorator override)
-python scripts/latency_budget_benchmark.py   # p95 budget gate
-cd frontend && npm ci && npm run build       # SPA rebuild (then commit static_app)
-make test / test-unit / test-integration / test-e2e / lint / typecheck
+python -m pip install -e ".[dev,api,ui,reporting,data,forecasting]"
+ruff check src tests
+mypy src/omniforge
+pytest -q tests --cov=omniforge --cov-report=term-missing --tb=short
+python scripts/latency_budget_benchmark.py
 ```
 
-**Make vs CI:** `Makefile` targets wrap the same tools with local flags
-(`pytest -v`, no coverage). CI (`.github/workflows/ci.yml`) runs
-`pytest -q tests --cov=omniforge --cov-report=term-missing` plus ruff/mypy
-with failure-summary annotations. If `make test` passes but CI fails, check
-coverage/lint/typecheck first — CI is stricter, not different.
+Focused examples:
 
-Pytest config (`pyproject.toml`): `testpaths=["tests"]`,
-`addopts="-ra --strict-markers"`, markers `unit|integration|e2e|slow`.
-`tests/conftest.py`: sets `OMNIFORGE_API__RATE_LIMIT_PER_MINUTE=0` (suite
-issues >300 req/min; limiter is unit-tested directly — never disable it
-elsewhere), autouse seed fixture (`set_global_seed(42)`), fixtures
-`classification_df` (220×6), `regression_df` (200×6), `timeseries_df`
-(110 periods), `causal_df` (280 rows, ATE 3.2) via `SyntheticDataGenerator`,
-`workspace_tmp`.
+```bash
+pytest -q tests/unit/test_workbench_inference_preprocessing.py
+pytest -q tests/unit/test_persistent_workbench_jobs.py tests/unit/test_persistent_workbench_processes.py
+pytest -q tests/unit/test_feature_freshness_monitoring.py tests/unit/test_registry_stage_and_fairness.py
+pytest -q tests/unit/test_fallback_observability.py
+pytest -q tests/e2e --tb=short
+```
 
-## What proves what (categories → representative files)
+For frontend changes: `cd frontend && npm ci && npm run build`, then inspect
+and commit `src/omniforge/ui/static_app/`. `Makefile` also supplies `make test`,
+`make test-unit`, `make test-integration`, `make test-e2e`, `make lint`, and
+`make typecheck`; its pytest targets use different flags and do not replicate
+the coverage invocation. `pyproject.toml` configures strict markers, Ruff and
+mypy. `tests/conftest.py` disables the API rate limit for the suite and seeds
+fixtures; direct limiter tests remain relevant. A local run with an unsupported
+Python/dependency combination is supplementary, not evidence that the
+supported CI matrix passes.
 
-| Category | Representative test file(s) | Proves |
+## Representative coverage and limits
+
+All filenames below are in `tests/unit/` unless otherwise indicated.
+
+| Area | Files | Scope to inspect |
 |---|---|---|
-| Leakage-safety | `test_anti_leakage_and_pipeline.py`, `test_phase2_statistical_and_pipeline_hardening.py` | splitter/cleaner/anomaly/clustering/AutoML never learn from test/future rows |
-| Security & tenancy | `test_bola_session_isolation.py`, `test_platform_admin_role.py`, `test_p0_security_and_runtime_hardening.py`, `test_p1_13_pseudonym_salt.py`, `test_p1_14_sql_identifier_allowlist.py` | tenant/subject isolation, unauthenticated rejection, salt strength, SQL allowlist |
-| Audit & headers | `test_audit_anchor_and_browser_headers.py`, `test_audit_regressions.py` (large) | checkpoint anchor, CSP/HSTS, hash-chain verification, tamper detection |
-| Statistical correctness | `test_p1_mathematical_and_statistical_integrity.py`, `test_pass2_ml_and_statistics.py`, `test_phase3_econometrics_conformal_and_governance.py` | golden values (AIPW/PSM SE, association-rule metrics), conformal, econometrics |
-| Data layer | `test_data_layer.py`, `test_format_audit_and_exclusions.py`, `test_p1_10_dataframe_fingerprint.py` | ingestion/cleaning/quality/format audit, fingerprint stability |
-| EDA & features | `test_eda_and_features.py`, `test_phase5_green_ai_explainability_pii.py` | profiling, selection, SHAP/PII/carbon |
-| Modeling & decision | `test_modeling_and_decision_engines.py`, `test_phase2_advanced_engines.py`, `test_phase4_pillars.py`, `test_phase6.py` | baselines, AutoML, forecasting, causal, optimization, simulation |
-| API & studios | `test_pass3_api_tenancy_and_studios.py`, `test_pass4_reporting_cli_docker_spa.py` | tenancy, studio endpoints, CLI/Docker/SPA |
-| Reporting | `test_comprehensive_reporting.py`, `test_model_card_pdf.py` | DOCX/PDF/XLSX/CSV exports, section filtering, model-card PDF |
-| Serialization | `test_model_serialization_and_unpickler.py` | HMAC verify + restricted unpickler refusal |
-| Packs & installer | `test_capability_packs.py`, `test_installer_iss.py`, `test_packaging_and_launcher.py` | tier cumulativeness, dedup pins, ISS validity, launcher |
-| Rate limits | `test_request_limits.py`, `test_rate_limit_shared.py` | sliding window, shared (Redis) behavior |
-| Third-party claims | `test_third_party_claims.py` | capability claims match installed backends/fallbacks |
-| Workspace & themes | `test_workspace_session_and_themes.py` | `.uap` save/load, session isolation, themes |
-| Regressions | `test_regression_items_10_23.py`, `test_phase1_critical_modifications.py`, `test_ct_kill_switch.py` | historical bug fixes stay fixed; CT kill-switches |
-| Full platform | `tests/integration/test_full_platform.py` | end-to-end lifecycle |
-| E2E | `tests/e2e/test_api_and_cli.py`, `test_omniforge_task33/34/35/37.py`, `test_workbench_spa.py` | live API/CLI/SPA serving |
+| Split/evaluation | `test_anti_leakage_and_pipeline.py`, `test_phase2_statistical_and_pipeline_hardening.py` | Exercises specific splitter, cleaner, anomaly and modeling cases. It does **not** establish leakage-free behavior for every studio; see [API and state](api-and-state.md). |
+| Scoring | `test_workbench_inference_preprocessing.py` | Studio 06 fitted preprocessing, mixed data scoring and cancellation before publication. Add per-path holdout/fold leakage tests when changing training. |
+| Jobs | `test_persistent_workbench_jobs.py`, `test_persistent_workbench_processes.py` | Owner scoping, capacity, cooperative cancellation, cross-process status and lost-worker failure. |
+| Freshness | `test_feature_freshness_monitoring.py` | TTL boundaries, unknown timestamps, purges and tenant-scoped endpoint. |
+| Governance | `test_registry_stage_and_fairness.py`, `test_p1_mathematical_and_statistical_integrity.py` | Stage validation, fairness result serialization and selected statistical regressions. |
+| Auth/tenancy | `test_bola_session_isolation.py`, `test_platform_admin_role.py`, `test_p0_security_and_runtime_hardening.py` | Representative unauthenticated, role and isolation cases; add a negative and positive test for each new route. |
+| Audit and privacy | `test_audit_anchor_and_browser_headers.py`, `test_audit_regressions.py`, `test_p1_13_pseudonym_salt.py` | Anchors/headers, audit behavior and salt handling; verify deployment controls separately. |
+| Serialization | `test_model_serialization_and_unpickler.py`, `test_workspace_session_and_themes.py` | Signed model/workspace behavior, unpickler restrictions and theme/session cases. |
+| Data and connectors | `test_data_layer.py`, `test_format_audit_and_exclusions.py`, `test_p1_14_sql_identifier_allowlist.py` | Selected ingestion, cleaning, exclusions and SQL identifier cases. |
+| Fallbacks | `test_fallback_observability.py`, `test_third_party_claims.py` | Specific fallback behaviors; the former guards four reviewed files, not every exception handler in the repository. |
+| Packs and installer | `test_capability_packs.py`, `test_installer_iss.py`, `test_packaging_and_launcher.py` | Catalogue and installer/launcher checks, not proof that arbitrary tier + pack unions or offline upgrades work. |
+| Reports | `test_comprehensive_reporting.py`, `test_model_card_pdf.py` | Selected report sections and export behavior, not all independent data exports. |
+| Integration/E2E | `tests/integration/test_full_platform.py`, `tests/e2e/test_api_and_cli.py`, `tests/e2e/test_workbench_spa.py` | Broad lifecycle and API/CLI/SPA smoke tests. |
 
-No per-file test counts are given here — they drift as tests are added.
-Use `grep -c "def test_" <file>` at the pinned commit if you need one.
+When adding a feature, add the right failure cases as well as success cases:
 
-## CI (`.github/workflows/ci.yml`, 4 jobs)
+- **Data/modeling:** distinguish raw input schema, training partition,
+  evaluation partition and each CV fold. Use holdout-only categories and
+  extreme holdout values to detect leaked encoders/medians. Test invalid
+  split locks and changes to target/dataset separately.
+- **Endpoint/state:** verify missing credentials, least-privilege decisions,
+  same session ID across different tenants/subjects, cache invalidation and
+  save/restore. Do not assume router-level authentication implies RBAC.
+- **Job:** test owner mismatch, saturation, queued/running cancellation,
+  commit races, worker expiry and cross-process polling with a shared DB.
+- **Fallback:** simulate backend initialization and inference failure; assert
+  the result, structured diagnostic, absence of sensitive input and exception
+  text, and no spurious warning for expected absence/disabled behavior.
+- **Installer:** inspect the selected lock and compare actual installed
+  distributions/imports for Simple, Advanced, Everything, single/multiple
+  packs, upgrade/repair and network-isolated wheelhouse provisioning.
+- **Security/export:** test tampered and unsigned artifacts, key continuity,
+  archive limits, input confinement, redirects and spreadsheet formula strings
+  at the actual export endpoint.
 
-`quality-and-tests` (py3.12/3.13: install `[dev,api,ui,reporting,data,
-forecasting]` → ruff → mypy → pytest+cov), `lock-verify`
-(`pip install --require-hashes -r requirements.lock` + smoke import),
-`e2e` (Node 22 `npm ci` → `npm run build` → **fail if `static_app` diff**
-→ pytest `tests/e2e`), `latency-budget`
-(`latency_budget_benchmark.py`). `windows-installer.yml` covers the installer.
+## CI and skill freshness
 
-## Adding tests
+`.github/workflows/ci.yml` runs on PRs to `main` and pushes to `main`:
 
-- **New engine/model:** unit test with `SyntheticDataGenerator` fixtures + a
-  leakage assertion (fit on train, transform test; assert no test-row
-  influence) + a golden-value test where math is hand-computable (follow
-  `test_association_rules_exact_hand_calculated_metrics`,
-  `test_causal_aipw_and_psm_golden_se`).
-- **New endpoint:** tenancy test (same header, two principals → isolated
-  state) + unauthenticated-rejection test + `wb_cache_and_respond` envelope
-  check.
-- **New security control:** negative test first (attack must fail), then
-  positive.
-- **New fallback:** assert the fallback path explicitly (framework metadata +
-  probe output), per `security.md`.
+1. `quality-and-tests`: Python 3.12 and 3.13 matrix; editable install with the
+   extras above, Ruff, mypy, and the full pytest command with coverage.
+2. `lock-verify`: Python 3.12 installs `requirements.lock` with hashes and
+   smoke-imports selected packages. It is not a recompile of all installer
+   locks.
+3. `e2e`: Node 22 runs `npm ci` and `npm run build`, checks tracked changes
+   under `static_app` with `git diff --quiet`, then runs the E2E tests on
+   Python 3.12. That tracked-diff command alone does not detect untracked files.
+4. `latency-budget`: runs `scripts/latency_budget_benchmark.py`.
+
+`.github/workflows/windows-installer.yml` is separate, configured for manual
+runs and version-tag pushes; it regenerates Windows locks, stages the
+bootstrap, tests the catalogue/ISS, provisions Simple and Advanced and builds
+an Inno installer. It is not a PR matrix of all selections.
+
+`.github/workflows/skill-staleness.yml` is **warn-only** on PRs/pushes to
+`main`. It extracts one quoted 40-hex pin and counts commits in
+`<pin>..HEAD` touching only `src/omniforge`, `frontend`, `tests` and `configs`.
+It does not check uncommitted files or validate pin ancestry; packaging,
+installer, scripts, Docker, `pyproject.toml` and workflows are outside that
+path filter. Invalid/missing pins also warn rather than fail. A green check
+therefore cannot prove the skill is current; follow the full-review procedure
+in [SKILL.md](../SKILL.md#maintaining-this-skill).

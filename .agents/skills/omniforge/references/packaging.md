@@ -1,123 +1,141 @@
-# OmniForge Packaging, Upgrade & Troubleshooting Reference
+# OmniForge packaging, upgrade and troubleshooting reference
 
-> Verified against commit `b7dc7ae` (2026-11-24); see `../SKILL.md` for provenance and authority policy.
+> Reverified at the code revision in [SKILL.md](../SKILL.md). Inspect the
+> actual environment and preserve user data before installation or repair.
 
-## Capability packs, tiers & locks
+## Packs, tiers and Python extras
 
-`src/omniforge/capabilities.py` is the single source of truth for the
-Windows installer (stdlib-only — see SKILL.md invariant 2). 12 packs:
+`src/omniforge/capabilities.py` is the stdlib-only installer catalogue. It
+lists five core and seven optional packs; pip extras in `pyproject.toml` are a
+separate interface and do not match these pack sets exactly.
 
-| Pack id | Kind | Unlocks |
+| Pack | Catalogue purpose |
+|---|---|
+| `core-runtime` | Scientific stack, settings, CLI and basic analytics |
+| `api-server` | FastAPI, Uvicorn, authentication and the workbench server |
+| `statistics` | statsmodels-based statistics and forecasting |
+| `data-io` | Arrow, DuckDB, SQLAlchemy and related data I/O |
+| `reporting` | Report and spreadsheet dependencies |
+| `boosting`, `deep` | Optional native boosted-tree and PyTorch backends |
+| `vision`, `nlp`, `foundation` | Optional vision, NLP and foundation-model dependencies |
+| `automl`, `responsible` | Optional AutoML, explainability and carbon backends |
+
+`TIERS` selects `simple` = core-runtime + statistics + data-io + reporting;
+`advanced` adds api-server; `everything` adds all optional packs. These are
+preselected dependencies, not studio access controls or verified capability
+promises. In particular, **Simple does not select FastAPI/Uvicorn**, although
+the React workbench requires the server. `resolve_selection()` unions the
+requested pack IDs but does not enforce an explicit dependency graph; for
+example, the catalogue describes foundation as requiring deep. Test clean
+installs and actual optional backend behavior for the chosen Python/platform.
+The catalogue's comments about a capabilities API and in-app install buttons
+are not evidence of implemented UI/API integration.
+
+## Two lock systems and the selection mismatch
+
+- `requirements.in` is floating runtime intent; `requirements.txt` includes
+  `requirements.lock`, a hash-pinned universal lock generated for Python 3.12.
+  `requirements-build.in`, `requirements-build.lock` and
+  `requirements-build.txt` cover build tools separately. CI installs the
+  runtime lock with `pip install --require-hashes -r requirements.lock`.
+- `scripts/build_locks.py` compiles `locks/{simple,advanced,everything}.lock`,
+  `pack-*.lock`, and `dev.lock` for Windows/Python 3.13. Each optional pack
+  lock is built from **Advanced plus that one pack**; `dev.lock` is the
+  developer-tool set, not a full tier. Regenerate with
+  `python scripts/build_locks.py` or compare with `--check` when `uv` and the
+  required package sources are available. Pin the tool version used by the
+  relevant release workflow and review generated diffs.
+
+**The current provisioner does not select an arbitrary union lock.**
+`installer/provision.py::_lock_for` uses the list explicitly passed in
+`--packs`: exactly one optional request prefers `pack-<id>.lock`, otherwise it
+prefers `<tier>.lock`, with `everything.lock` as a last resort. Examples
+with the committed locks present:
+
+| Requested tier / extra packs | Lock actually selected | Consequence |
 |---|---|---|
-| `core-runtime` | required | numpy/pandas/sklearn/scipy/pydantic/structlog/typer/rich/plotly/networkx… |
-| `api-server` | required (Advanced+) | FastAPI/Uvicorn/JWT/crypto/prometheus |
-| `statistics` | required | statsmodels — forecasting, causal DML/IV, hypothesis tests |
-| `data-io` | required | pyarrow/duckdb/SQLAlchemy/fsspec/lxml |
-| `reporting` | required | docx/pptx/reportlab/nbformat/openpyxl/matplotlib |
-| `boosting` | optional | XGBoost/LightGBM/CatBoost (fallback: HistGB) |
-| `deep` | optional | torch/lightning (fallback: NumPy) |
-| `vision` | optional | OpenCV/scikit-image (fallback: Pillow/NumPy) |
-| `nlp` | optional | NLTK/spaCy/gensim (fallback: TF-IDF) |
-| `foundation` | optional | transformers/timm/CLIP/ultralytics (needs `deep`) |
-| `automl` | optional | Optuna/FLAML (GP-UCB + random/grid included) |
-| `responsible` | optional | SHAP + codecarbon (fallback: permutation + estimated carbon) |
+| `advanced` + `boosting,vision` | `advanced.lock` | Neither optional pack is guaranteed to be installed. |
+| `everything` + `vision` | `pack-vision.lock` | The selected lock is Advanced + vision, not Everything. |
+| `simple` + `vision` | `pack-vision.lock` | The lock includes Advanced, not just Simple + vision. |
 
-Tiers: `simple` = core+statistics+data-io+reporting; `advanced` = simple +
-api-server; `everything` = advanced + all optionals.
+With a lock present, `install_packs()` calls `uv pip sync --require-hashes`:
+it syncs to that lock and can remove packages already in the environment.
+The planned requirements/pack list and `--check-only` do not prove the lock
+matches the requested union. After installation `verify()` import-probes the
+selected imports and may fail/rollback, but passing probes or having a receipt
+is not proof of exact versions, model weights, or end-to-end functionality.
+A missing lock triggers a non-release direct-resolution fallback. Fix lock
+selection and add real clean-install/upgrade tests before promising arbitrary
+pack combinations.
 
-**Coverage caveat:** `capabilities.py`'s “Studio 01–05 + Universal
-Diagnostics” comment uses older numbering where 01 combined ingestion and
-cleaning; React now separates 00 and 01, while legacy `/s01/*` routes remain.
-Tiers select dependencies, not studio access: `simple` omits FastAPI, so
-verify a clean install before promising React workflows without `api-server`.
+The Inno wizard's `GetTierArgument` returns Simple or Advanced based on the
+API component and passes selected optional checkboxes as `--packs`; it does not
+pass `everything` as the tier. Its wheelhouse option passes `--wheels`, not
+`--offline`. Supplying a wheelhouse alone allows network access for missing
+packages. For a genuinely offline provisioner run, pass **`--offline`** as
+well, provide all required compatible wheels, and test in a network-isolated
+clean environment. Do not infer offline behavior from installer comments.
 
-**Two lock systems (do not confuse them):**
-- `requirements.lock` — hash-pinned runtime lock for pip
-  (`pip install --require-hashes`), compiled **universal / Python 3.12**
-  (`requirements.txt` header). `requirements.in` is the floating intent.
-- `locks/*.lock` — installer locks compiled by `scripts/build_locks.py`
-  for **Windows / Python 3.13** (`PYTHON_PLATFORM`/`PYTHON_VERSION` in that
-  script) so every wheel is a prebuilt binary. `locks/{simple,advanced,
-  everything,dev}.lock` + `pack-*.lock`.
+## Build and deployment map
 
-Regenerate: `python scripts/build_locks.py` (needs `uv`); verify with
-`--check`. `pyproject.toml` extras mirror the packs (`api, redis, ui,
-reporting, data, connectors, mlops, forecasting, deep, boosting, automl,
-automl-java, foundation, responsible, nlp, vision, audio, build, dev,
-experimental, all`).
-
-## Why `static_app/` is committed
-
-`src/omniforge/ui/static_app/` is a **committed build artifact** (invariant
-8). This is deliberate, not an oversight: the `simple` tier and the desktop
-installer ship **without Node.js**, so the prebuilt SPA must be in the repo
-for `create_app()` to serve it. CI (`e2e` job) fails if the committed bundle
-is stale vs `frontend/` source. After any frontend change:
-`cd frontend && npm ci && npm run build` and commit the rebuilt assets.
-
-## PyInstaller / installer / Docker / scripts
-
-| Area | Files | Notes |
+| Area | Source | Practical scope |
 |---|---|---|
-| PyInstaller | `packaging/build_exe.py`, `packaging/pyinstaller/*.spec`, `packaging/entry_{desktop,cli}.py`, `packaging/generate_icon.py`, `packaging/assets/` | Validates env, ensures icons (Pillow), builds onedir, writes SHA-256 checksums, optional Inno compile. Entries call `multiprocessing.freeze_support()`. |
-| Inno Setup | `packaging/inno_setup/omniforge_installer.iss` | Full-exe variant. |
-| Tiered installer | `installer/omniforge_installer_tiers.iss`, `installer/provision.py` | Small payload (app + embeddable CPython + `uv.exe` + `locks/*.lock`) + wizard (Simple/Advanced/Everything + per-pack checkboxes). `provision.py` bootstraps a private venv, installs only selected packs (local wheels first), atomic `provision.json`, exit codes 0/2/3/4/5, offline `/WHEELHOUSE`. `LaunchMode=py` (default shim) vs `=exe` (PyInstaller). |
-| Bootstrap | `scripts/build_bootstrap.py` | Stages `dist/omniforge-bootstrap/`; ISS guards fail fast on stale payload. |
-| Launcher shim | `scripts/make_launcher_shim.py` | Retargets `venvlauncher.exe` (0 MB, offline) + `.cmd`/`.lnk` fallback. Refuses the fake “copy pythonw.exe” trick. |
-| SBOM | `scripts/generate_sbom.py` | CycloneDX via `core/sbom.py`. |
-| Benchmarks | `scripts/run_benchmark.py`, `scripts/latency_budget_benchmark.py` | Domain/baseline/AutoML/carbon smoke; p95 budget gate in CI. |
-| ISS check | `scripts/check_iss.py` | Validates Inno scripts. |
-| Docker | `docker/Dockerfile`, `docker/docker-compose.yml`, `docker/entrypoint.sh` | Multi-stage `python:3.12-slim`, non-root `omniforge:1000`, healthchecks. Compose: `omniforge-api` (:8000) + `omniforge-ui` (:8501, waits for healthy API), shared volume, secrets via env. Entrypoint modes `api` (uvicorn defaults to **1 worker** — sessions and job execution are process-local), `ui`, `worker`, `cli`. Job status is SQLite-backed; see `api-and-state.md`. |
-| Windows helpers | `install.bat`, `start.bat`, `build_exe.bat`, `build_installer.bat` | Thin wrappers. |
-| Build reqs | `requirements-build.in/.txt/.lock` | PyInstaller + Pillow + setuptools/wheel/build. |
+| SPA | `frontend/`, `src/omniforge/ui/static_app/`, `pyproject.toml` | Build with `cd frontend && npm ci && npm run build`; commit the static bundle so packaged runtimes need not build it with Node. CI checks it for drift. |
+| PyInstaller | `packaging/build_exe.py`, `packaging/pyinstaller/*.spec`, `packaging/entry_{desktop,cli}.py` | Frozen executable/launcher build; see also `packaging/inno_setup/omniforge_installer.iss`. |
+| Tiered installer | `installer/omniforge_installer_tiers.iss`, `installer/provision.py` | Wizard, private venv, plans, import verification and receipt; see lock caveat above. |
+| Bootstrap/ISS | `scripts/build_bootstrap.py`, `scripts/make_launcher_shim.py`, `scripts/check_iss.py` | Stage runtime/shim and statically validate the installer; a full Windows build needs the staged payload and Inno Setup. |
+| SBOM | `src/omniforge/core/sbom.py`, `scripts/generate_sbom.py`, `omniforge sbom` | Inspect generated provenance; `--verify` checks hash pinning, not runtime security. |
+| Containers | `docker/Dockerfile`, `docker/docker-compose.yml`, `docker/entrypoint.sh` | Non-root Python 3.12 image; API, UI, monitor worker and CLI modes; API defaults to one worker. |
 
-## Upgrade / migration playbook
+The Docker build resolves project extras (`[api,ui,reporting,data,forecasting]`)
+into wheels; it does not install from the hash-pinned runtime lock.
 
-1. **Version bump:** `src/omniforge/version.py`, `pyproject.toml`,
-   `frontend/package.json`, Docker image tag, installer `MyAppVersion`,
-   `CHANGELOG.md`. Bump `__api_version__`/`__schema_version__` only on
-   breaking change; migrate `.uap` loaders and registry DBs accordingly.
-2. **Dependencies:** edit `requirements.in` / `pyproject.toml` /
-   `capabilities.py` → regenerate `requirements.lock` (universal, 3.12) and
-   `locks/*.lock` (Windows, 3.13) → verify (`--check`, `omniforge sbom
-   --verify`) → CI `lock-verify` must pass.
-3. **SPA:** rebuild + commit `static_app` (above).
-4. **Installer:** `python scripts/build_bootstrap.py` → ISCC compile →
-   `scripts/check_iss.py` → `windows-installer.yml`. Test all tiers +
-   per-pack checkboxes + offline wheelhouse.
-5. **Data/DB:** `model_registry.db` / `mlops_tracking.db` are SQLite;
-   `.omniforge_workspace/` is disposable — never migrate secrets keyfiles;
-   rotate `OMNIFORGE_SECURITY__*` on upgrade.
-6. **Breaking API:** update `api/schemas.py` + `studios/schemas.py`,
-   `frontend/src/studioTypes.ts`, handbook, `docs/api_reference.md`; keep
-   old routes as deprecated shims for one minor version where feasible.
-7. **Deprecation:** `DeprecationWarning`, keep `uap_*` aliases, remove only
-   after tests + SPA migrated. Never silently rename a `uap_*` key or a
-   `ModelCatalog` id — both are persisted.
+The Compose file starts separate API and UI processes on ports 8000/8501 and
+mounts a workspace volume at `/var/lib/omniforge`; sharing that volume does
+**not** make their in-memory workspaces shared. More importantly, setting
+`OMNIFORGE_PATHS__WORKSPACE_DIR` does not rebase every path: default
+`ModelRegistry` and `ExperimentTracker` use relative
+`./.omniforge_workspace/...` paths, non-default tenant registry/tracker paths
+are also constructed relative to the working directory, and individual
+`PathsSettings` defaults remain separate. In the shipped image those paths
+may be under `/app`, outside the mounted volume. The `OMNIFORGE_API_BASE_URL`
+set by Compose has no corresponding use found in `src` or `frontend`; browser
+API calls are relative to the UI's own origin. Verify actual per-service DB,
+artifact, audit, feature-store and project paths, mount/back them up explicitly,
+and test recreation/recovery instead of assuming all data lives in the named
+volume. Sources: `src/omniforge/api/main.py`, `src/omniforge/api/workbench.py`,
+`src/omniforge/mlops/registry.py`, `src/omniforge/mlops/tracking.py`, and
+`src/omniforge/config/settings.py`.
 
-## Troubleshooting
+`.github/workflows/windows-installer.yml` is a separate manual/tag workflow,
+not an ordinary PR check. It builds the installer and exercises Simple and
+Advanced provisioning; it does not prove all checkbox combinations or offline
+upgrades. See [testing](testing.md) for the PR CI jobs.
 
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `static_app stale` CI failure | `frontend/` changed without rebuild | rebuild + commit `static_app` |
-| 429s in manual testing | limiter at 300/min | raise `OMNIFORGE_API__RATE_LIMIT_PER_MINUTE` or `0` locally; never in prod |
-| 413 on upload | body cap 256 MB | raise `OMNIFORGE_API__MAX_REQUEST_BODY_BYTES` |
-| `OmniForgeError` on model load | HMAC mismatch / unpickler refusal | re-save with current key; add class to allowlist (`core/security.py`) |
-| Studio results vanish after target change | downstream invalidation (by design) | re-run dependent studios; check `_reset_downstream_state` |
-| `torch` import error in simple tier | heavy dep leaked to top level | move behind `is_package_available` probe + NumPy fallback |
-| Copilot returns local-planner text | no provider keys | set `OPENAI_API_KEY` etc. or keep `provider="local"` (offline by design) |
-| Registry promotion blocked | fairness gate | run `FairnessAuditor`, fix disparate impact, re-register |
-| Docker sessions lost on restart | in-process state + >1 worker | keep `OMNIFORGE_API_WORKERS=1` or add sticky sessions/external state |
-| `omniforge check` fails | missing pack for tier | install the tier's packs (`capabilities.profile_summary`) or pick a lower tier |
+## Safe upgrade and troubleshooting
 
-## End-to-end flow (one pass)
-
-Ingest (`DataIngestionEngine` → format/intake audit → `load_new_dataset`)
-→ plan & split-lock (`AnalysisSpec` + `LeakageSafeSplitter` +
-`LeakageGuard`) → clean (`DataCleaner.fit_transform_split`, deleted-row
-provenance) → diagnose/EDA → features (fit on train only) → model
-(`AutoMLPipelineSearch`, baselines + lift, equations) → RAI (SHAP/fairness/
-conformal/model card) → decide (forecast/causal/optimize/simulate/specialized)
-→ pipeline (DAG executor, cached/carbon-tracked) → ship (registry fairness
-gate → serving; drift) → report (section-filtered exports) → copilot
-throughout → supervise (Studio 14) → persist (`.uap` ZIP + SHA-256).
+1. Inventory workspaces, per-tenant DBs, feature stores, artifacts, audit logs,
+   project archives, signing/encryption keys and pseudonym salts. Securely
+   back them up and test recovery before replacing images or environments.
+   Never assume `.omniforge_workspace/` is disposable or delete/rotate keys
+   merely to bypass a signature failure.
+2. Review version/schema/API changes, package constraints, lock selection and
+   frontend bundle; update code and compatibility tests together. Recompile
+   the relevant lockfiles and test clean provisioning on the intended platform.
+3. Test project and model save/load with the original keys, the supported
+   dependencies and the restricted deserializer. A signature failure may mean
+   corruption, a wrong key, or an untrusted artifact; investigate rather than
+   switching off verification or blindly adding unpickler allowlist entries.
+4. For multi-worker/container deployments, explicitly plan workspace affinity
+   or shared state, a reliable shared jobs DB, storage mounts and network
+   security. A shared job-status database alone does not share live workspaces.
+5. Diagnose 413/429 using the configured body limit and rate limiter; account
+   for proxy IP aggregation and Redis fallback before changing limits. If a
+   model or cached result seems inconsistent after a target/split change,
+   invalidate affected outputs and retrain while preserving needed user data.
+   Review `src/omniforge/ui/state.py`—those mutations do not currently
+   invalidate all downstream state.
+6. If registry promotion is blocked, inspect the fairness result and policy.
+   Failed fairness blocks Production without an override; missing fairness
+   blocks only when the gate is required. Overrides should follow the user's
+   governance process, not be inserted as an automatic workaround.

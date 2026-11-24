@@ -1,91 +1,137 @@
-# OmniForge Development Recipes
+# OmniForge development recipes
 
-> Verified against commit `b7dc7ae` (2026-11-24); see `../SKILL.md` for provenance and authority policy.
-
-## Add a model
-
-1. Create `src/omniforge/models/<family>/<name>.py` with
-   `class XxxModel(BaseOmniForgeModel)` implementing `_fit/_predict/
-   _predict_proba`; set `model_family`; accept `**hyperparameters`.
-2. Register in `models/registry.py` (`_register_defaults` eager, or lazy
-   `_lazy_deep` pattern for heavy deps).
-3. Add equation extraction in `evaluation/equations.py` if Studio 14 should
-   show it; add metrics in `evaluation/metrics.py` if new.
-4. Tests: fit/predict smoke, `get_params/set_params` round-trip,
-   `save`/`load` with signature verification, leakage check, golden metric.
-5. Optional: expose via Studio 06 (`s06_automl.py`) or Studio 09.
-6. If the model needs an optional dependency, follow the fallback pattern in
-   `security.md` (probe + `framework` metadata + pack `unlocks` + test).
-
-## Add a domain
-
-Create `domains/<slug>.py` (plugin class + module-level `plugin` instance
-implementing `engineer_domain_features`, `compute_domain_kpis`,
-`generate_sample_dataset`, optional `get_validation_rules`),
-`configs/domains/<slug>.yaml`, register in `domains/__init__.py`
-(`_BUILTIN_PLUGINS`), add entry point in `pyproject.toml`, add slug to
-`BUILTIN_DOMAINS` in `core/constants.py`, extend domain coverage tests
-(`test_p3_all_domain_plugins_load_and_generate_samples` pattern in
-`test_audit_regressions.py`).
-
-## Add a studio endpoint
-
-Add the Pydantic request class to `api/studios/schemas.py`, implement the
-handler in the matching `sNN_*.py` using `_wb()` + `wb_cache_and_respond`,
-add the frontend call in `frontend/src/api.ts` + payload type in
-`frontend/src/studioTypes.ts`, follow the `uap_*` key lifecycle in
-`api-and-state.md` (declare → write → invalidate → persist → surface →
-frontend), and cover it with tenancy + unauthenticated tests (see
-`testing.md`).
-
-## Add a Copilot tool
-
-Implement `tool_*` in `copilot/tools.py`, register in
-`_register_platform_tools` with name/description/JSON schema, ensure the
-local planner can select it (deterministic routing), add a prompt hint in
-`copilot/prompts.py`, test offline (`provider="local"`) with no API keys.
-
-## Add a capability pack
-
-Add `Pack(...)` to `capabilities.py` (`ALL_PACKS`, `TIERS` if preselected,
-`FEATURE_UPGRADES` if in-app installable), mirror the extra in
-`pyproject.toml`, regenerate locks (`scripts/build_locks.py`), add the
-fallback path in code (`is_package_available` probe + NumPy/sklearn
-fallback + `probe_*` entry + `unlocks` text), extend
-`test_capability_packs.py`.
-
-## Add a report section / exporter
-
-Add `ReportSectionSpec` in `reporting/sections.py`, builder in
-`reporting/charts.py`, exporter method in `reporting/exporters.py`
-(sanitize spreadsheet values), narrative in `reporting/narrative.py`,
-formula in `reporting/formulas.py`; verify section filtering + all formats
-in `test_comprehensive_reporting.py` style.
-
-## Change config
-
-Add the field to the matching `*Settings` class in `config/settings.py`,
-mirror in `configs/default.yaml` + `.env.example`, document the env var
-(`OMNIFORGE_<SECTION>__<FIELD>`), test composition in
-`test_core_and_config.py` style. Never read `os.environ` directly in library
-code — go through `get_settings()`.
+> Reverified at the code revision in [SKILL.md](../SKILL.md). These are
+> change checklists; read the named implementations and tests first.
 
 ## Run locally
 
+On Python 3.12+ in an isolated environment:
+
 ```bash
-pip install -e ".[dev,api,ui,reporting,data,forecasting]"
-omniforge check                       # environment diagnostics
-omniforge ui --port 8501 --no-browser # workbench (API+SPA on :8501)
-omniforge serve --port 8000           # REST API only (same app, :8000)
-omniforge desktop                     # API (:8000) + UI (:8501) together
-cd frontend && npm ci && npm run dev  # SPA dev on :5173 (proxied to :8501)
-python examples/quickstart_end_to_end.py
+python -m pip install -e ".[dev,api,ui,reporting,data,forecasting]"
+omniforge check --json
+omniforge ui --host 127.0.0.1 --port 8501 --no-browser
 ```
 
-CLI (`cli/main.py`): `version`, `domains [--sample --out --rows]`,
-`quality`, `clean`, `eda`, `automl`, `drift`, `copilot`, `check [--json]`,
-`desktop`, `monitor`, `sbom [--tier --verify]`, `serve`, `ui`. Heavy imports
-are function-local (fast `--help`, `simple`-tier usable). Launcher
-(`launcher.py`): `--mode {full,ui,api,cli,check}`, `--host`, `--api-port`,
-`--ui-port`, `--no-browser`, `--json`, `--cli-args`; `python -m omniforge`
-→ CLI; `omniforge-desktop` → `launcher:main`.
+The check command can exit nonzero with a degraded report when dependencies or
+resources are missing. The UI command serves both API and SPA; authentication
+is required for the workbench. For a **trusted loopback-only development
+session**, one option is
+to set `OMNIFORGE_SECURITY__AUTO_BOOTSTRAP_LOCAL_UI=true` before starting the
+server and visit `http://127.0.0.1:8501/` to receive local cookies. This
+bootstrap grants an admin session, is disabled in production and must not be
+used on an untrusted/exposed server. Otherwise configure an appropriate API
+key or Bearer token; see [security](security.md).
+
+For frontend development, keep the backend on 8501 and in another terminal run:
+
+```bash
+cd frontend
+npm ci
+npm run dev
+```
+
+Vite serves port 5173 and proxies `/api` and `/health` to 8501. With local
+cookie bootstrap, first visit the backend SPA on the same hostname, then open
+`http://127.0.0.1:5173/`; cookies are host-scoped. Use relative URLs in browser
+code. For an externally proxied preview, configure host/origin acceptance and
+use an appropriate authentication boundary; do not assume browser localhost
+means the sandbox.
+
+Other entry points: `omniforge serve --port 8000` serves the same API+SPA app;
+`omniforge desktop` starts both listeners; `python -m omniforge --help` lists
+CLI commands; `omniforge-desktop --help` describes launcher modes.
+`examples/quickstart_end_to_end.py` writes synthetic demonstration outputs under
+`.omniforge_workspace/quickstart_outputs`; it is not a substitute for an
+independent holdout evaluation.
+
+## Add a model
+
+1. For a `ModelCatalog` model, subclass `src/omniforge/models/base.py::BaseOmniForgeModel`,
+   implement `_fit` and `_predict`, set suitable family/framework metadata and
+   honor task semantics. Override `_predict_proba` only when appropriate: the
+   base already has a default projection. Not every engine needs to subclass it.
+2. Register a constructor in `src/omniforge/models/registry.py`; keep optional heavy imports
+   lazy where practical. Add backend-specific equation extraction or API/UI
+   exposure only if needed; catalog registration alone does not expose it in
+   every studio.
+3. Test fit/predict and task guards, model parameters, training-only
+   transformations, held-out scoring and signed save/load. Test optional
+   backend availability, failure and fallback separately; record the effective
+   backend without logging input data or sensitive exception messages.
+
+## Add a domain
+
+1. Implement `BaseDomainPlugin`'s `engineer_domain_features`,
+   `compute_domain_kpis` and `generate_sample_dataset`; provide a module-level
+   `plugin` instance and, where useful, validation rules and a domain YAML.
+2. For a new built-in, update `src/omniforge/domains/__init__.py`,
+   `src/omniforge/core/constants.py::BUILTIN_DOMAINS`, corresponding configuration, and any
+   distribution metadata. Test registration, generated data and KPIs.
+3. For external discovery, `DomainPluginRegistry.discover_entry_points()`
+   accepts only a loaded **instance**. Export the instance, explicitly call or
+   wire discovery, and test it. Existing `pyproject.toml` built-in entries
+   export classes and are skipped by this method; built-ins work through
+   manual registration. Do not assume discovery is invoked automatically.
+
+## Add a studio endpoint or state key
+
+1. Add/extend the request model in `src/omniforge/api/studios/schemas.py`; put the handler
+   in the appropriate router and ensure the router is included from
+   `src/omniforge/api/workbench.py`. Use `_sid` and session helpers for tenant/subject
+   ownership. Decide and enforce the required action permission explicitly;
+   router-level auth alone is insufficient for granular RBAC.
+2. If caching is appropriate, follow `wb_cache_and_respond` and keep the
+   response contract synchronized with `frontend/src/studioTypes.ts` and the
+   calling component. Record lineage/exclusions where meaningful.
+3. For new state, review defaults, dataset/target/split invalidation,
+   stage-preservation, serialization filters, save/load, completion markers
+   and frontend hydration. Do not rely on target/split setters to clear stale
+   models today. Test unauthorized and cross-owner requests, mutation and
+   restore, plus the supported non-happy paths.
+4. If the endpoint trains a model, fit learned preprocessing on each training
+   partition/fold and reuse that fitted pipeline for inference. Studio 06
+   nonparametric and Studio 14 quick-train currently need particular care;
+   follow [API and state](api-and-state.md), not their current leakage pattern.
+
+## Add a Copilot tool
+
+Implement/register a `CopilotTool` in `src/omniforge/copilot/tools.py`, following the
+existing name, description, parameter metadata and handler conventions.
+`list_tools()` returns this metadata for the provider prompt; it is not, by
+itself, proof of provider-native JSON Schema validation. Registration alone
+does not change the deterministic local planner: add intent routing in
+`src/omniforge/copilot/agent.py` if local chat should select it. Review authentication,
+allowed data sources, tool arguments, output/log privacy and provider
+fallbacks. Test direct invocation and offline planning, plus any provider path
+being changed.
+
+## Add a pack or change dependencies
+
+Update the catalogue and any intended tier in `src/omniforge/capabilities.py`,
+and separately update the applicable `pyproject.toml` extras and lock inputs.
+Regenerate and review the locks. Implement/test optional backend behavior and
+capability probes where relevant. **First fix and test provisioner lock selection** if
+multiple packs must install together; existing tier/pack locks and `uv pip
+sync` do not guarantee the requested union. Test clean install, upgrade,
+repair and actual offline execution, not just `profile_summary()`. See
+[packaging](packaging.md).
+
+## Add a report section or exporter
+
+Add a `ReportSectionSpec` to `src/omniforge/reporting/sections.py`; update
+`ReportGenerator` and only the chart, narrative, formula or exporter code the
+feature actually needs. Test selection filtering and each affected output
+format. Use `sanitize_spreadsheet_value` for untrusted spreadsheet cells and
+headers, and audit other exports separately; not all dataset exports use the
+reporting helper.
+
+## Change configuration
+
+Add a typed field to the relevant settings class where appropriate, update
+`configs/default.yaml` and `.env.example` when applicable, and document the
+actual environment name and precedence. `get_settings()` is cached, so tests
+that change environment variables must manage/reset the cache. Some components
+intentionally read env vars directly; trace the real consumer instead of
+assuming every setting is uniformly applied. Test defaults, overrides,
+production secret validation and deployment paths relevant to the change.
