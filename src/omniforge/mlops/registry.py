@@ -25,6 +25,17 @@ _SAFE_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _VALID_RISK_TIERS: frozenset[str] = frozenset({"low", "medium", "high", "critical"})
 
 
+def _normalize_stage(stage: ModelStage | str) -> ModelStage:
+    """Validate stage input before any governance checks or persistence."""
+    if isinstance(stage, str):
+        normalized = stage.strip().casefold()
+        for candidate in ModelStage:
+            if candidate.value.casefold() == normalized:
+                return candidate
+    valid = [candidate.value for candidate in ModelStage]
+    raise MLOpsError(f"Invalid model stage {stage!r}. Valid stages: {valid}.")
+
+
 def _audit_registry_event(action: str, *, model_name: str, status: str, details: dict[str, Any]) -> None:
     """Best-effort tamper-evident audit logging for registry governance gates & rollbacks."""
     try:
@@ -69,7 +80,7 @@ class RegisteredModelVersion(BaseModel):
     stage: ModelStage
     artifact_path: str
     checksum_sha256: str
-    metrics: dict[str, float] = Field(default_factory=dict)
+    metrics: dict[str, float | None] = Field(default_factory=dict)
     tags: dict[str, str] = Field(default_factory=dict)
     description: str = ""
     owner: str = ""
@@ -217,10 +228,14 @@ class ModelRegistry:
         fairness_passed: bool | None = None,
         require_fairness_gate: bool | None = None,
         override_reason: str | None = None,
-        stage: ModelStage = ModelStage.NONE,
+        stage: ModelStage | str = ModelStage.NONE,
         encrypt: bool = False,
     ) -> RegisteredModelVersion:
-        """Persist a fitted OmniForge (or wrapped sklearn) model with governance metadata and optional fairness gate."""
+        """Persist a fitted model with governance metadata and an optional fairness gate.
+
+        Stage names are accepted case-insensitively and validated before saving.
+        """
+        stage = _normalize_stage(stage)
         clean_name = str(model_name or "").strip()
         if not _SAFE_MODEL_NAME_RE.match(clean_name) or ".." in clean_name:
             raise SecurityError(
@@ -230,12 +245,13 @@ class ModelRegistry:
         if norm_tier not in _VALID_RISK_TIERS:
             raise MLOpsError(f"Invalid risk_tier '{risk_tier}'. Choose one of: {sorted(_VALID_RISK_TIERS)}.")
         eff_fairness: bool | None = fairness_passed
-        extra_fair_metrics: dict[str, float] = {}
+        extra_fair_metrics: dict[str, float | None] = {}
         if fairness_report is not None:
             if hasattr(fairness_report, "passed"):
                 eff_fairness = bool(fairness_report.passed)
                 extra_fair_metrics["disparate_impact_ratio"] = float(fairness_report.disparate_impact_ratio)
-                extra_fair_metrics["equalized_odds_diff"] = float(fairness_report.equalized_odds_diff)
+                eod = fairness_report.equalized_odds_diff
+                extra_fair_metrics["equalized_odds_diff"] = float(eod) if eod is not None else None
             elif isinstance(fairness_report, dict) and "passed" in fairness_report:
                 eff_fairness = bool(fairness_report["passed"])
 
@@ -332,7 +348,7 @@ class ModelRegistry:
         self,
         model_name: str,
         version: int,
-        target_stage: ModelStage,
+        target_stage: ModelStage | str,
         *,
         archive_existing_production: bool = True,
         fairness_report: Any | None = None,
@@ -340,6 +356,7 @@ class ModelRegistry:
         override_reason: str | None = None,
     ) -> RegisteredModelVersion:
         """Promote or transition a registered model version across lifecycle stages with Responsible AI gate."""
+        target_stage = _normalize_stage(target_stage)
         current = self.get_version(model_name, version)
         eff_fairness = current.fairness_passed
         if fairness_report is not None:

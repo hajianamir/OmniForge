@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul 2>&1
-title OmniForge v2.0.0 - Enterprise Launcher
+title OmniForge v4.0.0 - Enterprise Launcher
 
 set "ROOT_DIR=%~dp0"
 if "%ROOT_DIR:~-1%"=="\" set "ROOT_DIR=%ROOT_DIR:~0,-1%"
@@ -77,7 +77,7 @@ if not exist "%VENV_PY%" (
 :menu
 cls
 echo ============================================================================
-echo   OmniForge v2.0.0 - Enterprise Launch Center
+echo   OmniForge v4.0.0 - Enterprise Launch Center
 echo ============================================================================
 echo   Workspace : %ROOT_DIR%
 echo   Web UI    : http://%OMNIFORGE_HOST%:%OMNIFORGE_UI_PORT%
@@ -127,7 +127,7 @@ goto :menu
 :show_help
 echo.
 echo ============================================================================
-echo   OmniForge v2.0.0 - Launcher Usage
+echo   OmniForge v4.0.0 - Launcher Usage
 echo ============================================================================
 echo Usage: start.bat [option]
 echo.

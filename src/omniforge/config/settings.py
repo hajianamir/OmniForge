@@ -108,6 +108,16 @@ class MLOpsSettings(BaseModel):
     retrain_on_critical_drift: bool = True
 
 
+class JobSettings(BaseModel):
+    """Workbench job execution and shared SQLite status configuration."""
+
+    max_workers: int = Field(default=4, ge=1)
+    max_queue_depth: int = Field(default=128, ge=1)
+    max_history: int = Field(default=128, ge=1)
+    db_path: Path | None = None
+    worker_timeout_seconds: float = Field(default=120.0, ge=3.0)
+
+
 class SecuritySettings(BaseModel):
     """Security, encryption, RBAC, and compliance settings."""
 
@@ -228,6 +238,7 @@ class OmniForgeSettings(BaseSettings):
     modeling: ModelingSettings = Field(default_factory=ModelingSettings)
     automl: AutoMLSettings = Field(default_factory=AutoMLSettings)
     mlops: MLOpsSettings = Field(default_factory=MLOpsSettings)
+    jobs: JobSettings = Field(default_factory=JobSettings)
     security: SecuritySettings = Field(default_factory=SecuritySettings)
     copilot: CopilotSettings = Field(default_factory=CopilotSettings)
     api: APISettings = Field(default_factory=APISettings)

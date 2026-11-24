@@ -1,5 +1,5 @@
 ; ==============================================================================
-; OmniForge v2.0.0 — Tiered / Component-Based Windows Installer (Inno Setup 6)
+; OmniForge v4.0.0 — Tiered / Component-Based Windows Installer (Inno Setup 6)
 ;
 ; Small installer + on-demand provisioning:
 ;   * payload  = app code + embeddable CPython + uv.exe + locks/*.lock   (~55-75 MB)
@@ -21,7 +21,7 @@
 ; ==============================================================================
 
 #define MyAppName "OmniForge"
-#define MyAppVersion "2.0.0"
+#define MyAppVersion "4.0.0"
 #define MyAppPublisher "OmniForge Engineering"
 #define MyAppExeName "OmniForge.exe"
 

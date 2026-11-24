@@ -217,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     print("=" * 72)
-    print("  OmniForge v2.0.0 — Executable Builder")
+    print("  OmniForge v4.0.0 — Executable Builder")
     print("=" * 72)
 
     ico_path, png_path = ensure_icon_assets()

@@ -1,8 +1,8 @@
 @echo off
 REM ============================================================================
-REM  OmniForge v2.0.0 - Bootstrap Installer Builder (Windows)
+REM  OmniForge v4.0.0 - Bootstrap Installer Builder (Windows)
 REM
-REM  Produces:  dist\installer\OmniForge-2.0.0-Setup.exe   (~30-35 MB)
+REM  Produces:  dist\installer\OmniForge-4.0.0-Setup.exe   (~30-35 MB)
 REM
 REM  This replaces the PyInstaller flow for the installer:
 REM      app code + embeddable CPython + uv + hash-pinned locks

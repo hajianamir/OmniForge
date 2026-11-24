@@ -1,5 +1,5 @@
 # =============================================================================
-# OmniForge v3.0.1 — .exe build toolchain (hash-checked install)
+# OmniForge v4.0.0 — .exe build toolchain (hash-checked install)
 # =============================================================================
 # Floating minimums: requirements-build.in. Hash-pinned lock generated via:
 #

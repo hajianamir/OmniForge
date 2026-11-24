@@ -1,12 +1,12 @@
 ; ==============================================================================
-; OmniForge v2.0.0 — Inno Setup 6 Windows Installer
+; OmniForge v4.0.0 — Inno Setup 6 Windows Installer
 ; Prerequisites: Build onedir executable first (`build_exe.bat --onedir`)
 ; Compile with:  "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" omniforge_installer.iss
 ; ==============================================================================
 
 #define MyAppName "OmniForge"
 #define MyAppShortName "OmniForge"
-#define MyAppVersion "2.0.0"
+#define MyAppVersion "4.0.0"
 #define MyAppPublisher "OmniForge Engineering"
 #define MyAppExeName "OmniForge.exe"
 

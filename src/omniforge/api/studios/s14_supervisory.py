@@ -100,7 +100,7 @@ def s14_quick_train(req: SupervisoryQuickTrainReq, x_session_id: str | None = He
     target = req.target if (req.target and req.target in df.columns) else (targets[0] if targets else None)
     if not target:
         raise HTTPException(status_code=400, detail="Select a target column first before training a supervisory model.")
-    X, y, task = _wb()._prepare_xy(df, target)
+    X, y, task, input_preprocessor = _wb()._prepare_xy_fitted(df, target)
     if len(X) < 6:
         raise HTTPException(status_code=400, detail="Supervisory quick-train requires at least 6 rows.")
     is_clf = task in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION)
@@ -193,6 +193,7 @@ def s14_quick_train(req: SupervisoryQuickTrainReq, x_session_id: str | None = He
         state["uap_active_model_name"] = label
         state["uap_active_model_metrics"] = {metric_name: round(score, 4)}
         state["uap_active_feature_cols"] = list(X.columns)
+        state["uap_active_input_preprocessor"] = input_preprocessor
 
     record_lineage(state, "Supervisory Monitor", f"Quick-trained {label}", f"{metric_name}={score:.4f}")
     raw_models = SupervisoryPredictionMonitor.catalog_available_models(state)

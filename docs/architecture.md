@@ -20,7 +20,7 @@
 |                                                                       |
 |   AI Copilot: Multi-LLM (OpenAI/Anthropic/Azure/Ollama) +             |
 |   Offline deterministic local planner (C4, Phase 6)                   |
-|   26+ deterministic Copilot tools (16 base + 10 Phase 6 C4)           |
+|   24 deterministic Copilot tools (14 base + 10 Phase 6 C4)           |
 |   Automated Narrative Reporting                                       |
 |   18 Enterprise Industry Domain Plugins + Extensible Plugin SDK       |
 +-----------------------------------------------------------------------+
@@ -126,7 +126,7 @@ src/omniforge/
 │   ├── agent.py             # OmniForgeCopilotAgent (multi-provider + local planner)
 │   ├── memory.py            # CopilotMemory (datasets, models, working state)
 │   ├── prompts.py           # SYSTEM_PROMPT, TOOL_CALLING_INSTRUCTION
-│   └── tools.py             # CopilotToolRegistry (26+ tools, 10 Phase 6 C4 tools)
+│   └── tools.py             # CopilotToolRegistry (24 tools, 10 Phase 6 C4 tools)
 │
 ├── core/                    # Core infrastructure & governance
 │   ├── __init__.py
@@ -374,12 +374,12 @@ _chat_local_planner() — English keyword → tool routing
 CopilotToolRegistry.invoke(tool_name, arguments)
         │
         ▼
-26+ deterministic tools (16 base + 10 Phase 6 C4)
+24 deterministic tools (14 base + 10 Phase 6 C4)
 ```
 
 **Key Files:**
 - `src/omniforge/copilot/agent.py` — `OmniForgeCopilotAgent`, `_chat_local_planner`
-- `src/omniforge/copilot/tools.py` — `CopilotToolRegistry`, all 26+ tools
+- `src/omniforge/copilot/tools.py` — `CopilotToolRegistry`, all 24 tools
 - `src/omniforge/copilot/memory.py` — `CopilotMemory`
 - `src/omniforge/copilot/prompts.py` — `SYSTEM_PROMPT`, `TOOL_CALLING_INSTRUCTION`
 - `src/omniforge/api/studios/s13_copilot.py` — `POST /s13/chat`

@@ -48,6 +48,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
   const dlRes = studioCache.s06_dl ?? null;
 
   const [singleRec, setSingleRec] = useState<Record<string, string>>({});
+  const inputCols = ws.active_input_feature_cols?.length ? ws.active_input_feature_cols : ws.active_feature_cols;
   const singlePred = studioCache.s06_predict_single ?? null;
   const batchRes = studioCache.s06_predict_batch ?? null;
   const [busy, setBusy] = useState(false);
@@ -111,9 +112,9 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
   const runSinglePred = async () => {
     setBusy(true); setErr(null);
     try {
-      const numRec: Record<string, number> = {};
-      for (const c of ws.active_feature_cols) numRec[c] = Number(singleRec[c] || 0);
-      const res = await apiPost<SinglePredictionResponse>('/api/workbench/s06/predict-single', { record: numRec });
+      const record: Record<string, string> = {};
+      for (const c of inputCols) if (singleRec[c]?.trim()) record[c] = singleRec[c];
+      const res = await apiPost<SinglePredictionResponse>('/api/workbench/s06/predict-single', { record });
       setStudioResult('s06_predict_single', res);
     } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
@@ -391,12 +392,19 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
         <div className="grid-2">
           <div className="card">
             <div className="card-title">Single-Record Interactive Scoring</div>
-            {ws.active_feature_cols.length ? (
+            {inputCols.length ? (
               <>
+                <p>Enter raw values; leave a field blank to use the trained model's missing-value handling.</p>
                 <div className="grid-2" style={{ marginBottom: 12 }}>
-                  {ws.active_feature_cols.slice(0, 12).map((c) => (
+                  {inputCols.map((c) => (
                     <label className="field" key={c}>{c}
-                      <input type="number" step="any" value={singleRec[c] ?? '0'} onChange={(e) => setSingleRec({ ...singleRec, [c]: e.target.value })} />
+                      <input
+                        type={ws.active_input_feature_types?.[c] === 'numeric' ? 'number' : 'text'}
+                        step={ws.active_input_feature_types?.[c] === 'numeric' ? 'any' : undefined}
+                        placeholder={ws.active_input_feature_types?.[c] === 'datetime' ? 'ISO 8601 datetime' : ''}
+                        value={singleRec[c] ?? ''}
+                        onChange={(e) => setSingleRec({ ...singleRec, [c]: e.target.value })}
+                      />
                     </label>
                   ))}
                 </div>

@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul 2>&1
-title OmniForge v2.0.0 - Enterprise Installer
+title OmniForge v4.0.0 - Enterprise Installer
 
 set "ROOT_DIR=%~dp0"
 if "%ROOT_DIR:~-1%"=="\" set "ROOT_DIR=%ROOT_DIR:~0,-1%"
@@ -93,7 +93,7 @@ goto :parse_args
 :show_help
 echo.
 echo ============================================================================
-echo   OmniForge v2.0.0 - Windows Installer Help
+echo   OmniForge v4.0.0 - Windows Installer Help
 echo ============================================================================
 echo Usage: install.bat [options]
 echo.
@@ -115,13 +115,13 @@ exit /b 0
 
 :args_done
 echo ============================================================================
-echo   OmniForge v2.0.0 - Enterprise Windows Installer
+echo   OmniForge v4.0.0 - Enterprise Windows Installer
 echo ============================================================================
 echo   Project Root : %ROOT_DIR%
 echo   Install Log  : %LOG_FILE%
 echo ============================================================================
 echo.
-echo [%DATE% %TIME%] === Starting OmniForge v2.0.0 Installation === > "%LOG_FILE%"
+echo [%DATE% %TIME%] === Starting OmniForge v4.0.0 Installation === > "%LOG_FILE%"
 
 :: ----------------------------------------------------------------------------
 :: Step 1: Detect Latest Python >= 3.12 (3.15 / 3.14 / 3.13 / 3.12)

@@ -271,9 +271,11 @@ class OmniForgeCopilotAgent:
                     executed.append({"tool": "train_automl", "arguments": {"target_column": target_col}, "result": tr})
                 res = self.tools.invoke("audit_fairness", {"target_column": target_col})
                 executed.append({"tool": "audit_fairness", "arguments": {"target_column": target_col}, "result": res})
+                eod = res["equalized_odds_diff"]
+                eod_str = f"{eod:.3f}" if eod is not None else "undefined"
                 reply_parts.append(
                     f"Fairness Audit for `{res['protected_attribute']}`: **{'PASSED' if res['passed'] else 'FLAGGED'}** "
-                    f"(Disparate Impact={res['disparate_impact_ratio']}, Equalized Odds Diff={res['equalized_odds_diff']})."
+                    f"(Disparate Impact={res['disparate_impact_ratio']}, Equalized Odds Diff={eod_str})."
                 )
                 next_steps = ["Apply Kamiran-Calders reweighing if flagged", "Generate a compliance Model Card"]
 
@@ -308,21 +310,25 @@ class OmniForgeCopilotAgent:
                 _require_dataset()
                 ref_name = "reference_dataset"
                 cur_name = "current_dataset"
-                if ref_name not in self.memory.working_state["datasets"]:
-                    _require_dataset()
-                if cur_name not in self.memory.working_state["datasets"]:
-                    _require_dataset()
-                res = self.tools.invoke("root_cause_diagnosis", {"reference_dataset": ref_name, "current_dataset": cur_name})
-                executed.append({"tool": "root_cause_diagnosis", "arguments": {"reference_dataset": ref_name, "current_dataset": cur_name}, "result": res})
-                rc = res.get("root_causes", [])
-                sym = res.get("symptoms", [])
-                rx = res.get("remediation_prescriptions", [])
-                reply_parts.append(
-                    f"C5 Causal Drift Root-Cause (status={res.get('overall_status')}): "
-                    f"root causes={rc or 'none isolated'}, symptoms={sym or 'none'}. "
-                    + (" " + " ".join(rx[:3]) if rx else "")
-                )
-                next_steps = ["Remediate upstream root-cause sensors/feeds", "Re-run drift check after remediation", "Register updated model"]
+                missing = [n for n in (ref_name, cur_name) if n not in self.memory.working_state["datasets"]]
+                if missing:
+                    reply_parts.append(
+                        f"Root-cause diagnosis needs the loaded datasets: {', '.join(missing)}. "
+                        f"Load them first (e.g., upload CSVs as reference_dataset and current_dataset), then repeat."
+                    )
+                    next_steps = ["Load reference dataset", "Load current dataset", "Re-run root-cause diagnosis"]
+                else:
+                    res = self.tools.invoke("root_cause_diagnosis", {"reference_dataset": ref_name, "current_dataset": cur_name})
+                    executed.append({"tool": "root_cause_diagnosis", "arguments": {"reference_dataset": ref_name, "current_dataset": cur_name}, "result": res})
+                    rc = res.get("root_causes", [])
+                    sym = res.get("symptoms", [])
+                    rx = res.get("remediation_prescriptions", [])
+                    reply_parts.append(
+                        f"C5 Causal Drift Root-Cause (status={res.get('overall_status')}): "
+                        f"root causes={rc or 'none isolated'}, symptoms={sym or 'none'}. "
+                        + (" " + " ".join(rx[:3]) if rx else "")
+                    )
+                    next_steps = ["Remediate upstream root-cause sensors/feeds", "Re-run drift check after remediation", "Register updated model"]
 
             elif _contains_word(msg, ("twin control", "mpc", "closed-loop", "closed loop", "receding horizon", "digital twin control")):
                 res = self.tools.invoke("twin_control", {"n_x": 2, "n_u": 1, "horizon": 10, "n_steps": 8, "dt": 1.0})

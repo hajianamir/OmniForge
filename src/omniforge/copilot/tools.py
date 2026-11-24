@@ -454,7 +454,7 @@ class CopilotToolRegistry:
             train_df = df.iloc[:cut].copy()
             test_df = df.iloc[cut:].copy()
             report = LeakageGuard.validate_split(
-                train_df, test_df, group_col=group_col, time_col=time_col,
+                train_df, test_df, group_col=group_col, time_col=time_col, target_col=target_col,
             )
             self.memory.working_state["reports"]["split_lock"] = report
             return report.model_dump()

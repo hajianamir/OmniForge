@@ -1,7 +1,7 @@
 platform:
   name: OmniForge
   short_name: OmniForge
-  version: "2.0.0"
+  version: "4.0.0"
   edition: Enterprise Analytics & AI Workbench
   environment: development
   debug: false
@@ -78,6 +78,13 @@ mlops:
   drift_psi_critical: 0.25
   drift_ks_alpha: 0.05
   retrain_on_critical_drift: true
+
+jobs:
+  max_workers: 4
+  max_queue_depth: 128
+  max_history: 128
+  worker_timeout_seconds: 120.0
+  db_path: null  # defaults to paths.workspace_dir/workbench_jobs.db
 
 security:
   enable_rbac: true

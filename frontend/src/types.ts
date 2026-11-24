@@ -118,6 +118,8 @@ export interface WorkspaceState {
   active_model_name: string | null;
   active_model_metrics: Record<string, number> | null;
   active_feature_cols: string[];
+  active_input_feature_cols?: string[];
+  active_input_feature_types?: Record<string, 'numeric' | 'categorical' | 'datetime'>;
   available_models_count?: number;
   supervisory_status?: 'IDLE' | 'NORMAL' | 'WARNING' | 'CRITICAL_ALARM' | string;
   studio_completed?: Record<string, boolean>;

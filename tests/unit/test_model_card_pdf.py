@@ -45,7 +45,10 @@ def _fairness_report() -> FairnessReport:
             kwargs[name] = "group_attr"
         elif name == "passed":
             kwargs[name] = False
-        elif field.annotation in (float, "float"):
+        elif field.annotation in (float, "float") or str(field.annotation) in (
+            "float | None",
+            "typing.Optional[float]",
+        ):
             kwargs[name] = 0.5
     return FairnessReport(**kwargs)
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import io
-import math
 from typing import Any
 
 import numpy as np
@@ -11,6 +10,7 @@ import pandas as pd
 from fastapi import APIRouter, File, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
+from omniforge.api.jobs import JobCancellationToken, JobQueueFullError
 from omniforge.api.studios.schemas import (
     AutoMLRunReq,
     DeepBenchReq,
@@ -21,6 +21,7 @@ from omniforge.api.studios.schemas import (
 from omniforge.automl.backends import AutoMLBackendHub, probe_automl_backends
 from omniforge.core.utils import to_json_object
 from omniforge.evaluation.equations import ModelEquationExtractor
+from omniforge.features.inference import WorkbenchInputPreprocessor
 from omniforge.models.baselines import BaselineBenchmarkSuite
 from omniforge.models.deep import (
     CNN1DModel,
@@ -60,10 +61,12 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
     train_df, _test_df, _lock = _wb().get_active_split_frames(state, df)
     automl_source = train_df if (train_df is not None and not train_df.empty and _lock is not None) else df
 
-    def _execute() -> dict[str, Any]:
+    def _execute(*, cancellation_token: JobCancellationToken | None = None) -> dict[str, Any]:
         multi_target_summary: list[dict[str, Any]] = []
         if len(active_targets) > 1:
             for extra_t in active_targets[1:]:
+                if cancellation_token is not None:
+                    cancellation_token.checkpoint()
                 try:
                     Xt, yt, tt = _wb()._prepare_xy(automl_source, extra_t, raw_features=True)
                     wdf_t = Xt.copy()
@@ -88,7 +91,9 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
                     )
                 except Exception:
                     multi_target_summary.append({"target": extra_t, "task_type": "error", "best_model": None, "best_score": None})
-        X, y, task = _wb()._prepare_xy(automl_source, target, raw_features=True)
+        if cancellation_token is not None:
+            cancellation_token.checkpoint()
+        X, y, task, input_preprocessor = _wb()._prepare_xy_fitted(automl_source, target, raw_features=True)
         work_df = X.copy()
         work_df[target] = y.to_numpy()
         res = AutoMLBackendHub.run(
@@ -101,6 +106,8 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
             max_carbon_grams_co2e=req.max_carbon_grams_co2e,
             max_inference_latency_ms=req.max_inference_latency_ms,
         )
+        if cancellation_token is not None:
+            cancellation_token.checkpoint()
         eq_dict: dict[str, Any] = {}
         try:
             eq_rep = ModelEquationExtractor.extract(
@@ -133,6 +140,9 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
                 r_copy["rationale"] = f"Trailed champion by {res.best_score - r_score:.4f} on {res.primary_metric}."
             ranked_lb.append(r_copy)
 
+        # Once model publication begins, cancellation is no longer accepted.
+        if cancellation_token is not None:
+            cancellation_token.begin_commit()
         state["uap_active_model"] = res.best_model
         state["uap_active_model_name"] = f"{res.best_model_name} ({res.executed_backend})"
         state["uap_active_model_metrics"] = {
@@ -141,6 +151,7 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
             "lift_over_baseline": res.lift_over_best_baseline,
         }
         state["uap_active_feature_cols"] = list(X.columns)
+        state["uap_active_input_preprocessor"] = input_preprocessor
         state["uap_active_X_test"] = X.iloc[-min(len(X), 400) :]
         state["uap_active_y_test"] = y.iloc[-min(len(y), 400) :]
         state["uap_automl"] = res
@@ -175,7 +186,10 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
 
     if req.async_job:
         owner = _wb().current_job_owner_key() or "default"
-        rec = _wb().job_manager.submit(f"AutoML ({req.backend})", _execute, owner_key=owner)
+        try:
+            rec = _wb().job_manager.submit(f"AutoML ({req.backend})", _execute, owner_key=owner, cancellable=True)
+        except JobQueueFullError as exc:
+            raise HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": "5"}) from exc
         return {"job": rec.to_dict()}
     return _execute()
 
@@ -265,7 +279,7 @@ def s06_run_nonparametric_analytical(
     target = req.target if (req.target and req.target in df.columns) else (targets[0] if targets else None)
     if not target:
         raise HTTPException(status_code=400, detail="Select a target column first.")
-    X, y, task = _wb()._prepare_xy(df, target)
+    X, y, task, input_preprocessor = _wb()._prepare_xy_fitted(df, target)
     if len(X) < 12 or X.shape[1] < 1:
         raise HTTPException(status_code=400, detail="Non-parametric analytical modeling requires at least 12 rows and 1 predictor.")
 
@@ -313,6 +327,7 @@ def s06_run_nonparametric_analytical(
             "parametric_reference": float(res.get("parametric_reference_score", 0.0)),
         }
         state["uap_active_feature_cols"] = feat_cols
+        state["uap_active_input_preprocessor"] = input_preprocessor
         state["uap_active_X_test"] = X.iloc[-min(len(X), 400) :]
         state["uap_active_y_test"] = y.iloc[-min(len(y), 400) :]
 
@@ -417,6 +432,21 @@ def s06_run_deep_benchmark(req: DeepBenchReq, x_session_id: str | None = Header(
     )
 
 
+def _prediction_frame(state: dict[str, Any], frame: pd.DataFrame) -> pd.DataFrame:
+    """Use the exact raw-input preparation retained by the active training run."""
+    preprocessor = state.get("uap_active_input_preprocessor")
+    if isinstance(preprocessor, WorkbenchInputPreprocessor):
+        try:
+            return preprocessor.transform(frame)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    # Older saved workspaces may only contain already-encoded numeric feature names.
+    # Preserve their historic scoring behavior until they are retrained.
+    feat_cols = state.get("uap_active_feature_cols") or []
+    aligned = frame.reindex(columns=feat_cols)
+    return aligned.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
 @router.post("/s06/predict-single")
 def s06_predict_single(req: SinglePredictReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _wb()._sid(x_session_id)
@@ -425,19 +455,13 @@ def s06_predict_single(req: SinglePredictReq, x_session_id: str | None = Header(
     feat_cols = state.get("uap_active_feature_cols") or []
     if model is None or not feat_cols:
         raise HTTPException(status_code=400, detail="Train a model in Studio 06 first before scoring.")
-    row: dict[str, Any] = {}
-    for c in feat_cols:
-        val = req.record.get(c, 0.0)
-        if val is None or val == "":
-            row[c] = 0.0
-        else:
-            try:
-                fval = float(val)
-                row[c] = fval if math.isfinite(fval) else 0.0
-            except (TypeError, ValueError):
-                row[c] = 0.0
-    row_df = pd.DataFrame([row])
-    pred = model.predict(row_df)[0]
+    if any(isinstance(value, (list, dict)) for value in req.record.values()):
+        raise HTTPException(status_code=422, detail="Prediction values must be scalar.")
+    row_df = _prediction_frame(state, pd.DataFrame([req.record]))
+    try:
+        pred = model.predict(row_df)[0]
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"Unable to score the provided features: {exc}") from exc
     proba = None
     if hasattr(model, "predict_proba"):
         try:
@@ -465,18 +489,21 @@ async def s06_predict_batch(
     if model is None or not feat_cols:
         raise HTTPException(status_code=400, detail="Train a model in Studio 06 before batch scoring.")
     raw = await _wb().read_upload_bounded(file)
-    inc_df = pd.read_csv(io.BytesIO(raw))
+    try:
+        # Preserve raw category strings (e.g. "NA" or "001") exactly as single-record
+        # JSON does; the fitted schema parses numeric and datetime columns afterward.
+        inc_df = pd.read_csv(io.BytesIO(raw), dtype=str, keep_default_na=False)
+    except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid CSV: {exc}") from exc
+    if inc_df.empty:
+        raise HTTPException(status_code=400, detail="The CSV must contain at least one record.")
     ref_df = state.get("uap_df")
     target = (_wb().get_selected_targets(state, ref_df) or ["target"])[0]
-    aligned = pd.DataFrame(
-        {
-            c: pd.to_numeric(inc_df[c], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
-            if c in inc_df.columns
-            else 0.0
-            for c in feat_cols
-        }
-    )
-    preds = model.predict(aligned)
+    aligned = _prediction_frame(state, inc_df)
+    try:
+        preds = model.predict(aligned)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"Unable to score the provided features: {exc}") from exc
     scored = inc_df.copy()
     scored[f"predicted_{target}"] = preds
     state["uap_future_prediction_result"] = {"n_rows": len(scored), "preview": scored.head(100).to_dict(orient="records"), "scored_df": scored}

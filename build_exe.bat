@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul 2>&1
-title OmniForge v2.0.0 - Standalone .exe Builder
+title OmniForge v4.0.0 - Standalone .exe Builder
 
 set "ROOT_DIR=%~dp0"
 if "%ROOT_DIR:~-1%"=="\" set "ROOT_DIR=%ROOT_DIR:~0,-1%"
@@ -71,7 +71,7 @@ goto :parse_args
 :show_help
 echo.
 echo ============================================================================
-echo   OmniForge v2.0.0 - .exe Builder Help
+echo   OmniForge v4.0.0 - .exe Builder Help
 echo ============================================================================
 echo Usage: build_exe.bat [options]
 echo.
@@ -100,7 +100,7 @@ if not exist "%VENV_PY%" (
 
 if not defined BUILD_MODE (
     echo ============================================================================
-    echo   OmniForge v2.0.0 - Build Standalone Windows .exe
+    echo   OmniForge v4.0.0 - Build Standalone Windows .exe
     echo ============================================================================
     echo.
     echo   [1] Directory Bundle - dist\OmniForge\OmniForge.exe ^(Recommended: fast startup^)

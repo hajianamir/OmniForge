@@ -6,6 +6,7 @@ import contextvars
 import hashlib
 import hmac
 import secrets
+import time
 from collections.abc import Callable
 
 from fastapi import Depends, Header, HTTPException, Request, Response, status
@@ -116,8 +117,8 @@ def _verify_workbench_cookie_token(cookie_value: str) -> bool:
             return False
         nonce, timestamp_str, mac = parts
         ts = int(timestamp_str)
-        now = int(__import__("time").time())
-        if now - ts > _WORKBENCH_COOKIE_MAX_AGE:
+        now = int(time.time())
+        if ts > now or now - ts > _WORKBENCH_COOKIE_MAX_AGE:
             return False
         key_bytes = get_api_key().encode("utf-8")
         material = b"\x00".join(
@@ -133,8 +134,8 @@ def issue_local_workbench_cookies(response: Response, *, secure: bool = False) -
     """Attach HttpOnly SameSite=Strict auth + CSRF double-submit cookies for local SPA bootstrap.
 
     The auth cookie now includes a per-issuance session nonce, an issuance timestamp,
-    and an 8-hour max_age, so it is not static and expires. The CSRF token is bound
-    to the same issuance.
+    and an 8-hour max_age, so it is not static and expires. The CSRF token is an
+    independent double-submit value (not cryptographically bound to the auth issuance).
     """
     session_nonce = secrets.token_urlsafe(16)
     wb_token = _derive_workbench_cookie_token(session_id=session_nonce)

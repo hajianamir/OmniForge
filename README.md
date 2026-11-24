@@ -14,7 +14,7 @@ v4.0.0 is a major SemVer bump from 3.3.0. It delivers three contracted capabilit
 |---|------|------------------|----------------|
 | **C5 — Causal Drift Root-Cause Attribution** | `DriftRootCauseAnalyzer` + `CausalDiscovery` | Connects `DriftDetector` PSI/Wasserstein shifts → Delta-attribution per drifted feature → structural DAG upstream-ancestor traversal to isolate root-cause upstream sensor/source shifts from downstream correlated symptoms; emits remediation prescriptions | `src/omniforge/mlops/root_cause.py`; Studios 11 (`/s11/root-cause`) & 14 (`/s14/root-cause`) |
 | **C7 — Closed-Loop Digital Twin MPC** | `ClosedLoopMPCController` | Constrained receding-horizon quadratic control `argmin ||Hx̂−r||_Q² + ||u||_R²` subject to input/state safety bounds via SLSQP; constraint softening with slack variables, solve-time tracking, warm-start alignment, R-matrix dimension fix, bounded relaxation fallback; exposed via `POST /s09/twin-control` with interactive trajectory charts | `src/omniforge/simulation/closed_loop.py`; Studio 09 (`/s09/twin-control`) |
-| **C4 — Air-Gapped Deterministic Copilot** | `CopilotToolRegistry` + `_chat_local_planner` | 12 new deterministic offline tools spanning all 15 Studios: intake/PII auditing (`pii_audit`), Split Lock enforcement (`split_lock`), honest data cleaning, 18-domain validation (`domain_validate`), Green-AI Pareto AutoML (`pareto_automl`), causal root-cause diagnosis (`root_cause_diagnosis`), closed-loop twin control (`twin_control`), model register/promote (`register_model`/`promote_model`), studio listing/overview (`list_studios`/`studio_overview`) | `src/omniforge/copilot/tools.py`; Studio 13 (`/s13/chat`) |
+| **C4 — Air-Gapped Deterministic Copilot** | `CopilotToolRegistry` + `_chat_local_planner` | 10 new deterministic offline tools spanning all 15 Studios: intake/PII auditing (`pii_audit`), Split Lock enforcement (`split_lock`), honest data cleaning, 18-domain validation (`domain_validate`), Green-AI Pareto AutoML (`pareto_automl`), causal root-cause diagnosis (`root_cause_diagnosis`), closed-loop twin control (`twin_control`), model register/promote (`register_model`/`promote_model`), studio listing/overview (`list_studios`/`studio_overview`) | `src/omniforge/copilot/tools.py`; Studio 13 (`/s13/chat`) |
 | **Version Alignment** | `pyproject.toml`, `src/omniforge/version.py` | Canonical SemVer 3.3.0 → 4.0.0 across SDK, pyproject.toml, native hubs, exporters, SPA manifests, and tests | All packages |
 
 **Also included (bug-fix and hardening commits merged into v4.0.0):**
@@ -40,7 +40,7 @@ v4.0.0 is a major SemVer bump from 3.3.0. It delivers three contracted capabilit
 | **Evaluation & Responsible AI** | `omniforge.evaluation` | Comprehensive metrics, stratified/group/purged/combinatorial-purged CV, walk-forward backtesting, Permutation/SHAP/LIME/PDP/Counterfactual explainability, Fairness auditing & Kamiran-Calders mitigation, Conformal Prediction & Adversarial Robustness, automated Model Cards & Data Cards |
 | **AutoML & Pipelines** | `omniforge.automl`, `omniforge.pipelines` | GP-UCB Bayesian/Optuna/Random/Grid HPO, baseline-first `AutoMLPipelineSearch`, evolutionary NAS; Fluent & YAML `PipelineBuilder`, cycle-checked `PipelineDAG` (Mermaid & Python export), `PipelineExecutor` with caching & retries |
 | **MLOps** | `omniforge.mlops` | SQLite MLflow-compatible `ExperimentTracker`, semantic-versioned `ModelRegistry` (None/Staging/Production/Archived), `ModelServingEngine` (canary A/B routing + latency telemetry), `DriftDetector` (PSI/KS/Wasserstein/JS/Chi2/Page-Hinkley), `ModelMonitor`, `ContinuousTrainingOrchestrator`, **C5 `DriftRootCauseAnalyzer`** |
-| **AI Copilot & Domains** | `omniforge.copilot`, `omniforge.domains` | Multi-turn `OmniForgeCopilotAgent` (OpenAI, Anthropic, Azure, Ollama + offline deterministic planner) wired to 26+ platform tools including 12 Phase 6 C4 tools; Plugin SDK + 18 ready industry plugins |
+| **AI Copilot & Domains** | `omniforge.copilot`, `omniforge.domains` | Multi-turn `OmniForgeCopilotAgent` (OpenAI, Anthropic, Azure, Ollama + offline deterministic planner) wired to 24 platform tools including 10 Phase 6 C4 tools; Plugin SDK + 18 ready industry plugins |
 | **API, UI, CLI & Reporting** | `omniforge.api`, `omniforge.ui`, `omniforge.cli`, `omniforge.reporting` | FastAPI REST backend with JWT/RBAC, **15-studio CRISP-DM FastAPI + React TypeScript Workbench** (s00–s14), Rich Typer CLI, one-click export to HTML, PDF, DOCX, PPTX, XLSX, CSV, Markdown, JSON, Jupyter Notebook (.ipynb), and Docker Microservice Bundle |
 
 ---
@@ -75,7 +75,7 @@ OmniForge ships with complete Windows automation scripts and PyInstaller/Inno Se
 
 - **`install.bat`** — Detects Python 3.12–3.15 (latest stable: Python 3.15.2 / 3.14.10; offers automatic `winget` installation if absent), checks Visual C++ runtime prerequisites, creates an isolated `.venv`, installs the latest 2026 runtime & build dependencies, initializes `.env` and `packaging/assets/omniforge.ico`, verifies all 18 industry domain plugins, optionally builds standalone `OmniForge.exe` / `OmniForge-CLI.exe`, and creates a Windows Desktop shortcut.
 - **`start.bat`** — Enterprise Launch Center with interactive menu and direct CLI flags (`--full`, `--ui`, `--api`, `--exe`, `--cli`, `--check`, `--test`). Launches both the FastAPI REST API (`:8000/docs`) and FastAPI + React Enterprise Workbench (`:8501`) and automatically opens your browser.
-- **`build_exe.bat`** — Builds or rebuilds standalone Windows executables (`dist\\OmniForge\\OmniForge.exe` in fast `--onedir` mode or `dist\\OmniForge.exe` in single-file `--onefile` mode, plus optional `OmniForge-CLI.exe` and Inno Setup 6 Windows installer `OmniForge-1.0.0-Enterprise-Setup.exe`) with embedded Windows PE version metadata, multi-size icon, and `dist\\SHA256SUMS.txt`.
+- **`build_exe.bat`** — Builds or rebuilds standalone Windows executables (`dist\\OmniForge\\OmniForge.exe` in fast `--onedir` mode or `dist\\OmniForge.exe` in single-file `--onefile` mode, plus optional `OmniForge-CLI.exe` and Inno Setup 6 Windows installer `OmniForge-4.0.0-Enterprise-Setup.exe`) with embedded Windows PE version metadata, multi-size icon, and `dist\\SHA256SUMS.txt`.
 
 ```bat
 REM 1. Interactive full installation + optional .exe build
@@ -116,7 +116,7 @@ pip install --require-hashes -r requirements.lock
 pip install -e . --no-deps
 ```
 
-`requirements.in` (floating minimums) is the source of truth for intent; `requirements.lock` (89 pinned distributions, sha256 hashes) and `requirements-build.lock` (build toolchain) are the generated, committed deployment artifacts — `requirements.txt` / `requirements-build.txt` are thin compatibility shims that include the locks, so `pip install -r requirements.txt` is now hash-checked too. CI verifies the lock on every PR (`lock-verify` job). Regenerate after touching the `.in` files — do not edit locks by hand:
+`requirements.in` (floating minimums) is the source of truth for intent; `requirements.lock` (90 pinned distributions, sha256 hashes) and `requirements-build.lock` (build toolchain) are the generated, committed deployment artifacts — `requirements.txt` / `requirements-build.txt` are thin compatibility shims that include the locks, so `pip install -r requirements.txt` is now hash-checked too. CI verifies the lock on every PR (`lock-verify` job). Regenerate after touching the `.in` files — do not edit locks by hand:
 
 ```bash
 uv pip compile requirements.in --generate-hashes --python-version 3.12 --universal -o requirements.lock
@@ -155,8 +155,8 @@ print(f"Champion: {automl.best_model_name} | Lift over best baseline: {automl.li
 from omniforge.mlops import DriftRootCauseAnalyzer
 ref = df_clean.sample(n=200, random_state=1)
 cur = df_clean.sample(n=200, random_state=2)
-cur["source"] = cur["source"] + 1.5  # inject upstream shift
-rc_report = DriftRootCauseAnalyzer().analyze(ref, cur, feature_cols=["source", "derived", "noise"])
+cur["income"] = cur["income"] + 1.5e5  # inject upstream shift
+rc_report = DriftRootCauseAnalyzer().analyze(ref, cur, feature_cols=["income", "debt", "credit_score"])
 print(f"Root causes: {rc_report.root_causes}")
 print(f"Symptoms: {rc_report.symptoms}")
 for rx in rc_report.remediation_prescriptions:

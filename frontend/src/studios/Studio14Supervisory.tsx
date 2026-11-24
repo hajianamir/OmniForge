@@ -3,6 +3,7 @@ import { AlertTriangle, CheckCircle2, Database, FileSpreadsheet, Play, ShieldAle
 import { apiDownload, apiGet, apiPost, apiUpload, toErrorMessage } from '../api';
 import { BarChartSVG, DivergingDriverBarSVG, SPCControlSVG, SupervisoryTrendSVG } from '../components/Charts';
 import { SimpleTable } from '../components/DataGrid';
+import { FeatureFreshnessPanel } from '../components/FeatureFreshnessPanel';
 import { StudioHelpButton } from '../components/HelpGuideModal';
 import { MathEquationCard } from '../components/MathEquation';
 import type {
@@ -350,6 +351,7 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
 
       {msg && <div className="alert alert-success">{msg}</div>}
       {err && <div className="alert alert-error">{err}</div>}
+      <FeatureFreshnessPanel />
 
       {/* 1. MODEL & BASELINE SELECTOR + INLINE QUICK-TRAIN */}
       <div className="card">

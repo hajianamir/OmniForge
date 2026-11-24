@@ -161,7 +161,7 @@ Follow this CRISP-DM sequence to guarantee zero data leakage, reproducible data 
 | **10** | **Studio 07 · Responsible AI** | Recommended | Run Global Permutation Importance, Local SHAP, Partial Dependence Plots (PDP), Fairness Audit, Model Card generation. | Verifies explainability, domain plausibility, and fairness compliance (Disparate Impact ≥ 0.80). |
 | **11** | **Studios 08–11 · Decision AI, Specialized AI, DAG & MLOps** | Conditional | Run Forecasting / Causal ATE / Markowitz / Monte Carlo (S08), NLP / Vision / Graph / RecSys / Survival + **C7 Twin MPC** (S09), DAG Pipeline (S10), or **Model Registry & PSI/KS Drift Monitor** + **C5 Root-Cause** (S11). | Extends analysis to forecasting, causal policy impact, unstructured modalities, and production governance. |
 | **12** | **Studio 12 · Executive Reporting & Export** | Mandatory | Select desired sections from 14 available chapters, preview narratives/tables/charts, export **PDF, XLSX, DOCX, HTML, Markdown, CSV, JSON, LaTeX**. | Compiles full end-to-end audit evidence into publication-ready deliverables. |
-| **13** | **Studio 13 · AI Copilot** | Operational | Ask the air-gapped deterministic Copilot in plain English: "profile data quality", "train automl", "root cause diagnosis", "twin control", "pii audit", "pareto automl", "register model", etc. | Executes real OmniForge analytics end-to-end offline via 26+ deterministic tools. |
+| **13** | **Studio 13 · AI Copilot** | Operational | Ask the air-gapped deterministic Copilot in plain English: "profile data quality", "train automl", "root cause diagnosis", "twin control", "pii audit", "pareto automl", "register model", etc. | Executes real OmniForge analytics end-to-end offline via 24 deterministic tools. |
 | **14** | **Studio 14 · Live Supervisory Control Room** | Operational | Choose Champion + Baseline models, set Tolerance Rules (`% Error`, `Abs Error`, `σ-Z`, `Baseline Ratio`, `Batch Breach %`), connect live CSV/XLSX/SQL/MS Access or Probe input, evaluate. | Monitors real-time operational accuracy, plots Actual vs Predicted vs Baseline SPC limits, triggers `HEALTHY` / `WARNING` / `CRITICAL_ALARM` LEDs, exports scored audit logs. **C5 Root-Cause** available at `/s14/root-cause`. |
 
 ### 4.1 Split Lock — Mandatory Before Cleaning for Predictive Modeling
@@ -308,7 +308,11 @@ Follow this CRISP-DM sequence to guarantee zero data leakage, reproducible data 
 
 **3. Paper-Grade Deep Learning:** FT-Transformer, TabNet, ResNet-Tabular, MLP, 1D-CNN, GCN, GAT, GraphSAGE with loss curves & feature importances.
 
-**4. Single-Row & Batch CSV Scoring.**
+**4. Single-Row & Batch CSV Scoring.** Models trained by Studio 06 retain a fitted input schema with the workspace. Both scoring endpoints accept the original columns, including categorical values and datetime-typed features, and apply the same input preparation and model-fitted encoding used in training. Blank or omitted inputs follow the model's missing-value handling; unknown categories follow the trained encoder's policy. Numeric-only workbench models retain fitted medians and category encodings. Invalid numeric/datetime values return a 422 error rather than silently becoming zero. Older saved workspaces without a fitted schema retain their legacy numeric scoring behavior until retrained.
+
+**Background AutoML jobs:** Set `async_job: true` on `POST /api/workbench/s06/automl`, then poll `GET /api/workbench/jobs/{job_id}` or list `GET /api/workbench/jobs`. Cancel via `POST /api/workbench/jobs/{job_id}/cancel`. Queued jobs cancel immediately; running AutoML jobs return 202 (`cancelling`) and stop at the next checkpoint before the model is published. A training step already in progress cannot be forcibly interrupted. Once publication begins, or for running jobs that do not opt into cooperative cancellation, the endpoint returns 409. A full queue returns 429 with `Retry-After`.
+
+Job status and JSON results are stored in SQLite (default `paths.workspace_dir/workbench_jobs.db`). Configure `OMNIFORGE_JOBS__MAX_WORKERS` (per process), `OMNIFORGE_JOBS__MAX_QUEUE_DEPTH` (shared waiting-job limit), `OMNIFORGE_JOBS__MAX_HISTORY` (terminal records), `OMNIFORGE_JOBS__WORKER_TIMEOUT_SECONDS`, and optionally `OMNIFORGE_JOBS__DB_PATH`. API workers must use the same settings and a shared filesystem with reliable SQLite locking. A vanished worker's queued/running jobs are marked failed after the lease expires; Python callables are **not** persisted or automatically resumed. Workspace datasets and active models remain process-local, so multi-worker workspace operations still require sticky routing or a separate shared workspace implementation. The separate `omniforge.mlops.job_queue.BackgroundJobQueue` helper remains in-memory.
 
 **External Deployment Formula Kit:** After AutoML completes, OmniForge extracts governing mathematical relationships and exposes:
 - Standalone Python (`.py`) — zero-dependency scoring function
@@ -412,6 +416,8 @@ subject to u_min ≤ u ≤ u_max
 
 **Drift Detection:** PSI, KS, Wasserstein, JS, Chi², Page-Hinkley. PSI thresholds: < 0.10 stable, 0.10–0.25 moderate, ≥ 0.25 major drift.
 
+**Feature-store freshness:** Studios 11 and 14 show a tenant-scoped snapshot from `GET /api/workbench/feature-store/freshness`, refreshed every minute. It reports online vector counts, currently expired vectors and per-view stale alerts. Timestamp parsing falls back from event time to materialization time, matching online TTL retrieval; unknown timestamps are counted separately and nonpositive TTL disables expiry. Counts are snapshots of records still in the online store, not cumulative expiration events, and exclude purged records. The default tenant uses `paths.feature_store_dir`; other tenants use their workspace-isolated feature-store directory.
+
 **✅ C5 — Causal Drift Root-Cause Attribution (Phase 6):**
 
 Endpoint: `POST /s11/root-cause`
@@ -453,7 +459,7 @@ Connects `DriftDetector` feature shifts → Delta-attribution per drifted featur
 
 **✅ C4 — Air-Gapped Deterministic Copilot Tools (Phase 6):**
 
-12 new deterministic offline tools:
+10 new deterministic offline tools:
 
 | Tool | Purpose | Key Parameters |
 |---|---|---|
@@ -714,11 +720,11 @@ Accepts `TwinControlReq`. Builds or reuses a cached Digital Twin, runs closed-lo
 
 ### 8.1 Overview
 
-The C4 Copilot (`src/omniforge/copilot/tools.py`) extends `CopilotToolRegistry` with 12 new deterministic offline tools. All tools execute without network access or third-party LLM dependency. The `OmniForgeCopilotAgent._chat_local_planner()` maps English natural-language keywords to these tools.
+The C4 Copilot (`src/omniforge/copilot/tools.py`) extends `CopilotToolRegistry` with 10 new deterministic offline tools. All tools execute without network access or third-party LLM dependency. The `OmniForgeCopilotAgent._chat_local_planner()` maps English natural-language keywords to these tools.
 
-### 8.2 All Copilot Tools (26+ total)
+### 8.2 All Copilot Tools (24 total)
 
-**Pre-Phase 6 Tools (16):**
+**Pre-Phase 6 Tools (14):**
 `ingest_data`, `generate_demo_data`, `profile_quality`, `clean_data`, `run_eda`, `train_automl`, `run_forecast`, `explain_model`, `audit_fairness`, `check_drift`, `run_causal`, `generate_pipeline_code`, `list_domains`, `workspace_status`
 
 **Phase 6 C4 Tools (10):**

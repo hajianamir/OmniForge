@@ -11,8 +11,8 @@ from typing import Any, Generic, TypeVar
 
 T = TypeVar("T")
 
-import numpy as np
-import pandas as pd
+import numpy as np  # noqa: E402  # deliberate: TypeVar shim must precede imports for py3.11 compat
+import pandas as pd  # noqa: E402  # deliberate: TypeVar shim must precede imports for py3.11 compat
 
 
 def parallel_n_jobs(cap: int = 8) -> int:
@@ -296,7 +296,7 @@ def paginate_dataframe(
 dataframe_fingerprint = compute_df_fingerprint
 
 
-class TTLCache(Generic[T]):
+class TTLCache(Generic[T]):  # noqa: UP046  # deliberate: Generic[T] subclass for py3.11 compat
     """Lightweight thread-safe LRU + TTL cache supporting arbitrary keyed values."""
 
     def __init__(self, max_entries: int = 128, ttl_seconds: float = 300.0) -> None:

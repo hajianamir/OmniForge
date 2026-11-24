@@ -37,9 +37,11 @@ from omniforge.data.connectors import (
     sql_inspect_database,
     sql_load_dataframe,
 )
+from omniforge.data.feature_store import LocalFeatureStore
 from omniforge.data.ingestion import DataIngestionEngine
 from omniforge.data.quality import DataQualityProfiler
 from omniforge.domains import default_domain_registry
+from omniforge.features.inference import WorkbenchInputPreprocessor
 from omniforge.mlops.registry import ModelRegistry
 from omniforge.mlops.supervisory_monitor import SupervisoryPredictionMonitor
 from omniforge.mlops.tracking import ExperimentTracker
@@ -91,6 +93,7 @@ _SHARED_TRACKER = ExperimentTracker()
 _TENANT_STORES_LOCK = threading.RLock()
 _TENANT_REGISTRIES: OrderedDict[str, ModelRegistry] = OrderedDict()
 _TENANT_TRACKERS: OrderedDict[str, ExperimentTracker] = OrderedDict()
+_TENANT_FEATURE_STORES: OrderedDict[str, LocalFeatureStore] = OrderedDict()
 _MAX_TENANT_STORES = 128
 
 
@@ -149,6 +152,28 @@ def get_tenant_tracker(principal: Principal | None = None) -> ExperimentTracker:
         while len(_TENANT_TRACKERS) > _MAX_TENANT_STORES:
             _TENANT_TRACKERS.popitem(last=False)
         return trk
+
+
+def get_tenant_feature_store(principal: Principal | None = None) -> LocalFeatureStore:
+    """Return the default or tenant-isolated feature store used by monitoring."""
+    from omniforge.config.settings import get_settings
+
+    p = principal if principal is not None else _current_principal()
+    tenant = str(getattr(p, "tenant_id", "") or "default-tenant") if p is not None else "default-tenant"
+    with _TENANT_STORES_LOCK:
+        if tenant in _TENANT_FEATURE_STORES:
+            _TENANT_FEATURE_STORES.move_to_end(tenant)
+            return _TENANT_FEATURE_STORES[tenant]
+        settings = get_settings()
+        path = (
+            settings.paths.feature_store_dir if tenant == "default-tenant"
+            else settings.paths.workspace_dir / "tenants" / _tenant_slug(tenant) / "feature_store"
+        )
+        store = LocalFeatureStore(repo_path=path)
+        _TENANT_FEATURE_STORES[tenant] = store
+        while len(_TENANT_FEATURE_STORES) > _MAX_TENANT_STORES:
+            _TENANT_FEATURE_STORES.popitem(last=False)
+        return store
 
 
 def parse_model_stage(raw_stage: str, *, error_status: int = 400) -> ModelStage:
@@ -309,6 +334,7 @@ def _state_summary(state: dict[str, Any], session_id: str) -> dict[str, Any]:
     deleted_log = state.get("uap_deleted_records_log") or []
     total_deleted = int(sum(int(entry.get("rows_removed", entry.get("rows_deleted", 0))) for entry in deleted_log))
     fmt_audit = state.get("uap_format_audit") or {}
+    input_preprocessor = state.get("uap_active_input_preprocessor")
 
     return to_json_object(
         {
@@ -341,6 +367,13 @@ def _state_summary(state: dict[str, Any], session_id: str) -> dict[str, Any]:
             "active_model_name": state.get("uap_active_model_name"),
             "active_model_metrics": state.get("uap_active_model_metrics"),
             "active_feature_cols": state.get("uap_active_feature_cols") or [],
+            "active_input_feature_cols": (
+                input_preprocessor.input_columns if isinstance(input_preprocessor, WorkbenchInputPreprocessor)
+                else state.get("uap_active_feature_cols") or []
+            ),
+            "active_input_feature_types": (
+                input_preprocessor.column_types if isinstance(input_preprocessor, WorkbenchInputPreprocessor) else {}
+            ),
             "available_models_count": len(SupervisoryPredictionMonitor.catalog_available_models(state)),
             "supervisory_status": (
                 state["uap_supervisory_result"].get("system_status", "IDLE")
@@ -416,6 +449,27 @@ def _prepare_xy(df: pd.DataFrame, target: str, *, raw_features: bool = False) ->
     if num_df.shape[1] == 0:
         raise HTTPException(status_code=400, detail="No usable predictor columns remain after excluding target.")
     return num_df, y, _infer_task(y)
+
+
+def _prepare_xy_fitted(
+    df: pd.DataFrame, target: str, *, raw_features: bool = False
+) -> tuple[pd.DataFrame, pd.Series, TaskType, WorkbenchInputPreprocessor]:
+    """Prepare training data and retain the fitted raw-input transformation for scoring."""
+    work = df.dropna(subset=[target]).copy()
+    if len(work) < 10:
+        raise HTTPException(status_code=400, detail=f"Target '{target}' has fewer than 10 non-null observations.")
+    raw = work.drop(columns=[target])
+    if raw.shape[1] == 0:
+        raise HTTPException(status_code=400, detail="No usable predictor columns remain after excluding target.")
+    try:
+        preprocessor = WorkbenchInputPreprocessor(mode="raw" if raw_features else "numeric").fit(raw)
+        prepared = preprocessor.transform(raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if prepared.shape[1] == 0:
+        raise HTTPException(status_code=400, detail="No usable predictor columns remain after excluding target.")
+    y = work[target]
+    return prepared, y, _infer_task(y), preprocessor
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +670,12 @@ async def load_workspace_uap(
     return to_json_object({"restored": info, "state": _state_summary(state, sid)})
 
 
+@router.get("/feature-store/freshness")
+def feature_store_freshness() -> dict[str, Any]:
+    """Return tenant-scoped, point-in-time TTL and stale-vector monitoring."""
+    return to_json_object(get_tenant_feature_store().freshness_report())
+
+
 @router.get("/jobs")
 def list_jobs() -> dict[str, Any]:
     return {"jobs": job_manager.list_recent(owner_key=current_job_owner_key(for_query=True))}
@@ -626,6 +686,23 @@ def poll_job(job_id: str) -> dict[str, Any]:
     rec = job_manager.get(job_id, owner_key=current_job_owner_key(for_query=True))
     if rec is None:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+    return rec.to_dict()
+
+
+@router.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str, response: Response) -> dict[str, Any]:
+    owner = current_job_owner_key(for_query=True)
+    status = job_manager.cancel(job_id, owner_key=owner)
+    if status is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+    if status == "cancelling":
+        response.status_code = 202
+    elif status != "cancelled":
+        raise HTTPException(status_code=409, detail=f"Job is {status}; cancellation is unavailable or already too late.")
+    rec = job_manager.get(job_id, owner_key=owner)
+    if rec is None:
+        # A concurrently completed job may trigger history pruning after cancellation.
+        return {"job_id": job_id, "status": status}
     return rec.to_dict()
 
 

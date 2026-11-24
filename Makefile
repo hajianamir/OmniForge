@@ -54,7 +54,7 @@ run-ui:
 	python -m omniforge.launcher --mode ui --host 0.0.0.0 --ui-port 8501 --no-browser
 
 docker-build:
-	docker build -f docker/Dockerfile -t omniforge-enterprise:2.0.0 .
+	docker build -f docker/Dockerfile -t omniforge-enterprise:4.0.0 .
 
 docker-up:
 	docker compose -f docker/docker-compose.yml up -d --build
