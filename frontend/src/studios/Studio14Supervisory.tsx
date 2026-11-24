@@ -8,8 +8,8 @@ import { StudioHelpButton } from '../components/HelpGuideModal';
 import { MathEquationCard } from '../components/MathEquation';
 import type {
   ExcelSheetsResponse,
-  JsonRow,
   EquationPayload,
+  JsonRow,
   RootCauseReport,
   SQLInspectResponse,
   StateEnvelope,
@@ -22,9 +22,6 @@ import type {
   TableInfo,
 } from '../studioTypes';
 import { ProvenancePill, type StudioProps } from './StudiosPart1';
-
-/** Shape consumed by `SPCControlSVG` (Shewhart chart points). */
-type SPCControlPoint = { index: number; record_id?: string; residual: number; z_score?: number; severity?: string };
 
 /**
  * Studio 14 — Live Prediction, Actual-vs-Baseline Evaluation, Configurable Error Tolerance,
@@ -74,14 +71,15 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
   const [singleInputs, setSingleInputs] = useState<Record<string, string>>({});
   const [singleActual, setSingleActual] = useState('');
 
-  // Results & History (hydrated immediately from studioCache + /s14/models)
-  const [localEvalRes, setLocalEvalRes] = useState<SupervisoryEvaluation | null>(null);
-  const evalRes = localEvalRes ?? studioCache.s14_supervisory ?? null;
-  const setEvalRes = (val: SupervisoryEvaluation) => {
-    setLocalEvalRes(val);
-    setStudioResult('s14_supervisory', val);
-  };
-  const [history, setHistory] = useState<JsonRow[]>(studioCache.s14_supervisory?.history || []);
+  // The shared cache is the single source of truth. A separate local copy
+  // would survive server invalidation or hide a restored project's result.
+  const evalRes = studioCache.s14_supervisory ?? null;
+  const setEvalRes = (val: SupervisoryEvaluation) => setStudioResult('s14_supervisory', val);
+  // Historical runs are independent of the current evaluation and can outlive
+  // its invalidation. Scope the catalog response to its workspace snapshot so
+  // an old project's ledger cannot flash after a restore.
+  const [historySnapshot, setHistorySnapshot] = useState<{ workspace: StudioProps['ws']; runs: JsonRow[] } | null>(null);
+  const history = evalRes?.history ?? (historySnapshot?.workspace === ws ? historySnapshot.runs : []);
   const [alarmFilter, setAlarmFilter] = useState<'ALL' | 'CRITICAL' | 'WARNING'>('ALL');
   const [selectedAlarmIdx, setSelectedAlarmIdx] = useState<number>(0);
   const [previewChampEq, setPreviewChampEq] = useState<EquationPayload | null>(null);
@@ -90,39 +88,43 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
-  const loadModels = async () => {
-    try {
-      const r = await apiGet<SupervisoryStatusResponse>('/api/workbench/s14/models');
-      const list = r.models || [];
-      setModels(list);
-      if (list.length && !selectedModelId) {
-        setSelectedModelId(list[0]?.model_id ?? '');
-      }
-      if (r.last_evaluation) setEvalRes(r.last_evaluation);
-      if (r.history) setHistory(r.history);
-    } catch {
-      // Ignore if no session yet
-    }
-  };
-
   useEffect(() => {
-    loadModels();
-  }, [ws.active_model_name, ws.available_models_count, ws.dataset_name]);
+    let current = true;
+    // Dataset and model identifiers can be identical in two restored projects,
+    // so a new workspace snapshot must also refresh the model catalog.
+    setModels([]);
+    setPreviewChampEq(null);
+    setPreviewBaseEq(null);
+    apiGet<SupervisoryStatusResponse>('/api/workbench/s14/models')
+      .then((r) => {
+        if (!current) return;
+        const list = r.models || [];
+        setModels(list);
+        setHistorySnapshot({ workspace: ws, runs: Array.isArray(r.history) ? r.history : [] });
+        setSelectedModelId((selected) => list.some((m) => m.model_id === selected) ? selected : (list[0]?.model_id ?? ''));
+        setSelectedBaselineId((selected) => list.some((m) => m.model_id === selected) ? selected : '');
+      })
+      .catch(() => {});
+    return () => { current = false; };
+  }, [ws]);
 
   useEffect(() => {
     if (!models.length) return;
     const mid = selectedModelId || models[0]?.model_id || '';
     if (!mid) return;
+    let current = true;
     const q = new URLSearchParams();
     q.set('model_id', mid);
     if (selectedBaselineId) q.set('baseline_model_id', selectedBaselineId);
     apiGet<SupervisoryStatusResponse>(`/api/workbench/s14/equations?${q.toString()}`)
       .then((r) => {
-        if (r?.champion_equation) setPreviewChampEq(r.champion_equation);
-        if (r?.baseline_equation) setPreviewBaseEq(r.baseline_equation);
+        if (!current) return;
+        setPreviewChampEq(r?.champion_equation ?? null);
+        setPreviewBaseEq(r?.baseline_equation ?? null);
       })
       .catch(() => {});
-  }, [selectedModelId, selectedBaselineId, models.length]);
+    return () => { current = false; };
+  }, [selectedModelId, selectedBaselineId, models]);
 
   useEffect(() => {
     if (ws.primary_target && !actualCol) setActualCol(ws.primary_target);
@@ -197,7 +199,7 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
       fd.append('max_batch_breach_rate_pct', String(t.max_batch_breach_rate_pct));
       fd.append('min_classification_accuracy_pct', String(t.min_classification_accuracy_pct));
       const res = await apiUpload<SupervisoryEvaluateResponse>('/api/workbench/s14/evaluate-file', fd);
-      onSync(res.state); setEvalRes(res); setHistory(res.history || []);
+      onSync(res.state); setEvalRes(res);
       setMsg(`Evaluated '${liveFile.name}' — Status: ${res.system_status} (${res.kpis?.breach_count ?? 0} tolerance breaches).`);
     } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
@@ -233,7 +235,7 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
         table_name: sqlQuery.trim() ? null : (sqlTable || null),
         query: sqlQuery.trim() || null,
       });
-      onSync(res.state); setEvalRes(res); setHistory(res.history || []);
+      onSync(res.state); setEvalRes(res);
       setMsg(`SQL Live Evaluation complete — Status: ${res.system_status} (${res.kpis?.breach_count ?? 0} breaches).`);
     } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
@@ -256,7 +258,7 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
         file_path: accessPath,
         table_name: accessTable,
       });
-      onSync(res.state); setEvalRes(res); setHistory(res.history || []);
+      onSync(res.state); setEvalRes(res);
       setMsg(`MS Access Live Evaluation complete — Status: ${res.system_status}.`);
     } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
@@ -270,7 +272,7 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
         inject_fault_pct: simFaultPct,
         noise_scale: simNoise,
       });
-      onSync(res.state); setEvalRes(res); setHistory(res.history || []);
+      onSync(res.state); setEvalRes(res);
       setMsg(`Supervisory evaluation complete — Status: ${res.system_status} (${res.kpis?.breach_count ?? 0} breaches, ${res.kpis?.warning_count ?? 0} warnings).`);
     } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
@@ -290,7 +292,7 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
         record: rec,
         actual_value: singleActual.trim() ? (Number.isNaN(Number(singleActual)) ? singleActual : Number(singleActual)) : null,
       });
-      onSync(res.state); setEvalRes(res); setHistory(res.history || []);
+      onSync(res.state); setEvalRes(res);
       setMsg(`Single reading evaluated — Status: ${res.system_status}.`);
     } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
@@ -803,7 +805,7 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
               <SupervisoryTrendSVG points={evalRes.trend_series || []} />
             </div>
             <div className="card" style={{ marginBottom: 0 }}>
-              <SPCControlSVG points={(evalRes.spc_points || []) as SPCControlPoint[]} limits={evalRes.spc_limits || undefined} />
+              <SPCControlSVG points={evalRes.spc_points || []} limits={evalRes.spc_limits || undefined} />
             </div>
           </div>
 
@@ -893,6 +895,7 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
       {history.length > 0 && (
         <div className="card">
           <div className="card-title">Longitudinal Supervisory Evaluation History ({history.length} runs)</div>
+          <p style={{ fontSize: 12, color: 'var(--text-muted)' }}>Past runs are historical; their model or study scope may differ from the current evaluation.</p>
           <SimpleTable title="Supervisory Monitoring Run Ledger" rows={history} maxRows={30} />
         </div>
       )}

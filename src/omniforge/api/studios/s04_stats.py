@@ -49,7 +49,9 @@ def s04_run_eda(x_session_id: str | None = Header(default="default")) -> dict[st
             )
     corr_matrix: dict[str, Any] = {"columns": [], "values": []}
     if len(num_cols) >= 2:
-        cm = sample_df[num_cols].corr(numeric_only=True).fillna(0.0)
+        # Undefined correlations (e.g. constant columns) are not zero.
+        # JSON serialization converts the resulting NaNs to null.
+        cm = sample_df[num_cols].corr(numeric_only=True)
         corr_matrix = {"columns": list(cm.columns), "values": np.round(cm.to_numpy(dtype=float), 3).tolist()}
 
     missing_bars = [

@@ -345,28 +345,26 @@ def compact_scatter_payload(
     max_points: int = 5000,
     random_seed: int = 42,
 ) -> dict[str, Any]:
-    """Produce a compact, rounded JSON scatter payload capped at ``max_points`` for 60fps Canvas rendering."""
+    """Produce a compact scatter payload, omitting non-finite coordinate pairs rather than inventing zeros."""
     x_arr = np.asarray(x, dtype=float).ravel()
     y_arr = np.asarray(y, dtype=float).ravel()
     n = min(len(x_arr), len(y_arr))
     x_arr, y_arr = x_arr[:n], y_arr[:n]
-    g_arr = np.asarray(groups).ravel()[:n] if groups is not None else None
+    g_arr = np.asarray(groups, dtype=object).ravel()[:n] if groups is not None else None
 
-    downsampled = n > max_points
+    indices = np.flatnonzero(np.isfinite(x_arr) & np.isfinite(y_arr))
+    downsampled = len(indices) > max_points
     if downsampled:
         rng = np.random.default_rng(random_seed)
-        idx = np.sort(rng.choice(n, size=max_points, replace=False))
-        x_arr = x_arr[idx]
-        y_arr = y_arr[idx]
-        if g_arr is not None:
-            g_arr = g_arr[idx]
+        indices = np.sort(rng.choice(indices, size=max_points, replace=False))
+    selected_groups = [g_arr[i] if i < len(g_arr) else None for i in indices] if g_arr is not None else None
 
     return {
-        "x": np.round(np.nan_to_num(x_arr, nan=0.0, posinf=0.0, neginf=0.0), 4).tolist(),
-        "y": np.round(np.nan_to_num(y_arr, nan=0.0, posinf=0.0, neginf=0.0), 4).tolist(),
-        "groups": g_arr.tolist() if g_arr is not None else None,
+        "x": np.round(x_arr[indices], 4).tolist(),
+        "y": np.round(y_arr[indices], 4).tolist(),
+        "groups": selected_groups,
         "total_points": int(n),
-        "rendered_points": int(len(x_arr)),
+        "rendered_points": int(len(indices)),
         "downsampled": bool(downsampled),
     }
 

@@ -471,7 +471,7 @@ export const Studio07Responsible: React.FC<StudioProps> = ({ ws, studioCache, se
       {err && <div className="alert alert-error">{err}</div>}
       <div className="grid-2">
         <div className="card">
-          <div className="card-title">Global &amp; Local SHAP Attribution</div>
+          <div className="card-title">Global Permutation Importance &amp; Local Explanation</div>
           <div className="row" style={{ marginBottom: 12 }}>
             <label className="field">Instance Index
               <input type="number" min={0} value={rowIdx} onChange={(e) => setRowIdx(Number(e.target.value))} style={{ width: 90 }} />
@@ -479,7 +479,14 @@ export const Studio07Responsible: React.FC<StudioProps> = ({ ws, studioCache, se
             <button className="btn btn-primary" disabled={busy || !ws.active_model_name} onClick={runExplain}>Run Explainability</button>
           </div>
           {expRes?.global_importance && (
-            <BarChartSVG horizontal items={Object.entries(expRes.global_importance).map(([k, v]) => ({ label: k, value: Number(v) }))} />
+            <BarChartSVG
+              title="Global Permutation Importance"
+              horizontal
+              items={Object.entries(expRes.global_importance).flatMap(([label, entry]) => {
+                const value = typeof entry === 'number' ? entry : entry?.importance_mean;
+                return typeof value === 'number' && Number.isFinite(value) ? [{ label, value }] : [];
+              })}
+            />
           )}
         </div>
         <div className="card">

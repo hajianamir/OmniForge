@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { apiDelete, apiDownload, apiGet, apiPost, apiUpload, toErrorMessage } from '../api';
 import { BarChartSVG, CanvasScatter, HeatmapGrid } from '../components/Charts';
 import { PaginatedDataGrid, SimpleTable } from '../components/DataGrid';
@@ -6,6 +6,7 @@ import { StudioHelpButton, type HandbookSectionId } from '../components/HelpGuid
 import { MathEquationCard, type EquationEntry } from '../components/MathEquation';
 import { ModeBar, type ExecutionMode } from '../components/ModeBar';
 import type {
+  AdvancedMiningResponse,
   AnomalyResponse,
   CleanResponse,
   ClusteringCommitResponse,
@@ -74,26 +75,32 @@ export const Studio00Ingestion: React.FC<StudioProps> = (props) => {
     pairs: Array<{ feature_a: string; feature_b: string; pearson: number; spearman: number; dcor: number; relationship_type: string }>;
   } | null>(null);
   const [relBusy, setRelBusy] = useState(false);
+  const relationshipRequest = useRef(0);
 
   const loadRelationships = async () => {
+    const request = ++relationshipRequest.current;
     setRelBusy(true);
     try {
       const res = await apiGet<typeof relData>('/api/workbench/s00/data_relationships');
-      setRelData(res);
+      if (request === relationshipRequest.current) setRelData(res);
     } catch {
-      setRelData(null);
+      if (request === relationshipRequest.current) setRelData(null);
     } finally {
-      setRelBusy(false);
+      if (request === relationshipRequest.current) setRelBusy(false);
     }
   };
 
   useEffect(() => {
+    // Dataset replacements and edits can retain the same target/exclusion
+    // names. Clear and recompute the relationship chart on every grid change.
+    setRelData(null);
     if (props.ws.has_dataset) {
       void loadRelationships();
     } else {
-      setRelData(null);
+      setRelBusy(false);
     }
-  }, [props.ws.has_dataset, props.ws.targets.join(','), props.ws.excluded_columns.join(',')]);
+    return () => { relationshipRequest.current += 1; };
+  }, [props.gridVersion, props.ws.has_dataset, props.ws.targets.join(','), props.ws.excluded_columns.join(',')]);
 
   return (
     <div>
@@ -790,6 +797,12 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
   const [minConf, setMinConf] = useState(0.55);
   const [minLift, setMinLift] = useState(1.1);
   const mineRes = studioCache.s02_mining ?? null;
+  const manifold = mineRes?.manifold;
+  const explainedPct = typeof manifold?.total_explained_pct === 'number' && Number.isFinite(manifold.total_explained_pct)
+    ? manifold.total_explained_pct
+    : manifold?.explained_variance_ratio?.every(Number.isFinite)
+      ? manifold.explained_variance_ratio.reduce((sum, value) => sum + value, 0) * 100
+      : undefined;
 
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
@@ -827,7 +840,12 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
         attach_cluster_id: attachAfterDrop,
       });
       onSync(res.state);
-      if (clRes) {
+      if (res.result) {
+        setStudioResult('s02_clustering', { ...res.result, state: res.state });
+      } else if (res.result === null) {
+        setStudioResult('s02_clustering', null);
+      } else if (clRes && (!Array.isArray(res.state.cached_result_keys) || res.state.cached_result_keys.includes('s02_clustering'))) {
+        // Compatibility with older servers that only returned the commit summary.
         setStudioResult('s02_clustering', {
           ...clRes,
           cluster_choices: res.remaining_cluster_choices ?? clRes.cluster_choices,
@@ -859,12 +877,12 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
     try {
       const res = await apiPost<AnomalyCommitResponse>('/api/workbench/s02/anomaly/commit', { mode });
       onSync(res.state);
-      if (anRes) {
-        setStudioResult('s02_anomaly', {
-          ...anRes,
-          committed_action: res.action,
-          n_anomalies: mode === 'remove_anomalies' ? 0 : anRes.n_anomalies,
-        });
+      if (res.result) {
+        setStudioResult('s02_anomaly', { ...res.result, state: res.state });
+      } else if (res.result === null) {
+        setStudioResult('s02_anomaly', null);
+      } else if (anRes && (!Array.isArray(res.state.cached_result_keys) || res.state.cached_result_keys.includes('s02_anomaly'))) {
+        setStudioResult('s02_anomaly', { ...anRes, committed_action: res.action, committed_mode: mode });
       }
       bumpGrid();
       setMsg(`Committed: ${res.action}. Active dataset now has ${Number(res.rows_after ?? 0).toLocaleString()} rows.`);
@@ -875,14 +893,17 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
     setMineTasks((prev) => (prev.includes(t) ? prev.filter((x) => x !== t) : [...prev, t]));
   };
 
-  const [advMineRes, setAdvMineRes] = useState<Record<string, unknown> | null>(null);
+  // Like the other dataset-dependent results, this must follow server cache
+  // invalidation and workspace restore rather than living in component state.
+  const advMineRes = studioCache.s02_advanced_mining ?? null;
 
   const runAdvancedMining = async () => {
     setBusy(true);
     setErr(null);
     try {
-      const res = await apiPost<Record<string, unknown>>('/api/workbench/s02/advanced_mining', {});
-      setAdvMineRes(res);
+      const { state, ...result } = await apiPost<AdvancedMiningResponse>('/api/workbench/s02/advanced_mining', {});
+      onSync(state);
+      setStudioResult('s02_advanced_mining', result);
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : 'Advanced mining failed');
     } finally {
@@ -980,6 +1001,11 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
                 <span>Clustering Preview — Winner: {clRes.algorithm} ({clRes.n_clusters} clusters, {clRes.noise_count} noise pts)</span>
                 <span className="badge badge-accent">Silhouette = {Number(clRes.metrics?.silhouette ?? 0).toFixed(4)}</span>
               </div>
+              {clRes.committed_action && (
+                <div className="alert alert-warn" role="status">
+                  This chart, its counts and metrics show the original pre-commit preview. Cluster choices below reflect remaining rows.
+                </div>
+              )}
 
               {(clRes.algorithm_benchmark?.length ?? 0) > 1 && (
                 <div style={{ marginBottom: 14 }}>
@@ -987,7 +1013,11 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
                 </div>
               )}
 
-              <CanvasScatter title={`Cluster Map (${clRes.algorithm})`} data={clRes.scatter ?? EMPTY_SCATTER} xLabel="PCA 1" yLabel="PCA 2" />
+              {clRes.scatter_error ? (
+                <div className="alert alert-error">{clRes.scatter_error}</div>
+              ) : (
+                <CanvasScatter title={`Cluster Map (${clRes.algorithm})`} data={clRes.scatter ?? EMPTY_SCATTER} xLabel="PCA 1" yLabel="PCA 2" />
+              )}
 
               {/* FIXED INTERACTIVE CLUSTER SELECTION & REMOVAL PANEL */}
               <div style={{ marginTop: 14, padding: 14, background: 'var(--bg)', borderRadius: 10, border: '1px solid var(--border)' }}>
@@ -1077,10 +1107,15 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
               <div className="card-title">
                 <span>Detected Anomalies: {anRes.n_anomalies} ({anRes.anomaly_rate_pct}%) · Method: {anRes.method}</span>
                 <div className="row">
-                  <button className="btn btn-success btn-sm" onClick={() => commitAnomaly('attach')}>Attach is_anomaly &amp; Score</button>
-                  <button className="btn btn-danger btn-sm" onClick={() => commitAnomaly('remove_anomalies')}>Remove {anRes.n_anomalies} Anomalies</button>
+                  <button className="btn btn-success btn-sm" disabled={busy || anRes.committed_mode === 'remove_anomalies'} onClick={() => commitAnomaly('attach')}>Attach is_anomaly &amp; Score</button>
+                  <button className="btn btn-danger btn-sm" disabled={busy || anRes.committed_mode === 'remove_anomalies'} onClick={() => commitAnomaly('remove_anomalies')}>Remove {anRes.n_anomalies} Anomalies</button>
                 </div>
               </div>
+              {anRes.committed_action && (
+                <div className="alert alert-warn" role="status">
+                  This chart and its anomaly counts show the original pre-commit preview. Run screening again for the current dataset.
+                </div>
+              )}
               {(anRes.detector_comparison?.length ?? 0) > 1 && (
                 <div style={{ marginBottom: 12 }}>
                   <SimpleTable title="Multi-Detector Anomaly Comparison" rows={anRes.detector_comparison || []} />
@@ -1148,17 +1183,16 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
 
           {mineRes && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-              {mineRes.manifold?.scatter && (
+              {manifold?.error && <div className="alert alert-error">Manifold projection failed: {manifold.error}</div>}
+              {manifold?.scatter && (
                 <div className="card">
                   <div className="card-title">
-                    <span>Manifold Embedding ({String(mineRes.manifold.method || manifoldMethod).toUpperCase()})</span>
-                    {mineRes.manifold.explained_variance_ratio && (
-                      <span className="badge badge-accent">
-                        Explained Variance: {(mineRes.manifold.explained_variance_ratio.reduce((a: number, b: number) => a + b, 0) * 100).toFixed(1)}%
-                      </span>
+                    <span>Manifold Embedding ({String(manifold.method || 'Projection').toUpperCase()})</span>
+                    {explainedPct !== undefined && (
+                      <span className="badge badge-accent">Explained Variance: {explainedPct.toFixed(1)}%</span>
                     )}
                   </div>
-                  <CanvasScatter title={`2D ${manifoldMethod.toUpperCase()} Manifold Projection`} data={mineRes.manifold.scatter ?? EMPTY_SCATTER} xLabel="Dim 1" yLabel="Dim 2" />
+                  <CanvasScatter title={`2D ${String(manifold.method || 'Projection').toUpperCase()} Manifold Projection`} data={manifold.scatter} xLabel={manifold.x_label || 'Dim 1'} yLabel={manifold.y_label || 'Dim 2'} />
                 </div>
               )}
               {mineRes.association_rules && (

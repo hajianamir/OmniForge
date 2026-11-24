@@ -52,3 +52,5 @@ locks/.requirements.*.txt
 # Frontend build tooling (lock-pinned; never commit dependencies)
 node_modules/
 frontend/dist/
+frontend/test-results/
+frontend/playwright-report/

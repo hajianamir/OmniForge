@@ -57,8 +57,12 @@ def s05_engineer_features(req: FeatureEngReq, x_session_id: str | None = Header(
         )
     fe = FeatureEngineeringPipeline(cfg)
     primary_target = next((t for t in _wb().get_selected_targets(state, df) if t in df.columns), None)
-    train_df, _test_df, _lock = _wb().get_active_split_frames(state, df)
-    split_locked = isinstance(train_df, pd.DataFrame) and not train_df.empty and all(c in train_df.columns for c in feat_cols)
+    train_df, _test_df, lock = _wb().get_active_split_frames(state, df)
+    split_locked = (
+        isinstance(lock, dict) and bool(lock.get("active"))
+        and isinstance(train_df, pd.DataFrame) and not train_df.empty
+        and all(c in train_df.columns for c in feat_cols)
+    )
     if split_locked:
         y_fit_fe = train_df[primary_target] if (primary_target and primary_target in train_df.columns) else None
         fe.fit(train_df[feat_cols], y_fit_fe)
@@ -79,6 +83,7 @@ def s05_engineer_features(req: FeatureEngReq, x_session_id: str | None = Header(
             action=f"Engineered {len(new_cols)} new features ({mode})",
             details=", ".join(new_cols[:8]),
             preserve_stage="s05_features",
+            row_index_preserved=True,  # concatenation retains the input row labels.
         )
     return wb_cache_and_respond(
         state,
@@ -155,8 +160,6 @@ def s05_select_features(req: FeatureSelReq, x_session_id: str | None = Header(de
         key=lambda r: float(str(r["score"])),
         reverse=True,
     )
-    state["uap_fs_selected_cols"] = selected
-    state["uap_fs_scores"] = scores
     if req.commit and selected:
         full_df = _wb()._require_df(state)
         target_set = set(targets) | {target}
@@ -186,17 +189,22 @@ def s05_select_features(req: FeatureSelReq, x_session_id: str | None = Header(de
                 reason=f"Feature selection kept top {len(selected)} highest-signal predictors.",
                 sample_identifiers=dropped[:10],
             )
-        # Actually drop the unselected columns from the active dataset
-        remaining_cols = [c for c in full_df.columns if c not in set(dropped)]
-        updated_df = full_df[remaining_cols].copy()
-        _wb().update_active_dataset(
-            state,
-            updated_df,
-            stage="Feature Selection",
-            action=f"Dropped {len(dropped)} unselected columns (commit)",
-            details=", ".join(dropped[:10]),
-            preserve_stage="s05_features",
-        )
+            # Only mutate the dataset when columns actually change; a no-op
+            # selection should not erase otherwise valid charts or create Undo.
+            remaining_cols = [c for c in full_df.columns if c not in set(dropped)]
+            updated_df = full_df[remaining_cols].copy()
+            _wb().update_active_dataset(
+                state,
+                updated_df,
+                stage="Feature Selection",
+                action=f"Dropped {len(dropped)} unselected columns (commit)",
+                details=", ".join(dropped[:10]),
+                preserve_stage="s05_features",
+                row_index_preserved=True,  # selection changes columns, not row labels.
+            )
+    # Scope/dataset invalidation during a commit clears old selection state.
+    state["uap_fs_selected_cols"] = selected
+    state["uap_fs_scores"] = scores
     return wb_cache_and_respond(
         state,
         sid,

@@ -138,7 +138,11 @@ def test_spa_static_bundle_gzip_and_all_13_studios_e2e() -> None:
     r_cop = client.post("/api/workbench/s13/chat", json={"message": "Summarize my active dataset"}, headers=hdr)
     assert r_cop.status_code == 200 and len(r_cop.json()["reply"]) > 5
 
-    # 15. Portable .uap Workspace Save & Restore Roundtrip
+    # 15. Portable .uap Workspace Save & Restore Roundtrip, including charts
+    # alongside the fitted models produced by the full workflow.
+    before_save = client.get("/api/workbench/results", headers=hdr).json()["results"]
+    chart_keys = ("s04_eda", "s07_explain", "s08_forecast", "s09_graph", "s12_report")
+    assert all(key in before_save for key in chart_keys)
     r_save = client.post("/api/workbench/workspace/save", data={"project_name": "e2e_roundtrip"}, headers=hdr)
     assert r_save.status_code == 200 and len(r_save.content) > 200
     sid2 = f"e2e_restore_{uuid.uuid4().hex[:8]}"
@@ -147,9 +151,11 @@ def test_spa_static_bundle_gzip_and_all_13_studios_e2e() -> None:
         files={"file": ("e2e_roundtrip.uap", io.BytesIO(r_save.content), "application/octet-stream")},
         headers={"X-Session-ID": sid2},
     )
-    assert r_restore.status_code == 200
+    assert r_restore.status_code == 200, r_restore.text
     assert r_restore.json()["state"]["has_dataset"] is True
     assert r_restore.json()["state"]["active_model_name"] is not None
+    after_restore = client.get("/api/workbench/results", headers={"X-Session-ID": sid2}).json()["results"]
+    assert all(after_restore[key] == before_save[key] for key in chart_keys)
 
 
 def test_to_json_safe_strict_rfc8259_compliance() -> None:

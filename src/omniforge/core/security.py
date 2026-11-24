@@ -733,6 +733,27 @@ _BLOCKED_UNPICKLE_SYMBOL_NAMES: frozenset[str] = frozenset(
 )
 
 
+# Some scikit-learn wheels serialize Cython loss classes under the bare
+# ``_loss`` alias rather than ``sklearn._loss._loss``. Resolve only these known
+# globals to the canonical, already-allowed sklearn module; never allow the
+# arbitrary top-level ``_loss`` module to supply executable objects.
+_SKLEARN_CY_LOSS_GLOBALS: frozenset[str] = frozenset(
+    {
+        "CyAbsoluteError",
+        "CyExponentialLoss",
+        "CyHalfBinomialLoss",
+        "CyHalfGammaLoss",
+        "CyHalfMultinomialLoss",
+        "CyHalfPoissonLoss",
+        "CyHalfSquaredError",
+        "CyHalfTweedieLoss",
+        "CyHalfTweedieLossIdentity",
+        "CyHuberLoss",
+        "CyPinballLoss",
+        "__pyx_unpickle_CyHalfMultinomialLoss",
+    }
+)
+
 _BLOCKED_UNPICKLE_SUBMODULE_PREFIXES: tuple[str, ...] = (
     "torch.hub",
     "torch.serialization",
@@ -796,6 +817,8 @@ def safe_joblib_load_bytes(payload_bytes: bytes, *, filename: str = "") -> Any:
 
     class _RestrictedNumpyUnpickler(NumpyUnpickler):
         def find_class(self, module: str, name: str) -> Any:
+            if module == "_loss" and name in _SKLEARN_CY_LOSS_GLOBALS:
+                module = "sklearn._loss._loss"
             _validate_unpickle_target(module, name)
             return super().find_class(module, name)
 

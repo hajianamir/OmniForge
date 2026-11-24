@@ -46,6 +46,9 @@ _DOWNSTREAM_KEYS: tuple[str, ...] = (
     "uap_fairness_result",
     "uap_model_card",
     "uap_forecast_report",
+    "uap_forecast_result",
+    "uap_hypothesis_battery",
+    "uap_future_scores",
     "uap_causal_result",
     "uap_opt_result",
     "uap_sim_result",
@@ -65,6 +68,8 @@ _DOWNSTREAM_KEYS: tuple[str, ...] = (
     "uap_mining_result",
     "uap_supervisory_result",
     "uap_supervisory_scored_df",
+    "uap_supervisory_models",
+    "uap_s02_pending_feedback",
     "uap_fs_selected_cols",
     "uap_fs_scores",
     "uap_fs_dropped",
@@ -92,7 +97,6 @@ _STAGE_PRESERVE_KEYS: dict[str, tuple[str, ...]] = {
         "uap_s01_cleaned",
         "uap_s02_cluster_committed",
         "uap_s02_cluster_summary",
-        "uap_clustering_result",
         "uap_s02_anomaly_committed",
         "uap_s02_anomaly_summary",
         "uap_anomaly_meta",
@@ -103,16 +107,8 @@ _STAGE_PRESERVE_KEYS: dict[str, tuple[str, ...]] = {
         "uap_s01_cleaned",
         "uap_s02_cluster_committed",
         "uap_s02_cluster_summary",
-        "uap_clustering_result",
         "uap_s02_anomaly_committed",
         "uap_s02_anomaly_summary",
-        "uap_mining_result",
-        "uap_diag_report",
-        "uap_diag_criteria",
-        "uap_eda_report",
-        "uap_feature_report",
-        "uap_fs_selected_cols",
-        "uap_fs_scores",
     ),
 }
 
@@ -297,6 +293,7 @@ def _reset_downstream_state(state: dict[str, Any], *, keep_keys: set[str] | None
             "uap_baseline_models",
             "uap_nonparametric_models",
             "uap_dl_models",
+            "uap_supervisory_models",
         }:
             state[key] = {}
         elif key == "uap_active_model_metrics":
@@ -309,10 +306,16 @@ def _reset_downstream_state(state: dict[str, Any], *, keep_keys: set[str] | None
 
 _STUDIO_RESULT_KEEP_PREFIXES: dict[str, tuple[str, ...]] = {
     "s01": ("s01_",),
-    "s02_cluster": ("s01_", "s02_"),
-    "s02_anomaly": ("s01_", "s02_"),
-    "s05_features": ("s01_", "s02_", "s03_", "s04_", "s05_"),
+    # The committed operation remains as a labelled historical preview; other
+    # Studio 02 analyses no longer describe the changed dataset.
+    "s02_cluster": ("s01_", "s02_clustering"),
+    "s02_anomaly": ("s01_", "s02_anomaly"),
+    # Adding or dropping features changes the study used by earlier analyses.
+    "s05_features": ("s01_",),
 }
+
+# These operate on explicitly supplied text/images, not the workspace dataset.
+_DATASET_INDEPENDENT_RESULTS = frozenset({"s09_nlp", "s09_vision"})
 
 
 def save_studio_result(state: dict[str, Any], key: str, payload: dict[str, Any]) -> None:
@@ -336,13 +339,54 @@ def _prune_studio_results_for_stage(state: dict[str, Any], stage_key: str | None
     if not isinstance(cache, dict):
         state["uap_studio_results"] = {}
         return
-    if not stage_key or stage_key not in _STUDIO_RESULT_KEEP_PREFIXES:
-        state["uap_studio_results"] = {}
-        return
-    prefixes = _STUDIO_RESULT_KEEP_PREFIXES[stage_key]
+    prefixes = _STUDIO_RESULT_KEEP_PREFIXES.get(stage_key or "", ())
     state["uap_studio_results"] = {
-        k: v for k, v in cache.items() if any(str(k).startswith(p) for p in prefixes)
+        k: v for k, v in cache.items()
+        if (k in _DATASET_INDEPENDENT_RESULTS or any(str(k).startswith(p) for p in prefixes))
+        and not (k == "s01_clean" and isinstance(v, dict) and v.get("preview_only"))
     }
+
+
+def _prune_scope_results(state: dict[str, Any], *, split_only: bool = False) -> None:
+    """Keep only results whose inputs are unchanged by a study or split change."""
+    cache = get_studio_results(state)
+    keep = set(_DATASET_INDEPENDENT_RESULTS) | {"s01_quality"}
+    clean = cache.get("s01_clean")
+    if isinstance(clean, dict) and not clean.get("preview_only"):
+        # A committed cleaning report is historical provenance, not a preview.
+        keep.add("s01_clean")
+    if split_only:
+        # These analyses use the same full study data, not the train/test lock.
+        keep.update({
+            "s02_mining", "s02_advanced_mining", "s04_eda", "s04_hypothesis",
+            "s08_forecast", "s08_causal", "s08_optimize", "s08_simulate",
+            "s09_graph", "s09_survival",
+        })
+    state["uap_studio_results"] = {k: v for k, v in cache.items() if k in keep}
+
+
+def _invalidate_study_scope(state: dict[str, Any], *, preserve_split: bool) -> None:
+    """Invalidate study-dependent previews/models while preserving committed provenance."""
+    lock = state.get("uap_split_lock")
+    audit = state.get("uap_split_audit_report")
+    _reset_downstream_state(state, keep_keys={"uap_quality", "uap_clean_report"})
+    _prune_scope_results(state)
+    if preserve_split and isinstance(lock, dict) and lock.get("active"):
+        state["uap_split_lock"] = lock
+        state["uap_split_audit_report"] = audit
+
+
+def _invalidate_split_results(state: dict[str, Any]) -> None:
+    """Invalidate fits based on the old train/test split, retaining full-data analyses."""
+    _reset_downstream_state(
+        state,
+        keep_keys={
+            "uap_quality", "uap_clean_report", "uap_mining_result", "uap_eda_report",
+            "uap_hypothesis_battery", "uap_forecast_report", "uap_forecast_result",
+            "uap_causal_result", "uap_opt_result", "uap_sim_result",
+        },
+    )
+    _prune_scope_results(state, split_only=True)
 
 
 def record_lineage(state: dict[str, Any], stage: str, action: str, details: str = "") -> None:
@@ -453,6 +497,8 @@ def set_excluded_columns(
         valid = valid[: max(0, len(all_cols) - 1)]
 
     prev_excl = list(state.get("uap_excluded_columns") or [])
+    previous_target = state.get("uap_target")
+    previous_lock = state.get("uap_split_lock")
     state["uap_excluded_columns"] = valid
 
     # Ensure active targets remain inside the included study columns
@@ -464,18 +510,11 @@ def set_excluded_columns(
     state["uap_target"] = cur_targets[0] if cur_targets else None
 
     if valid != prev_excl:
-        # Preserve Split Lock & upstream stage completion flags cleanly across study-scope changes
-        prev_lock = state.get("uap_split_lock")
-        prev_audit = state.get("uap_split_audit_report")
-        keep_keys = set(_STAGE_PRESERVE_KEYS.get("s05_features", ()))
-        saved_vals = {k: state.get(k) for k in keep_keys if k in state}
-        _reset_downstream_state(state, keep_keys=keep_keys)
-        for k, v in saved_vals.items():
-            state[k] = v
-        _prune_studio_results_for_stage(state, "s05_features")
-        if isinstance(prev_lock, dict) and prev_lock.get("active"):
-            state["uap_split_lock"] = prev_lock
-            state["uap_split_audit_report"] = prev_audit
+        # Cluster/EDA/diagnostic previews also use study scope. Preserve the
+        # committed stage flags, but not analyses computed with old columns.
+        locked_target = previous_lock.get("target_col") if isinstance(previous_lock, dict) else None
+        preserve_split = previous_target == state["uap_target"] and locked_target not in valid
+        _invalidate_study_scope(state, preserve_split=preserve_split)
         if valid:
             record_exclusion(
                 state,
@@ -625,16 +664,22 @@ def set_selected_targets(state: dict[str, Any], targets: list[str], df: pd.DataF
         state["uap_target"] = None
         return []
     cols = list(active_df.columns)
-    valid = [c for c in targets if c in cols]
+    previous = get_selected_targets(state, active_df)
+    cur_excl = list(state.get("uap_excluded_columns") or [])
+    previous_lock = state.get("uap_split_lock")
+    valid = [c for c in dict.fromkeys(targets) if c in cols]
     if not valid:
         valid = [cols[-1]]
-    # Selecting a column as target automatically includes it in study scope
-    cur_excl = list(state.get("uap_excluded_columns") or [])
-    if any(t in cur_excl for t in valid):
-        state["uap_excluded_columns"] = [c for c in cur_excl if c not in set(valid)]
+    # Selecting a column as target automatically includes it in study scope.
+    remaining_exclusions = [c for c in cur_excl if c not in set(valid)]
+    state["uap_excluded_columns"] = remaining_exclusions
     state["uap_targets"] = valid
     state["uap_target"] = valid[0]
-    request_studio_remount(state)
+    if valid != previous or remaining_exclusions != cur_excl:
+        locked_target = previous_lock.get("target_col") if isinstance(previous_lock, dict) else None
+        preserve_split = bool(previous and previous[0] == valid[0] and locked_target not in remaining_exclusions)
+        _invalidate_study_scope(state, preserve_split=preserve_split)
+        request_studio_remount(state)
     return valid
 
 
@@ -665,7 +710,7 @@ def load_new_dataset(
     state["uap_s02_anomaly_summary"] = None
     state["uap_supervisory_history"] = []
     state["uap_supervisory_models"] = {}
-    state["uap_studio_results"] = {}
+    _prune_studio_results_for_stage(state, None)
     state["uap_s05_engineered"] = False
     state["uap_pending_excel"] = None
     state["uap_last_clean_diff"] = None
@@ -722,13 +767,121 @@ def clear_workspace_dataset(state: dict[str, Any]) -> None:
     state["uap_s02_anomaly_summary"] = None
     state["uap_supervisory_history"] = []
     state["uap_supervisory_models"] = {}
-    state["uap_studio_results"] = {}
+    _prune_studio_results_for_stage(state, None)
     state["uap_s05_engineered"] = False
     state["uap_pending_excel"] = None
     state["uap_last_clean_diff"] = None
     _reset_downstream_state(state)
     request_studio_remount(state)
     record_lineage(state, "Workspace", f"Cleared active dataset '{prev_name}'", "Ready for next dataset upload")
+
+
+def _locked_positions(values: Any, n_rows: int) -> list[int] | None:
+    """Validate stored positional indices without silently dropping bad entries."""
+    if not isinstance(values, (list, tuple, np.ndarray, pd.Index)):
+        return None
+    try:
+        positions = list(values)
+    except TypeError:
+        return None
+    if any(isinstance(i, bool) or not isinstance(i, (int, np.integer)) or not 0 <= int(i) < n_rows
+           for i in positions):
+        return None
+    result = [int(i) for i in positions]
+    return result if len(set(result)) == len(result) else None
+
+
+def _locked_row_id_sets(lock: dict[str, Any]) -> tuple[set[Any], set[Any]] | None:
+    train = lock.get("train_row_ids")
+    test = lock.get("test_row_ids")
+    if not isinstance(train, (list, tuple, np.ndarray, pd.Index)) or not isinstance(test, (list, tuple, np.ndarray, pd.Index)):
+        return None
+    try:
+        train_set, test_set = set(train), set(test)
+    except TypeError:
+        return None
+    if len(train_set) != len(train) or len(test_set) != len(test) or train_set & test_set:
+        return None
+    return train_set, test_set
+
+
+def _realign_split_lock(
+    lock: dict[str, Any], previous: pd.DataFrame, updated: pd.DataFrame, *, row_index_preserved: bool,
+) -> dict[str, Any] | None:
+    """Map a locked split to surviving rows; fail closed if identity is ambiguous.
+
+    Explicit unique row IDs are authoritative. Otherwise the caller must know
+    the transformation preserves index labels: equal labels alone do not prove
+    identity, since filtering/reordering followed by reset_index can reuse them.
+    Stored train/test indices are *positions*, not index labels.
+    """
+    for key in ("target_col", "group_col", "time_col"):
+        column = lock.get(key)
+        if column and column not in updated.columns:
+            return None
+
+    row_id_col = lock.get("row_id_col")
+    has_row_ids = row_id_col is not None or lock.get("train_row_ids") is not None or lock.get("test_row_ids") is not None
+    if has_row_ids:
+        if not isinstance(row_id_col, str) or row_id_col not in previous.columns or row_id_col not in updated.columns:
+            return None
+        old_ids, new_ids = previous[row_id_col], updated[row_id_col]
+        row_id_sets = _locked_row_id_sets(lock)
+        if row_id_sets is None:
+            return None
+        try:
+            if (not old_ids.is_unique or not new_ids.is_unique or old_ids.isna().any()
+                    or new_ids.isna().any() or not new_ids.isin(old_ids).all()):
+                return None
+            train_ids, test_ids = row_id_sets
+            if not (train_ids | test_ids).issubset(set(old_ids)):
+                return None
+            train_idx = [i for i, row_id in enumerate(new_ids) if row_id in train_ids]
+            test_idx = [i for i, row_id in enumerate(new_ids) if row_id in test_ids]
+        except TypeError:
+            return None
+    else:
+        if not row_index_preserved or not previous.index.is_unique or not updated.index.is_unique:
+            return None
+        try:
+            old_positions = previous.index.get_indexer(updated.index)
+        except (TypeError, ValueError):
+            return None
+        if (old_positions < 0).any():
+            return None
+        old_to_new = {int(old): new for new, old in enumerate(old_positions)}
+        train_old = _locked_positions(lock.get("train_indices"), len(previous))
+        test_old = _locked_positions(lock.get("test_indices"), len(previous))
+        if train_old is None or test_old is None or set(train_old) & set(test_old):
+            return None
+        train_idx = [old_to_new[i] for i in train_old if i in old_to_new]
+        test_idx = [old_to_new[i] for i in test_old if i in old_to_new]
+
+    if len(train_idx) < 5 or len(test_idx) < 2:
+        return None
+    result = dict(lock)
+    result.update(train_indices=train_idx, test_indices=test_idx, n_train=len(train_idx), n_test=len(test_idx))
+    if has_row_ids:
+        result["train_row_ids"] = updated[row_id_col].iloc[train_idx].tolist()
+        result["test_row_ids"] = updated[row_id_col].iloc[test_idx].tolist()
+
+    # An audit calculated on the old rows/columns cannot describe the new data.
+    try:
+        config = SplitConfig(group_col=lock.get("group_col"), time_col=lock.get("time_col"))
+        audit = LeakageSafeSplitter(config).verify_no_leakage(
+            updated,
+            train_idx=np.asarray(train_idx, dtype=int),
+            test_idx=np.asarray(test_idx, dtype=int),
+            strategy_used=str(lock.get("strategy") or "random"),
+        )
+        if not audit.passed:
+            logger.warning("split_lock_reaudit_not_passed", warnings=audit.warnings)
+            return None
+        result["audit_report"] = audit.model_dump()
+    except Exception as exc:
+        logger.warning("split_lock_reaudit_failed", error=str(exc))
+        return None
+    return result
 
 
 def update_active_dataset(
@@ -738,10 +891,18 @@ def update_active_dataset(
     action: str,
     details: str = "",
     preserve_stage: str | None = None,
+    *,
+    row_index_preserved: bool = False,
 ) -> None:
-    """Update the active dataset with 1-step Undo, Split Lock re-alignment, and stage-aware state preservation."""
-    if state.get("uap_df") is not None:
-        state["uap_prev_df"] = state["uap_df"].copy()
+    """Update the dataset with Undo, safe Split Lock realignment and stage-aware invalidation.
+
+    Set ``row_index_preserved`` only for transformations known to keep each
+    surviving row's original index label. Otherwise a lock without explicit
+    row IDs is invalidated even if the new index happens to match the old one.
+    """
+    previous = state.get("uap_df")
+    if isinstance(previous, pd.DataFrame):
+        state["uap_prev_df"] = previous.copy()
     updated = new_df.copy()
     state["uap_df"] = updated
 
@@ -751,16 +912,11 @@ def update_active_dataset(
     ]
 
     prev_lock = state.get("uap_split_lock")
-    preserved_lock: dict[str, Any] | None = None
-    if isinstance(prev_lock, dict) and prev_lock.get("active"):
-        tr_idx = [i for i in (prev_lock.get("train_indices") or []) if i in updated.index]
-        te_idx = [i for i in (prev_lock.get("test_indices") or []) if i in updated.index]
-        if len(tr_idx) >= 5 and len(te_idx) >= 2:
-            preserved_lock = dict(prev_lock)
-            preserved_lock["train_indices"] = tr_idx
-            preserved_lock["test_indices"] = te_idx
-            preserved_lock["n_train"] = len(tr_idx)
-            preserved_lock["n_test"] = len(te_idx)
+    had_lock = isinstance(prev_lock, dict) and bool(prev_lock.get("active"))
+    preserved_lock = (
+        _realign_split_lock(prev_lock, previous, updated, row_index_preserved=row_index_preserved)
+        if isinstance(prev_lock, dict) and had_lock and isinstance(previous, pd.DataFrame) else None
+    )
 
     # Auto-infer stage preservation key from stage name if not explicitly provided
     stage_key = preserve_stage
@@ -787,6 +943,8 @@ def update_active_dataset(
     if preserved_lock is not None:
         state["uap_split_lock"] = preserved_lock
         state["uap_split_audit_report"] = preserved_lock.get("audit_report")
+    elif had_lock:
+        record_lineage(state, "Split Lock", "Unlocked split after dataset update", "Row identity, split membership or leakage audit could not be safely preserved.")
     run_format_audit(state, updated)
     try:
         state["uap_intake_audit"] = InitialIntakeAuditor().audit(updated, target_col=state.get("uap_target"))
@@ -809,7 +967,7 @@ def undo_last_dataset_change(state: dict[str, Any]) -> bool:
     ]
     get_selected_targets(state, state["uap_df"])
     _reset_downstream_state(state)
-    state["uap_studio_results"] = {}
+    _prune_studio_results_for_stage(state, None)
     run_format_audit(state, state["uap_df"])
     try:
         state["uap_intake_audit"] = InitialIntakeAuditor().audit(state["uap_df"], target_col=state.get("uap_target"))
@@ -842,7 +1000,7 @@ def revert_to_raw_dataset(state: dict[str, Any]) -> bool:
     state["uap_last_clean_diff"] = None
     get_selected_targets(state, state["uap_df"])
     _reset_downstream_state(state)
-    state["uap_studio_results"] = {}
+    _prune_studio_results_for_stage(state, None)
     run_format_audit(state, state["uap_df"])
     try:
         state["uap_intake_audit"] = InitialIntakeAuditor().audit(state["uap_df"], target_col=state.get("uap_target"))
@@ -1017,6 +1175,7 @@ def lock_leakage_safe_split(
         "audit_report": (res.audit_report.model_dump() if res.audit_report is not None else {}),
         "locked_at": datetime.now().strftime("%H:%M:%S"),
     }
+    _invalidate_split_results(state)
     state["uap_split_lock"] = lock_payload
     state["uap_split_audit_report"] = lock_payload["audit_report"]
     request_studio_remount(state)
@@ -1031,7 +1190,10 @@ def lock_leakage_safe_split(
 
 
 def clear_split_lock(state: dict[str, Any]) -> None:
-    """Unlock the active Train/Test split."""
+    """Unlock the active Train/Test split and invalidate fits made under it."""
+    lock = state.get("uap_split_lock")
+    if isinstance(lock, dict) and lock.get("active"):
+        _invalidate_split_results(state)
     state["uap_split_lock"] = None
     state["uap_split_audit_report"] = None
     request_studio_remount(state)
@@ -1047,24 +1209,29 @@ def get_active_split_frames(state: dict[str, Any], df: pd.DataFrame | None = Non
     if not isinstance(lock, dict) or not lock.get("active"):
         return active_df, None, None
     row_id_col = lock.get("row_id_col")
-    if isinstance(row_id_col, str) and row_id_col in active_df.columns and lock.get("train_row_ids") is not None:
-        tr_set = set(lock.get("train_row_ids") or [])
-        te_set = set(lock.get("test_row_ids") or [])
-        tr_mask = active_df[row_id_col].isin(tr_set)
-        te_mask = active_df[row_id_col].isin(te_set)
-        if int(tr_mask.sum()) < 5 or int(te_mask.sum()) < 2:
-            raise ValueError("Active Split Lock is invalid or corrupted (insufficient train/test row_ids).")
+    has_row_ids = row_id_col is not None or lock.get("train_row_ids") is not None or lock.get("test_row_ids") is not None
+    if has_row_ids:
+        row_id_sets = _locked_row_id_sets(lock)
+        if not isinstance(row_id_col, str) or row_id_col not in active_df.columns or row_id_sets is None:
+            raise ValueError("Active Split Lock is invalid or corrupted (ambiguous train/test row_ids).")
+        try:
+            ids = active_df[row_id_col]
+            if not ids.is_unique or ids.isna().any():
+                raise ValueError("Active Split Lock is invalid or corrupted (ambiguous train/test row_ids).")
+            tr_set, te_set = row_id_sets
+            tr_mask = ids.isin(tr_set)
+            te_mask = ids.isin(te_set)
+        except TypeError as exc:
+            raise ValueError("Active Split Lock is invalid or corrupted (ambiguous train/test row_ids).") from exc
+        if (int(tr_mask.sum()) != len(tr_set) or int(te_mask.sum()) != len(te_set)
+                or len(tr_set) < 5 or len(te_set) < 2):
+            raise ValueError("Active Split Lock is invalid or corrupted (missing or insufficient train/test row_ids).")
         return active_df.loc[tr_mask].copy(), active_df.loc[te_mask].copy(), lock
-    # train_indices/test_indices are 0-based positional indices (from reset_index(drop=True) in
-    # lock_leakage_safe_split). Use iloc[] (position-based) not loc[] (label-based) so the lock
-    # works on DataFrames with non-RangeIndex.
-    raw_tr_idx = lock.get("train_indices") or []
-    raw_te_idx = lock.get("test_indices") or []
-    n_rows = len(active_df)
-    tr_idx = [int(i) for i in raw_tr_idx if isinstance(i, (int, np.integer)) and 0 <= int(i) < n_rows]
-    te_idx = [int(i) for i in raw_te_idx if isinstance(i, (int, np.integer)) and 0 <= int(i) < n_rows]
-    if len(tr_idx) < 5 or len(te_idx) < 2:
-        raise ValueError("Active Split Lock is invalid or corrupted (insufficient train/test indices).")
+    # The splitter stores zero-based positions, regardless of DataFrame labels.
+    tr_idx = _locked_positions(lock.get("train_indices"), len(active_df))
+    te_idx = _locked_positions(lock.get("test_indices"), len(active_df))
+    if tr_idx is None or te_idx is None or len(tr_idx) < 5 or len(te_idx) < 2 or set(tr_idx) & set(te_idx):
+        raise ValueError("Active Split Lock is invalid or corrupted (invalid or overlapping train/test indices).")
     return active_df.iloc[tr_idx].copy(), active_df.iloc[te_idx].copy(), lock
 
 
@@ -1218,17 +1385,30 @@ def restore_workspace_project_bytes(
     """Validate and atomically restore a complete ``.uap`` workspace snapshot into ``state``."""
     from omniforge.core.workspace_session import WorkspaceSessionManager
 
+    # Validate the signed archive before touching the existing workspace, then
+    # build a fresh replacement. Merging into the old dict leaves stale cached
+    # charts behind when a legacy archive lacks uap_studio_results entirely.
     restored_state, manifest = WorkspaceSessionManager.load_from_bytes(raw_bytes)
-    _reset_downstream_state(state)
-    state["uap_df"] = None
-    state["uap_raw_df"] = None
-    state["uap_prev_df"] = None
-    state["uap_copilot"] = None
+    target_state = state
+    state = default_workspace_dict()
+    if not restore_studio:
+        for key in ("uap_selected_studio", "uap_active_studio"):
+            if key in target_state:
+                state[key] = target_state[key]
 
     for key, val in restored_state.items():
         if not restore_studio and key in {"uap_selected_studio", "uap_active_studio"}:
             continue
         state[key] = val
+
+    # Older archives stored the latest monitor evaluation but had no studio
+    # cache. Migrate that real result, never one absent from an explicit cache.
+    if "uap_studio_results" not in restored_state and isinstance(state.get("uap_supervisory_result"), dict):
+        save_studio_result(
+            state,
+            "s14_supervisory",
+            {**state["uap_supervisory_result"], "history": state.get("uap_supervisory_history") or []},
+        )
 
     # Normalize legacy studio labels (e.g., "06 · AutoML...") to canonical 2-digit studio code "06"
     raw_studio = str(state.get("uap_selected_studio") or state.get("uap_active_studio") or "01").strip()
@@ -1236,7 +1416,7 @@ def restore_workspace_project_bytes(
     state["uap_selected_studio"] = studio_code
     state["uap_active_studio"] = studio_code
 
-    restored_theme = str(state.get("uap_theme") or manifest.theme or "dark").lower()
+    restored_theme = str(restored_state.get("uap_theme") or manifest.theme or "dark").lower()
     state["uap_theme"] = "light" if restored_theme == "light" else "dark"
 
     if isinstance(state.get("uap_df"), pd.DataFrame):
@@ -1259,6 +1439,8 @@ def restore_workspace_project_bytes(
         f"dataset: {manifest.dataset_name or 'none'}, {len(manifest.completed_stages)} completed stages)."
     )
     request_studio_remount(state)
+    target_state.clear()
+    target_state.update(state)
     return manifest.model_dump()
 
 

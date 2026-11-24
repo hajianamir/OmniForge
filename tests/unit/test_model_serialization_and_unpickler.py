@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import io
 import pickle
+import sys
+import types
 
 import joblib
 import numpy as np
@@ -67,6 +69,61 @@ def test_classical_ml_model_joblib_roundtrip_through_restricted_loader() -> None
 
     # Ensure the wrapped scikit-learn estimator itself survives restricted loading intact.
     assert restored._estimator is not None
+
+
+@pytest.mark.parametrize("kind", ["binomial", "squared", "multinomial"])
+def test_sklearn_cython_losses_roundtrip_through_restricted_loader(kind: str) -> None:
+    """Some sklearn wheels pickle fitted loss objects under the bare _loss alias."""
+    from sklearn._loss.loss import HalfBinomialLoss, HalfMultinomialLoss, HalfSquaredError
+
+    value = {
+        "binomial": HalfBinomialLoss,
+        "squared": HalfSquaredError,
+        "multinomial": lambda: HalfMultinomialLoss(n_classes=3),
+    }[kind]()
+    buf = io.BytesIO()
+    joblib.dump(value, buf, compress=0)
+    restored = safe_joblib_load_bytes(buf.getvalue(), filename="loss.joblib")
+    assert type(restored) is type(value)
+    assert type(restored.closs) is type(value.closs)
+
+
+def test_signed_workspace_restores_gradient_boosting_model_and_charts() -> None:
+    import pandas as pd
+    from sklearn.ensemble import HistGradientBoostingClassifier
+
+    from omniforge.ui.state import export_workspace_project_bytes, get_studio_results, restore_workspace_project_bytes
+
+    X = pd.DataFrame({"feature": np.arange(80, dtype=float)})
+    model = HistGradientBoostingClassifier(max_iter=5, random_state=42).fit(X, (X["feature"] > 40).astype(int))
+    original = {
+        "uap_df": X,
+        "uap_raw_df": X.copy(),
+        "uap_active_model": model,
+        "uap_studio_results": {"s04_eda": {"distributions": [{"column": "feature", "mean": 39.5}]}},
+    }
+    blob, _ = export_workspace_project_bytes(original, project_name="gradient-boosting")
+    restored: dict = {}
+    restore_workspace_project_bytes(restored, blob)
+    np.testing.assert_array_equal(restored["uap_active_model"].predict(X), model.predict(X))
+    assert get_studio_results(restored) == original["uap_studio_results"]
+
+
+@pytest.mark.parametrize("name", ["CyHalfBinomialLoss", "CyHalfSquaredError", "__pyx_unpickle_CyHalfMultinomialLoss"])
+def test_sklearn_loss_alias_resolves_only_to_canonical_module(name: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    import sklearn._loss._loss as canonical
+
+    # A top-level _loss module must not be able to supply an arbitrary object.
+    fake = types.ModuleType("_loss")
+    setattr(fake, name, object())
+    monkeypatch.setitem(sys.modules, "_loss", fake)
+    payload = f"c_loss\n{name}\n.".encode()
+    assert safe_joblib_load_bytes(payload) is getattr(canonical, name)
+
+
+def test_restricted_unpickler_rejects_unrecognized_loss_alias() -> None:
+    with pytest.raises(SecurityError):
+        safe_joblib_load_bytes(b"c_loss\nUnrecognizedGlobal\n.")
 
 
 def test_restricted_unpickler_rejects_os_system_payload() -> None:
