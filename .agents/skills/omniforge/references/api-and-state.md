@@ -54,12 +54,22 @@ are rejected.
 
 ## Jobs — `api/jobs.py`
 
-`BackgroundJobManager(max_workers=4, max_history=128)` (ThreadPoolExecutor);
-`submit(name, fn, *args, owner_key, **kwargs)` → `JobRecord`
-(`queued/running/completed/failed`); `get(job_id, owner_key)` returns `None`
-on owner mismatch (BOLA guard); `list_recent`. Singleton `job_manager`.
-Exposed as `GET /api/workbench/jobs`, `GET /jobs/{id}`. Distinct from
-`mlops/job_queue.py::BackgroundJobQueue` (async queue + MLflow config).
+Job state and cancellation rechecked against `49b9058`.
+`BackgroundJobManager` uses a process-local ThreadPoolExecutor and a bounded
+queue; the configured `job_manager` persists owner-scoped status and JSON
+results in `settings.jobs.db_path` (default
+`paths.workspace_dir/workbench_jobs.db`). A directly constructed manager with
+no `db_path` uses in-memory SQLite. `get(job_id, owner_key)` returns `None`
+on owner mismatch (BOLA guard). Endpoints: `GET /api/workbench/jobs`,
+`GET /jobs/{id}`, and `POST /jobs/{id}/cancel`.
+
+Queued jobs cancel immediately; running callables must opt into cooperative
+cancellation and check a token. A full queue returns 429. If a worker lease
+expires, its unfinished jobs are marked failed, not resumed: callables and
+workspaces are not persisted. Multiple API workers need the same settings
+and reliable shared SQLite locking; workspace operations still need sticky
+routing or shared workspace state. The separate
+`mlops/job_queue.py::BackgroundJobQueue` remains in-memory.
 
 ## Workbench — `api/workbench.py` (1775 lines)
 
@@ -71,7 +81,8 @@ Exposed as `GET /api/workbench/jobs`, `GET /jobs/{id}`. Distinct from
 `_cache_and_respond`, `_infer_task`, `_prepare_xy`. Core endpoints:
 `GET /state`, `GET /results`, `GET /benchmarks`,
 `POST /theme|targets|exclusions|split-lock`, `DELETE /split-lock`,
-`POST /workspace/clear|save|load`, `GET /jobs[/{id}]`, `GET /s01/catalog`,
+`POST /workspace/clear|save|load`, `GET /jobs[/{id}]`,
+`POST /jobs/{id}/cancel`, `GET /feature-store/freshness`, `GET /s01/catalog`,
 `DELETE /dataset`, `POST /s01/excel-sheets|upload|sql/demo|sql/inspect|
 sql/load|access/inspect|access/load|load-sample`, `GET /s01/grid`,
 `POST /s01/quality|profile|clean`, `GET /s01/export-clean/{fmt}`,
@@ -103,6 +114,13 @@ at 521, then `s06_automl.py` at 494.
 | `s12_reports.py` (341) | `GET /s12/catalog`, `POST /s12/compile`, `GET /s12/export/{fmt}` |
 | `s13_copilot.py` (54) | `POST /s13/chat` |
 | `s14_supervisory.py` (521) | `GET /s14/models`, `GET /s14/equations`, `POST /s14/quick-train|evaluate-file|evaluate-sql|evaluate-access|evaluate-demo-batch|evaluate-single|root-cause`, `GET /s14/export/{fmt}` |
+
+Rechecked against `49b9058`: Studio 06 single and batch scoring both use
+`_prediction_frame` and the active `WorkbenchInputPreprocessor` fitted during
+training. Legacy workspaces without it retain numeric alignment/zero-fill
+behavior until retrained. Studios 11 and 14 use `FeatureFreshnessPanel`,
+which polls the tenant-scoped `/feature-store/freshness` snapshot every minute;
+counts cover currently stored online vectors, not historical expiry events.
 
 ## Workspace state lifecycle — `ui/state.py` + `core/workspace_session.py`
 

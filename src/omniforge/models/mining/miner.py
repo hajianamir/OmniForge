@@ -44,7 +44,7 @@ class AssociationRuleMiner:
 
         # Build binary item matrix from top categoricals + discretized numerics
         item_cols: dict[str, np.ndarray] = {}
-        for col in list(sample_df.columns)[:16]:
+        for column_index, col in enumerate(list(sample_df.columns)[:16]):
             if len(item_cols) >= max_items:
                 break
             ser = sample_df[col]
@@ -71,8 +71,14 @@ class AssociationRuleMiner:
                             if low_mask.any() and high_mask.any():
                                 item_cols[f"{col}=Low"] = low_mask
                                 item_cols[f"{col}=High"] = high_mask
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # Dataset headers and exception messages may contain private content.
+                        logger.warning(
+                            "association_binning_failed",
+                            column_index=column_index,
+                            error_type=type(exc).__name__,
+                            fallback="continue_mining",
+                        )
             else:
                 top_cats = ser.dropna().astype(str).value_counts().head(4)
                 for cat_val, cnt in top_cats.items():

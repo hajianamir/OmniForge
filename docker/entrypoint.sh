@@ -7,8 +7,8 @@ mkdir -p "${WORKSPACE_DIR}"
 
 case "$MODE" in
   api)
-    # Default to 1 worker because interactive Workbench sessions & background jobs
-    # are stored in-process; scale horizontally only with sticky sessions or external state.
+    # Default to 1 worker because Workbench sessions and job execution are process-local.
+    # Job status is SQLite-backed; multi-worker workspaces need sticky or shared state.
     exec uvicorn omniforge.api.main:app \
       --host "${OMNIFORGE_API_HOST:-0.0.0.0}" \
       --port "${OMNIFORGE_API_PORT:-8000}" \

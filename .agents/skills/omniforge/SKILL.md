@@ -108,10 +108,13 @@ supervisory live scoring (Studio 14) → `.uap` project save. Detail:
 
 ## 4. Known limitations
 
-- **Per-process state.** Workbench sessions, background jobs, and copilot
-  agents live in memory (`ServerSessionRegistry`, `BackgroundJobManager`).
-  Docker must run **1 worker**; horizontal scaling needs sticky sessions or
-  external state. Restart loses unsaved sessions.
+- **Process-local execution and workspaces.** Workbench sessions, job
+  callables, and copilot agents remain in memory. Workbench job status and
+  results are persisted in SQLite with bounded queue and history, but lost
+  workers' callables are not resumed. Docker defaults to **1 worker**;
+  multi-worker workspace operations need sticky sessions or shared workspace
+  state. Shared job status requires a filesystem with reliable SQLite locking.
+  Restart loses unsaved sessions (job details rechecked against `49b9058`).
 - **Tier-gated features.** `simple` has no FastAPI server; `foundation`
   models need the `deep` pack + API keys/weights; SHAP/codecarbon, native
   boosting, OpenCV, spaCy, Optuna/FLAML are all optional-pack upgrades with

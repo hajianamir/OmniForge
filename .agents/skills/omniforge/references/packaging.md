@@ -67,7 +67,7 @@ is stale vs `frontend/` source. After any frontend change:
 | SBOM | `scripts/generate_sbom.py` | CycloneDX via `core/sbom.py`. |
 | Benchmarks | `scripts/run_benchmark.py`, `scripts/latency_budget_benchmark.py` | Domain/baseline/AutoML/carbon smoke; p95 budget gate in CI. |
 | ISS check | `scripts/check_iss.py` | Validates Inno scripts. |
-| Docker | `docker/Dockerfile`, `docker/docker-compose.yml`, `docker/entrypoint.sh` | Multi-stage `python:3.12-slim`, non-root `omniforge:1000`, healthchecks. Compose: `omniforge-api` (:8000) + `omniforge-ui` (:8501, waits for healthy API), shared volume, secrets via env. Entrypoint modes `api` (uvicorn, **1 worker** — sessions/jobs are in-process), `ui`, `worker`, `cli`. |
+| Docker | `docker/Dockerfile`, `docker/docker-compose.yml`, `docker/entrypoint.sh` | Multi-stage `python:3.12-slim`, non-root `omniforge:1000`, healthchecks. Compose: `omniforge-api` (:8000) + `omniforge-ui` (:8501, waits for healthy API), shared volume, secrets via env. Entrypoint modes `api` (uvicorn defaults to **1 worker** — sessions and job execution are process-local), `ui`, `worker`, `cli`. Job status is SQLite-backed; see `api-and-state.md`. |
 | Windows helpers | `install.bat`, `start.bat`, `build_exe.bat`, `build_installer.bat` | Thin wrappers. |
 | Build reqs | `requirements-build.in/.txt/.lock` | PyInstaller + Pillow + setuptools/wheel/build. |
 

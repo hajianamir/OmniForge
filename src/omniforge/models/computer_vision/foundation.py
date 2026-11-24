@@ -13,8 +13,11 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import StandardScaler
 
+from omniforge.core.logging import get_logger
 from omniforge.core.utils import is_package_available
 from omniforge.models.computer_vision.vision import ComputerVisionEngine
+
+logger = get_logger(__name__)
 
 
 def _ver(pkg: str) -> str | None:
@@ -151,8 +154,15 @@ class VisionFoundationHub:
                 if nrm > 1e-12:
                     emb = emb / nrm
                 return {"backend": f"timm:{backbone}", "embedding_dim": int(len(emb)), "embedding": emb}
-            except Exception:
-                pass
+            except Exception as exc:
+                # Avoid logging exception text, which can include image paths or credentials.
+                logger.warning(
+                    "vision_backend_failed",
+                    operation="foundation_embedding",
+                    backend="timm",
+                    error_type=type(exc).__name__,
+                    fallback="torchvision_or_native_spatial_pyramid",
+                )
 
         if is_package_available("torchvision") and is_package_available("torch"):
             try:
@@ -174,8 +184,14 @@ class VisionFoundationHub:
                 if nrm > 1e-12:
                     emb = emb / nrm
                 return {"backend": f"torchvision:{backbone}", "embedding_dim": int(len(emb)), "embedding": emb}
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "vision_backend_failed",
+                    operation="foundation_embedding",
+                    backend="torchvision",
+                    error_type=type(exc).__name__,
+                    fallback="native_spatial_pyramid",
+                )
 
         emb = self.extract_spatial_pyramid_descriptor(rgb)
         return {"backend": "native_spatial_pyramid", "embedding_dim": int(len(emb)), "embedding": emb}
@@ -219,8 +235,14 @@ class VisionFoundationHub:
                     reverse=True,
                 )
                 return {"backend": f"open_clip:{model_name}", "predictions": ranked, "top_label": ranked[0]["label"]}
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "vision_backend_failed",
+                    operation="zero_shot_classification",
+                    backend="open_clip",
+                    error_type=type(exc).__name__,
+                    fallback="native_visual_semantic_fallback",
+                )
 
         # Calibrated visual-attribute semantic scoring fallback (color dominance, brightness, texture, edge complexity)
         r_m, g_m, b_m = float(rgb[:, :, 0].mean()) / 255.0, float(rgb[:, :, 1].mean()) / 255.0, float(rgb[:, :, 2].mean()) / 255.0
@@ -294,8 +316,14 @@ class VisionFoundationHub:
                             }
                         )
                 return {"backend": "ultralytics:yolov8n", "n_detections": len(dets), "detections": dets}
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "vision_backend_failed",
+                    operation="object_detection",
+                    backend="ultralytics",
+                    error_type=type(exc).__name__,
+                    fallback="native_otsu_morphological",
+                )
 
         # Offline multi-scale foreground region detector with confidence scoring
         objs = self._base_cv.detect_objects(rgb, min_area=max(24, int(rgb.shape[0] * rgb.shape[1] * 0.005)))
