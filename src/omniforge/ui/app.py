@@ -9,6 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from omniforge.api.main import create_app
+from omniforge.core.logging import get_logger
+
+logger = get_logger(__name__)
 
 STUDIOS: list[tuple[str, str, str]] = [
     ("01", "Data Ingestion, Quality & Cleaning", "database"),
@@ -56,9 +59,20 @@ def run_workbench_server(
         def _opener() -> None:
             time.sleep(1.0)
             try:
-                webbrowser.open(url)
-            except Exception:
-                pass
+                if not webbrowser.open(url):
+                    logger.warning(
+                        "workbench_browser_open_failed",
+                        reason="browser_open_returned_false",
+                        fallback="server_only",
+                    )
+            except Exception as exc:
+                # Exception messages can contain URLs or local paths; avoid logging them.
+                logger.warning(
+                    "workbench_browser_open_failed",
+                    reason="browser_open_exception",
+                    error_type=type(exc).__name__,
+                    fallback="server_only",
+                )
 
         threading.Thread(target=_opener, daemon=True, name="omniforge-browser").start()
 

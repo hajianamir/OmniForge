@@ -13,8 +13,11 @@ from sklearn.decomposition import LatentDirichletAllocation, TruncatedSVD
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+from omniforge.core.logging import get_logger
 from omniforge.core.utils import is_package_available
 from omniforge.models.nlp.nlp_engine import NLPEngine
+
+logger = get_logger(__name__)
 
 _EMOTION_LEXICONS: dict[str, frozenset[str]] = {
     "joy": frozenset({"happy", "great", "excellent", "love", "delighted", "success", "celebrate", "wonderful", "win", "profit", "growth", "thrilled", "positive", "best"}),
@@ -96,8 +99,15 @@ class AdvancedNLPSuite(NLPEngine):
                     scores = {str(lb): round(float(sc), 5) for lb, sc in zip(res["labels"], res["scores"], strict=False)}
                     out.append({"text": txt[:140], "top_label": res["labels"][0], "confidence": round(float(res["scores"][0]), 5), "scores": scores, "backend": "transformers_nli"})
                 return out
-            except Exception:
-                pass
+            except Exception as exc:
+                # Backend exception text may contain user documents or credentials.
+                logger.warning(
+                    "nlp_backend_failed",
+                    operation="zero_shot_classification",
+                    backend="transformers",
+                    error_type=type(exc).__name__,
+                    fallback="native_semantic_tfidf",
+                )
 
         # Calibrated hybrid word + character n-gram TF-IDF semantic similarity
         corpus = [*[self.preprocess(t) for t in texts], *[self.preprocess(lb) for lb in labels]]
@@ -156,8 +166,14 @@ class AdvancedNLPSuite(NLPEngine):
                     "candidates": [res],
                     "backend": "transformers_qa",
                 }
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "nlp_backend_failed",
+                    operation="question_answering",
+                    backend="transformers",
+                    error_type=type(exc).__name__,
+                    fallback="native_extractive_qa",
+                )
 
         # BM25-weighted sentence + entity-type boost extractive QA
         sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", ctx_clean) if len(s.strip()) > 3]
@@ -214,8 +230,14 @@ class AdvancedNLPSuite(NLPEngine):
                     self._hf_pipelines["st"] = SentenceTransformer("all-MiniLM-L6-v2")
                 emb = self._hf_pipelines["st"].encode(cleaned, normalize_embeddings=True)
                 return np.asarray(emb, dtype=float), "sentence_transformers"
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "nlp_backend_failed",
+                    operation="embeddings",
+                    backend="sentence_transformers",
+                    error_type=type(exc).__name__,
+                    fallback="native_tfidf_svd",
+                )
 
         vec = TfidfVectorizer(max_features=2000, ngram_range=(1, 2), sublinear_tf=True)
         mat = vec.fit_transform(cleaned)
@@ -392,8 +414,14 @@ class AdvancedNLPSuite(NLPEngine):
                 res = self._hf_pipelines["summarizer"](clean[:3000], max_length=130, min_length=25, do_sample=False)
                 if res:
                     return {"backend": "transformers:distilbart-cnn-12-6", "summary": str(res[0].get("summary_text", "")), "sentences_selected": max_sentences}
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "nlp_backend_failed",
+                    operation="summarization",
+                    backend="transformers",
+                    error_type=type(exc).__name__,
+                    fallback="native_textrank",
+                )
 
         sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", clean) if len(s.strip()) > 10]
         if len(sents) <= max_sentences:

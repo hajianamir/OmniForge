@@ -41,7 +41,7 @@ jobs:
             fi
             echo "Commits touching code since pin: $n"
             if (( n > 0 )); then
-              echo "::warning title=SKILL.md may be stale::Code changed $n commit(s) since $pinned. Re-verify .agents/skills/omniforge/SKILL.md + its references/ per section 7 before updating the pin."
+              echo "::warning title=SKILL.md may be stale::Code changed $n commit(s) since $pinned. Re-verify .agents/skills/omniforge/SKILL.md + its references/ per 'Maintaining this skill' before updating the pin."
               # Reuse captured output; avoid git | head and its SIGPIPE failure mode.
               printf '%s\n' "$logs" | sed -n '1,20p'
             else
