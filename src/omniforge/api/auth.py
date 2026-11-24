@@ -82,15 +82,62 @@ def verify_api_key(candidate: str | None) -> bool:
     return hmac.compare_digest(candidate.strip(), expected)
 
 
-def _derive_workbench_cookie_token() -> str:
-    """Derive a deterministic HMAC-authenticated cookie value bound to the server API key."""
+_WORKBENCH_COOKIE_MAX_AGE = 8 * 60 * 60  # 8 hours
+
+
+def _derive_workbench_cookie_token(*, session_id: str | None = None) -> str:
+    """Derive an HMAC-authenticated cookie value bound to the server API key and a session.
+
+    Returns ``{nonce}.{timestamp}.{hmac_hex}`` so verification is stateless:
+    the nonce and timestamp are carried in the cookie value, and the HMAC covers
+    all three fields bound to the server API key.
+    """
+    import time
+
     key_bytes = get_api_key().encode("utf-8")
-    return hmac.new(key_bytes, _WORKBENCH_COOKIE_CONTEXT, hashlib.sha256).hexdigest()
+    nonce = session_id or secrets.token_urlsafe(16)
+    timestamp = str(int(time.time()))
+    material = b"\x00".join(
+        [_WORKBENCH_COOKIE_CONTEXT, nonce.encode("utf-8"), timestamp.encode("utf-8")]
+    )
+    mac = hmac.new(key_bytes, material, hashlib.sha256).hexdigest()
+    return f"{nonce}.{timestamp}.{mac}"
+
+
+def _verify_workbench_cookie_token(cookie_value: str) -> bool:
+    """Statelessly verify a workbench auth cookie value.
+
+    Parses ``{nonce}.{timestamp}.{hmac_hex}``, checks the timestamp is within
+    ``_WORKBENCH_COOKIE_MAX_AGE``, and verifies the HMAC.
+    """
+    try:
+        parts = cookie_value.split(".")
+        if len(parts) != 3:
+            return False
+        nonce, timestamp_str, mac = parts
+        ts = int(timestamp_str)
+        now = int(__import__("time").time())
+        if now - ts > _WORKBENCH_COOKIE_MAX_AGE:
+            return False
+        key_bytes = get_api_key().encode("utf-8")
+        material = b"\x00".join(
+            [_WORKBENCH_COOKIE_CONTEXT, nonce.encode("utf-8"), timestamp_str.encode("utf-8")]
+        )
+        expected = hmac.new(key_bytes, material, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(mac, expected)
+    except (ValueError, TypeError):
+        return False
 
 
 def issue_local_workbench_cookies(response: Response, *, secure: bool = False) -> None:
-    """Attach HttpOnly SameSite=Strict auth + CSRF double-submit cookies for local SPA bootstrap."""
-    wb_token = _derive_workbench_cookie_token()
+    """Attach HttpOnly SameSite=Strict auth + CSRF double-submit cookies for local SPA bootstrap.
+
+    The auth cookie now includes a per-issuance session nonce, an issuance timestamp,
+    and an 8-hour max_age, so it is not static and expires. The CSRF token is bound
+    to the same issuance.
+    """
+    session_nonce = secrets.token_urlsafe(16)
+    wb_token = _derive_workbench_cookie_token(session_id=session_nonce)
     csrf_token = secrets.token_urlsafe(32)
     response.set_cookie(
         key=WORKBENCH_AUTH_COOKIE,
@@ -99,6 +146,7 @@ def issue_local_workbench_cookies(response: Response, *, secure: bool = False) -
         secure=secure,
         samesite="strict",
         path="/",
+        max_age=_WORKBENCH_COOKIE_MAX_AGE,
     )
     response.set_cookie(
         key=WORKBENCH_CSRF_COOKIE,
@@ -107,6 +155,7 @@ def issue_local_workbench_cookies(response: Response, *, secure: bool = False) -
         secure=secure,
         samesite="strict",
         path="/",
+        max_age=_WORKBENCH_COOKIE_MAX_AGE,
     )
 
 
@@ -122,11 +171,10 @@ def _authenticate_from_cookie(request: Request) -> Principal | None:
     cookie_token = request.cookies.get(WORKBENCH_AUTH_COOKIE)
     if not cookie_token:
         return None
-    expected_cookie = _derive_workbench_cookie_token()
-    if not hmac.compare_digest(cookie_token, expected_cookie):
+    if not _verify_workbench_cookie_token(cookie_token):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid workbench session cookie.",
+            detail="Invalid or expired workbench session cookie.",
             headers={"WWW-Authenticate": "Bearer"},
         )
     if request.method.upper() in _STATE_CHANGING_METHODS:

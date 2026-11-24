@@ -164,224 +164,248 @@ class OmniForgeCopilotAgent:
             return str(resp.json()["message"]["content"])
 
     def _chat_local_planner(self, user_message: str) -> CopilotResponse:
-        """Deterministic English NLP planner routing instructions directly to live OmniForge tools."""
+        """Deterministic English NLP planner routing instructions directly to live OmniForge tools.
+
+        Uses word-boundary keyword matching (not substring matching) so that short
+        keywords like ``ate`` do not false-positive on ``validate``, ``estimate``,
+        or ``Update``. Never silently generates demo data — requires an explicitly
+        loaded dataset for data-dependent intents.
+        """
         msg = user_message.lower().strip()
         executed: list[dict[str, Any]] = []
         reply_parts: list[str] = []
         next_steps: list[str] = []
 
-        # Helper to auto-load demo data if user asks to analyze without loading a dataset first
-        def _ensure_dataset(default_task: str = "classification") -> None:
+        def _contains_word(text: str, keywords: tuple[str, ...]) -> bool:
+            """Return True if any keyword appears as a whole word in ``text``."""
+            return any(re.search(r"\b" + re.escape(k) + r"\b", text) for k in keywords)
+
+        class _NoDatasetError(Exception):
+            pass
+
+        def _require_dataset() -> None:
+            """Require an explicitly loaded dataset; never silently generate demo data."""
             if not self.memory.working_state["datasets"]:
-                res = self.tools.invoke("generate_demo_data", {"task": default_task, "n_samples": 240})
-                executed.append({"tool": "generate_demo_data", "arguments": {"task": default_task}, "result": res})
                 reply_parts.append(
-                    f"Loaded a synthetic `{default_task}` dataset (`{res['dataset_name']}`, {res['rows']} rows)."
+                    "No dataset is loaded. Please load a dataset first (e.g., upload a CSV or "
+                    "call ``load_dataframe``), then repeat your request."
                 )
+                raise _NoDatasetError()
 
         # Extract optional target column from patterns like "target=y" or "predict churn"
         target_match = re.search(r"target[=:\s]+['\"]?([A-Za-z0-9_]+)['\"]?", user_message, re.I)
         target_col = target_match.group(1) if target_match else "target"
 
-        if any(k in msg for k in ("domain", "industr", "plugin")):
-            res = self.tools.invoke("list_domains")
-            executed.append({"tool": "list_domains", "arguments": {}, "result": res})
-            names = [d["display_name"] for d in res["domains"]]
-            reply_parts.append(f"OmniForge includes **{len(names)} ready-to-use industry domain plugins**: {', '.join(names)}.")
-            next_steps = ["Specify a domain (e.g., finance, healthcare, energy) to load domain KPIs and compliance rules."]
+        try:
+            if _contains_word(msg, ("domain", "industry", "plugin")):
+                res = self.tools.invoke("list_domains")
+                executed.append({"tool": "list_domains", "arguments": {}, "result": res})
+                names = [d["display_name"] for d in res["domains"]]
+                reply_parts.append(f"OmniForge includes **{len(names)} ready-to-use industry domain plugins**: {', '.join(names)}.")
+                next_steps = ["Specify a domain (e.g., finance, healthcare, energy) to load domain KPIs and compliance rules."]
 
-        elif any(k in msg for k in ("pipeline", "code", "export dag", "generate pipeline")):
-            res = self.tools.invoke("generate_pipeline_code", {"target_column": target_col})
-            executed.append({"tool": "generate_pipeline_code", "arguments": {"target_column": target_col}, "result": res})
-            reply_parts.append(
-                f"Generated a reproducible DAG pipeline (`{res['pipeline_name']}`) with Mermaid topology and standalone Python code:\n\n"
-                f"```mermaid\n{res['mermaid_dag']}\n```"
-            )
-            next_steps = ["Execute the pipeline via PipelineExecutor or export to Jupyter Notebook."]
+            elif _contains_word(msg, ("pipeline", "code", "dag", "generate pipeline")):
+                res = self.tools.invoke("generate_pipeline_code", {"target_column": target_col})
+                executed.append({"tool": "generate_pipeline_code", "arguments": {"target_column": target_col}, "result": res})
+                reply_parts.append(
+                    f"Generated a reproducible DAG pipeline (`{res['pipeline_name']}`) with Mermaid topology and standalone Python code:\n\n"
+                    f"```mermaid\n{res['mermaid_dag']}\n```"
+                )
+                next_steps = ["Execute the pipeline via PipelineExecutor or export to Jupyter Notebook."]
 
-        elif any(k in msg for k in ("forecast", "time series", "time-series")):
-            _ensure_dataset("forecasting")
-            _, df = self.memory.get_dataset()
-            fc_target = target_col if target_col in df.columns else ("y" if "y" in df.columns else str(df.select_dtypes(include=["number"]).columns[-1]))
-            res = self.tools.invoke("run_forecast", {"target_column": fc_target, "horizon": 14})
-            executed.append({"tool": "run_forecast", "arguments": {"target_column": fc_target, "horizon": 14}, "result": res})
-            reply_parts.append(
-                f"Completed forecasting tournament for **`{fc_target}`** (horizon=14). "
-                f"Champion model: **{res['champion_model']}** (top leaderboard entry: `{res['leaderboard'][0]}`)."
-            )
-            next_steps = ["Run walk-forward backtesting", "Export interactive HTML/PDF forecast report"]
+            elif _contains_word(msg, ("forecast", "time series", "time-series")):
+                _require_dataset()
+                _, df = self.memory.get_dataset()
+                fc_target = target_col if target_col in df.columns else ("y" if "y" in df.columns else str(df.select_dtypes(include=["number"]).columns[-1]))
+                res = self.tools.invoke("run_forecast", {"target_column": fc_target, "horizon": 14})
+                executed.append({"tool": "run_forecast", "arguments": {"target_column": fc_target, "horizon": 14}, "result": res})
+                reply_parts.append(
+                    f"Completed forecasting tournament for **`{fc_target}`** (horizon=14). "
+                    f"Champion model: **{res['champion_model']}** (top leaderboard entry: `{res['leaderboard'][0]}`)."
+                )
+                next_steps = ["Run walk-forward backtesting", "Export interactive HTML/PDF forecast report"]
 
-        elif any(k in msg for k in ("causal", "treatment", "ate", "uplift")):
-            _ensure_dataset("causal")
-            res = self.tools.invoke("run_causal", {"method": "aipw"})
-            executed.append({"tool": "run_causal", "arguments": {"method": "aipw"}, "result": res})
-            reply_parts.append(
-                f"Doubly Robust (AIPW) causal estimate: **ATE = {res['ate']}** "
-                f"(95% CI: [{res['ci_lower']}, {res['ci_upper']}], p={res['p_value']}). "
-                f"Refutation checks: `{res['refutations']}`."
-            )
-            next_steps = ["Compare against Double Machine Learning (DML)", "Inspect heterogeneous CATE subgroups"]
+            elif _contains_word(msg, ("causal", "treatment", "uplift")):
+                _require_dataset()
+                res = self.tools.invoke("run_causal", {"method": "aipw"})
+                executed.append({"tool": "run_causal", "arguments": {"method": "aipw"}, "result": res})
+                reply_parts.append(
+                    f"Doubly Robust (AIPW) causal estimate: **ATE = {res['ate']}** "
+                    f"(95% CI: [{res['ci_lower']}, {res['ci_upper']}], p={res['p_value']}). "
+                    f"Refutation checks: `{res['refutations']}`."
+                )
+                next_steps = ["Compare against Double Machine Learning (DML)", "Inspect heterogeneous CATE subgroups"]
 
-        elif any(k in msg for k in ("clean", "impute", "outlier", "dedup")):
-            _ensure_dataset("classification")
-            res = self.tools.invoke("clean_data")
-            executed.append({"tool": "clean_data", "arguments": {}, "result": res})
-            reply_parts.append(
-                f"Data cleaning completed into **`{res['output_dataset']}`**: "
-                f"missing values reduced from {res['missing_values_before']} to {res['missing_values_after']}, "
-                f"exact duplicates removed={res['exact_duplicates_removed']}, outliers handled={res['outliers_detected']}."
-            )
-            next_steps = ["Run Automated EDA", "Train AutoML models with baseline benchmarks"]
+            elif _contains_word(msg, ("clean", "impute", "outlier", "dedup")):
+                _require_dataset()
+                res = self.tools.invoke("clean_data")
+                executed.append({"tool": "clean_data", "arguments": {}, "result": res})
+                reply_parts.append(
+                    f"Data cleaning completed into **`{res['output_dataset']}`**: "
+                    f"missing values reduced from {res['missing_values_before']} to {res['missing_values_after']}, "
+                    f"exact duplicates removed={res['exact_duplicates_removed']}, outliers handled={res['outliers_detected']}."
+                )
+                next_steps = ["Run Automated EDA", "Train AutoML models with baseline benchmarks"]
 
-        elif any(k in msg for k in ("quality", "scorecard")):
-            _ensure_dataset("classification")
-            res = self.tools.invoke("profile_quality")
-            executed.append({"tool": "profile_quality", "arguments": {}, "result": res})
-            reply_parts.append(
-                f"Six-dimensional Data Quality Score: **{res['overall_score']}/100 (Grade {res['grade']})**. "
-                f"Dimensions: {res['dimensions']}. Recommendations: {'; '.join(res['recommendations'])}."
-            )
-            next_steps = ["Clean detected data issues", "Auto-generate a DataValidator expectation suite"]
+            elif _contains_word(msg, ("quality", "scorecard")):
+                _require_dataset()
+                res = self.tools.invoke("profile_quality")
+                executed.append({"tool": "profile_quality", "arguments": {}, "result": res})
+                reply_parts.append(
+                    f"Six-dimensional Data Quality Score: **{res['overall_score']}/100 (Grade {res['grade']})**. "
+                    f"Dimensions: {res['dimensions']}. Recommendations: {'; '.join(res['recommendations'])}."
+                )
+                next_steps = ["Clean detected data issues", "Auto-generate a DataValidator expectation suite"]
 
-        elif any(k in msg for k in ("eda", "explor", "profile", "insight")):
-            _ensure_dataset("classification")
-            res = self.tools.invoke("run_eda", {"target_column": target_col})
-            executed.append({"tool": "run_eda", "arguments": {"target_column": target_col}, "result": res})
-            reply_parts.append(res["narrative"])
-            next_steps = ["Clean data if alerts were raised", "Run AutoML pipeline search"]
+            elif _contains_word(msg, ("eda", "explore", "profile", "insight")):
+                _require_dataset()
+                res = self.tools.invoke("run_eda", {"target_column": target_col})
+                executed.append({"tool": "run_eda", "arguments": {"target_column": target_col}, "result": res})
+                reply_parts.append(res["narrative"])
+                next_steps = ["Clean data if alerts were raised", "Run AutoML pipeline search"]
 
-        elif any(k in msg for k in ("fairness", "bias", "disparate")):
-            _ensure_dataset("classification")
-            if not self.memory.working_state["models"]:
-                tr = self.tools.invoke("train_automl", {"target_column": target_col, "time_budget_seconds": 15.0})
-                executed.append({"tool": "train_automl", "arguments": {"target_column": target_col}, "result": tr})
-            res = self.tools.invoke("audit_fairness", {"target_column": target_col})
-            executed.append({"tool": "audit_fairness", "arguments": {"target_column": target_col}, "result": res})
-            reply_parts.append(
-                f"Fairness Audit for `{res['protected_attribute']}`: **{'PASSED' if res['passed'] else 'FLAGGED'}** "
-                f"(Disparate Impact={res['disparate_impact_ratio']}, Equalized Odds Diff={res['equalized_odds_diff']})."
-            )
-            next_steps = ["Apply Kamiran-Calders reweighing if flagged", "Generate a compliance Model Card"]
+            elif _contains_word(msg, ("fairness", "bias", "disparate")):
+                _require_dataset()
+                if not self.memory.working_state["models"]:
+                    tr = self.tools.invoke("train_automl", {"target_column": target_col, "time_budget_seconds": 15.0})
+                    executed.append({"tool": "train_automl", "arguments": {"target_column": target_col}, "result": tr})
+                res = self.tools.invoke("audit_fairness", {"target_column": target_col})
+                executed.append({"tool": "audit_fairness", "arguments": {"target_column": target_col}, "result": res})
+                reply_parts.append(
+                    f"Fairness Audit for `{res['protected_attribute']}`: **{'PASSED' if res['passed'] else 'FLAGGED'}** "
+                    f"(Disparate Impact={res['disparate_impact_ratio']}, Equalized Odds Diff={res['equalized_odds_diff']})."
+                )
+                next_steps = ["Apply Kamiran-Calders reweighing if flagged", "Generate a compliance Model Card"]
 
-        elif any(k in msg for k in ("explain", "shap", "interpret", "why")):
-            _ensure_dataset("classification")
-            if not self.memory.working_state["models"]:
-                tr = self.tools.invoke("train_automl", {"target_column": target_col, "time_budget_seconds": 15.0})
-                executed.append({"tool": "train_automl", "arguments": {"target_column": target_col}, "result": tr})
-            res = self.tools.invoke("explain_model", {"target_column": target_col})
-            executed.append({"tool": "explain_model", "arguments": {"target_column": target_col}, "result": res})
-            top_shap = list(res["local_shap_sample_0"]["attributions"].items())[:5]
-            reply_parts.append(
-                f"Explainability report for **{res['model']}**: top local SHAP drivers on sample 0 are "
-                + ", ".join(f"`{k}` ({v:+.4f})" for k, v in top_shap)
-                + "."
-            )
-            next_steps = ["Run fairness audit", "Run adversarial robustness stress test"]
+            elif _contains_word(msg, ("explain", "shap", "interpret", "why")):
+                _require_dataset()
+                if not self.memory.working_state["models"]:
+                    tr = self.tools.invoke("train_automl", {"target_column": target_col, "time_budget_seconds": 15.0})
+                    executed.append({"tool": "train_automl", "arguments": {"target_column": target_col}, "result": tr})
+                res = self.tools.invoke("explain_model", {"target_column": target_col})
+                executed.append({"tool": "explain_model", "arguments": {"target_column": target_col}, "result": res})
+                top_shap = list(res["local_shap_sample_0"]["attributions"].items())[:5]
+                reply_parts.append(
+                    f"Explainability report for **{res['model']}**: top local SHAP drivers on sample 0 are "
+                    + ", ".join(f"`{k}` ({v:+.4f})" for k, v in top_shap)
+                    + "."
+                )
+                next_steps = ["Run fairness audit", "Run adversarial robustness stress test"]
 
-        elif any(k in msg for k in ("train", "automl", "model", "predict")):
-            _ensure_dataset("classification")
-            res = self.tools.invoke("train_automl", {"target_column": target_col, "time_budget_seconds": 25.0})
-            executed.append({"tool": "train_automl", "arguments": {"target_column": target_col}, "result": res})
-            reply_parts.append(
-                f"AutoML complete for `{res['task_type']}`! Champion: **{res['best_algorithm']}** "
-                f"achieving **{res['primary_metric']} = {res['best_score']}** "
-                f"(lift over strongest baseline: **{res['lift_over_best_baseline']:+.4f}**; "
-                f"carbon footprint: {res['carbon_g_co2eq']:.6f} gCO2eq)."
-            )
-            next_steps = ["Explain model with SHAP/LIME", "Audit fairness & robustness", "Register model to Production"]
+            elif _contains_word(msg, ("train", "automl", "model", "predict")):
+                _require_dataset()
+                res = self.tools.invoke("train_automl", {"target_column": target_col, "time_budget_seconds": 25.0})
+                executed.append({"tool": "train_automl", "arguments": {"target_column": target_col}, "result": res})
+                reply_parts.append(
+                    f"AutoML complete for `{res['task_type']}`! Champion: **{res['best_algorithm']}** "
+                    f"achieving **{res['primary_metric']} = {res['best_score']}** "
+                    f"(lift over strongest baseline: **{res['lift_over_best_baseline']:+.4f}**; "
+                    f"carbon footprint: {res['carbon_g_co2eq']:.6f} gCO2eq)."
+                )
+                next_steps = ["Explain model with SHAP/LIME", "Audit fairness & robustness", "Register model to Production"]
 
-        elif any(k in msg for k in ("root cause", "root-cause", "drift attribution", "causal drift")):
-            _ensure_dataset("classification")
-            ref_name = "reference_dataset"
-            cur_name = "current_dataset"
-            if ref_name not in self.memory.working_state["datasets"]:
-                self.tools.invoke("generate_demo_data", {"task": "classification", "n_samples": 240, "dataset_name": ref_name})
-            if cur_name not in self.memory.working_state["datasets"]:
-                self.tools.invoke("generate_demo_data", {"task": "classification", "n_samples": 240, "dataset_name": cur_name})
-            res = self.tools.invoke("root_cause_diagnosis", {"reference_dataset": ref_name, "current_dataset": cur_name})
-            executed.append({"tool": "root_cause_diagnosis", "arguments": {"reference_dataset": ref_name, "current_dataset": cur_name}, "result": res})
-            rc = res.get("root_causes", [])
-            sym = res.get("symptoms", [])
-            rx = res.get("remediation_prescriptions", [])
-            reply_parts.append(
-                f"C5 Causal Drift Root-Cause (status={res.get('overall_status')}): "
-                f"root causes={rc or 'none isolated'}, symptoms={sym or 'none'}. "
-                + (" " + " ".join(rx[:3]) if rx else "")
-            )
-            next_steps = ["Remediate upstream root-cause sensors/feeds", "Re-run drift check after remediation", "Register updated model"]
+            elif _contains_word(msg, ("root cause", "root-cause", "drift attribution", "causal drift")):
+                _require_dataset()
+                ref_name = "reference_dataset"
+                cur_name = "current_dataset"
+                if ref_name not in self.memory.working_state["datasets"]:
+                    _require_dataset()
+                if cur_name not in self.memory.working_state["datasets"]:
+                    _require_dataset()
+                res = self.tools.invoke("root_cause_diagnosis", {"reference_dataset": ref_name, "current_dataset": cur_name})
+                executed.append({"tool": "root_cause_diagnosis", "arguments": {"reference_dataset": ref_name, "current_dataset": cur_name}, "result": res})
+                rc = res.get("root_causes", [])
+                sym = res.get("symptoms", [])
+                rx = res.get("remediation_prescriptions", [])
+                reply_parts.append(
+                    f"C5 Causal Drift Root-Cause (status={res.get('overall_status')}): "
+                    f"root causes={rc or 'none isolated'}, symptoms={sym or 'none'}. "
+                    + (" " + " ".join(rx[:3]) if rx else "")
+                )
+                next_steps = ["Remediate upstream root-cause sensors/feeds", "Re-run drift check after remediation", "Register updated model"]
 
-        elif any(k in msg for k in ("twin control", "mpc", "closed-loop", "closed loop", "receding horizon", "digital twin control")):
-            res = self.tools.invoke("twin_control", {"n_x": 2, "n_u": 1, "horizon": 10, "n_steps": 8, "dt": 1.0})
-            executed.append({"tool": "twin_control", "arguments": {"n_x": 2, "n_u": 1, "horizon": 10, "n_steps": 8, "dt": 1.0}, "result": res})
-            reply_parts.append(
-                f"C7 Closed-Loop Twin MPC: {res['n_steps_applied']} steps applied, "
-                f"constraints satisfied={res['all_constraints_satisfied']}, total cost={res['total_cost']:.4f}."
-            )
-            next_steps = ["Inspect trajectory chart", "Tighten state safety bounds", "Export control log"]
+            elif _contains_word(msg, ("twin control", "mpc", "closed-loop", "closed loop", "receding horizon", "digital twin control")):
+                res = self.tools.invoke("twin_control", {"n_x": 2, "n_u": 1, "horizon": 10, "n_steps": 8, "dt": 1.0})
+                executed.append({"tool": "twin_control", "arguments": {"n_x": 2, "n_u": 1, "horizon": 10, "n_steps": 8, "dt": 1.0}, "result": res})
+                reply_parts.append(
+                    f"C7 Closed-Loop Twin MPC: {res['n_steps_applied']} steps applied, "
+                    f"constraints satisfied={res['all_constraints_satisfied']}, total cost={res['total_cost']:.4f}."
+                )
+                next_steps = ["Inspect trajectory chart", "Tighten state safety bounds", "Export control log"]
 
-        elif any(k in msg for k in ("split lock", "split_lock", "leakage guard", "train/test integrity")):
-            res = self.tools.invoke("split_lock", {})
-            executed.append({"tool": "split_lock", "arguments": {}, "result": res})
-            passed = res.get("passed", False)
-            reply_parts.append(
-                f"Split Lock: {'PASSED' if passed else 'FAILED'} — "
-                f"row_overlap={res.get('row_overlap_count', 0)}, group_overlap={res.get('group_overlap_count', 0)}, "
-                f"temporal_valid={res.get('temporal_order_valid', True)}."
-            )
-            next_steps = ["Fix overlapping groups/rows before training", "Re-run split lock"]
+            elif _contains_word(msg, ("split lock", "split_lock", "leakage guard", "train/test integrity")):
+                res = self.tools.invoke("split_lock", {})
+                executed.append({"tool": "split_lock", "arguments": {}, "result": res})
+                passed = res.get("passed", False)
+                reply_parts.append(
+                    f"Split Lock: {'PASSED' if passed else 'FAILED'} — "
+                    f"row_overlap={res.get('row_overlap_count', 0)}, group_overlap={res.get('group_overlap_count', 0)}, "
+                    f"temporal_valid={res.get('temporal_order_valid', True)}."
+                )
+                next_steps = ["Fix overlapping groups/rows before training", "Re-run split lock"]
 
-        elif any(k in msg for k in ("pii audit", "pii_audit", "pseudonymize", "pii guard", "zero trust pii")):
-            res = self.tools.invoke("pii_audit", {"dataset_name": None, "pii_policy": "pseudonymize"})
-            executed.append({"tool": "pii_audit", "arguments": {"dataset_name": None, "pii_policy": "pseudonymize"}, "result": res})
-            reply_parts.append(
-                f"C8 PII Audit (policy=pseudonymize): PII detected={res.get('pii_detected')}, "
-                f"columns={', '.join(res.get('pii_columns', [])) or 'none'}, cells={res.get('pii_cells_total', 0)}."
-            )
-            next_steps = ["Inspect guarded output dataset", "Re-audit with policy=block to fail-closed"]
+            elif _contains_word(msg, ("pii audit", "pii_audit", "pseudonymize", "pii guard", "zero trust pii")):
+                res = self.tools.invoke("pii_audit", {"dataset_name": None, "pii_policy": "pseudonymize"})
+                executed.append({"tool": "pii_audit", "arguments": {"dataset_name": None, "pii_policy": "pseudonymize"}, "result": res})
+                reply_parts.append(
+                    f"C8 PII Audit (policy=pseudonymize): PII detected={res.get('pii_detected')}, "
+                    f"columns={', '.join(res.get('pii_columns', [])) or 'none'}, cells={res.get('pii_cells_total', 0)}."
+                )
+                next_steps = ["Inspect guarded output dataset", "Re-audit with policy=block to fail-closed"]
 
-        elif any(k in msg for k in ("pareto", "green-ai", "carbon budget", "latency budget", "green automl")):
-            res = self.tools.invoke("pareto_automl", {"target_column": target_col, "time_budget_seconds": 25.0})
-            executed.append({"tool": "pareto_automl", "arguments": {"target_column": target_col, "time_budget_seconds": 25.0}, "result": res})
-            reply_parts.append(
-                f"C3 Green-AI Pareto AutoML: champion={res.get('best_algorithm')} "
-                f"({res.get('primary_metric')}={res.get('best_score')}, "
-                f"carbon={res.get('carbon_gco2e'):.6f} gCO2eq). Pareto frontier: {len(res.get('pareto_frontier', []))} candidates."
-            )
-            next_steps = ["Inspect Pareto frontier trade-offs", "Register Pareto champion", "Promote to Production"]
+            elif _contains_word(msg, ("pareto", "green-ai", "carbon budget", "latency budget", "green automl")):
+                res = self.tools.invoke("pareto_automl", {"target_column": target_col, "time_budget_seconds": 25.0})
+                executed.append({"tool": "pareto_automl", "arguments": {"target_column": target_col, "time_budget_seconds": 25.0}, "result": res})
+                reply_parts.append(
+                    f"C3 Green-AI Pareto AutoML: champion={res.get('best_algorithm')} "
+                    f"({res.get('primary_metric')}={res.get('best_score')}, "
+                    f"carbon={res.get('carbon_gco2e'):.6f} gCO2eq). Pareto frontier: {len(res.get('pareto_frontier', []))} candidates."
+                )
+                next_steps = ["Inspect Pareto frontier trade-offs", "Register Pareto champion", "Promote to Production"]
 
-        elif any(k in msg for k in ("domain validate", "domain_validation", "industry domain", "compliance")):
-            domain_name = target_col
-            res = self.tools.invoke("domain_validate", {"domain": domain_name, "dataset_name": None})
-            executed.append({"tool": "domain_validate", "arguments": {"domain": domain_name, "dataset_name": None}, "result": res})
-            reply_parts.append(f"Domain validation for '{domain_name}': {res.get('note', 'checks completed')}.")
-            next_steps = ["Address domain compliance gaps", "Generate Model Card"]
+            elif _contains_word(msg, ("domain validate", "domain_validation", "industry domain", "compliance")):
+                domain_name = target_col
+                res = self.tools.invoke("domain_validate", {"domain": domain_name, "dataset_name": None})
+                executed.append({"tool": "domain_validate", "arguments": {"domain": domain_name, "dataset_name": None}, "result": res})
+                reply_parts.append(f"Domain validation for '{domain_name}': {res.get('note', 'checks completed')}.")
+                next_steps = ["Address domain compliance gaps", "Generate Model Card"]
 
-        elif any(k in msg for k in ("register model", "model registry", "promote model", "model promotion")):
-            res = self.tools.invoke("register_model", {"model_name": "copilot_champion", "stage": "Staging"})
-            executed.append({"tool": "register_model", "arguments": {"model_name": "copilot_champion", "stage": "Staging"}, "result": res})
-            reply_parts.append(f"Model registered to MLOps Registry (Staging): {res.get('registered', {}).get('version', 'n/a')}.")
-            next_steps = ["Promote to Production", "Configure drift monitoring"]
+            elif _contains_word(msg, ("register model", "model registry", "promote model", "model promotion")):
+                res = self.tools.invoke("register_model", {"model_name": "copilot_champion", "stage": "Staging"})
+                executed.append({"tool": "register_model", "arguments": {"model_name": "copilot_champion", "stage": "Staging"}, "result": res})
+                reply_parts.append(f"Model registered to MLOps Registry (Staging): {res.get('registered', {}).get('version', 'n/a')}.")
+                next_steps = ["Promote to Production", "Configure drift monitoring"]
 
-        elif any(k in msg for k in ("list studios", "studios", "studio overview")):
-            res = self.tools.invoke("list_studios", {})
-            executed.append({"tool": "list_studios", "arguments": {}, "result": res})
-            studio_names = ", ".join(s["name"] for s in res.get("studios", []))
-            reply_parts.append(f"OmniForge Workbench has {res.get('count', 0)} studios: {studio_names}.")
-            next_steps = ["Open a studio in the Workbench UI", "Run a studio endpoint via API"]
+            elif _contains_word(msg, ("list studios", "studios", "studio overview")):
+                res = self.tools.invoke("list_studios", {})
+                executed.append({"tool": "list_studios", "arguments": {}, "result": res})
+                studio_names = ", ".join(s["name"] for s in res.get("studios", []))
+                reply_parts.append(f"OmniForge Workbench has {res.get('count', 0)} studios: {studio_names}.")
+                next_steps = ["Open a studio in the Workbench UI", "Run a studio endpoint via API"]
 
-        else:
-            status = self.tools.invoke("workspace_status")
-            executed.append({"tool": "workspace_status", "arguments": {}, "result": status})
-            reply_parts.append(
-                "I am the **OmniForge AI Copilot** (air-gapped deterministic planner). "
-                f"Current workspace state: {len(status['loaded_datasets'])} dataset(s), {len(status['trained_models'])} trained model(s). "
-                "You can ask me in plain English to: profile data quality, clean data, run Automated EDA, "
-                "train AutoML models with baseline benchmarks, run forecasting or causal inference, "
-                "explain models (SHAP/LIME), audit fairness, run drift root-cause diagnosis, "
-                "run closed-loop twin MPC control, enforce split lock, audit PII, run Green-AI Pareto AutoML, "
-                "validate against industry domains, list studios, or export production pipeline code."
-            )
-            next_steps = ["Profile data quality", "Run AutoML", "Generate production pipeline code"]
+            elif _contains_word(msg, ("workspace", "status")):
+                res = self.tools.invoke("workspace_status", {})
+                executed.append({"tool": "workspace_status", "arguments": {}, "result": res})
+                reply_parts.append(
+                    f"Current workspace state: {len(res.get('loaded_datasets', []))} dataset(s), {len(res.get('trained_models', []))} trained model(s)."
+                )
+                next_steps = ["Profile data quality", "Run AutoML", "Generate production pipeline code"]
+
+            else:
+                reply_parts.append(
+                    "I'm not sure what you'd like to do. I can help you with:\n"
+                    "• Profile data quality, clean data, run Automated EDA\n"
+                    "• Train AutoML models, explain predictions (SHAP/LIME), audit fairness\n"
+                    "• Run forecasting or causal inference (ATE, DML, DiD)\n"
+                    "• Enforce split lock, audit PII, run Green-AI Pareto AutoML\n"
+                    "• Validate against industry domains, list studios, export pipeline code\n\n"
+                    "Please load a dataset first if your request involves data analysis."
+                )
+                next_steps = ["Load a dataset", "Profile data quality", "Run AutoML", "Generate production pipeline code"]
+
+        except _NoDatasetError:
+            # reply_parts already contains the "no dataset loaded" message from _require_dataset()
+            pass
 
         return CopilotResponse(
             reply="\n\n".join(reply_parts),
