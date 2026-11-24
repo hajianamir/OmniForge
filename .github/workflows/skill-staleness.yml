@@ -1,0 +1,52 @@
+name: Skill staleness check
+
+# Warn-only maintenance signal on pushes to main and PRs targeting main;
+# not a per-push guard on feature or other long-lived branches.
+# Any code commit since the pin warns intentionally: re-verify before bumping it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  skill-staleness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compare pinned commit against HEAD
+        shell: bash
+        run: |
+          # Contract: exactly one commit: "<40 lowercase hex digits>" line.
+          # Missing, unquoted, single-quoted, or malformed pins warn explicitly.
+          skill=.agents/skills/omniforge/SKILL.md
+          if ! pinned=$(sed -n 's/^commit: "\([0-9a-f]\{40\}\)"$/\1/p' "$skill"); then
+            echo "::warning title=Staleness check failed::Cannot read .agents/skills/omniforge/SKILL.md; freshness unknown."
+          elif [[ ! "$pinned" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::warning title=Invalid skill pin::Expected exactly one commit: "<40 lowercase hex digits>" frontmatter line; freshness unknown.'
+          elif ! git cat-file -e "$pinned^{commit}"; then
+            echo "::warning title=SKILL.md pin not found::Pinned commit $pinned not in history; freshness unknown."
+          elif logs=$(git log --format=%h "$pinned"..HEAD -- src/omniforge frontend tests configs); then
+            n=0
+            if [[ -n "$logs" ]]; then
+              # Count in Bash: empty output is zero; no grep exit-status or pipefail traps.
+              while IFS= read -r line; do
+                n=$((n + 1))
+              done <<< "$logs"
+            fi
+            echo "Commits touching code since pin: $n"
+            if (( n > 0 )); then
+              echo "::warning title=SKILL.md may be stale::Code changed $n commit(s) since $pinned. Re-verify .agents/skills/omniforge/SKILL.md + its references/ per section 7 before updating the pin."
+              # Reuse captured output; avoid git | head and its SIGPIPE failure mode.
+              printf '%s\n' "$logs" | sed -n '1,20p'
+            else
+              echo "No scoped code commits since the skill pin."
+            fi
+          else
+            echo "::warning title=Staleness check failed::git log errored; skill freshness unknown."
+          fi
