@@ -462,7 +462,9 @@ class TestClaims15_16_FairnessEdgeCases:
         sensitive = np.array(["A", "A", "A", "A", "A", "A"])
 
         report = auditor.audit(y_true, y_pred, sensitive, attribute_name="group")
-        assert report.passed is True
+        assert report.passed is False
+        assert report.selection_interval_method is None
+        assert report.demographic_parity_ci_95 is None
         assert report.disparate_impact_ratio == 1.0
         assert report.demographic_parity_diff == 0.0
 

@@ -813,6 +813,7 @@ class MultiBackendAutoMLResult:
     lift_over_best_baseline: float
     elapsed_seconds: float
     extra: dict[str, Any] = field(default_factory=dict)
+    evaluation_indices: np.ndarray | None = None
 
 
 class AutoMLBackendHub:
@@ -837,6 +838,9 @@ class AutoMLBackendHub:
         random_seed: int = 42,
         max_carbon_grams_co2e: float | None = None,
         max_inference_latency_ms: float | None = None,
+        groups: pd.Series | np.ndarray | None = None,
+        time_values: pd.Series | np.ndarray | None = None,
+        gap: int = 0,
     ) -> MultiBackendAutoMLResult:
         """Run any selected AutoML engine with baseline comparison and optional native fallback."""
         if target_col not in df.columns:
@@ -848,7 +852,50 @@ class AutoMLBackendHub:
         resolved_task = _infer_task(y_all, task_type)
         is_clf = resolved_task != TaskType.REGRESSION
 
-        # Strict leakage-safe holdout split
+        def run_native(used_fallback: bool = False, fallback_reason: str | None = None) -> MultiBackendAutoMLResult:
+            observed = df[target_col].notna().to_numpy()
+            if any(values is not None and len(values) != len(df) for values in (groups, time_values)):
+                raise AutoMLError("Group and time vectors must align with the input data.")
+            aligned_groups = np.asarray(groups)[observed] if groups is not None else None
+            aligned_times = np.asarray(time_values)[observed] if time_values is not None else None
+            native_res: AutoMLResult = AutoMLPipelineSearch(
+                task_type=resolved_task,
+                time_budget_seconds=time_budget_seconds,
+                cv_folds=cv_folds,
+                split_strategy=split_strategy,
+                gap=gap,
+                random_seed=random_seed,
+                max_carbon_grams_co2e=max_carbon_grams_co2e,
+                max_inference_latency_ms=max_inference_latency_ms,
+            ).fit(X_all, y_all, groups=aligned_groups, time_values=aligned_times)
+            return MultiBackendAutoMLResult(
+                requested_backend=req_backend,
+                executed_backend="omniforge_native",
+                used_fallback=used_fallback,
+                fallback_reason=fallback_reason,
+                task_type=native_res.task_type,
+                best_model_name=native_res.best_model_name,
+                best_model=native_res.best_model,
+                best_score=native_res.best_score,
+                primary_metric=native_res.primary_metric,
+                leaderboard=native_res.leaderboard,
+                baseline_benchmarks=native_res.baseline_benchmarks,
+                lift_over_best_baseline=native_res.lift_over_best_baseline,
+                elapsed_seconds=native_res.elapsed_seconds,
+                extra={"cv_summary": native_res.cv_summary, "evaluation": native_res.metadata["evaluation"]},
+                evaluation_indices=native_res.test_indices,
+            )
+
+        if req_backend == "omniforge_native":
+            return run_native()
+
+        if groups is not None or time_values is not None or gap:
+            raise AutoMLError(
+                "This AutoML backend does not support explicit group or time split metadata.",
+                suggestions=["Choose the OmniForge native backend for grouped or chronological evaluation."],
+            )
+
+        # Benchmark comparison for specialized and external backends.
         splitter = LeakageSafeSplitter(SplitConfig(strategy=split_strategy, test_size=0.2, cv_folds=cv_folds, random_seed=random_seed))
         split_res = splitter.split(clean_df, target_col=target_col)
         tr_df = clean_df.iloc[split_res.train_indices]
@@ -894,6 +941,7 @@ class AutoMLBackendHub:
                     lift_over_best_baseline=round(float(lift), 6),
                     elapsed_seconds=float(ext_out["elapsed_seconds"]),
                     extra=dict(ext_out.get("extra") or {}),
+                    evaluation_indices=split_res.test_indices.copy(),
                 )
             if not fallback_to_native:
                 raise AutoMLError(f"External AutoML backend '{req_backend}' is not installed or unavailable on this system.")
@@ -931,6 +979,7 @@ class AutoMLBackendHub:
                 lift_over_best_baseline=round(float(lift), 6),
                 elapsed_seconds=float(res["elapsed_seconds"]),
                 extra={"ensemble_weights": res.get("ensemble_weights", {})},
+                evaluation_indices=split_res.test_indices.copy(),
             )
 
         if exec_backend == "genetic_pipeline":
@@ -952,6 +1001,7 @@ class AutoMLBackendHub:
                 lift_over_best_baseline=round(float(lift), 6),
                 elapsed_seconds=float(res["elapsed_seconds"]),
                 extra={"evolution_history": res.get("evolution_history", [])},
+                evaluation_indices=split_res.test_indices.copy(),
             )
 
         if exec_backend == "meta_bayesian":
@@ -973,34 +1023,10 @@ class AutoMLBackendHub:
                 lift_over_best_baseline=round(float(lift), 6),
                 elapsed_seconds=float(res["elapsed_seconds"]),
                 extra={"meta_features": res.get("meta_features", {})},
+                evaluation_indices=split_res.test_indices.copy(),
             )
 
-        # Default: OmniForge Native Leakage-Safe AutoMLPipelineSearch
-        native_res: AutoMLResult = AutoMLPipelineSearch(
-            task_type=resolved_task,
-            time_budget_seconds=time_budget_seconds,
-            cv_folds=cv_folds,
-            split_strategy=split_strategy,
-            random_seed=random_seed,
-            max_carbon_grams_co2e=max_carbon_grams_co2e,
-            max_inference_latency_ms=max_inference_latency_ms,
-        ).fit(X_all, y_all)
-        return MultiBackendAutoMLResult(
-            requested_backend=req_backend,
-            executed_backend="omniforge_native",
-            used_fallback=used_fallback,
-            fallback_reason=fallback_reason,
-            task_type=native_res.task_type,
-            best_model_name=native_res.best_model_name,
-            best_model=native_res.best_model,
-            best_score=native_res.best_score,
-            primary_metric=native_res.primary_metric,
-            leaderboard=native_res.leaderboard,
-            baseline_benchmarks=native_res.baseline_benchmarks,
-            lift_over_best_baseline=native_res.lift_over_best_baseline,
-            elapsed_seconds=native_res.elapsed_seconds,
-            extra={"cv_summary": native_res.cv_summary},
-        )
+        return run_native(used_fallback, fallback_reason)
 
     @staticmethod
     def _try_external_adapter(

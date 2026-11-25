@@ -50,9 +50,8 @@ RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
 
 COPY configs /app/configs
 COPY src /app/src
-COPY docker/entrypoint.sh /usr/local/bin/omniforge-entrypoint.sh
-RUN chmod +x /usr/local/bin/omniforge-entrypoint.sh && \
-    mkdir -p /var/lib/omniforge && \
+COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/omniforge-entrypoint.sh
+RUN mkdir -p /var/lib/omniforge && \
     chown -R omniforge:omniforge /app /var/lib/omniforge
 
 USER omniforge
@@ -60,7 +59,8 @@ USER omniforge
 EXPOSE 8000 8501
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8000/api/v1/health || exit 1
+    CMD curl -fs --max-time 4 "http://127.0.0.1:${OMNIFORGE_API_PORT}/api/v1/health" || \
+        curl -fs --max-time 4 "http://127.0.0.1:${OMNIFORGE_UI_PORT}/api/v1/health"
 
 ENTRYPOINT ["/usr/local/bin/omniforge-entrypoint.sh"]
 CMD ["api"]

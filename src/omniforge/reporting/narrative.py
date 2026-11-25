@@ -382,14 +382,19 @@ class NarrativeGenerator:
                         "Apply Kamiran-Calders reweighing or group threshold calibration prior to production release."
                     )
             if carbon_report:
-                g_co2 = float(carbon_report.get("emissions_g_co2eq", 0.0))
-                kwh = float(carbon_report.get("energy_kwh", 0.0))
-                green = carbon_report.get("green_score", 100.0)
-                bits.append(
-                    f"Green AI telemetry measured {kwh:.8f} kWh generating {g_co2:.6f} gCO2eq "
-                    f"(Green AI Score: {green}/100, grid: {carbon_report.get('country_iso', 'DEU')})."
-                )
-                bullets.append(f"Carbon Footprint: {g_co2:.6f} gCO2eq | Green Score: {green}/100")
+                emissions = carbon_report.get("emissions_g_co2eq")
+                energy = carbon_report.get("energy_kwh")
+                backend = carbon_report.get("tracker_backend")
+                sources = carbon_report.get("metadata") or {}
+                if backend == "disabled" or emissions is None:
+                    bits.append("Carbon footprint was unmeasured for this run.")
+                else:
+                    source = sources.get("emissions_source") or backend or "unspecified source"
+                    bits.append(f"Reported emissions were {float(emissions):.6f} gCO2eq ({source}).")
+                    if energy is not None:
+                        energy_source = sources.get("energy_source") or backend or "unspecified source"
+                        bits.append(f"Reported energy was {float(energy):.8f} kWh ({energy_source}).")
+                    bullets.append(f"Carbon footprint: {float(emissions):.6f} gCO2eq")
             sections.append(
                 {
                     "section_id": "responsible_ai_governance",

@@ -27,22 +27,17 @@ def _causal_impute_split(
     raw_train: pd.Series,
     raw_val: pd.Series | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None]:
-    """Strictly causal past-only forward-fill imputation with zero look-ahead across train/val boundary."""
-    tr = pd.to_numeric(raw_train, errors="coerce")
-    if not tr.notna().any():
-        raise ForecastingError("Training time series contains no valid numeric values.")
-    first_valid_tr = float(tr.dropna().iloc[0])
-    # Fill strictly from past within train (t=0 uses first observed train anchor only; never peeks into val)
-    tr_clean = tr.ffill().fillna(first_valid_tr).to_numpy(dtype=float)
+    """Trim leading training gaps, forward-fill from the past, and return raw validation outcomes."""
+    train = pd.to_numeric(raw_train, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    observed = np.flatnonzero(train.notna().to_numpy())
+    if not len(observed):
+        raise ForecastingError("Training time series contains no finite numeric values.")
+    tr_clean = train.iloc[observed[0] :].ffill().to_numpy(dtype=float)
 
     if raw_val is None:
         return tr_clean, None
-
-    va = pd.to_numeric(raw_val, errors="coerce")
-    # Seed any leading NaN in validation strictly from the last observed training point (zero future peeking!)
-    last_train_val = float(tr_clean[-1])
-    va_clean = va.ffill().fillna(last_train_val).to_numpy(dtype=float)
-    return tr_clean, va_clean
+    val = pd.to_numeric(raw_val, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    return tr_clean, val.to_numpy(dtype=float)
 
 
 def _forecast_metrics(
@@ -56,6 +51,11 @@ def _forecast_metrics(
 ) -> dict[str, float]:
     yt = np.asarray(y_true, dtype=float).ravel()
     yp = np.asarray(y_pred, dtype=float).ravel()
+    observed = np.isfinite(yt)
+    if not observed.any() or not np.isfinite(yp[observed]).all():
+        raise ForecastingError("Forecast scoring requires finite predictions at observed evaluation outcomes.")
+    yt = yt[observed]
+    yp = yp[observed]
     rmse = float(np.sqrt(np.mean((yt - yp) ** 2)))
     mae = float(np.mean(np.abs(yt - yp)))
     denom = (np.abs(yt) + np.abs(yp)) / 2.0 + 1e-9
@@ -67,8 +67,13 @@ def _forecast_metrics(
         if scale > 1e-9:
             res["mase"] = round(mae / scale, 6)
     if y_lo is not None and y_hi is not None:
-        cov = float(np.mean((yt >= y_lo) & (yt <= y_hi)))
-        res["interval_coverage"] = round(cov, 4)
+        lo = np.asarray(y_lo, dtype=float).ravel()[observed]
+        hi = np.asarray(y_hi, dtype=float).ravel()[observed]
+        usable = np.isfinite(lo) & np.isfinite(hi) & (lo <= hi)
+        if usable.any():
+            cov = float(np.mean((yt[usable] >= lo[usable]) & (yt[usable] <= hi[usable])))
+            res["interval_coverage"] = round(cov, 4)
+            res["interval_coverage_n"] = float(np.count_nonzero(usable))
     return res
 
 
@@ -92,6 +97,8 @@ def diebold_mariano_test(
     n = len(yt)
     if len(p1) != n or len(p2) != n or n < 4:
         return {"evaluable": False, "reason": "Requires equal-length forecast arrays with n >= 4."}
+    if not (np.isfinite(yt).all() and np.isfinite(p1).all() and np.isfinite(p2).all()):
+        return {"evaluable": False, "reason": "Requires finite observations and forecasts on a contiguous evaluation window."}
     e1 = yt - p1
     e2 = yt - p2
     d = (e1**2 - e2**2) if loss == "squared" else (np.abs(e1) - np.abs(e2))
@@ -101,6 +108,15 @@ def diebold_mariano_test(
 
     gamma_0 = float(np.dot(d_c, d_c) / n)
     if gamma_0 <= 1e-18:
+        if abs(d_bar) > 1e-12:
+            return {
+                "evaluable": False,
+                "reason": "Constant nonzero loss difference has no estimable sampling variance.",
+                "p_value": None,
+                "mean_loss_diff": round(d_bar, 6),
+                "preferred_model": "model_1" if d_bar < 0 else "model_2",
+                "n": n,
+            }
         return {
             "evaluable": True,
             "dm_statistic": 0.0,
@@ -194,15 +210,26 @@ class ForecastingEngine:
         if len(raw_series) < 20:
             raise ForecastingError("ForecastingEngine requires at least 20 observations.")
 
-        val_h = validation_horizon or min(horizon, max(4, len(raw_series) // 5))
-        # Split chronologically FIRST, then apply strictly causal past-only imputation (zero look-ahead!)
-        y_train, y_val = _causal_impute_split(raw_series.iloc[:-val_h], raw_series.iloc[-val_h:])
+        val_h = validation_horizon if validation_horizon is not None else min(horizon, max(4, len(raw_series) // 5))
+        train_end = len(raw_series) - val_h - self.gap
+        if horizon < 1 or val_h < 1 or train_end < 2:
+            raise ForecastingError(
+                "Forecast and validation horizons and the embargo must leave at least two training observations.",
+                suggestions=["Choose a shorter horizon or embargo, or provide more history."],
+            )
+        y_train, y_val = _causal_impute_split(raw_series.iloc[:train_end], raw_series.iloc[-val_h:])
         assert y_val is not None
+        n_observed = int(np.count_nonzero(np.isfinite(y_val)))
+        if len(y_train) < 2 or not n_observed:
+            raise ForecastingError(
+                "Forecast validation needs at least two usable training points and one observed validation outcome.",
+                suggestions=["Check the target column and adjust the validation horizon."],
+            )
         full_causal_series, _ = _causal_impute_split(raw_series, None)
 
         with CarbonTracker("forecasting_tournament") as tracker:
             baseline_scores = BaselineBenchmarkSuite.run_forecasting(
-                y_train, y_val, seasonal_period=self.seasonal_period
+                y_train, y_val, seasonal_period=self.seasonal_period, gap=self.gap
             )
             leaderboard: list[dict[str, Any]] = [
                 {"model": name, "family": "baseline", **scores}
@@ -228,7 +255,7 @@ class ForecastingEngine:
                 try:
                     model = builder()
                     model.fit(y_train)
-                    fc_val = model.predict(val_h)
+                    fc_val = model.predict(val_h + self.gap).iloc[self.gap :]
                     metrics = _forecast_metrics(
                         y_val,
                         fc_val["yhat"].to_numpy(),
@@ -245,8 +272,8 @@ class ForecastingEngine:
 
             if self.include_foundation:
                 try:
-                    ff = FoundationForecaster()
-                    fc_val = ff.forecast_zero_shot(y_train, val_h)
+                    ff = self._patch_forecaster()
+                    fc_val = ff.forecast_zero_shot(y_train, val_h + self.gap).iloc[self.gap :]
                     metrics = _forecast_metrics(
                         y_val,
                         fc_val["yhat"].to_numpy(),
@@ -255,9 +282,15 @@ class ForecastingEngine:
                         y_train_ref=y_train,
                         seasonal_period=self.seasonal_period,
                     )
-                    leaderboard.append({"model": "Foundation_ZeroShot", "family": "foundation", **metrics})
-                    val_preds_map["Foundation_ZeroShot"] = fc_val
-                    fitted_builders["Foundation_ZeroShot"] = "foundation"
+                    leaderboard.append({
+                        "model": "HistoricalPatchRetrieval",
+                        "family": "historical_analogs",
+                        "backend": "historical_patch_retrieval",
+                        "nominal_interval_level": self.confidence_level,
+                        **metrics,
+                    })
+                    val_preds_map["HistoricalPatchRetrieval"] = fc_val
+                    fitted_builders["HistoricalPatchRetrieval"] = "patch_retrieval"
                 except Exception as exc:
                     logger.warning("foundation_forecast_failed", error=str(exc))
 
@@ -268,27 +301,34 @@ class ForecastingEngine:
                 )
             )
             non_baseline = [r for r in leaderboard if r["model"] in fitted_builders]
-            champion_name = non_baseline[0]["model"] if non_baseline else leaderboard[0]["model"]
+            champion_name = leaderboard[0]["model"]
 
             # Expanding-Window Multi-Origin TimeSeriesSplit Rolling CV on top-3 candidates
             rolling_cv_results: list[dict[str, Any]] = []
             if self.n_cv_splits >= 2 and len(raw_series) >= 30:
                 max_splits = min(self.n_cv_splits, max(2, (len(raw_series) - 12) // max(4, val_h)))
-                if max_splits >= 2:
-                    tscv = TimeSeriesSplit(n_splits=max_splits, test_size=min(val_h, max(3, len(raw_series) // (max_splits + 2))), gap=self.gap)
+                cv_size = min(val_h, (len(raw_series) - self.gap - 12) // max_splits)
+                if cv_size >= 2:
+                    tscv = TimeSeriesSplit(n_splits=max_splits, test_size=cv_size, gap=self.gap)
                     for m_name in [r["model"] for r in non_baseline[:3]]:
                         fold_rmses: list[float] = []
                         fold_smapes: list[float] = []
+                        fold_observed: list[int] = []
                         for tr_idx, va_idx in tscv.split(raw_series):
                             if len(tr_idx) < 12 or len(va_idx) < 2:
                                 continue
                             try:
                                 fold_tr, fold_va = _causal_impute_split(raw_series.iloc[tr_idx], raw_series.iloc[va_idx])
                                 assert fold_va is not None
-                                fc_fold = self._refit_and_predict(m_name, fitted_builders, fold_tr, len(fold_va))
-                                fm = _forecast_metrics(fold_va, fc_fold["yhat"].to_numpy())
+                                if len(fold_tr) < 12 or not np.isfinite(fold_va).any():
+                                    continue
+                                fc_fold = self._refit_and_predict(
+                                    m_name, fitted_builders, fold_tr, self.gap + len(fold_va)
+                                )
+                                fm = _forecast_metrics(fold_va, fc_fold["yhat"].to_numpy()[self.gap :])
                                 fold_rmses.append(fm["rmse"])
                                 fold_smapes.append(fm["smape"])
+                                fold_observed.append(int(np.count_nonzero(np.isfinite(fold_va))))
                             except Exception as exc:
                                 logger.debug("rolling_cv_fold_skipped", model=m_name, error=str(exc))
                         if fold_rmses:
@@ -296,6 +336,7 @@ class ForecastingEngine:
                                 {
                                     "model": m_name,
                                     "cv_strategy": f"TimeSeriesSplit(n_splits={len(fold_rmses)}, gap={self.gap})",
+                                    "cv_observed_counts": fold_observed,
                                     "cv_rmse_mean": round(float(np.mean(fold_rmses)), 6),
                                     "cv_rmse_std": round(float(np.std(fold_rmses, ddof=1) if len(fold_rmses) > 1 else 0.0), 6),
                                     "cv_smape_mean": round(float(np.mean(fold_smapes)), 4),
@@ -306,8 +347,7 @@ class ForecastingEngine:
             # Refit champion on full causal series
             future_fc = self._refit_and_predict(champion_name, fitted_builders, full_causal_series, horizon)
 
-            # Build top-3 inverse-sMAPE weighted ensemble forecast with exact Law of Total Variance intervals
-            # (Wallis 2005; Gneiting & Ranjan 2013): combines within-model aleatoric variance + epistemic disagreement.
+            # Build approximate normal bounds from within-model spread and between-model disagreement.
             top_models = [r["model"] for r in non_baseline[:3]]
             ensemble_fc: pd.DataFrame | None = None
             if len(top_models) >= 2:
@@ -380,26 +420,36 @@ class ForecastingEngine:
             metadata={
                 "n_history": len(full_causal_series),
                 "validation_horizon": val_h,
+                "validation_observed": n_observed,
+                "validation_missing": val_h - n_observed,
+                "validation_gap": self.gap,
                 "causal_imputation_verified": True,
                 "ensemble_variance_method": "law_of_total_variance_mixture",
+                "ensemble_interval_method": "approximate_normal_moment_bounds" if ensemble_fc is not None else None,
                 "rolling_cv_results": rolling_cv_results,
                 "diebold_mariano_vs_runner_up": dm_summary,
             },
         )
 
+    def _patch_forecaster(self) -> FoundationForecaster:
+        tail = (1.0 - self.confidence_level) / 2.0
+        return FoundationForecaster(quantiles=(tail, 0.5, 1.0 - tail))
+
     def _refit_and_predict(
         self, name: str, builders: dict[str, Any], full_series: np.ndarray, horizon: int
     ) -> pd.DataFrame:
         entry = builders.get(name)
-        if entry == "foundation":
-            return FoundationForecaster().forecast_zero_shot(full_series, horizon)
+        if entry == "patch_retrieval":
+            return self._patch_forecaster().forecast_zero_shot(full_series, horizon)
         if callable(entry):
             model = entry()
             model.fit(full_series)
             return model.predict(horizon)
         from omniforge.models.baselines import ForecastingBaseline
 
-        bl = ForecastingBaseline(method="naive", seasonal_period=self.seasonal_period).fit(full_series)
-        res = bl.predict(horizon, return_intervals=True)
+        method = name.removeprefix("Baseline_")
+        bl = ForecastingBaseline(method=method, seasonal_period=self.seasonal_period).fit(full_series)
+        z = float(stats.norm.ppf((1.0 + self.confidence_level) / 2.0))
+        res = bl.predict(horizon, return_intervals=True, z=z)
         assert isinstance(res, dict)
         return pd.DataFrame({"step": np.arange(1, horizon + 1), **res})

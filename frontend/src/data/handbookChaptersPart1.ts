@@ -46,7 +46,7 @@ export const HANDBOOK_CHAPTERS_PART1: StudioChapter[] = [
       'Ingest data from File Upload (CSV/TSV/XLSX/Parquet/JSON), SQL Database Connector, MS Access (.accdb/.mdb), or Benchmark Datasets.',
       'Review the automatic Intake Defect Audit scorecard (Grade A–F) and confirm Targets & Exclusions in the topbar.',
       'CRITICAL FOR MODELING: Open "Split Lock" in the topbar and lock your Train/Test partition BEFORE running Data Cleaning.',
-      'Click "Run Deep 6D Quality Profile" to inspect Completeness, Uniqueness, Validity, Consistency, Accuracy, and Timeliness.',
+      'Click "Run Deep 6D Quality Profile" to inspect Completeness, Uniqueness, Validity, Consistency, Accuracy (requires trusted reference data), and Timeliness.',
       'Select Auto, Complete, or Custom cleaning mode, click "Dry-Run Preview" to verify impact safely, then click "Apply & Commit Cleaning".',
       'Optionally export clean CSV/XLSX, inspect the Forensic Deleted-Records Audit Log, or Undo / Revert to Raw anytime.',
     ],
@@ -98,10 +98,10 @@ export const HANDBOOK_CHAPTERS_PART1: StudioChapter[] = [
         name: '6-Dimensional Enterprise Data Quality Score',
         paradigm: 'Quality Governance',
         whatItDoes:
-          'Quantifies overall dataset trustworthiness on a 0–100 scale across six formal ISO-8000 / DAMA-DMBOK dimensions: Completeness (non-null ratio), Uniqueness (non-duplicate ratio), Validity (type/format conformance), Consistency (absence of conflicting formats/tokens), Accuracy (outlier-free ratio), and Timeliness/Structural Hygiene.',
+          'Summarizes six dataset quality dimensions on a 0–100 scale. Accuracy is the percentage of observed values that match a trusted reference over comparable cells. Numeric range conformance and IQR-based plausibility are separate diagnostics.',
         formula: {
-          equation: 'Q_overall = (1/6) · (Q_complete + Q_unique + Q_valid + Q_consistent + Q_accurate + Q_structural)',
-          symbols: 'Each dimension is normalized to [0, 100]% across all active columns and records.',
+          equation: 'Q_overall = Σ(wᵢ · Qᵢ) / Σwᵢ over evaluated dimensions',
+          symbols: 'Qᵢ is a dimension score from 0 to 100. The reported effective weights are normalized over the evaluated dimensions.',
         },
         whenToUse: 'Run immediately before and after cleaning to document measurable quality uplift in Studio 12 Executive Reports.',
         recommendedParams: 'Target Overall Score >= 85/100 before modeling.',

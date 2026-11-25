@@ -83,3 +83,59 @@ test('real charts survive navigation, reload and signed workspace restore, but n
   await expect(alphaChart).toBeVisible();
   await expect(page.getByRole('button', { name: 'Exclusions (0)' })).toBeVisible();
 });
+
+
+test('small Studio 04 results and exclusions survive Studio 01 cleaning', async ({ page }) => {
+  await page.addInitScript((key) => localStorage.setItem('omniforge_api_key', key), apiKey!);
+  await page.goto('/');
+  await page.locator('input[accept=".csv,.tsv,.xlsx,.xls,.xlsm,.parquet,.json"]').setInputFiles({
+    name: 'small-study.csv',
+    mimeType: 'text/csv',
+    buffer: Buffer.from('Skip Me,Reading,Group\nx,1,a\ny,2,b\nz,3,a\nw,4,b\n'),
+  });
+  await expect(page.getByText(/Ingested 'small-study.csv'/)).toBeVisible();
+  await page.getByRole('button', { name: 'Exclusions (0)' }).click();
+  await page.getByRole('button', { name: 'Skip Me', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Skip Me', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  await page.locator('.modal-backdrop').click({ position: { x: 5, y: 5 } });
+
+  await page.locator('[data-studio="04"]').click();
+  await page.getByRole('button', { name: 'Run Automated EDA' }).click();
+  await expect(page.getByText('Analyzed 4 rows in the current study.')).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText('Distribution: Reading')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Exclusions (1)' })).toBeVisible();
+
+  await page.locator('[data-studio="01"]').click();
+  await page.getByRole('button', { name: 'Run Deep 6D Quality Profile' }).click();
+  const accuracy = page.locator('.kpi-card:visible').filter({ has: page.getByText('accuracy', { exact: true }) });
+  await expect(accuracy).toContainText('Unavailable');
+  await page.getByRole('button', { name: /Apply & Commit Cleaning/ }).click();
+  await expect(page.getByText(/Cleaning \(.*\) committed/)).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Exclusions (1)' })).toBeVisible();
+
+  await page.locator('[data-studio="04"]').click();
+  await page.getByLabel('Statistical Test (17 Available)').selectOption('shapiro');
+  const input = page.getByLabel('Column A (Value)');
+  await expect(input.locator('option', { hasText: 'Skip Me' })).toHaveCount(0);
+  await input.selectOption('Reading');
+  await page.getByRole('button', { name: 'Run Hypothesis Test (CUSTOM)' }).click();
+  await expect(page.getByText('Not evaluable', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Exclusions (1)' })).toBeVisible();
+});
+
+test('native AutoML labels candidate validation and champion test scores separately', async ({ page }) => {
+  await page.addInitScript((key) => localStorage.setItem('omniforge_api_key', key), apiKey!);
+  await page.goto('/');
+  const rows = ['reading,load,target'];
+  for (let i = 0; i < 80; i++) rows.push(`${i},${(i * 7) % 31},${i % 2}`);
+  await page.locator('input[accept=".csv,.tsv,.xlsx,.xls,.xlsm,.parquet,.json"]').setInputFiles({
+    name: 'automl-study.csv', mimeType: 'text/csv', buffer: Buffer.from(rows.join('\n')),
+  });
+  await expect(page.getByText(/Ingested 'automl-study.csv'/)).toBeVisible();
+  await page.locator('[data-studio="06"]').click();
+  await page.getByLabel('Time Budget (sec)').fill('10');
+  await page.getByRole('button', { name: 'Launch AutoML Tournament' }).click();
+  await expect(page.getByText('Test f1_weighted', { exact: true })).toBeVisible({ timeout: 20_000 });
+  await expect(page.getByText(/16 held-out rows/)).toBeVisible();
+  await expect(page.getByText('Validation f1_weighted (higher is better)').first()).toBeVisible();
+});

@@ -50,16 +50,32 @@ def s06_list_backends() -> dict[str, Any]:
 def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
-    df = _wb().get_analysis_dataframe(state, _wb()._require_df(state))
-    targets = _wb().get_selected_targets(state, df)
+    active_df = _wb()._require_df(state)
+    df = _wb().get_analysis_dataframe(state, active_df)
+    targets = _wb().get_selected_targets(state, active_df)
     active_targets = [req.target] if (req.target and req.target in df.columns) else targets
     if not active_targets:
         raise HTTPException(status_code=400, detail="Select a target column first.")
     target = active_targets[0]
 
     # Honor Split Lock: train only on train partition when lock is active
-    train_df, _test_df, _lock = _wb().get_active_split_frames(state, df)
-    automl_source = train_df if (train_df is not None and not train_df.empty and _lock is not None) else df
+    train_df, _test_df, lock = _wb().get_active_split_frames(state, active_df)
+    automl_source = train_df.loc[:, df.columns]
+    strategy = lock.get("strategy", "auto") if lock else None
+
+    def split_options(target_name: str) -> dict[str, Any]:
+        if not lock or req.backend.strip().lower() != "omniforge_native":
+            return {}
+        rows = train_df.loc[train_df[target_name].notna()]
+        options: dict[str, Any] = {"split_strategy": strategy}
+        if strategy == "group":
+            options["groups"] = rows[lock["group_col"]].to_numpy()
+        elif strategy == "time_series":
+            time_col = lock.get("time_col")
+            if time_col:
+                options["time_values"] = rows[time_col].to_numpy()
+            options["gap"] = lock.get("gap", 0)
+        return options
 
     def _execute(*, cancellation_token: JobCancellationToken | None = None) -> dict[str, Any]:
         multi_target_summary: list[dict[str, Any]] = []
@@ -80,6 +96,7 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
                         cv_folds=req.cv_folds,
                         max_carbon_grams_co2e=req.max_carbon_grams_co2e,
                         max_inference_latency_ms=req.max_inference_latency_ms,
+                        **split_options(extra_t),
                     )
                     multi_target_summary.append(
                         {
@@ -105,6 +122,7 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
             cv_folds=req.cv_folds,
             max_carbon_grams_co2e=req.max_carbon_grams_co2e,
             max_inference_latency_ms=req.max_inference_latency_ms,
+            **split_options(target),
         )
         if cancellation_token is not None:
             cancellation_token.checkpoint()
@@ -120,24 +138,30 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
         except Exception as exc:
             _wb().logger.debug("equation_extract_skipped", error=str(exc))
 
-        baseline_score = round(float(res.best_score - res.lift_over_best_baseline), 4)
+        regression = task == _wb().TaskType.REGRESSION
+        baseline_score = round(float(
+            res.best_score + res.lift_over_best_baseline if regression
+            else res.best_score - res.lift_over_best_baseline
+        ), 4)
+        evaluation = res.extra.get("evaluation") or {}
         ranked_lb = []
         for idx_lb, row_lb in enumerate(res.leaderboard or [], start=1):
             r_copy = dict(row_lb)
-            r_score = float(r_copy.get("cv_score", r_copy.get("score", 0.0)) or 0.0)
-            r_lift = r_score - baseline_score
+            name = r_copy.get("model") or r_copy.get("model_name")
+            raw_score = r_copy.get(res.primary_metric, r_copy.get("cv_score", r_copy.get("score")))
             r_copy["rank"] = idx_lb
-            r_copy["selection_criterion"] = f"Max CV {res.primary_metric} + Lift over Baseline ({baseline_score:.4f})"
-            r_copy["lift_over_baseline"] = round(r_lift, 4)
-            if idx_lb == 1:
-                r_copy["acceptance_status"] = "ACCEPTED (CHAMPION)" if r_lift >= 0 else "ACCEPTED (BEST AVAILABLE)"
-                r_copy["rationale"] = (
-                    f"Rank #1 out of {len(res.leaderboard or [])} candidates with {res.primary_metric}={r_score:.4f} "
-                    f"(lift {r_lift:+.4f} vs strong baseline {baseline_score:.4f})."
-                )
+            if name == res.best_model_name:
+                r_copy["acceptance_status"] = "ACCEPTED (CHAMPION)" if res.lift_over_best_baseline >= 0 else "ACCEPTED (BEST AVAILABLE)"
             else:
-                r_copy["acceptance_status"] = "BENCHMARKED (RUNNER-UP)" if idx_lb <= 3 else "REJECTED (SUBOPTIMAL)"
-                r_copy["rationale"] = f"Trailed champion by {res.best_score - r_score:.4f} on {res.primary_metric}."
+                r_copy["acceptance_status"] = "BENCHMARKED"
+            if evaluation and raw_score is not None:
+                r_score = float(raw_score)
+                validation_baseline = evaluation.get("validation_baseline_score")
+                r_copy["selection_criterion"] = f"Validation {res.primary_metric} ({'lower' if regression else 'higher'} is better)"
+                if validation_baseline is not None:
+                    r_lift = validation_baseline - r_score if regression else r_score - validation_baseline
+                    r_copy["lift_over_baseline"] = round(r_lift, 4)
+                r_copy["rationale"] = f"Validation {res.primary_metric}={r_score:.4f}."
             ranked_lb.append(r_copy)
 
         # Once model publication begins, cancellation is no longer accepted.
@@ -152,8 +176,13 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
         }
         state["uap_active_feature_cols"] = list(X.columns)
         state["uap_active_input_preprocessor"] = input_preprocessor
-        state["uap_active_X_test"] = X.iloc[-min(len(X), 400) :]
-        state["uap_active_y_test"] = y.iloc[-min(len(y), 400) :]
+        evaluation_indices = getattr(res, "evaluation_indices", None)
+        if evaluation_indices is not None:
+            state["uap_active_X_test"] = X.iloc[evaluation_indices]
+            state["uap_active_y_test"] = y.iloc[evaluation_indices]
+        else:
+            state["uap_active_X_test"] = None
+            state["uap_active_y_test"] = None
         state["uap_automl"] = res
         state["uap_active_model_equation"] = eq_dict
         state["uap_model_equations"] = {target: {res.best_model_name: eq_dict}} if eq_dict else {}

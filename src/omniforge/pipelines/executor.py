@@ -2,54 +2,79 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
-import json
+import os
 import pickle
 import re
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
-
-import joblib
-import numpy as np
-import pandas as pd
 
 from omniforge.core.carbon import CarbonTracker
 from omniforge.core.exceptions import PipelineError
 from omniforge.core.logging import get_logger
-from omniforge.core.performance import compute_df_fingerprint
 from omniforge.core.security import ArtifactSigner, safe_joblib_load_bytes
 from omniforge.core.types import CarbonReport
-from omniforge.core.utils import safe_json_default
 from omniforge.pipelines.base import PipelineContext, PipelineStep, StepExecutionRecord
 from omniforge.pipelines.dag import PipelineDAG
 
 logger = get_logger(__name__)
-_CACHE_HMAC_CONTEXT = b"omniforge:pipeline-cache:v2"
+_CACHE_HMAC_CONTEXT = b"omniforge:pipeline-cache:v3:"
 
 
-def _fingerprint_value(val: Any) -> str:
-    """Compute a deterministic content digest for DataFrames, arrays, JSON primitives, or Python objects."""
-    if isinstance(val, pd.DataFrame):
-        return f"df:{compute_df_fingerprint(val)}"
-    if isinstance(val, pd.Series):
-        return f"series:{compute_df_fingerprint(val.to_frame())}"
-    if isinstance(val, np.ndarray):
-        h = hashlib.sha256()
-        h.update(f"{val.shape}:{val.dtype}:".encode())
-        h.update(np.ascontiguousarray(val).tobytes())
-        return f"ndarray:{h.hexdigest()[:24]}"
+def _state_snapshot(ctx: PipelineContext) -> dict[str, dict[str, Any]]:
+    return {"params": ctx.params, "artifacts": ctx.artifacts, "step_outputs": ctx.step_outputs}
+
+
+def _apply_snapshot(ctx: PipelineContext, snapshot: dict[str, dict[str, Any]]) -> None:
+    ctx.params = snapshot["params"]
+    ctx.artifacts = snapshot["artifacts"]
+    ctx.step_outputs = snapshot["step_outputs"]
+
+
+def _load_snapshot(path: Path, step_id: str) -> tuple[dict[str, dict[str, Any]], str] | None:
     try:
-        encoded = json.dumps(val, sort_keys=True, default=safe_json_default).encode("utf-8")
-        return f"json:{hashlib.sha256(encoded).hexdigest()[:24]}"
-    except Exception:
-        try:
-            raw = pickle.dumps(val, protocol=5)
-            return f"pkl:{hashlib.sha256(raw).hexdigest()[:24]}"
-        except Exception:
-            return f"repr:{hashlib.sha256(repr(val).encode('utf-8')).hexdigest()[:24]}"
+        signature, _, payload = path.read_bytes().partition(b"\n")
+        if not signature or not ArtifactSigner().verify_bytes(
+            payload, signature.decode("ascii"), context=_CACHE_HMAC_CONTEXT + path.name.encode()
+        ):
+            logger.warning("pipeline_step_cache_signature_rejected", step_id=step_id)
+            return None
+        snapshot = safe_joblib_load_bytes(payload, filename=path.name)
+        if (
+            not isinstance(snapshot, dict)
+            or set(snapshot) != {"params", "artifacts", "step_outputs"}
+            or any(not isinstance(value, dict) for value in snapshot.values())
+            or step_id not in snapshot["step_outputs"]
+        ):
+            return None
+        return snapshot, hashlib.sha256(payload).hexdigest()
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logger.warning("pipeline_step_cache_invalid_recomputing", step_id=step_id, error_type=type(exc).__name__)
+        return None
+
+
+def _publish_snapshot(path: Path, ctx: PipelineContext) -> str:
+    payload = pickle.dumps(_state_snapshot(ctx), protocol=5)
+    signature = ArtifactSigner().sign_bytes(payload, context=_CACHE_HMAC_CONTEXT + path.name.encode())
+    temp_path: Path | None = None
+    try:
+        with NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", delete=False) as fh:
+            temp_path = Path(fh.name)
+            fh.write(signature.encode("ascii") + b"\n" + payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temp_path, path)
+        return hashlib.sha256(payload).hexdigest()
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 @dataclass
@@ -101,18 +126,20 @@ class PipelineExecutor:
         params: dict[str, Any] | None = None,
         tenant_id: str = "default-tenant",
     ) -> PipelineExecutionResult:
-        """Validate and execute all steps in ``dag``."""
+        """Run the DAG using copyable artifacts; cacheable steps must be deterministic over the artifact bus."""
         dag.validate()
         order = dag.topological_order()
-        ctx = PipelineContext(
-            tenant_id=tenant_id,
-            params=dict(params or {}),
-            artifacts=dict(initial_artifacts or {}),
-        )
-        initial_digests = {str(k): _fingerprint_value(v) for k, v in (initial_artifacts or {}).items()}
-        step_digests: dict[str, str] = {}
+        try:
+            initial_params, artifacts = copy.deepcopy((dict(params or {}), dict(initial_artifacts or {})))
+        except Exception as exc:
+            raise PipelineError(
+                "Pipeline inputs could not be copied into a private execution context.",
+                suggestions=["Supply copyable data and model artifacts instead of live resource handles."],
+            ) from exc
+        ctx = PipelineContext(tenant_id=tenant_id, params=initial_params, artifacts=artifacts)
         t_total = time.perf_counter()
         overall_status = "success"
+        state_digest: str | None = None
 
         with CarbonTracker(f"pipeline:{dag.name}", enabled=self.track_carbon) as tracker:
             for sid in order:
@@ -120,93 +147,55 @@ class PipelineExecutor:
                 started_at = datetime.now(UTC).isoformat()
                 t0 = time.perf_counter()
                 cache_path = (
-                    self._cache_key_path(
-                        dag.name,
-                        step,
-                        tenant_id=tenant_id,
-                        params=ctx.params,
-                        initial_digests=initial_digests,
-                        upstream_digests=step_digests,
-                    )
-                    if (step.cacheable and self.cache_dir)
-                    else None
+                    self._cache_key_path(dag.name, step, ctx, state_digest)
+                    if step.cacheable and self.cache_dir else None
                 )
+                state_digest = None
+                cached = _load_snapshot(cache_path, sid) if cache_path is not None else None
+                if cached is not None:
+                    snapshot, state_digest = cached
+                    _apply_snapshot(ctx, snapshot)
+                    ctx.records.append(
+                        StepExecutionRecord(
+                            step_id=sid,
+                            step_type=step.step_type,
+                            status="cached",
+                            started_at=started_at,
+                            finished_at=datetime.now(UTC).isoformat(),
+                            duration_seconds=round(time.perf_counter() - t0, 6),
+                            cache_hit=True,
+                        )
+                    )
+                    continue
 
-                if cache_path is not None and cache_path.exists():
-                    sig_path = cache_path.with_suffix(cache_path.suffix + ".hmac")
-                    cached_bytes = cache_path.read_bytes()
-                    expected_sig = sig_path.read_text(encoding="utf-8").strip() if sig_path.is_file() else ""
-                    if expected_sig and ArtifactSigner().verify_bytes(
-                        cached_bytes, expected_sig, context=_CACHE_HMAC_CONTEXT
-                    ):
-                        try:
-                            cached_payload = safe_joblib_load_bytes(cached_bytes, filename=cache_path.name)
-                            if isinstance(cached_payload, dict) and cached_payload.get("__omniforge_cache_v2__") is True:
-                                cached_out = cached_payload.get("output")
-                                for ak, av in (cached_payload.get("artifact_deltas") or {}).items():
-                                    ctx.artifacts[str(ak)] = av
-                            else:
-                                cached_out = cached_payload
-                            ctx.step_outputs[sid] = cached_out
-                            step_digests[sid] = _fingerprint_value(cached_out)
-                            rec = StepExecutionRecord(
-                                step_id=sid,
-                                step_type=step.step_type,
-                                status="cached",
-                                started_at=started_at,
-                                finished_at=datetime.now(UTC).isoformat(),
-                                duration_seconds=round(time.perf_counter() - t0, 6),
-                                cache_hit=True,
-                            )
-                            ctx.records.append(rec)
-                            continue
-                        except Exception as exc:
-                            logger.warning("pipeline_step_cache_invalid_recomputing", step_id=sid, error=str(exc))
-                    else:
-                        logger.warning("pipeline_step_cache_signature_rejected", step_id=sid)
-
-                attempt = 0
                 last_exc: Exception | None = None
-                while attempt <= step.retries:
+                for attempt in range(1, step.retries + 2):
                     try:
-                        pre_keys = {k: id(v) for k, v in ctx.artifacts.items()}
-                        output = step.run(ctx)
-                        ctx.step_outputs[sid] = output
-                        step_digests[sid] = _fingerprint_value(output)
-                        if cache_path is not None:
-                            try:
-                                artifact_deltas = {
-                                    k: v for k, v in ctx.artifacts.items() if k not in pre_keys or id(v) != pre_keys[k]
-                                }
-                                envelope = {
-                                    "__omniforge_cache_v2__": True,
-                                    "output": output,
-                                    "artifact_deltas": artifact_deltas,
-                                }
-                                joblib.dump(envelope, cache_path)
-                                sig = ArtifactSigner().sign_bytes(
-                                    cache_path.read_bytes(), context=_CACHE_HMAC_CONTEXT
-                                )
-                                cache_path.with_suffix(cache_path.suffix + ".hmac").write_text(
-                                    sig, encoding="utf-8"
-                                )
-                            except Exception as exc:
-                                logger.debug("pipeline_step_cache_write_skipped", step_id=sid, error=str(exc))
-                        rec = StepExecutionRecord(
+                        # Isolate attempts when execution may continue after a failure.
+                        attempt_ctx = copy.deepcopy(ctx) if step.retries or not self.fail_fast else ctx
+                        attempt_ctx.step_outputs[sid] = step.run(attempt_ctx)
+                    except Exception as exc:
+                        last_exc = exc
+                        continue
+                    _apply_snapshot(ctx, _state_snapshot(attempt_ctx))
+                    if cache_path is not None:
+                        try:
+                            state_digest = _publish_snapshot(cache_path, ctx)
+                        except Exception as exc:
+                            logger.debug("pipeline_step_cache_write_skipped", step_id=sid, error_type=type(exc).__name__)
+                    ctx.records.append(
+                        StepExecutionRecord(
                             step_id=sid,
                             step_type=step.step_type,
                             status="success",
                             started_at=started_at,
                             finished_at=datetime.now(UTC).isoformat(),
                             duration_seconds=round(time.perf_counter() - t0, 6),
-                            metadata={"attempts": attempt + 1},
+                            metadata={"attempts": attempt},
                         )
-                        ctx.records.append(rec)
-                        last_exc = None
-                        break
-                    except Exception as exc:
-                        last_exc = exc
-                        attempt += 1
+                    )
+                    last_exc = None
+                    break
 
                 if last_exc is not None:
                     overall_status = "failed"
@@ -241,40 +230,26 @@ class PipelineExecutor:
         )
 
     def _cache_key_path(
-        self,
-        pipeline_name: str,
-        step: PipelineStep,
-        *,
-        tenant_id: str = "default-tenant",
-        params: dict[str, Any] | None = None,
-        initial_digests: dict[str, str] | None = None,
-        upstream_digests: dict[str, str] | None = None,
-    ) -> Path:
+        self, pipeline_name: str, step: PipelineStep, ctx: PipelineContext, state_digest: str | None
+    ) -> Path | None:
         assert self.cache_dir is not None
         base_dir = self.cache_dir.resolve()
-        up_map = {dep: (upstream_digests or {}).get(dep, "") for dep in sorted(step.depends_on)}
-        digest = hashlib.sha256(
-            json.dumps(
-                {
-                    "tenant_id": tenant_id,
-                    "pipeline": pipeline_name,
-                    "step": step.step_id,
-                    "step_type": step.step_type,
-                    "config": step.config,
-                    "params": params or {},
-                    "initial_artifacts": initial_digests or {},
-                    "upstream_outputs": up_map,
-                },
-                sort_keys=True,
-                default=safe_json_default,
-            ).encode("utf-8")
-        ).hexdigest()[:24]
+        # Steps share the artifact bus, including outputs from earlier undeclared readers.
+        # Cache identity covers the entire state that a step is allowed to read/write.
+        try:
+            if state_digest is None:
+                state_digest = hashlib.sha256(pickle.dumps(_state_snapshot(ctx), protocol=5)).hexdigest()
+            data = pickle.dumps((ctx.tenant_id, pipeline_name, step.to_spec(), state_digest), protocol=5)
+        except Exception as exc:
+            logger.debug("pipeline_step_uncacheable_input", step_id=step.step_id, error_type=type(exc).__name__)
+            return None
+        digest = hashlib.sha256(data).hexdigest()[:24]
         safe_pipe = re.sub(r"[^A-Za-z0-9._-]", "_", pipeline_name).strip("._-")[:64] or "pipeline"
         safe_step = re.sub(r"[^A-Za-z0-9._-]", "_", step.step_id).strip("._-")[:64] or "step"
-        filename = f"{safe_pipe}_{safe_step}_{digest}.joblib"
+        filename = f"{safe_pipe}_{safe_step}_{digest}.cache-v3"
         if ".." in filename or "/" in filename or "\\" in filename:
-            raise PipelineError(f"Unsafe cache filename rejected: {filename!r}")
+            raise PipelineError("Pipeline cache filename could not be safely resolved.")
         candidate = (base_dir / filename).resolve()
         if not candidate.is_relative_to(base_dir):
-            raise PipelineError(f"Cache path escaped cache_dir confinement: {candidate}")
+            raise PipelineError("Pipeline cache entry is outside the configured cache directory.")
         return candidate

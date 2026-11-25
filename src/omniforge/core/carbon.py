@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import math
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -23,9 +24,9 @@ class CarbonTracker:
     """Context manager measuring compute energy (kWh) and emissions (kgCO2eq).
 
     Automatically integrates with ``codecarbon`` when installed and enabled;
-    otherwise uses a deterministic hardware-telemetry model calibrated to CPU
-    utilization, allocated RAM power draw, GPU TDP, data-center PUE, and
-    regional grid carbon intensity.
+    otherwise estimates energy from CPU utilization, memory, and power assumptions.
+    GPU power is included only when a reader supplies average power attributable to
+    the operation. Device availability and TDP alone do not establish GPU use.
     """
 
     def __init__(
@@ -37,6 +38,7 @@ class CarbonTracker:
         pue: float = 1.25,
         cpu_tdp_watts: float = 65.0,
         gpu_tdp_watts: float = 250.0,
+        gpu_power_reader: Callable[[], float] | None = None,
         use_codecarbon: bool = False,
         enabled: bool = True,
     ) -> None:
@@ -50,6 +52,7 @@ class CarbonTracker:
         self.pue = max(1.0, float(pue))
         self.cpu_tdp_watts = float(cpu_tdp_watts)
         self.gpu_tdp_watts = float(gpu_tdp_watts)
+        self._gpu_power_reader = gpu_power_reader
         self.use_codecarbon = use_codecarbon and is_package_available("codecarbon")
         self.enabled = enabled
 
@@ -76,11 +79,12 @@ class CarbonTracker:
                     project_name=self.operation_name,
                     country_iso_code=self.country_iso,
                     save_to_file=False,
+                    tracking_mode="process",
                     log_level="error",
                 )
                 self._cc_tracker.start()
             except Exception as exc:
-                logger.warning("codecarbon_fallback", reason=str(exc))
+                logger.warning("codecarbon_fallback", error_type=type(exc).__name__)
                 self._cc_tracker = None
 
     def stop(self) -> CarbonReport:
@@ -90,6 +94,7 @@ class CarbonTracker:
             self.report = CarbonReport(
                 operation_name=self.operation_name,
                 tracker_backend="disabled",
+                metadata={"energy_source": "unmeasured", "emissions_source": "unmeasured"},
                 country_iso=self.country_iso,
                 grid_intensity_g_per_kwh=self.grid_intensity,
                 pue=self.pue,
@@ -111,28 +116,37 @@ class CarbonTracker:
         cpu_power_w = self.cpu_tdp_watts * (0.15 + 0.85 * (avg_cpu_util / 100.0))
 
         gpu_power_w = 0.0
-        if is_package_available("torch"):
-            import torch
-
-            if torch.cuda.is_available():
-                gpu_power_w = self.gpu_tdp_watts * 0.6
+        gpu_attribution = "unavailable"
+        if self._gpu_power_reader is not None:
+            try:
+                reading = float(self._gpu_power_reader())
+                if math.isfinite(reading) and reading >= 0:
+                    gpu_power_w = reading
+                    gpu_attribution = "workload_telemetry"
+            except Exception as exc:
+                logger.warning("gpu_power_unavailable", error_type=type(exc).__name__)
 
         total_power_w = (cpu_power_w + ram_power_w + gpu_power_w) * self.pue
         energy_kwh = (total_power_w * (duration_s / 3600.0)) / 1000.0
         emissions_g = energy_kwh * self.grid_intensity
         emissions_kg = emissions_g / 1000.0
         backend = "omniforge_hardware_estimator"
+        energy_source = emissions_source = "modeled_estimate"
 
         if self._cc_tracker is not None:
             try:
-                cc_emissions_kg = float(self._cc_tracker.stop() or 0.0)
-                if cc_emissions_kg > 0:
-                    emissions_kg = cc_emissions_kg
-                    emissions_g = cc_emissions_kg * 1000.0
-                    energy_kwh = emissions_g / max(self.grid_intensity, 1.0)
-                    backend = "codecarbon"
+                cc_emissions_kg = self._cc_tracker.stop()
+                cc_data = getattr(self._cc_tracker, "final_emissions_data", None)
+                cc_energy = getattr(cc_data, "energy_consumed", None)
+                if cc_emissions_kg is not None and math.isfinite(cc_emissions_kg) and cc_emissions_kg >= 0:
+                    emissions_kg = float(cc_emissions_kg)
+                    emissions_g = emissions_kg * 1000.0
+                    backend = emissions_source = "codecarbon"
+                if cc_energy is not None and math.isfinite(cc_energy) and cc_energy >= 0:
+                    energy_kwh = float(cc_energy)
+                    backend = energy_source = "codecarbon"
             except Exception as exc:
-                logger.warning("codecarbon_stop_failed", reason=str(exc))
+                logger.warning("codecarbon_stop_failed", error_type=type(exc).__name__)
 
         # Green score rewards lower emissions per run (exponentially decaying scale)
         green_score = round(100.0 * float(pow(2.718281828, -emissions_g / 50.0)), 2)
@@ -140,6 +154,13 @@ class CarbonTracker:
         self.report = CarbonReport(
             operation_name=self.operation_name,
             tracker_backend=backend,
+            metadata={
+                "energy_source": energy_source,
+                "emissions_source": emissions_source,
+                "gpu_attribution": gpu_attribution,
+                "modeled_cpu_tdp_watts": self.cpu_tdp_watts,
+                "modeled_ram_watts_per_gib": 0.3725,
+            },
             duration_seconds=round(duration_s, 6),
             energy_kwh=round(energy_kwh, 9),
             emissions_kg_co2eq=round(emissions_kg, 9),

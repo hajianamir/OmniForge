@@ -259,7 +259,7 @@ def test_vision_failure_logs_and_keeps_fallback(
         assert result["backend"] == "native_spatial_pyramid" and result["embedding_dim"] > 0
     elif operation == "zero_shot_classification":
         result = hub.zero_shot_classify(image, ["sky", "forest"])
-        assert result["backend"] == fallback and result["top_label"] in {"sky", "forest"}
+        assert result["backend"] == fallback and result["top_label"] is None
     else:
         result = hub.detect_objects(image)
         assert result["backend"] == fallback and isinstance(result["detections"], list)

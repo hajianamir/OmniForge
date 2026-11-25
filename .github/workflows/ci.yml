@@ -100,6 +100,26 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev,api,ui,reporting,data,forecasting]"
+      - name: Run live Workbench browser regressions
+        run: |
+          set -euo pipefail
+          runtime=$(mktemp -d)
+          export OMNIFORGE_KEY_DIR="$runtime/keys"
+          export OMNIFORGE_PATHS__WORKSPACE_DIR="$runtime/workspace"
+          export OMNIFORGE_PATHS__AUDIT_LOG_PATH="$runtime/workspace/audit.jsonl"
+          export OMNIFORGE_API__RATE_LIMIT_PER_MINUTE=0
+          export OMNIFORGE_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          omniforge ui --host 127.0.0.1 --port 8501 > "$runtime/service.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8501/health >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8501/health >/dev/null
+          export OMNIFORGE_BROWSER_API_KEY="$OMNIFORGE_API_KEY"
+          export PLAYWRIGHT_BASE_URL=http://127.0.0.1:8501
+          npm --prefix frontend run test:browser -- tests/browser/live-workspace.spec.ts --workers=1
       # tests/e2e also runs inside the main pytest matrix; this job additionally verifies
       # the SPA builds from lock-pinned sources and that the served assets are fresh.
       - name: Run e2e suite (API, CLI, workbench SPA)

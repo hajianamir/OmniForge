@@ -28,7 +28,6 @@ import type {
   HypothesisResponse,
   IntakeAuditPayload,
   MiningResponse,
-  QualityDimensionScores,
   SelectionResponse,
   StateEnvelope,
 } from '../studioTypes';
@@ -842,7 +841,7 @@ export const Studio01Data: React.FC<StudioProps & { sectionMode?: 'ingestion' | 
             {Object.entries(quality.quality?.dimensions || {}).map(([k, v]) => (
               <div key={k} className="kpi-card">
                 <div className="kpi-label">{k}</div>
-                <div className="kpi-value">{Number(v).toFixed(1)}%</div>
+                <div className="kpi-value">{typeof v === 'number' ? `${v.toFixed(1)}%` : 'Unavailable'}</div>
               </div>
             ))}
           </div>
@@ -1606,10 +1605,11 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (ws.numeric_columns.length && !colA) setColA(ws.numeric_columns[0]);
-    if (ws.columns.length > 1 && !colB) setColB(ws.columns[1]);
-  }, [ws.numeric_columns, ws.columns, colA, colB]);
+  const columns = ws.columns.filter((column) => !ws.excluded_columns.includes(column));
+  const selectedA = columns.includes(colA) ? colA : ws.numeric_columns.find((column) => columns.includes(column)) ?? columns[0] ?? '';
+  const otherColumns = columns.filter((column) => column !== selectedA);
+  const selectedB = otherColumns.includes(colB) ? colB : otherColumns[0] ?? '';
+  const needsSecondColumn = !['shapiro', 'dagostino', 'anderson', 'ks_normality', 'distribution_fit'].includes(testType);
 
   const runEDA = async () => {
     setBusy(true); setErr(null);
@@ -1627,8 +1627,8 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
       const res = await apiPost<HypothesisResponse>('/api/workbench/s04/hypothesis', {
         mode: hypMode,
         test_type: testType,
-        col_a: colA || null,
-        col_b: colB || null,
+        col_a: selectedA || null,
+        col_b: needsSecondColumn ? selectedB || null : null,
         alpha,
       });
       if (res.state) onSync(res.state);
@@ -1653,9 +1653,10 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
           </button>
         </div>
       </div>
-      {err && <div className="alert alert-error">{err}</div>}
+      {err && <div className="alert alert-error" role="alert">{err}</div>}
+      {busy && <div role="status">Analyzing the current study data…</div>}
 
-      {!eda && ws.has_dataset && (
+      {!busy && !eda && ws.has_dataset && (
         <div className="card" style={{ borderStyle: 'dashed' }}>
           <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>
             Click <strong>Run Automated EDA</strong> above to generate numeric distribution histograms, categorical frequency charts, missingness bars, and the feature correlation heatmap.
@@ -1665,6 +1666,11 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
 
       {eda && (
         <>
+          {eda.n_rows_analyzed !== undefined && (
+            <div className="alert alert-info" role="status">
+              Analyzed {eda.n_rows_analyzed.toLocaleString()} {eda.sampled ? 'sampled rows' : 'rows'} in the current study.
+            </div>
+          )}
           {(eda.distributions?.length ?? 0) > 0 && (
             <div className="grid-2">
               {(eda.distributions || []).map((d) => (
@@ -1770,21 +1776,23 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
                 </select>
               </label>
               <label className="field">Column A (Value)
-                <select value={colA} onChange={(e) => setColA(e.target.value)}>
-                  {ws.columns.map((c) => <option key={c} value={c}>{c}</option>)}
+                <select value={selectedA} onChange={(e) => setColA(e.target.value)}>
+                  {columns.map((c) => <option key={c} value={c}>{c}</option>)}
                 </select>
               </label>
-              <label className="field">Column B (Group / Pair)
-                <select value={colB} onChange={(e) => setColB(e.target.value)}>
-                  {ws.columns.map((c) => <option key={c} value={c}>{c}</option>)}
-                </select>
-              </label>
+              {needsSecondColumn && (
+                <label className="field">Column B (Group / Pair)
+                  <select value={selectedB} onChange={(e) => setColB(e.target.value)}>
+                    {otherColumns.map((c) => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                </label>
+              )}
             </>
           )}
           <label className="field">α Threshold
             <input type="number" step={0.01} min={0.001} max={0.2} value={alpha} onChange={(e) => setAlpha(Number(e.target.value))} style={{ width: 85 }} />
           </label>
-          <button className="btn btn-primary" disabled={busy || !ws.has_dataset} onClick={runHyp}>
+          <button className="btn btn-primary" disabled={busy || !ws.has_dataset || (hypMode === 'custom' && (!selectedA || (needsSecondColumn && !selectedB)))} onClick={runHyp}>
             {busy ? <span className="spinner" /> : null} Run Hypothesis Test ({hypMode.toUpperCase()})
           </button>
         </div>
@@ -1802,7 +1810,7 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
                   horizontal
                   items={hypRes.battery.slice(0, 14).map((row) => {
                     const pVal = Number(row.p_value ?? 1);
-                    const safeP = Number.isFinite(pVal) && pVal > 0 ? Math.max(pVal, 1e-16) : 1;
+                    const safeP = Number.isFinite(pVal) ? Math.max(pVal, 1e-16) : 1;
                     const sig = Boolean(row.significant ?? pVal < alpha);
                     return {
                       label: `${String(row.column ?? row.pair ?? row.variables ?? '')} · ${String(row.test_name ?? row.test ?? '')}`,
@@ -1813,17 +1821,25 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
                 />
               </div>
             )}
+            {hypRes.battery.length === 0 && <div className="alert alert-info">No tests were evaluable for the selected data.</div>}
             <SimpleTable title={`Hypothesis Test Battery (${(hypRes.mode || '').toUpperCase()})`} rows={hypRes.battery} maxRows={100} />
+            {Boolean(hypRes.skipped?.length) && (
+              <SimpleTable title="Tests skipped and why" rows={hypRes.skipped ?? []} maxRows={100} />
+            )}
           </div>
         )}
 
         {hypRes?.mode === 'custom' && hypRes.result && (
           <div>
             <div className="alert alert-info">
-              <strong>{hypRes.result.test_name}:</strong> stat={Number(hypRes.result.statistic ?? 0).toFixed(4)} · p-value={Number(hypRes.result.p_value ?? 1).toExponential(3)} · <strong>{hypRes.result.significant ? 'SIGNIFICANT' : 'NOT SIGNIFICANT'}</strong> — {hypRes.result.interpretation}
+              {hypRes.result.evaluable === false || hypRes.result.p_value == null ? (
+                <><strong>Not evaluable</strong> · {hypRes.result.interpretation}</>
+              ) : (
+                <><strong>{hypRes.result.test_name}:</strong> statistic={hypRes.result.statistic == null ? 'unavailable' : Number(hypRes.result.statistic).toFixed(4)} · p-value={Number(hypRes.result.p_value).toExponential(3)} · <strong>{hypRes.result.significant ? 'SIGNIFICANT' : 'NOT SIGNIFICANT'}</strong> · {hypRes.result.interpretation}</>
+              )}
             </div>
             {hypRes.result.extra_table && (
-              <SimpleTable title="Distribution Goodness-of-Fit Ranking (Lowest KS Statistic Wins)" rows={hypRes.result.extra_table} />
+              <SimpleTable title="Distribution Fit Ranking by AIC" rows={hypRes.result.extra_table} />
             )}
           </div>
         )}

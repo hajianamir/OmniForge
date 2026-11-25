@@ -281,3 +281,34 @@ def test_pii_guard_audit_logs_no_raw_pii():
 def test_pii_guard_unknown_policy_rejected():
     with pytest.raises(SecurityError):
         DataFramePIIGuard(tenant_id="t1", pii_policy="nonsense")
+
+
+def test_automl_latency_units_match_the_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = iter([0.0, 0.1])
+    monkeypatch.setattr("omniforge.automl.pipeline_search.time.perf_counter", lambda: next(clock))
+    search = AutoMLPipelineSearch(max_inference_latency_ms=500)
+    latency = search._inference_latency_ms_per_1k(_StubModel([1]), pd.DataFrame({"feature": range(100)}))
+    assert latency == pytest.approx(1000)
+    assert search._budget_rejected("test", 0, latency)
+
+
+def test_automl_rejects_unaffordable_deep_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omniforge.core.exceptions import AutoMLError
+
+    search = AutoMLPipelineSearch(
+        include_deep=True, max_inference_latency_ms=500, time_budget_seconds=60,
+    )
+    seen: list[str] = []
+    reject = search._budget_rejected
+
+    def record_rejection(name: str, carbon_g: float, latency_ms: float) -> bool:
+        seen.append(name)
+        return reject(name, carbon_g, latency_ms)
+
+    monkeypatch.setattr(search, "_fit_measured", lambda *_: 0.1)
+    monkeypatch.setattr(search, "_inference_latency_ms_per_1k", lambda *_: 1000.0)
+    monkeypatch.setattr(search, "_budget_rejected", record_rejection)
+    with pytest.raises(AutoMLError, match="No candidate model"):
+        search.fit(pd.DataFrame({"x": range(40)}), np.arange(40) % 2)
+    assert "random_forest" in seen
+    assert {"deep_mlp", "deep_cnn1d", "deep_tabular_transformer"}.issubset(seen)

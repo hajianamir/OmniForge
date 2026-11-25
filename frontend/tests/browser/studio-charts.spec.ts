@@ -518,6 +518,22 @@ test('standalone vision results restore even when no dataset is loaded', async (
   await expect(page.getByText('0.6250')).toBeVisible();
 });
 
+test('vision displays heuristic scores and abstention on an ambiguous image', async ({ page }) => {
+  const backend = new MockWorkbench({
+    s09_vision: { zero_shot: {
+      backend: 'native_visual_semantic_fallback', score_kind: 'visual_cue_heuristic', top_label: null,
+      predictions: [{ label: 'black', score: 2.4 }, { label: 'dark', score: 2.4 }],
+    } },
+  });
+  await backend.install(page);
+  await page.goto('/');
+  await openStudio(page, '09');
+  await page.getByRole('button', { name: 'Vision Foundation Hub' }).click();
+  await expect(page.getByText('No supported top label.')).toBeVisible();
+  await expect(page.getByText('Uncalibrated visual scores')).toBeVisible();
+  await expect(page.getByText('2.4000', { exact: true })).toHaveCount(2);
+});
+
 test('scatter charts handle empty or non-finite data without inventing zero-valued points', async ({ page }) => {
   const results = initialResults();
   results.s02_clustering.scatter = { ...scatter, x: [null, null] as any, y: [null, null] as any, rendered_points: 2, total_points: 2 };

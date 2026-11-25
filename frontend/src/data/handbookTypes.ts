@@ -155,7 +155,7 @@ export const WORKFLOW_ROADMAP: WorkflowRoadmapStep[] = [
     requirement: 'MANDATORY',
     objective: 'Remediate missing values, duplicates, corrupt tokens, extreme measurement errors, and constant/high-missing columns with complete audit traceability.',
     exactActions: [
-      'Run "Deep 6D Quality Profile" to review Completeness, Uniqueness, Validity, Consistency, Accuracy, and Timeliness scores.',
+      'Run "Deep 6D Quality Profile" to review Completeness, Uniqueness, Validity, Consistency, Accuracy (requires trusted reference data), and Timeliness scores.',
       'Select Auto (smart safe defaults), Complete (comprehensive sweep), or Custom (explicit imputer, outlier rule, threshold).',
       'Click "Dry-Run Preview" to verify row/column impact first, then click "Apply & Commit Cleaning".',
     ],
