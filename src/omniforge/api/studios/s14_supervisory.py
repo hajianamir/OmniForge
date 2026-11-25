@@ -10,8 +10,9 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter, File, Form, Header, HTTPException, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Response, UploadFile
 
+from omniforge.api.auth import require_permission
 from omniforge.api.studios.schemas import (
     RootCauseReq,
     SupervisoryAccessReq,
@@ -24,6 +25,7 @@ from omniforge.api.studios.schemas import (
 from omniforge.core.types import TaskType
 from omniforge.core.utils import to_json_object
 from omniforge.data.ingestion import DataIngestionEngine
+from omniforge.features.inference import WorkbenchInputPreprocessor
 from omniforge.mlops.root_cause import DriftRootCauseAnalyzer
 from omniforge.mlops.supervisory_monitor import SupervisoryPredictionMonitor
 from omniforge.models.deep import FTTransformerModel, MLPModel, ResNetTabularModel, TabNetModel
@@ -43,7 +45,7 @@ def s14_list_models(x_session_id: str | None = Header(default="default")) -> dic
     sid = _wb()._sid(x_session_id)
     state = get_session_state(sid)
     raw_models = SupervisoryPredictionMonitor.catalog_available_models(state)
-    models = [{k: v for k, v in m.items() if k != "_estimator"} for m in raw_models]
+    models = [{k: v for k, v in m.items() if not k.startswith("_")} for m in raw_models]
     last_eval = state.get("uap_supervisory_result")
     return to_json_object(
         {
@@ -90,23 +92,40 @@ def s14_get_model_equations(
     )
 
 
-@router.post("/s14/quick-train")
+@router.post("/s14/quick-train", dependencies=[Depends(require_permission("model:train"))])
 def s14_quick_train(req: SupervisoryQuickTrainReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     """Quickly train a selected baseline, ensemble, or neural network directly from Studio 14 so any model family is immediately available."""
     sid = _wb()._sid(x_session_id)
     state = get_session_state(sid)
-    df = get_analysis_dataframe(state, _wb()._require_df(state))
+    active_df = _wb()._require_df(state)
+    df = get_analysis_dataframe(state, active_df)
     targets = get_selected_targets(state, df)
     target = req.target if (req.target and req.target in df.columns) else (targets[0] if targets else None)
     if not target:
         raise HTTPException(status_code=400, detail="Select a target column first before training a supervisory model.")
-    X, y, task, input_preprocessor = _wb()._prepare_xy_fitted(df, target)
-    if len(X) < 6:
-        raise HTTPException(status_code=400, detail="Supervisory quick-train requires at least 6 rows.")
+    train_df, test_df, lock = _wb().get_active_split_frames(state, active_df)
+    train_df = train_df.loc[:, df.columns].dropna(subset=[target])
+    if test_df is None:
+        split = min(len(train_df) - 2, int(len(train_df) * 0.8))
+        train_df, test_df = train_df.iloc[:split], train_df.iloc[split:]
+    else:
+        test_df = test_df.loc[:, df.columns].dropna(subset=[target])
+    if len(train_df) < 4 or len(test_df) < 2 or df.shape[1] < 2:
+        raise HTTPException(status_code=400, detail="Supervisory quick-train requires four training rows, two test rows, and a predictor.")
+    y_tr, y_te = train_df[target], test_df[target]
+    task = _wb()._infer_task(y_tr)
     is_clf = task in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION)
-    split = min(len(X) - 2, max(2, int(len(X) * 0.8)))
-    X_tr, X_te = X.iloc[:split], X.iloc[split:]
-    y_tr, y_te = y.iloc[:split], y.iloc[split:]
+    if is_clf and y_tr.nunique() < 2:
+        raise HTTPException(status_code=400, detail="Supervisory training requires at least two observed classes.")
+    try:
+        raw_train = train_df.drop(columns=[target])
+        input_preprocessor = WorkbenchInputPreprocessor(mode="numeric").fit(raw_train)
+        X_tr = input_preprocessor.transform(raw_train)
+        X_te = input_preprocessor.transform(test_df.drop(columns=[target]))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not len(X_tr.columns):
+        raise HTTPException(status_code=400, detail="No usable predictor columns remain after excluding target.")
 
     from sklearn.ensemble import (
         GradientBoostingClassifier,
@@ -171,9 +190,10 @@ def s14_quick_train(req: SupervisoryQuickTrainReq, x_session_id: str | None = He
         dl_dict[m_key] = {
             "model": model,
             "name": label,
-            "feature_cols": list(X.columns),
+            "feature_cols": list(X_tr.columns),
             "metrics": {metric_name: round(score, 4)},
             "target": target,
+            "input_preprocessor": input_preprocessor,
         }
         state["uap_dl_models"] = dl_dict
     elif family == "Baseline":
@@ -183,8 +203,9 @@ def s14_quick_train(req: SupervisoryQuickTrainReq, x_session_id: str | None = He
         t_bl: dict[str, Any] = _t_bl_raw if isinstance(_t_bl_raw, dict) else {}
         t_bl[label] = {
             "model": model,
-            "feature_cols": list(X.columns),
+            "feature_cols": list(X_tr.columns),
             "metrics": {metric_name: round(score, 4)},
+            "input_preprocessor": input_preprocessor,
         }
         bl_all[target] = t_bl
         state["uap_baseline_models"] = bl_all
@@ -192,18 +213,23 @@ def s14_quick_train(req: SupervisoryQuickTrainReq, x_session_id: str | None = He
         state["uap_active_model"] = model
         state["uap_active_model_name"] = label
         state["uap_active_model_metrics"] = {metric_name: round(score, 4)}
-        state["uap_active_feature_cols"] = list(X.columns)
+        state["uap_active_feature_cols"] = list(X_tr.columns)
         state["uap_active_input_preprocessor"] = input_preprocessor
+        state["uap_active_X_test"], state["uap_active_y_test"] = X_te, y_te
+        state["uap_fairness_result"] = None
+        state["uap_model_card"] = None
 
     record_lineage(state, "Supervisory Monitor", f"Quick-trained {label}", f"{metric_name}={score:.4f}")
     raw_models = SupervisoryPredictionMonitor.catalog_available_models(state)
-    models_clean = [{k: v for k, v in m.items() if k != "_estimator"} for m in raw_models]
+    models_clean = [{k: v for k, v in m.items() if not k.startswith("_")} for m in raw_models]
     return to_json_object(
         {
             "trained_model": label,
             "family": family,
             "metric": metric_name,
             "score": round(score, 4),
+            "evaluation": {"partition": "test", "source": "split_lock" if lock else "ordered_split",
+                           "n_train": len(X_tr), "n_test": len(X_te)},
             "models": models_clean,
             "state": _wb()._state_summary(state, sid),
         }

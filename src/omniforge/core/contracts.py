@@ -150,25 +150,23 @@ class LeakageGuard:
                     except Exception:
                         pass
 
-                # 3. Near-perfect categorical prediction: each feature value maps to
-                #    exactly one target value (one-to-one) in both splits
-                if (
-                    not pd.api.types.is_numeric_dtype(x_train)
-                    or not pd.api.types.is_numeric_dtype(y_train)
-                ):
-                    try:
-                        tr_groups = train_df.groupby(x_train.astype(str))[y_train.name].nunique()
-                        te_groups = test_df.groupby(x_test.astype(str))[y_test.name].nunique()
-                        if (tr_groups == 1).all() and (te_groups == 1).all():
-                            target_leakage_detected = True
-                            target_leakage_columns.append(col)
-                            target_leakage_details.append(
-                                f"Column '{col}' perfectly predicts target '{target_col}' "
-                                f"(one-to-one mapping in both train and test)."
-                            )
-                            continue
-                    except Exception:
-                        pass
+                # A train-learned mapping must transfer to test, with repeated
+                # support for every test key. Unique row identifiers cannot qualify.
+                if not pd.api.types.is_numeric_dtype(x_train) or not pd.api.types.is_numeric_dtype(y_train):
+                    train_pairs = pd.DataFrame({"feature": x_train, "target": y_train}).dropna()
+                    test_pairs = pd.DataFrame({"feature": x_test, "target": y_test}).dropna()
+                    if test_pairs["target"].nunique() < 2 or train_pairs.empty:
+                        continue
+                    groups = train_pairs.groupby(train_pairs["feature"].astype(str))["target"]
+                    summary = groups.agg(["first", "size", "nunique"])
+                    supported = summary.loc[(summary["size"] >= 2) & (summary["nunique"] == 1), "first"]
+                    mapped = test_pairs["feature"].astype(str).map(supported)
+                    if mapped.notna().all() and mapped.eq(test_pairs["target"]).all():
+                        target_leakage_detected = True
+                        target_leakage_columns.append(col)
+                        target_leakage_details.append(
+                            f"Column '{col}' perfectly predicts target '{target_col}' through a repeated train mapping."
+                        )
 
         # Any target leakage makes the split fail
         if target_leakage_detected:

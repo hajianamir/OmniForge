@@ -275,7 +275,6 @@ urlsafe-b64(`b"OF2GCM\x01"` + nonce + ciphertext). Legacy Fernet tokens (`gAAAAA
 `OMNIFORGE_ARTIFACT_SIGNING_KEY`, `OMNIFORGE_SECURITY__ARTIFACT_SIGNING_KEY`, with `OMNIFORGE_JWT_SECRET_KEY` as fallback. Contexts: `omniforge:model:v1`, `omniforge:workspace:v2`, `omniforge-audit-event-v2`, `omniforge-audit-checkpoint-v1`.
 - **`safe_joblib_load_bytes`:** restricted `NumpyUnpickler` subclass. Enforces a module allow-list plus a 
 denylist of root modules, submodules and symbol names. Call it **after** HMAC verification.
- - [!] The allow-list contains the test module name `test_third_party_claims` **[V]**.
  - [!] It imports the private joblib names `NumpyUnpickler` and `_validate_fileobject_and_memmap`, 
 which can break on a joblib upgrade.
  - [!] `torch` is allow-listed broadly, apart from a few submodules.
@@ -288,8 +287,7 @@ Aborts with the internal `_PayloadTooLarge(BaseException)`, deliberately derivin
 - **`SlidingWindowRateLimitMiddleware`:** keyed by the ASGI client host, **not** `X-Forwarded-For`. 
 Returns 429 + `Retry-After`. Exempts `/health` and `/api/v1/health` only. A value of 0 disables it.
 - **`AuditLogger` (`core/security.py:1506`) [V]:** hash-chained, HMAC-signed JSONL audit trail. `__init__` caches `_last_hash` via `_load_last_hash()` and `_record_count` via `_count_records()`; `log_event()` builds the next event from the cached `self._last_hash` and appends without re-reading the tail and without a lock. The chain-fork defect (D1) is therefore **confirmed**: concurrent writers (e.g. a fresh `AuditLogger` per event in `mlops/registry.py` / `mlops/continuous_training.py` alongside the long-lived instance in `api/auth.py`) can fork the chain. Fix by re-reading the tail under a lock (plus an inter-process file lock) on every append. The prior draft's "could not locate" note was a search miss and is superseded.
-- **`ComplianceValidator(profiles=["GDPR","SOX"])`:** `evaluate_dataset(df, *, strict, 
-has_consent_record, encryption_enabled)` returns `compliant`, `violations`, `warnings`, `pii_columns_detected`. Implements GDPR Art. 6/5, HIPAA safe-harbour + encryption, SOX empty-dataset warning. The EU AI Act appears in the docstring only.
+- **`ComplianceValidator`** screens a limited set of GDPR, HIPAA and SOX indicators. It reports unsupported profiles, missing evidence, PII scan coverage and an assessment status. Strict mode requires the implemented checks to pass with sufficient evidence. A passed screen leaves the legal compliance conclusion unknown.
 ### 6.7 `carbon.py` **[V]**
 - CPU power = `TDP*(0.15 + 0.85*util)`. RAM power = `max(0.2, rss_gb*0.3725)`. GPU power = `0.6*TDP` 
 when CUDA is available.
@@ -500,8 +498,7 @@ double-submit `omniforge_csrf` cookie to equal the `X-CSRF-Token` header. Princi
 ->- No credentials 401 with `WWW-Authenticate: Bearer`. Never add an anonymous fallback.
 - `get_current_principal` is `async def` **on purpose**, so the `ContextVar` it sets is visible to sync path 
 operations (anyio copies the context into worker threads). **Do not make it sync.**
-- `require_workbench_auth` guards every `/api/workbench/*` route and **authenticates only**. Any valid 
-principal, including a `viewer` JWT, can reach every workbench route except `POST /s11/promote`, which adds `require_permission("model:promote")`. **Fine-grained RBAC is not applied across the workbench.**
+- `require_workbench_auth` authenticates every `/api/workbench/*` route. Studio 01 data writes and workspace restore require `data:write`. Studio 06 training requires `model:train`. Studio 10 requires `pipeline:execute` and additionally `model:train` for AutoML. Studio 11 registration requires `mlops:write`. Direct Production registration, promotion, and rollback also require `model:promote`. Review other routes individually.
 
 - `require_permission(perm)` calls the shared `access_controller`. The app **refuses to boot** 
 (`RuntimeError`) if the audit path is unusable.
@@ -514,8 +511,7 @@ therefore aborts import, which is the intended fail-closed behaviour.
  - **Mitigation:** set `OMNIFORGE_ENVIRONMENT=production`, or `OMNIFORGE_SECURITY__AUTO_BOOTSTRAP_LOCAL_UI=false`, or bind `127.0.0.1`, for anything beyond a single-user machine.
 - `POST /api/v1/auth/token` mints JWTs. It requires a valid API key (header or body) or an admin Bearer 
 token. A tenant-scoped admin cannot mint `platform_admin` tokens or tokens for another tenant.
-- [!] **RBAC inconsistency (D4) [V].** `/api/v1/registry/{name}/v{n}/stage` requires only `model:deploy` (`api/main.py:496`), yet 
-it can move a model to Production. `/s11/promote` requires `model:promote` (`api/studios/s11_mlops.py:72`). The Copilot `promote_model` tool applies no principal check. The registry's fairness gate applies on all three paths, but the RBAC permission does not.
+- **Production registry transitions.** The REST transition route requires `model:deploy` and additionally `model:promote` for Production. The Workbench promotion route requires `model:promote`. Request-scoped Copilot tools enforce their own stage-specific permissions.
 - **Session namespacing (OWASP API1/BOLA):** `_sid(x_session_id)` returns `ws:<sha256(tenant NUL 
 subject)[:16]>:<raw id>`. It falls back to the raw id only when there is no authenticated principal, which does not happen on workbench routes. **Limit:** every cookie and API-key caller has the **same** (tenant, subject) pair. For those callers the unguessable session id is the only separator. Isolation by identity is real only for JWT principals with distinct subjects.
 - **Jobs:** `BackgroundJobManager` (`ThreadPoolExecutor`, `max_workers=4`, `max_history=128`) 

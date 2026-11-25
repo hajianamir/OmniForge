@@ -17,7 +17,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import pandas as pd
 
@@ -553,8 +553,8 @@ def _resolve_or_persist_secret(
 _PII_PATTERNS: dict[str, re.Pattern[str]] = {
     "email": re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
     "ssn": re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
-    "phone": re.compile(r"\b(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b"),
     "credit_card": re.compile(r"\b(?:\d{4}[-\s]?){3}\d{4}\b"),
+    "phone": re.compile(r"\b(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b"),
     "ipv4": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
 }
 
@@ -778,7 +778,6 @@ _ALLOWED_UNPICKLE_BUILTINS: frozenset[str] = frozenset(
 
 _ALLOWED_UNPICKLE_MODULE_PREFIXES: tuple[str, ...] = (
     "omniforge",
-    "test_third_party_claims",
     "numpy",
     "pandas",
     "pyarrow",
@@ -1198,45 +1197,80 @@ class SecretsManager:
         self._store.pop(key, None)
 
 
+class PIIScanReport(TypedDict):
+    columns: dict[str, list[str]]
+    rows_scanned: int
+    total_rows: int
+    mode: str
+
+
 class PIIRedactor:
     """Detects and redacts personally identifiable information (PII) in text and DataFrames."""
 
+    @staticmethod
+    def _valid_match(category: str, value: str) -> bool:
+        if category == "ipv4":
+            return all(int(octet) <= 255 for octet in value.split("."))
+        if category == "credit_card":
+            digits = [int(char) for char in value if char.isdecimal()]
+            checksum = sum(digit if i % 2 == 0 else (digit * 2 - 9 if digit > 4 else digit * 2)
+                           for i, digit in enumerate(reversed(digits)))
+            return any(digits) and checksum % 10 == 0
+        return True
+
     def detect_text_pii(self, text: str) -> dict[str, list[str]]:
-        """Return PII matches keyed by category found in ``text``."""
+        """Return recognized PII matches keyed by category."""
         findings: dict[str, list[str]] = {}
         for category, pattern in _PII_PATTERNS.items():
-            matches = pattern.findall(text)
+            matches = [m[0] for m in pattern.finditer(text) if self._valid_match(category, m[0])]
             if matches:
                 findings[category] = matches
         return findings
 
     def redact_text(self, text: str, replacement: str = "[REDACTED]") -> str:
-        """Replace all recognized PII patterns in ``text``."""
+        """Replace all recognized PII patterns in text."""
         redacted = text
         for category, pattern in _PII_PATTERNS.items():
-            redacted = pattern.sub(f"{replacement}:{category.upper()}", redacted)
+            def redact(match: re.Match[str], cat: str = category) -> str:
+                return f"{replacement}:{cat.upper()}" if self._valid_match(cat, match[0]) else match[0]
+
+            redacted = pattern.sub(redact, redacted)
         return redacted
 
-    def scan_dataframe(self, df: pd.DataFrame, sample_size: int = 200) -> dict[str, list[str]]:
-        """Scan DataFrame columns and values for potential PII indicators."""
+    def scan_dataframe(self, df: pd.DataFrame, sample_size: int | None = 200) -> dict[str, list[str]]:
+        """Return potential PII indicators. Use scan_dataframe_report for coverage."""
+        return self.scan_dataframe_report(df, sample_size)["columns"]
+
+    def scan_dataframe_report(self, df: pd.DataFrame, sample_size: int | None = 200) -> PIIScanReport:
+        """Inspect evenly spaced rows, or all rows when sample_size is None."""
+        if sample_size is not None and sample_size < 1:
+            raise SecurityError("PII scan sample_size must be positive or None.")
+        row_count = len(df)
+        scanned = row_count if sample_size is None else min(row_count, sample_size)
+        if scanned == row_count:
+            sample = df
+        else:
+            row_positions = [i * (row_count - 1) // max(scanned - 1, 1) for i in range(scanned)]
+            sample = df.iloc[row_positions]
         flagged: dict[str, list[str]] = {}
-        sample_df = df.head(sample_size)
-
-        for col in df.columns:
-            reasons: list[str] = []
-            col_lower = str(col).lower()
-            if any(keyword in col_lower for keyword in _PII_COLUMN_KEYWORDS):
-                reasons.append("column_name_indicator")
-
-            if pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_string_dtype(df[col]):
-                text_blob = "\n".join(sample_df[col].dropna().astype(str).tolist())
-                pattern_hits = self.detect_text_pii(text_blob)
-                for cat in pattern_hits:
-                    reasons.append(f"value_pattern:{cat}")
-
+        for column, values in sample.items():
+            reasons = set()
+            if any(keyword in str(column).lower() for keyword in _PII_COLUMN_KEYWORDS):
+                reasons.add("column_name_indicator")
+            dtype = values.dtype
+            if (
+                pd.api.types.is_object_dtype(dtype)
+                or pd.api.types.is_string_dtype(dtype)
+                or isinstance(dtype, pd.CategoricalDtype)
+                or pd.api.types.is_integer_dtype(dtype)
+            ):
+                for cell in values.dropna():
+                    reasons.update(f"value_pattern:{category}" for category in self.detect_text_pii(str(cell)))
             if reasons:
-                flagged[str(col)] = sorted(set(reasons))
-        return flagged
+                column_name = str(column)
+                flagged[column_name] = sorted(reasons.union(flagged.get(column_name, [])))
+        return {"columns": flagged, "rows_scanned": scanned, "total_rows": row_count,
+                "mode": "all_rows" if scanned == row_count else "systematic_sample"}
 
     def anonymize_dataframe(
         self,
@@ -1271,7 +1305,7 @@ class PIIRedactor:
                 salt_bytes = salt.encode("utf-8") if isinstance(salt, str) else bytes(salt)
             else:
                 salt_bytes = resolve_pseudonym_salt(tenant)
-        target_cols = columns if columns is not None else list(self.scan_dataframe(df).keys())
+        target_cols = columns if columns is not None else list(self.scan_dataframe(df, sample_size=None))
         result = df.copy()
         for col in target_cols:
             if col not in result.columns:
@@ -1470,6 +1504,8 @@ def _verify_anchor_records(
     verify_mac: Callable[[dict[str, Any]], bool],
 ) -> tuple[bool, int, str]:
     """Shared consistency check for anchor checkpoints against the parsed log hashes."""
+    if hashes and not checkpoint_lines:
+        return False, 0, "anchor is empty; no checkpoint covers the non-empty audit log"
     checked = 0
     last_seq = 0
     max_covered = 0
@@ -2027,10 +2063,10 @@ class AuditLogger:
 
 
 class ComplianceValidator:
-    """Evaluates datasets and workflows against GDPR, HIPAA, SOX, and EU AI Act controls."""
+    """Screen for a limited set of privacy and data-quality controls."""
 
     def __init__(self, profiles: list[str] | None = None) -> None:
-        self.profiles = [p.upper() for p in (profiles or ["GDPR", "SOX"])]
+        self.profiles = list(dict.fromkeys(p.strip().upper() for p in (profiles or ["GDPR", "SOX"])))
         self._pii = PIIRedactor()
 
     def evaluate_dataset(
@@ -2038,75 +2074,63 @@ class ComplianceValidator:
         df: pd.DataFrame,
         *,
         strict: bool = False,
-        has_consent_record: bool = True,
-        encryption_enabled: bool = True,
+        has_consent_record: bool | None = None,
+        encryption_enabled: bool | None = None,
+        sample_size: int | None = 200,
     ) -> dict[str, Any]:
-        """Run compliance checks against a dataset and return a structured assessment."""
-        pii_findings = self._pii.scan_dataframe(df)
-        violations: list[dict[str, Any]] = []
-        warnings: list[dict[str, Any]] = []
-
-        if "GDPR" in self.profiles:
-            if pii_findings and not has_consent_record:
-                violations.append(
-                    {
-                        "framework": "GDPR",
-                        "control": "Art. 6 Lawful Basis",
-                        "detail": f"PII detected in columns {list(pii_findings.keys())} without recorded consent.",
-                    }
-                )
-            elif pii_findings:
-                warnings.append(
-                    {
-                        "framework": "GDPR",
-                        "control": "Art. 5 Data Minimization",
-                        "detail": f"Consider pseudonymizing detected PII columns: {list(pii_findings.keys())}.",
-                    }
-                )
-
-        if "HIPAA" in self.profiles:
+        """Return observed issues and missing evidence without certifying compliance."""
+        scan = self._pii.scan_dataframe_report(df, sample_size)
+        pii_findings = scan["columns"]
+        supported = [profile for profile in self.profiles if profile in {"GDPR", "HIPAA", "SOX"}]
+        unsupported = [profile for profile in self.profiles if profile not in supported]
+        violations: list[dict[str, str]] = []
+        warnings: list[dict[str, str]] = []
+        missing_evidence: list[str] = []
+        if scan["mode"] == "systematic_sample":
+            missing_evidence.append("PII screening covered a sample of the dataset.")
+        if unsupported:
+            missing_evidence.append("Some requested profiles have no implemented checks.")
+        if "GDPR" in supported:
+            if has_consent_record is None:
+                missing_evidence.append("Consent record evidence was not supplied.")
             if pii_findings:
-                violations.append(
-                    {
-                        "framework": "HIPAA",
-                        "control": "Safe Harbor De-identification",
-                        "detail": f"Potential PHI identifiers detected in columns {list(pii_findings.keys())}.",
-                    }
-                )
-            if not encryption_enabled:
-                violations.append(
-                    {
-                        "framework": "HIPAA",
-                        "control": "Technical Safeguards - Encryption",
-                        "detail": "Encryption at rest must be enabled for HIPAA workloads.",
-                    }
-                )
-
-        if "SOX" in self.profiles and len(df) == 0:
-            warnings.append(
-                {
-                    "framework": "SOX",
-                    "control": "Data Completeness",
-                    "detail": "Empty dataset detected; audit reconciliation may fail.",
-                }
-            )
-
-        compliant = len(violations) == 0
+                warnings.append({"framework": "GDPR", "control": "Data minimization and lawful basis",
+                                 "detail": "Review detected identifiers and document the applicable lawful basis."})
+                if has_consent_record is False:
+                    missing_evidence.append("No consent record was provided for data with potential identifiers.")
+        if "HIPAA" in supported:
+            if pii_findings:
+                warnings.append({"framework": "HIPAA", "control": "Identifier screening",
+                                 "detail": "Potential identifiers require a de-identification review."})
+            if encryption_enabled is None:
+                missing_evidence.append("Encryption evidence was not supplied.")
+            elif not encryption_enabled:
+                violations.append({"framework": "HIPAA", "control": "Encryption safeguard",
+                                   "detail": "Encryption is disabled according to the supplied evidence."})
+        if "SOX" in supported and df.empty:
+            missing_evidence.append("An empty dataset cannot support audit reconciliation checks.")
+        if violations:
+            status = "issues_found"
+        elif missing_evidence or warnings:
+            status = "review_required"
+        else:
+            status = "checks_passed"
         report = {
-            "compliant": compliant,
-            "profiles_evaluated": self.profiles,
+            "compliant": False if violations else None,
+            "assessment_status": status,
+            "profiles_evaluated": supported,
+            "unsupported_profiles": unsupported,
             "pii_columns_detected": pii_findings,
+            "pii_scan_coverage": {key: value for key, value in scan.items() if key != "columns"},
+            "missing_evidence": missing_evidence,
             "violations": violations,
             "warnings": warnings,
             "checked_at": datetime.now(UTC).isoformat(),
         }
-        if strict and not compliant:
+        if strict and status != "checks_passed":
             raise ComplianceError(
-                f"Dataset failed strict compliance validation for profiles {self.profiles}.",
+                "Dataset screening found issues or lacks sufficient evidence.",
                 context=report,
-                suggestions=[
-                    "Anonymize detected PII/PHI columns with PIIRedactor.anonymize_dataframe().",
-                    "Enable encryption at rest and document lawful consent basis.",
-                ],
+                suggestions=["Review potential identifiers and supply evidence for the requested controls."],
             )
         return report

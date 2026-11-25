@@ -13,6 +13,7 @@ from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, r2_sc
 from omniforge.core.logging import get_logger
 from omniforge.core.utils import to_json_safe
 from omniforge.evaluation.equations import ModelEquationExtractor
+from omniforge.features.inference import WorkbenchInputPreprocessor
 
 logger = get_logger(__name__)
 
@@ -36,7 +37,7 @@ class SupervisoryPredictionMonitor:
         models: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
 
-        def _add(mid: str, label: str, family: str, target: str, feature_cols: list[str], obj: Any, metrics: dict[str, Any] | None = None) -> None:
+        def _add(mid: str, label: str, family: str, target: str, feature_cols: list[str], obj: Any, metrics: dict[str, Any] | None = None, preprocessor: WorkbenchInputPreprocessor | None = None) -> None:
             if mid in seen_ids or obj is None or not hasattr(obj, "predict"):
                 return
             seen_ids.add(mid)
@@ -50,6 +51,7 @@ class SupervisoryPredictionMonitor:
                     "feature_cols": list(feature_cols),
                     "metrics": metrics or {},
                     "_estimator": obj,
+                    "_input_preprocessor": preprocessor,
                 }
             )
 
@@ -66,6 +68,7 @@ class SupervisoryPredictionMonitor:
                 list(state.get("uap_active_feature_cols") or []),
                 state.get("uap_active_model"),
                 state.get("uap_active_model_metrics") or {},
+                state.get("uap_active_input_preprocessor"),
             )
 
         # 2. All Neural Network / Deep Learning Models trained in Studio 06
@@ -82,6 +85,7 @@ class SupervisoryPredictionMonitor:
                         list(entry.get("feature_cols") or dl_feats),
                         entry["model"],
                         entry.get("metrics") or {},
+                        entry.get("input_preprocessor"),
                     )
                 elif hasattr(entry, "predict"):
                     _add(
@@ -109,6 +113,7 @@ class SupervisoryPredictionMonitor:
                             list(entry.get("feature_cols") or []),
                             entry["model"],
                             entry.get("metrics") or {},
+                            entry.get("input_preprocessor"),
                         )
                     elif hasattr(entry, "predict"):
                         _add(
@@ -136,6 +141,7 @@ class SupervisoryPredictionMonitor:
                             list(entry.get("feature_cols") or []),
                             entry["model"],
                             entry.get("metrics") or {},
+                            entry.get("input_preprocessor"),
                         )
 
         # 4. Studio 14 Quick-Fit Models
@@ -151,6 +157,7 @@ class SupervisoryPredictionMonitor:
                         list(entry.get("feature_cols") or []),
                         entry["model"],
                         entry.get("metrics") or {},
+                        entry.get("input_preprocessor"),
                     )
 
         return models
@@ -193,6 +200,16 @@ class SupervisoryPredictionMonitor:
                         fill_v = float(ref_num.median())
                 out[col] = np.full(len(incoming_df), fill_v if math.isfinite(fill_v) else 0.0)
         return pd.DataFrame(out, index=incoming_df.index)
+
+    @classmethod
+    def _model_input(
+        cls, incoming_df: pd.DataFrame, entry: dict[str, Any], ref_df: pd.DataFrame | None,
+        fallback_features: list[str] | None = None,
+    ) -> pd.DataFrame:
+        preprocessor = entry.get("_input_preprocessor")
+        if isinstance(preprocessor, WorkbenchInputPreprocessor):
+            return preprocessor.transform(incoming_df)
+        return cls._align_features(incoming_df, entry["feature_cols"] or fallback_features or [], ref_df=ref_df)
 
     @staticmethod
     def _predict_safe(estimator: Any, X: pd.DataFrame) -> np.ndarray:
@@ -245,7 +262,7 @@ class SupervisoryPredictionMonitor:
             fcols = list(entry.get("feature_cols") or [])
             X_ref = None
             if ref_df is not None and not ref_df.empty:
-                X_ref = cls._align_features(ref_df.iloc[: min(len(ref_df), 400)].copy(), fcols, ref_df=ref_df)
+                X_ref = cls._model_input(ref_df.head(400), entry, ref_df)
             rep = ModelEquationExtractor.extract(
                 entry["_estimator"],
                 X_reference=X_ref,
@@ -643,11 +660,11 @@ class SupervisoryPredictionMonitor:
 
         # Cap row telemetry table at 5,000 rows while computing full-batch KPIs
         work_df = incoming_df.copy().reset_index(drop=True)
-        X_primary = self._align_features(work_df, primary_entry["feature_cols"], ref_df=ref_df)
+        X_primary = self._model_input(work_df, primary_entry, ref_df)
         preds = self._predict_safe(primary_entry["_estimator"], X_primary)
 
         if baseline_entry is not None:
-            X_base = self._align_features(work_df, baseline_entry["feature_cols"] or primary_entry["feature_cols"], ref_df=ref_df)
+            X_base = self._model_input(work_df, baseline_entry, ref_df, primary_entry["feature_cols"])
             base_preds = self._predict_safe(baseline_entry["_estimator"], X_base)
             baseline_label = baseline_entry["label"]
         else:
@@ -1125,7 +1142,7 @@ class SupervisoryPredictionMonitor:
         preds_scalar = self._predict_scalar_response(primary_entry["_estimator"], X_primary, is_clf)
         base_scalar: np.ndarray | None
         if baseline_entry is not None:
-            X_base_rc = self._align_features(work_df, baseline_entry["feature_cols"] or primary_entry["feature_cols"], ref_df=ref_df)
+            X_base_rc = self._model_input(work_df, baseline_entry, ref_df, primary_entry["feature_cols"])
             base_scalar = self._predict_scalar_response(baseline_entry["_estimator"], X_base_rc, is_clf)
         else:
             b_num_rc = pd.to_numeric(pd.Series(base_preds), errors="coerce").to_numpy(dtype=float)

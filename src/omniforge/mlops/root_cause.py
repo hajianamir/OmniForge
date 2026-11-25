@@ -95,24 +95,23 @@ class CausalDiscovery:
         df: pd.DataFrame, x: str, y: str, cond_cols: list[str]
     ) -> tuple[float, float]:
         """Return (partial_correlation, p_value) of x vs y controlling for cond_cols."""
-        sub = df[[x, y] + list(cond_cols)].dropna()
-        n = len(sub)
-        if n < 4 or len(cond_cols) >= n - 2:
+        data = df[[x, y, *cond_cols]].to_numpy(dtype=float, na_value=np.nan)
+        data = data[np.isfinite(data).all(axis=1)]
+        n = len(data)
+        if n < 4:
             return 0.0, 1.0
-        X = sub[[x] + list(cond_cols)].to_numpy(dtype=float)
-        Y = sub[[y] + list(cond_cols)].to_numpy(dtype=float)
-        # Regress x on cond, y on cond; correlate residuals.
-        cx = X[:, 0]
-        cy = Y[:, 0]
-        if len(cond_cols) > 0:
-            C = X[:, 1:]
-            # Ordinary least squares residuals via lstsq
-            bx, _, _, _ = np.linalg.lstsq(C, cx, rcond=None)
-            by, _, _, _ = np.linalg.lstsq(C, cy, rcond=None)
-            rx = cx - C @ bx
-            ry = cy - C @ by
-        else:
-            rx, ry = cx, cy
+        outcomes = data[:, :2]
+        outcomes = outcomes - outcomes.mean(axis=0)
+        effective_controls = 0
+        if cond_cols:
+            controls = data[:, 2:]
+            controls = controls - controls.mean(axis=0)
+            scale = np.linalg.norm(controls, axis=0)
+            controls = controls[:, scale > 0] / scale[scale > 0]
+            if controls.shape[1]:
+                coefficients, _, effective_controls, _ = np.linalg.lstsq(controls, outcomes, rcond=None)
+                outcomes = outcomes - controls @ coefficients
+        rx, ry = outcomes.T
         sx = float(np.std(rx, ddof=1))
         sy = float(np.std(ry, ddof=1))
         if sx <= 1e-12 or sy <= 1e-12:
@@ -120,11 +119,11 @@ class CausalDiscovery:
         r = float(np.corrcoef(rx, ry)[0, 1])
         r = float(np.clip(r, -1.0, 1.0))
         # t-statistic for partial correlation
-        df_resid = n - len(cond_cols) - 2
-        if df_resid <= 1:
+        df_resid = n - effective_controls - 2
+        if df_resid < 1:
             return r, 1.0
-        t_stat = r * np.sqrt(df_resid / max(1.0 - r * r, 1e-12))
-        p_val = 2.0 * (1.0 - stats.t.cdf(abs(t_stat), df_resid))
+        t_stat = r * np.sqrt(df_resid / max(1.0 - r * r, np.finfo(float).tiny))
+        p_val = 2.0 * stats.t.sf(abs(t_stat), df_resid)
         return r, float(p_val)
 
     @staticmethod

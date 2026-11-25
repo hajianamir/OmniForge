@@ -111,21 +111,16 @@ differs by route:
   and reports a leakage warning. Feature selection also has a separate
   full-data preparation path; do not infer that its entire evaluation pipeline
   is leakage-free from the lock alone.
-- Studio 06 AutoML uses locked train as its input when a valid lock exists,
-  otherwise the full analysis dataframe
-  (`src/omniforge/api/studios/s06_automl.py::s06_run_automl`).
-  This is a holdout boundary, not proof that every backend's internal CV is
-  fold-safe. `uap_active_X_test` and `uap_active_y_test` are assigned a tail
-  of the AutoML input, not the locked test partition; do not treat those keys
-  as an independent test set.
-- Studio 06 **nonparametric** fits `_prepare_xy_fitted()` on the full analysis
-  dataframe before `NonParametricAnalyticalSuite` creates CV folds. Studio 14
-  **quick-train** fits it on the full analysis dataframe before its 80/20
-  positional split. Neither handler calls `get_active_split_frames`. Numeric
-  medians and category vocabularies can therefore include evaluation rows;
-  Split Lock does not make these scores leakage-free. Fit within each training
-  fold/partition and add adversarial held-out-category and median tests before
-  making a stronger claim.
+- Studio 06 native AutoML selects on development rows and scores the locked
+  test partition when present. Specialized backends receive development rows
+  only, and Studio 06 supplies reserved test data for final scoring when the
+  dataset supports a holdout. Inspect adapter internals separately for
+  fold-local preprocessing.
+- Studio 06 non-parametric training fits on the locked training partition when
+  present. Its internal CV still shares a preprocessing fit across that
+  partition. Studio 14 quick-train fits preprocessing on its training partition
+  and evaluates on locked rows when present. Studio 14 monitor inference reuses
+  saved preprocessing for entries that have it.
 
 `src/omniforge/features/inference.py::WorkbenchInputPreprocessor` remembers input column
 order and types. In numeric mode it retains fitted numeric/datetime medians

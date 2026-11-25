@@ -30,8 +30,10 @@ def s07_explain(req: ExplainReq, x_session_id: str | None = Header(default="defa
     model = state.get("uap_active_model")
     X_te = state.get("uap_active_X_test")
     y_te = state.get("uap_active_y_test")
-    if model is None or not isinstance(X_te, pd.DataFrame) or X_te.empty:
+    if model is None:
         raise HTTPException(status_code=400, detail="Train a model in Studio 06 first to inspect explanations.")
+    if not isinstance(X_te, pd.DataFrame) or X_te.empty:
+        raise HTTPException(status_code=400, detail="Explanations require held-out data. Enable Split Lock and retrain.")
     eng = InterpretabilityEngine()
     perm = eng.permutation_importance(model, X_te, y_te, n_repeats=5)
     local_idx = max(0, min(req.row_index, len(X_te) - 1))
@@ -53,8 +55,10 @@ def s07_fairness(req: FairnessReq, x_session_id: str | None = Header(default="de
     X_te = state.get("uap_active_X_test")
     y_te = state.get("uap_active_y_test")
     sens_source = df if req.sensitive_col in df.columns else full_df
-    if model is None or X_te is None or req.sensitive_col not in sens_source.columns:
+    if model is None or req.sensitive_col not in sens_source.columns:
         raise HTTPException(status_code=400, detail="Train a model and select a valid sensitive attribute column.")
+    if not isinstance(X_te, pd.DataFrame) or X_te.empty:
+        raise HTTPException(status_code=400, detail="Fairness auditing requires held-out data. Enable Split Lock and retrain.")
     _sens = sens_source[req.sensitive_col].reindex(X_te.index)
     if isinstance(_sens.dtype, pd.CategoricalDtype) and "Missing" not in _sens.cat.categories:
         _sens = _sens.cat.add_categories(["Missing"])
