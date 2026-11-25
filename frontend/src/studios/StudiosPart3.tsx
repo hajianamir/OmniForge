@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { apiDownload, apiGet, apiPost, apiUpload, toErrorMessage } from '../api';
-import { BarChartSVG, NetworkGraphSVG } from '../components/Charts';
+import { BarChartSVG, LineSeriesSVG, NetworkGraphSVG } from '../components/Charts';
 import { SimpleTable } from '../components/DataGrid';
 import { FeatureFreshnessPanel } from '../components/FeatureFreshnessPanel';
 import { StudioHelpButton } from '../components/HelpGuideModal';
@@ -150,7 +150,26 @@ export const Studio09Specialized: React.FC<StudioProps> = ({ ws, studioCache, se
             <textarea rows={4} value={nlpText} onChange={(e) => setNlpText(e.target.value)} />
           </label>
           <button className="btn btn-primary" disabled={busy} onClick={runNLP}>{busy ? <span className="spinner" /> : null} Run Advanced NLP</button>
-          {nlpRes && <pre className="code-block" style={{ marginTop: 12, maxHeight: 380 }}>{JSON.stringify(nlpRes, null, 2)}</pre>}
+          {nlpRes && (
+            <div style={{ marginTop: 12 }}>
+              {(() => {
+                const zsRows = Array.isArray(nlpRes.zero_shot) ? (nlpRes.zero_shot as Array<Record<string, unknown>>) : [];
+                const firstScores = zsRows[0]?.scores;
+                const zsItems =
+                  typeof firstScores === 'object' && firstScores !== null && !Array.isArray(firstScores)
+                    ? Object.entries(firstScores as Record<string, unknown>).flatMap(([lbl, val]) =>
+                        typeof val === 'number' && Number.isFinite(val) ? [{ label: lbl, value: val, color: '#38bdf8' }] : [],
+                      )
+                    : [];
+                return zsItems.length > 0 ? (
+                  <div style={{ marginBottom: 12 }}>
+                    <BarChartSVG title="Zero-Shot Topic / Intent Confidence (Doc #1)" horizontal items={zsItems} />
+                  </div>
+                ) : null;
+              })()}
+              <pre className="code-block" style={{ maxHeight: 380 }}>{JSON.stringify(nlpRes, null, 2)}</pre>
+            </div>
+          )}
         </div>
       )}
 
@@ -247,7 +266,24 @@ export const Studio09Specialized: React.FC<StudioProps> = ({ ws, studioCache, se
             setBusy(true); setErr(null);
             try { setStudioResult('s09_recommend', await apiPost<RecommendResponse>('/api/workbench/s09/recommend', {})); } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
           }}>Run Hybrid Recommender</button>
-          {recRes && <div style={{ marginTop: 12 }}><SimpleTable rows={recRes.recommendations || []} /></div>}
+          {recRes && (
+            <div style={{ marginTop: 12 }}>
+              {(recRes.recommendations?.length ?? 0) > 0 && (
+                <div style={{ marginBottom: 12 }}>
+                  <BarChartSVG
+                    title="Hybrid Recommendation Affinity Scores"
+                    horizontal
+                    items={(recRes.recommendations || []).slice(0, 12).flatMap((r, idx) => {
+                      const sc = Number(r.score ?? r.affinity ?? NaN);
+                      const lbl = String(r.item ?? r.item_id ?? r.title ?? `Item ${idx + 1}`);
+                      return Number.isFinite(sc) ? [{ label: lbl, value: sc, color: '#34d399' }] : [];
+                    })}
+                  />
+                </div>
+              )}
+              <SimpleTable rows={recRes.recommendations || []} />
+            </div>
+          )}
         </div>
       )}
 
@@ -255,17 +291,56 @@ export const Studio09Specialized: React.FC<StudioProps> = ({ ws, studioCache, se
         <div className="card">
           <div className="row" style={{ marginBottom: 12 }}>
             <label className="field">Duration Column
-              <select value={durCol} onChange={(e) => setDurCol(e.target.value)}>{ws.numeric_columns.map((c) => <option key={c} value={c}>{c}</option>)}</select>
+              <select value={durCol} onChange={(e) => setDurCol(e.target.value)}>{(ws.numeric_columns.length ? ws.numeric_columns : ws.columns).map((c) => <option key={c} value={c}>{c}</option>)}</select>
             </label>
             <label className="field">Event Column
-              <select value={evtCol} onChange={(e) => setEvtCol(e.target.value)}>{ws.numeric_columns.map((c) => <option key={c} value={c}>{c}</option>)}</select>
+              <select value={evtCol} onChange={(e) => setEvtCol(e.target.value)}>{(ws.numeric_columns.length ? ws.numeric_columns : ws.columns).map((c) => <option key={c} value={c}>{c}</option>)}</select>
             </label>
             <button className="btn btn-primary" disabled={busy || !ws.has_dataset} onClick={async () => {
               setBusy(true); setErr(null);
-              try { setStudioResult('s09_survival', await apiPost<SurvivalResponse>('/api/workbench/s09/survival', { duration_col: durCol || ws.numeric_columns[0], event_col: evtCol || ws.numeric_columns[1] })); } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
+              const cols = ws.numeric_columns.length ? ws.numeric_columns : ws.columns;
+              try { setStudioResult('s09_survival', await apiPost<SurvivalResponse>('/api/workbench/s09/survival', { duration_col: durCol || cols[0], event_col: evtCol || cols[1] || cols[0] })); } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
             }}>Fit Kaplan-Meier &amp; CoxPH</button>
           </div>
-          {survRes && <pre className="code-block">{JSON.stringify({ median_survival: survRes.median_survival, cox: survRes.cox, points: survRes.km_curve?.length }, null, 2)}</pre>}
+          {survRes && (
+            <>
+              <div className="grid-2" style={{ marginBottom: 12 }}>
+                {(survRes.km_curve?.length ?? 0) > 0 && (
+                  <LineSeriesSVG
+                    title="Kaplan-Meier Survival Probability Curve S(t)"
+                    subtitle={survRes.median_survival !== null && survRes.median_survival !== undefined ? `Median Survival = ${Number(survRes.median_survival).toFixed(3)}` : 'Stepwise survival function with 95% Greenwood CI'}
+                    xLabel="Duration (t)"
+                    yLabel="Survival Probability S(t)"
+                    series={[
+                      {
+                        name: 'Kaplan-Meier S(t)',
+                        color: '#38bdf8',
+                        stepAfter: true,
+                        points: (survRes.km_curve || []).map((pt) => ({
+                          x: Number(pt.time ?? 0),
+                          y: Number(pt.survival_prob ?? 0),
+                          lower: typeof pt.ci_lower === 'number' ? pt.ci_lower : null,
+                          upper: typeof pt.ci_upper === 'number' ? pt.ci_upper : null,
+                        })),
+                      },
+                    ]}
+                  />
+                )}
+                {survRes.cox && typeof survRes.cox.hazard_ratios === 'object' && survRes.cox.hazard_ratios !== null && (
+                  <BarChartSVG
+                    title="Cox Proportional Hazards — Covariate Hazard Ratios exp(β)"
+                    horizontal
+                    items={Object.entries(survRes.cox.hazard_ratios as Record<string, unknown>).flatMap(([feat, hr]) =>
+                      typeof hr === 'number' && Number.isFinite(hr)
+                        ? [{ label: feat, value: hr, color: hr > 1 ? '#f87171' : '#34d399' }]
+                        : [],
+                    )}
+                  />
+                )}
+              </div>
+              <pre className="code-block">{JSON.stringify({ median_survival: survRes.median_survival, cox: survRes.cox, points: survRes.km_curve?.length }, null, 2)}</pre>
+            </>
+          )}
         </div>
       )}
     </div>
@@ -316,19 +391,38 @@ export const Studio10DAG: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
             <button key={s} className={`chip ${stages.includes(s) ? 'selected' : ''}`} onClick={() => toggle(s)}>{s.toUpperCase()}</button>
           ))}
         </div>
-        <svg viewBox="0 0 760 110" style={{ width: '100%', height: 110, background: 'var(--bg)', borderRadius: 10 }}>
-          {stages.map((s, i) => {
-            const x = 35 + i * 145;
-            return (
-              <g key={s}>
-                {i > 0 && <line x1={x - 30} y1={55} x2={x} y2={55} stroke="#38bdf8" strokeWidth={2} />}
-                <rect x={x} y={32} width={115} height={46} rx={10} fill="#111b2e" stroke="#38bdf8" strokeWidth={1.6} />
-                <text x={x + 57} y={59} textAnchor="middle" fill="#edf2ff" fontSize={12} fontWeight={700}>{s.toUpperCase()}</text>
-              </g>
-            );
-          })}
-        </svg>
-        {dagRes && <pre className="code-block" style={{ marginTop: 12, maxHeight: 320 }}>{JSON.stringify(dagRes.execution, null, 2)}</pre>}
+        <InspectableBox title="Topological Pipeline DAG" subtitle={`${stages.length} ordered execution stage(s)`} compact>
+          <svg viewBox="0 0 760 110" style={{ width: '100%', height: 110, background: 'var(--bg)', borderRadius: 10, display: 'block' }}>
+            {stages.map((s, i) => {
+              const x = 35 + i * 145;
+              return (
+                <g key={s}>
+                  {i > 0 && <line x1={x - 30} y1={55} x2={x} y2={55} stroke="#38bdf8" strokeWidth={2} />}
+                  <rect x={x} y={32} width={115} height={46} rx={10} fill="var(--bg-card)" stroke="#38bdf8" strokeWidth={1.6} />
+                  <text x={x + 57} y={59} textAnchor="middle" fill="var(--text)" fontSize={12} fontWeight={700}>{s.toUpperCase()}</text>
+                </g>
+              );
+            })}
+          </svg>
+        </InspectableBox>
+        {dagRes?.execution && (
+          <div style={{ marginTop: 12 }}>
+            {Array.isArray(dagRes.execution.step_records) && dagRes.execution.step_records.length > 0 && (
+              <div style={{ marginBottom: 12 }}>
+                <BarChartSVG
+                  title="DAG Stage Execution Telemetry (Duration in Seconds)"
+                  horizontal
+                  items={(dagRes.execution.step_records as Array<Record<string, unknown>>).map((sr) => ({
+                    label: String(sr.step_id ?? 'stage'),
+                    value: Number(sr.duration_seconds ?? 0),
+                    color: sr.status === 'success' ? '#34d399' : '#f87171',
+                  }))}
+                />
+              </div>
+            )}
+            <pre className="code-block" style={{ maxHeight: 320 }}>{JSON.stringify(dagRes.execution, null, 2)}</pre>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -378,7 +472,27 @@ export const Studio11MLOps: React.FC<StudioProps> = ({ ws, studioCache, setStudi
             setBusy(true); setErr(null);
             try { const r = await apiPost<DriftResponse>('/api/workbench/s11/drift', { split_ratio: 0.5 }); setStudioResult('s11_drift', r); } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
           }}>Run Drift Detection</button>
-          {driftRes && <pre className="code-block" style={{ marginTop: 12, maxHeight: 300 }}>{JSON.stringify(driftRes, null, 2)}</pre>}
+          {driftRes && (
+            <div style={{ marginTop: 12 }}>
+              {Array.isArray(driftRes.features) && driftRes.features.length > 0 && (
+                <div style={{ marginBottom: 12 }}>
+                  <BarChartSVG
+                    title="Feature Population Stability Index (PSI) Drift Profile"
+                    horizontal
+                    items={(driftRes.features as Array<Record<string, unknown>>).slice(0, 14).flatMap((f) => {
+                      const col = String(f.column ?? '');
+                      const psi = Number(f.psi ?? f.ks_statistic ?? NaN);
+                      const status = String(f.status || '').toLowerCase();
+                      return col && Number.isFinite(psi)
+                        ? [{ label: col, value: psi, color: status === 'critical' ? '#f87171' : status === 'warning' ? '#fbbf24' : '#34d399' }]
+                        : [];
+                    })}
+                  />
+                </div>
+              )}
+              <pre className="code-block" style={{ maxHeight: 300 }}>{JSON.stringify(driftRes, null, 2)}</pre>
+            </div>
+          )}
         </div>
       </div>
       <FeatureFreshnessPanel />

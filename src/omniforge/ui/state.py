@@ -683,6 +683,26 @@ def set_selected_targets(state: dict[str, Any], targets: list[str], df: pd.DataF
     return valid
 
 
+def _ensure_unique_str_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure DataFrame column labels are non-empty unique strings so JSON/API lookups never mismatch."""
+    raw_cols = list(df.columns)
+    if (
+        all(isinstance(c, str) and bool(c.strip()) for c in raw_cols)
+        and len(set(raw_cols)) == len(raw_cols)
+    ):
+        return df
+    out = df.copy()
+    seen: dict[str, int] = {}
+    clean_names: list[str] = []
+    for idx, c in enumerate(raw_cols):
+        base = str(c).strip() if c is not None and str(c).strip() else f"column_{idx + 1}"
+        cnt = seen.get(base, 0) + 1
+        seen[base] = cnt
+        clean_names.append(base if cnt == 1 else f"{base}_{cnt}")
+    out.columns = pd.Index(clean_names)
+    return out
+
+
 def load_new_dataset(
     state: dict[str, Any],
     df: pd.DataFrame,
@@ -692,7 +712,7 @@ def load_new_dataset(
     default_targets: list[str] | None = None,
 ) -> None:
     """Store a newly ingested DataFrame, snapshot raw copy, run format audit, and clear stale caches."""
-    clean_df = df.copy()
+    clean_df = _ensure_unique_str_columns(df.copy())
     state["uap_df"] = clean_df
     state["uap_raw_df"] = clean_df.copy()
     state["uap_prev_df"] = None

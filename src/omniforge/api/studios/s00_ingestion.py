@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 from fastapi import APIRouter, Header, HTTPException
 
+from omniforge.core.utils import to_json_object
 from omniforge.eda.statistics import distance_correlation
 from omniforge.ui.state import get_session_state
 
@@ -28,11 +29,33 @@ def _safe_float(val: Any) -> float:
         return 0.0
 
 
-def _to_numeric_series(s: pd.Series) -> pd.Series:
+def _to_numeric_series(s: pd.Series | pd.DataFrame) -> pd.Series:
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    if pd.api.types.is_bool_dtype(s):
+        return s.astype(float)
     if pd.api.types.is_numeric_dtype(s):
         return pd.to_numeric(s, errors="coerce")
-    codes, _ = pd.factorize(s.astype(str), sort=True)
-    return pd.Series(codes, index=s.index, dtype=float)
+    if pd.api.types.is_datetime64_any_dtype(s):
+        dt = pd.to_datetime(s, errors="coerce")
+        out = pd.Series(np.nan, index=s.index, dtype=float)
+        valid = dt.notna()
+        if valid.any():
+            out.loc[valid] = dt.loc[valid].astype("int64").astype(float)
+        return out
+    coerced = pd.to_numeric(
+        s.astype("string").str.strip().str.replace(",", "", regex=False),
+        errors="coerce",
+    )
+    non_na_count = int(s.notna().sum())
+    if non_na_count > 0 and float(coerced.notna().sum()) / non_na_count >= 0.6:
+        return coerced.astype(float)
+    mask = s.notna()
+    out = pd.Series(np.nan, index=s.index, dtype=float)
+    if mask.any():
+        codes, _ = pd.factorize(s.loc[mask].astype(str), sort=True)
+        out.loc[mask] = codes.astype(float)
+    return out
 
 
 def _classify_rel(pear: float, spear: float, dcor: float, both_numeric: bool) -> str:
@@ -136,14 +159,26 @@ def s00_data_relationships(x_session_id: str | None = Header(default="default"))
             )
     target_relationships.sort(key=lambda r: max(abs(r["pearson"]), r["dcor"]), reverse=True)
 
-    return {
-        "n_rows": int(len(df)),
-        "n_cols": int(len(active_cols)),
-        "target": target,
-        "targets": targets,
-        "excluded_columns": sorted(excluded),
-        "numeric_cols": [c for c in work_cols if c in numeric_set],
-        "active_cols": work_cols,
-        "target_relationships": target_relationships,
-        "pairs": pairs[:200],
-    }
+    corr_cols = work_cols[:12]
+    corr_matrix: dict[str, Any] = {"columns": [], "values": []}
+    if len(corr_cols) >= 2:
+        cm = encoded_df[corr_cols].corr(numeric_only=True)
+        corr_matrix = {
+            "columns": [str(c) for c in cm.columns],
+            "values": np.round(cm.to_numpy(dtype=float), 3).tolist(),
+        }
+
+    return to_json_object(
+        {
+            "n_rows": int(len(df)),
+            "n_cols": int(len(active_cols)),
+            "target": target,
+            "targets": targets,
+            "excluded_columns": sorted(excluded),
+            "numeric_cols": [str(c) for c in work_cols if c in numeric_set],
+            "active_cols": [str(c) for c in work_cols],
+            "target_relationships": target_relationships,
+            "pairs": pairs[:200],
+            "correlation_matrix": corr_matrix,
+        }
+    )

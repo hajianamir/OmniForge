@@ -73,18 +73,24 @@ export const Studio00Ingestion: React.FC<StudioProps> = (props) => {
     targets?: string[];
     target_relationships?: Array<{ feature: string; target: string; pearson: number; spearman: number; dcor: number; relationship_type: string }>;
     pairs: Array<{ feature_a: string; feature_b: string; pearson: number; spearman: number; dcor: number; relationship_type: string }>;
+    correlation_matrix?: { columns?: string[]; values?: (number | null)[][] };
   } | null>(null);
   const [relBusy, setRelBusy] = useState(false);
+  const [relErr, setRelErr] = useState<string | null>(null);
   const relationshipRequest = useRef(0);
 
   const loadRelationships = async () => {
     const request = ++relationshipRequest.current;
     setRelBusy(true);
+    setRelErr(null);
     try {
       const res = await apiGet<typeof relData>('/api/workbench/s00/data_relationships');
       if (request === relationshipRequest.current) setRelData(res);
-    } catch {
-      if (request === relationshipRequest.current) setRelData(null);
+    } catch (er: unknown) {
+      if (request === relationshipRequest.current) {
+        setRelData(null);
+        setRelErr(toErrorMessage(er));
+      }
     } finally {
       if (request === relationshipRequest.current) setRelBusy(false);
     }
@@ -94,6 +100,7 @@ export const Studio00Ingestion: React.FC<StudioProps> = (props) => {
     // Dataset replacements and edits can retain the same target/exclusion
     // names. Clear and recompute the relationship chart on every grid change.
     setRelData(null);
+    setRelErr(null);
     if (props.ws.has_dataset) {
       void loadRelationships();
     } else {
@@ -113,6 +120,47 @@ export const Studio00Ingestion: React.FC<StudioProps> = (props) => {
               {relBusy ? 'Analyzing…' : 'Analyze Data Relationships (Chart & Table)'}
             </button>
           </div>
+          {relErr && <div className="alert alert-error">{relErr}</div>}
+          {relData && ((relData.target_relationships?.length ?? 0) > 0 || relData.pairs.length > 0) && (
+            <div className="grid-2" style={{ marginBottom: 14 }}>
+              {(relData.target_relationships?.length ?? 0) > 0 && (
+                <BarChartSVG
+                  title={`Target Correlation Profile (${(relData.targets && relData.targets.length > 0 ? relData.targets.join(', ') : relData.target) || 'Target'})`}
+                  items={(relData.target_relationships || []).slice(0, 14).map((tr) => ({
+                    label: tr.feature,
+                    value: Number(tr.pearson) || 0,
+                    color: tr.pearson >= 0 ? '#38bdf8' : '#f87171',
+                  }))}
+                  height={195}
+                />
+              )}
+              {relData.pairs.length > 0 && (
+                <BarChartSVG
+                  title="Top Pairwise Nonlinear / Linear Dependency (max |r|, dCor)"
+                  items={relData.pairs.slice(0, 12).map((p) => ({
+                    label: `${p.feature_a}×${p.feature_b}`,
+                    value: Math.max(Math.abs(Number(p.pearson) || 0), Number(p.dcor) || 0),
+                    color: '#34d399',
+                  }))}
+                  height={195}
+                />
+              )}
+            </div>
+          )}
+          {relData?.correlation_matrix && (relData.correlation_matrix.columns?.length ?? 0) > 1 && (
+            <div style={{ marginBottom: 14 }}>
+              <HeatmapGrid
+                title="Studio 00 Variable Association Matrix"
+                columns={relData.correlation_matrix.columns || []}
+                values={relData.correlation_matrix.values || []}
+              />
+            </div>
+          )}
+          {relData && (relData.target_relationships?.length ?? 0) === 0 && relData.pairs.length === 0 && (
+            <div style={{ color: 'var(--text-muted)', fontSize: 12.5 }}>
+              Need at least 2 active columns and 5 non-empty paired rows to compute variable relationship charts.
+            </div>
+          )}
           {relData && relData.target_relationships && relData.target_relationships.length > 0 && (
             <div style={{ marginBottom: 14, overflowX: 'auto' }}>
               <div style={{ fontWeight: 700, fontSize: 12.5, marginBottom: 6, color: '#38bdf8' }}>
@@ -566,6 +614,34 @@ export const Studio01Data: React.FC<StudioProps & { sectionMode?: 'ingestion' | 
             {(ia.summary_bullets || []).map((b, i) => <li key={i}>{b}</li>)}
           </ul>
 
+          {((ia.dimensions && Object.values(ia.dimensions).some((v) => typeof v === 'number' && Number.isFinite(v))) ||
+            (ia.outlier_summary?.length ?? 0) > 0) && (
+            <div className="grid-2" style={{ marginBottom: 14 }}>
+              {ia.dimensions && Object.values(ia.dimensions).some((v) => typeof v === 'number' && Number.isFinite(v)) && (
+                <BarChartSVG
+                  title="6D Intake Quality & Readiness Profile (%)"
+                  horizontal
+                  items={Object.entries(ia.dimensions).flatMap(([dim, score]) =>
+                    typeof score === 'number' && Number.isFinite(score)
+                      ? [{ label: dim, value: score, color: score >= 85 ? '#34d399' : score >= 65 ? '#fbbf24' : '#f87171' }]
+                      : [],
+                  )}
+                />
+              )}
+              {(ia.outlier_summary?.length ?? 0) > 0 && (
+                <BarChartSVG
+                  title="Column IQR Outlier Rate (%)"
+                  items={(ia.outlier_summary || []).slice(0, 14).map((row) => ({
+                    label: String(row.column ?? ''),
+                    value: Number(row.iqr_pct ?? 0) || 0,
+                    color: Number(row.iqr_pct ?? 0) > 5 ? '#f87171' : '#38bdf8',
+                  }))}
+                  height={185}
+                />
+              )}
+            </div>
+          )}
+
           {ia.defects?.length > 0 ? (
             <div style={{ marginBottom: 14 }}>
               <SimpleTable title="Detected Dataset Defects & Recommended Remediations" rows={ia.defects} maxRows={100} />
@@ -721,8 +797,38 @@ export const Studio01Data: React.FC<StudioProps & { sectionMode?: 'ingestion' | 
                 </div>
               )}
               <div className="kpi-card"><div className="kpi-label">Missing Cells</div><div className="kpi-value" style={{ fontSize: 16 }}>{cleanPreview.cleaning_report.missing_before} → {cleanPreview.cleaning_report.missing_after}</div></div>
+              <div style={{ gridColumn: '1 / -1', marginTop: 6 }}>
+                <BarChartSVG
+                  title="Cleaning Remediation Impact (Before vs. After)"
+                  items={[
+                    { label: 'Rows Before', value: Number(cleanPreview.cleaning_report.rows_before ?? 0), color: '#64748b' },
+                    { label: 'Rows After', value: Number(cleanPreview.cleaning_report.rows_after ?? 0), color: '#34d399' },
+                    { label: 'Missing Before', value: Number(cleanPreview.cleaning_report.missing_before ?? 0), color: '#f87171' },
+                    { label: 'Missing After', value: Number(cleanPreview.cleaning_report.missing_after ?? 0), color: '#38bdf8' },
+                  ]}
+                  height={180}
+                />
+              </div>
             </div>
           )}
+        </div>
+      )}
+
+      {sectionMode === 'cleaning' && ws.has_dataset && !quality && !cleanPreview?.cleaning_report && ia?.dimensions && (
+        <div className="card">
+          <div className="card-title">
+            <span>Baseline Intake Quality Dimensions (Pre-Cleaning Snapshot)</span>
+            <span className="badge badge-accent">Grade {ia.quality_grade} · {ia.quality_score}/100</span>
+          </div>
+          <BarChartSVG
+            title="Pre-Cleaning 6-Dimensional Quality Scores (%)"
+            horizontal
+            items={Object.entries(ia.dimensions).flatMap(([dim, score]) =>
+              typeof score === 'number' && Number.isFinite(score)
+                ? [{ label: dim, value: score, color: score >= 85 ? '#34d399' : score >= 65 ? '#fbbf24' : '#f87171' }]
+                : [],
+            )}
+          />
         </div>
       )}
 
@@ -740,6 +846,30 @@ export const Studio01Data: React.FC<StudioProps & { sectionMode?: 'ingestion' | 
               </div>
             ))}
           </div>
+          {quality.quality?.dimensions && Object.keys(quality.quality.dimensions).length > 0 && (
+            <div className="grid-2" style={{ marginBottom: 14 }}>
+              <BarChartSVG
+                title="6-Dimensional Data Quality Breakdown (%)"
+                horizontal
+                items={Object.entries(quality.quality.dimensions).flatMap(([k, v]) =>
+                  typeof v === 'number' && Number.isFinite(v)
+                    ? [{ label: k, value: v, color: v >= 85 ? '#34d399' : v >= 65 ? '#fbbf24' : '#f87171' }]
+                    : [],
+                )}
+              />
+              {(quality.quality.column_scores?.length ?? 0) > 0 && (
+                <BarChartSVG
+                  title="Column Completeness / Quality Profile (%)"
+                  horizontal
+                  items={(quality.quality.column_scores || []).slice(0, 14).flatMap((row) => {
+                    const colName = String(row.column ?? row.name ?? '');
+                    const rawScore = Number(row.completeness_pct ?? row.quality_score ?? row.completeness ?? NaN);
+                    return colName && Number.isFinite(rawScore) ? [{ label: colName, value: rawScore, color: '#38bdf8' }] : [];
+                  })}
+                />
+              )}
+            </div>
+          )}
           <SimpleTable title="Column-Level Quality Metrics" rows={quality.quality?.column_scores || []} />
         </div>
       )}
@@ -1360,6 +1490,66 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
             <div className="kpi-card"><div className="kpi-label">Risk Band</div><div className="kpi-value">{report.risk_assessment?.overall_risk_band || 'N/A'}</div></div>
           </div>
 
+          {/* Visual Diagnostics Charts: Baseline Comparison, Hypothesis Significance & VIF */}
+          <div className="grid-2" style={{ marginBottom: 14 }}>
+            {report.baseline_equations && Object.keys(report.baseline_equations).length > 0 && (() => {
+              const eqItems = Object.values(report.baseline_equations).flatMap((eqList) =>
+                Array.isArray(eqList) ? (eqList as EquationEntry[]) : (Object.values(eqList || {}) as EquationEntry[]),
+              );
+              const chartItems = eqItems
+                .filter((eq) => typeof eq.primary_score === 'number' && Number.isFinite(eq.primary_score))
+                .slice(0, 12)
+                .map((eq) => ({
+                  label: String(eq.model_name || 'Baseline'),
+                  value: Number(eq.primary_score),
+                  color: eq.rank === 1 ? '#34d399' : '#38bdf8',
+                }));
+              return chartItems.length > 0 ? (
+                <div className="card" style={{ marginBottom: 0 }}>
+                  <BarChartSVG title="Ranked Baseline Model Performance" horizontal items={chartItems} />
+                </div>
+              ) : null;
+            })()}
+
+            {(report.hypothesis_ledger?.length ?? 0) > 0 && (
+              <div className="card" style={{ marginBottom: 0 }}>
+                <BarChartSVG
+                  title="Top Hypothesis Significance (−log₁₀ Adjusted p-value)"
+                  horizontal
+                  items={(report.hypothesis_ledger || [])
+                    .slice(0, 12)
+                    .map((row) => {
+                      const rawP = Number(row.adjusted_p_value ?? row.p_value ?? 1);
+                      const safeP = Number.isFinite(rawP) && rawP > 0 ? Math.max(rawP, 1e-16) : 1;
+                      const negLog = -Math.log10(safeP);
+                      const sig = rawP < alpha;
+                      return {
+                        label: `${String(row.variable || row.family || 'Test')} (${String(row.test_name || '')})`,
+                        value: Number(negLog.toFixed(3)),
+                        color: sig ? '#f87171' : '#64748b',
+                      };
+                    })}
+                />
+              </div>
+            )}
+          </div>
+
+          {Array.isArray(report.vif_scores) && (report.vif_scores as Array<Record<string, unknown>>).length > 0 && (
+            <div className="card">
+              <BarChartSVG
+                title={`Variance Inflation Factor (VIF) Multicollinearity Profile (Threshold = ${vifThresh})`}
+                horizontal
+                items={(report.vif_scores as Array<Record<string, unknown>>).slice(0, 14).flatMap((v) => {
+                  const col = String(v.feature ?? v.column ?? '');
+                  const vifVal = Number(v.vif ?? NaN);
+                  return col && Number.isFinite(vifVal)
+                    ? [{ label: col, value: Math.min(vifVal, 100), color: vifVal >= vifThresh ? '#f87171' : '#34d399' }]
+                    : [];
+                })}
+              />
+            </div>
+          )}
+
           {/* MODERN RANKED BASELINE MATHEMATICAL EQUATIONS + SELECTION RATIONALE */}
           {report.baseline_equations && Object.keys(report.baseline_equations).length > 0 && (
             <div className="card">
@@ -1465,16 +1655,61 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
       </div>
       {err && <div className="alert alert-error">{err}</div>}
 
+      {!eda && ws.has_dataset && (
+        <div className="card" style={{ borderStyle: 'dashed' }}>
+          <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>
+            Click <strong>Run Automated EDA</strong> above to generate numeric distribution histograms, categorical frequency charts, missingness bars, and the feature correlation heatmap.
+          </div>
+        </div>
+      )}
+
       {eda && (
         <>
-          <div className="grid-2">
-            {(eda.distributions || []).map((d) => (
-              <div key={String(d.column)} className="card">
-                <div className="card-title"><span>{String(d.column)}</span><span className="badge">μ={String(d.mean)} · σ={String(d.std)}</span></div>
-                <BarChartSVG title={`Distribution: ${String(d.column)}`} items={(Array.isArray(d.bins) ? d.bins : []).map((b) => ({ label: String(b.label), value: Number(b.count) || 0 }))} height={175} />
-              </div>
-            ))}
-          </div>
+          {(eda.distributions?.length ?? 0) > 0 && (
+            <div className="grid-2">
+              {(eda.distributions || []).map((d) => (
+                <div key={String(d.column)} className="card">
+                  <div className="card-title"><span>{String(d.column)}</span><span className="badge">μ={String(d.mean)} · σ={String(d.std)}</span></div>
+                  <BarChartSVG title={`Distribution: ${String(d.column)}`} items={(Array.isArray(d.bins) ? d.bins : []).map((b) => ({ label: String(b.label), value: Number(b.count) || 0 }))} height={175} />
+                </div>
+              ))}
+            </div>
+          )}
+          {(eda.categorical_distributions?.length ?? 0) > 0 && (
+            <div className="grid-2">
+              {(eda.categorical_distributions || []).map((cd) => (
+                <div key={String(cd.column)} className="card">
+                  <div className="card-title">
+                    <span>{String(cd.column)}</span>
+                    <span className="badge">{Number(cd.unique_count ?? 0)} unique categories</span>
+                  </div>
+                  <BarChartSVG
+                    title={`Category Breakdown: ${String(cd.column)}`}
+                    horizontal
+                    items={(Array.isArray(cd.top_values) ? cd.top_values : []).map((tv) => ({
+                      label: String(tv.label ?? ''),
+                      value: Number(tv.count) || 0,
+                      color: '#a78bfa',
+                    }))}
+                  />
+                </div>
+              ))}
+            </div>
+          )}
+          {(eda.missing_bars?.length ?? 0) > 0 && (
+            <div className="card">
+              <div className="card-title">Column Missingness Rate (%)</div>
+              <BarChartSVG
+                title="Missing Values by Column (%)"
+                horizontal
+                items={(eda.missing_bars || []).map((mb) => ({
+                  label: String(mb.column ?? ''),
+                  value: Number(mb.missing_pct) || 0,
+                  color: Number(mb.missing_pct ?? 0) > 20 ? '#f87171' : '#fbbf24',
+                }))}
+              />
+            </div>
+          )}
           {(eda.correlation_matrix?.columns?.length ?? 0) > 1 && (
             <div className="card">
               <div className="card-title">Correlation Matrix Heatmap</div>
@@ -1483,7 +1718,10 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
           )}
           <div className="card">
             <div className="card-title">Automated Statistical Insights ({eda.insights?.length || 0})</div>
-            <SimpleTable title="Automated EDA Insights" rows={(eda.insights || []).map((text) => ({ insight: text }))} />
+            <SimpleTable
+              title="Automated EDA Insights"
+              rows={(eda.insights || []).map((item) => (typeof item === 'string' ? { insight: item } : item))}
+            />
           </div>
         </>
       )}
@@ -1557,6 +1795,24 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
               <div className="kpi-card"><div className="kpi-label">Tests Executed</div><div className="kpi-value">{hypRes.total_tests}</div></div>
               <div className="kpi-card"><div className="kpi-label">Statistically Significant</div><div className="kpi-value">{hypRes.significant_tests}</div></div>
             </div>
+            {hypRes.battery.length > 0 && (
+              <div style={{ marginBottom: 14 }}>
+                <BarChartSVG
+                  title="Hypothesis Battery Evidence (−log₁₀ p-value)"
+                  horizontal
+                  items={hypRes.battery.slice(0, 14).map((row) => {
+                    const pVal = Number(row.p_value ?? 1);
+                    const safeP = Number.isFinite(pVal) && pVal > 0 ? Math.max(pVal, 1e-16) : 1;
+                    const sig = Boolean(row.significant ?? pVal < alpha);
+                    return {
+                      label: `${String(row.column ?? row.pair ?? row.variables ?? '')} · ${String(row.test_name ?? row.test ?? '')}`,
+                      value: Number((-Math.log10(safeP)).toFixed(3)),
+                      color: sig ? '#34d399' : '#64748b',
+                    };
+                  })}
+                />
+              </div>
+            )}
             <SimpleTable title={`Hypothesis Test Battery (${(hypRes.mode || '').toUpperCase()})`} rows={hypRes.battery} maxRows={100} />
           </div>
         )}

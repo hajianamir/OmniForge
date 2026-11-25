@@ -753,9 +753,14 @@ async def s01_upload_dataset(
         )
     raw = await read_upload_bounded(file)
     t0 = time.perf_counter()
-    if suffix in {".xlsx", ".xls", ".xlsm"} and sheet_name:
-        df = read_excel_sheet(raw, sheet_name=sheet_name)
-        src_label = f"Excel Upload ({fname} · Sheet '{sheet_name}')"
+    if suffix in {".xlsx", ".xls", ".xlsm"}:
+        chosen_sheet: str | int = sheet_name if sheet_name else 0
+        df = read_excel_sheet(raw, sheet_name=chosen_sheet)
+        src_label = (
+            f"Excel Upload ({fname} · Sheet '{sheet_name}')"
+            if sheet_name
+            else f"Excel Upload ({fname})"
+        )
     else:
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp.write(raw)
@@ -1326,19 +1331,73 @@ def s01_deleted_audit_csv(x_session_id: str | None = Header(default="default")) 
 # ---------------------------------------------------------------------------
 # Studio 02 — Clustering, Anomaly Screening & Data Mining Lab
 # ---------------------------------------------------------------------------
+def _prepare_numeric_feature_frame(
+    df: pd.DataFrame,
+    helper_cols: set[str],
+    requested_features: list[str] | None = None,
+    min_cols: int = 2,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Return a working DataFrame and numeric feature column list, encoding string/categorical columns if needed."""
+    if requested_features:
+        cand = [c for c in requested_features if c in df.columns]
+    else:
+        cand = [c for c in df.select_dtypes(include=[np.number]).columns if c not in helper_cols]
+    if len(cand) >= min_cols and all(pd.api.types.is_numeric_dtype(df[c]) for c in cand):
+        return df, cand
+
+    work = df.copy()
+    encoded_cols: list[str] = list(cand)
+    pool = requested_features or [c for c in work.columns if c not in helper_cols]
+    for col in pool:
+        if col not in work.columns:
+            continue
+        ser = work[col]
+        if pd.api.types.is_numeric_dtype(ser):
+            if col not in encoded_cols:
+                encoded_cols.append(col)
+            continue
+        if pd.api.types.is_bool_dtype(ser):
+            work[col] = ser.astype(float)
+            if col not in encoded_cols:
+                encoded_cols.append(col)
+            continue
+        coerced = pd.to_numeric(
+            ser.astype("string").str.strip().str.replace(",", "", regex=False),
+            errors="coerce",
+        )
+        non_na = int(ser.notna().sum())
+        if non_na >= 3 and float(coerced.notna().sum()) / max(non_na, 1) >= 0.6:
+            work[col] = coerced.astype(float)
+            if col not in encoded_cols:
+                encoded_cols.append(col)
+            continue
+        if non_na >= 3 and int(ser.nunique(dropna=True)) >= 2:
+            codes, _ = pd.factorize(ser.astype(str), sort=True)
+            num_ser = pd.Series(codes, index=ser.index, dtype=float)
+            num_ser.loc[ser.isna()] = np.nan
+            work[col] = num_ser
+            if col not in encoded_cols:
+                encoded_cols.append(col)
+        if len(encoded_cols) >= max(min_cols, 12) and not requested_features:
+            break
+    return work, encoded_cols
+
+
 @router.post("/s02/clustering")
 def s02_run_clustering(req: ClusterReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _sid(x_session_id)
     state = get_session_state(sid)
-    df = get_analysis_dataframe(state, _require_df(state))
-    targets = set(get_selected_targets(state, df))
+    raw_analysis_df = get_analysis_dataframe(state, _require_df(state))
+    targets = set(get_selected_targets(state, raw_analysis_df))
     helper_cols = {"cluster_id", "is_anomaly", "anomaly_score"} | targets
-    num_cols = req.features or [
-        c for c in df.select_dtypes(include=[np.number]).columns if c not in helper_cols
-    ]
-    num_cols = [c for c in num_cols if c in df.columns]
+    df, num_cols = _prepare_numeric_feature_frame(raw_analysis_df, helper_cols, req.features, min_cols=2)
+    if len(num_cols) < 2 and targets:
+        # Fall back to including target columns only when fewer than 2 non-target columns exist
+        df, num_cols = _prepare_numeric_feature_frame(
+            raw_analysis_df, {"cluster_id", "is_anomaly", "anomaly_score"}, req.features, min_cols=2
+        )
     if len(num_cols) < 2:
-        raise HTTPException(status_code=400, detail="Clustering requires at least 2 numeric columns.")
+        raise HTTPException(status_code=400, detail="Clustering requires at least 2 usable columns.")
     train_df, test_df, _ = get_active_split_frames(state, df)
 
     mode = req.mode.lower()
@@ -1371,7 +1430,7 @@ def s02_run_clustering(req: ClusterReq, x_session_id: str | None = Header(defaul
                     k_max=req.k_max,
                 )
                 cur_res = tr_res
-                cur_preview = df.copy()
+                cur_preview = raw_analysis_df.copy()
                 cur_preview["cluster_id"] = -1
                 cur_preview.loc[train_df.index, "cluster_id"] = cur_res.labels
                 cur_preview.loc[test_df.index, "cluster_id"] = te_labels
@@ -1383,7 +1442,7 @@ def s02_run_clustering(req: ClusterReq, x_session_id: str | None = Header(defaul
                     k_min=req.k_min,
                     k_max=req.k_max,
                 )
-                cur_preview = df.copy()
+                cur_preview = raw_analysis_df.copy()
                 cur_preview["cluster_id"] = cur_res.labels
 
             sil = float(cur_res.metrics.get("silhouette", -1.0)) if isinstance(cur_res.metrics, dict) else -1.0
@@ -1605,14 +1664,15 @@ def s02_commit_clustering(req: ClusterCommitReq, x_session_id: str | None = Head
 def s02_run_anomaly(req: AnomalyReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _sid(x_session_id)
     state = get_session_state(sid)
-    df = get_audit_anomaly_dataframe(state, _require_df(state))
-    helper_cols = {"cluster_id", "is_anomaly", "anomaly_score"} | set(get_selected_targets(state, df))
-    num_cols = req.features or [
-        c for c in df.select_dtypes(include=[np.number]).columns if c not in helper_cols
-    ]
-    num_cols = [c for c in num_cols if c in df.columns]
+    raw_audit_df = get_audit_anomaly_dataframe(state, _require_df(state))
+    helper_cols = {"cluster_id", "is_anomaly", "anomaly_score"} | set(get_selected_targets(state, raw_audit_df))
+    df, num_cols = _prepare_numeric_feature_frame(raw_audit_df, helper_cols, req.features, min_cols=2)
     if not num_cols:
-        raise HTTPException(status_code=400, detail="Anomaly detection requires numeric columns.")
+        df, num_cols = _prepare_numeric_feature_frame(
+            raw_audit_df, {"cluster_id", "is_anomaly", "anomaly_score"}, req.features, min_cols=1
+        )
+    if not num_cols:
+        raise HTTPException(status_code=400, detail="Anomaly detection requires at least 1 usable column.")
 
     train_df, _test_df, _lock = get_active_split_frames(state, df)
     fit_source = train_df if isinstance(train_df, pd.DataFrame) and not train_df.empty else df
@@ -1659,7 +1719,7 @@ def s02_run_anomaly(req: AnomalyReq, x_session_id: str | None = Header(default="
             detector_comparison.append({"detector": m_name, "n_anomalies": 0, "anomaly_rate_pct": 0.0, "error": str(exc)[:100]})
 
     assert selected_flags is not None and selected_scores is not None
-    preview = df.copy()
+    preview = raw_audit_df.copy()
     preview["is_anomaly"] = selected_flags
     preview["anomaly_score"] = selected_scores
     state["uap_anomaly_df"] = preview
@@ -1811,8 +1871,11 @@ def s02_data_mining(req: MiningReq, x_session_id: str | None = Header(default="d
         out["subgroups"] = SubgroupDiscoveryMiner().discover(df, target_col=target)
     if "manifold" in tasks:
         try:
+            proj_df = df
+            if df.select_dtypes(include=[np.number]).shape[1] < 2:
+                proj_df, _ = _prepare_numeric_feature_frame(df, set(), None, min_cols=2)
             out["manifold"] = ManifoldProjector().project(
-                df,
+                proj_df,
                 method=req.manifold_method,
                 color_col=req.color_col or target,
             )

@@ -94,12 +94,15 @@ def s08_causal(req: CausalReq, x_session_id: str | None = Header(default="defaul
 
 @router.post("/s08/optimize")
 def s08_optimize(req: OptimizeReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
-    state = _wb().get_session_state(_wb()._sid(x_session_id))
+    sid = _wb()._sid(x_session_id)
+    state = _wb().get_session_state(sid)
     df = _wb().get_analysis_dataframe(state, _wb()._require_df(state))
     cols = [c for c in req.asset_cols if c in df.columns] or list(df.select_dtypes(include=[np.number]).columns)[:5]
     if len(cols) < 2:
         raise HTTPException(status_code=400, detail="Portfolio optimization needs at least 2 numeric columns.")
-    sub = df[cols].dropna()
+    sub = df[cols].apply(pd.to_numeric, errors="coerce").dropna()
+    if len(sub) < 3:
+        raise HTTPException(status_code=400, detail="Portfolio optimization needs at least 3 complete numeric rows.")
     returns = sub.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
     if len(returns) < 5:
         returns = (sub - sub.mean()) / sub.std().replace(0, 1.0)
@@ -108,14 +111,13 @@ def s08_optimize(req: OptimizeReq, x_session_id: str | None = Header(default="de
     res = OptimizationEngine().optimize_portfolio(mu, cov, risk_aversion=req.risk_aversion, asset_names=cols)
     out = res.model_dump() if hasattr(res, "model_dump") else res
     state["uap_opt_result"] = out
-    payload = to_json_object({"optimization": out})
-    _wb().save_studio_result(state, "s08_optimize", payload)
-    return payload
+    return wb_cache_and_respond(state, sid, "s08_optimize", {"optimization": out})
 
 
 @router.post("/s08/simulate")
 def s08_simulate(req: SimulateReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
-    state = _wb().get_session_state(_wb()._sid(x_session_id))
+    sid = _wb()._sid(x_session_id)
+    state = _wb().get_session_state(sid)
     df = _wb().get_analysis_dataframe(state, _wb()._require_df(state))
     if req.target_col not in df.columns:
         raise HTTPException(status_code=400, detail=f"Column '{req.target_col}' not found.")
@@ -123,7 +125,7 @@ def s08_simulate(req: SimulateReq, x_session_id: str | None = Header(default="de
     if len(vals) == 0:
         raise HTTPException(status_code=400, detail=f"Column '{req.target_col}' contains no numeric values.")
     mu, sigma = float(np.mean(vals)), max(float(np.std(vals)), 1e-6)
-    sim_res, _samples = MonteCarloSimulator(n_simulations=req.n_simulations).run(
+    sim_res, samples = MonteCarloSimulator(n_simulations=req.n_simulations).run(
         input_specs={
             "base": {"dist": "normal", "mean": mu, "std": sigma},
             "drift": {"dist": "normal", "mean": 0.0, "std": sigma * 0.25},
@@ -131,7 +133,10 @@ def s08_simulate(req: SimulateReq, x_session_id: str | None = Header(default="de
         model_fn=lambda s: s["base"] + np.sqrt(req.horizon_steps) * s["drift"],
     )
     out = sim_res.model_dump()
+    finite_samples = np.asarray(samples, dtype=float)
+    finite_samples = finite_samples[np.isfinite(finite_samples)]
+    if len(finite_samples) >= 5:
+        counts, edges = np.histogram(finite_samples, bins=18)
+        out["histogram"] = [{"label": f"{edges[i]:.3g}", "count": int(counts[i])} for i in range(len(counts))]
     state["uap_sim_result"] = out
-    payload = to_json_object({"simulation": out})
-    _wb().save_studio_result(state, "s08_simulate", payload)
-    return payload
+    return wb_cache_and_respond(state, sid, "s08_simulate", {"simulation": out})

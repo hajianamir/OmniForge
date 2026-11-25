@@ -218,9 +218,10 @@ export interface DiagnosticsResponse extends StateEnvelope {
 
 export interface EDAResponse extends StateEnvelope {
   n_rows_analyzed?: number;
-  insights?: string[];
+  insights?: (string | JsonRow)[];
   distributions?: { column?: unknown; mean?: unknown; std?: unknown; bins?: { label?: unknown; count?: unknown }[] }[];
-  missing_bars?: JsonRow[];
+  categorical_distributions?: { column?: string; unique_count?: number; top_values?: { label?: string; count?: number }[] }[];
+  missing_bars?: { column?: string; missing_pct?: number; [key: string]: unknown }[];
   correlation_matrix?: { columns?: string[]; values?: (number | null)[][] } | null;
   extra_table?: JsonRow[] | null;
   sampled?: boolean;
@@ -350,16 +351,20 @@ export interface BatchPredictionResponse {
 export interface ExplainResponse {
   global_importance?: Record<string, number | { importance_mean?: number | null; importance_std?: number | null }>;
   local_explanation?: JsonRow | JsonRow[] | null;
-  pdp?: JsonRow[] | null;
+  pdp?: { feature?: string; grid?: number[]; pdp_mean?: number[]; pdp_std?: number[]; [key: string]: unknown } | JsonRow[] | null;
   pdp_feature?: string | null;
   [key: string]: unknown;
 }
 
 export interface FairnessReportPayload {
   sensitive_column?: string;
+  protected_attribute?: string;
+  demographic_parity_diff?: number;
   demographic_parity_difference?: number;
   disparate_impact_ratio?: number;
+  equal_opportunity_diff?: number;
   equal_opportunity_difference?: number;
+  group_metrics?: Record<string, JsonRow>;
   groups?: JsonRow[];
   [key: string]: unknown;
 }

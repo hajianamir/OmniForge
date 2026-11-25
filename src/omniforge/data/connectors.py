@@ -681,10 +681,127 @@ def list_excel_sheets(raw_bytes: bytes) -> list[str]:
         raise DataIngestionError(f"Unable to inspect Excel workbook sheets: {exc}") from exc
 
 
+_EXCEL_MISSING_SENTINELS: frozenset[str] = frozenset(
+    {
+        "",
+        "-",
+        "--",
+        "—",
+        "–",
+        "n/a",
+        "na",
+        "#n/a",
+        "#na",
+        "#div/0!",
+        "#value!",
+        "#ref!",
+        "#name?",
+        "#num!",
+        "null",
+        "none",
+        "nan",
+    }
+)
+
+
+def _normalize_excel_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean common Excel layout artifacts (title banners, blank rows/cols, string-formatted numbers)."""
+    if df.empty:
+        return df
+
+    work = df.dropna(axis=0, how="all").copy()
+    if work.empty:
+        return df
+
+    # 1. If ≥50% of columns are pandas 'Unnamed: ...', check whether an early row (0..8)
+    #    actually contains the real worksheet column header row beneath a title banner.
+    col_strs = [str(c).strip() for c in work.columns]
+    unnamed_ratio = sum(1 for c in col_strs if not c or c.lower().startswith("unnamed:")) / max(len(col_strs), 1)
+    if unnamed_ratio >= 0.5 and len(work) >= 2:
+        max_probe = min(8, len(work) - 1)
+        for row_pos in range(max_probe):
+            row_vals = work.iloc[row_pos]
+            non_null = [str(v).strip() for v in row_vals if pd.notna(v) and str(v).strip()]
+            if len(non_null) < max(2, int(np.ceil(work.shape[1] * 0.5))):
+                continue
+            # Prefer a row with distinct text-like header labels rather than pure numbers
+            alpha_like = sum(1 for v in non_null if any(ch.isalpha() for ch in v))
+            if alpha_like >= max(1, len(non_null) // 2) and len(set(non_null)) >= max(2, int(len(non_null) * 0.7)):
+                new_headers = [
+                    str(v).strip() if (pd.notna(v) and str(v).strip()) else f"column_{idx + 1}"
+                    for idx, v in enumerate(row_vals)
+                ]
+                work = work.iloc[row_pos + 1 :].reset_index(drop=True)
+                work.columns = pd.Index(new_headers)
+                break
+
+    # 2. Drop completely empty 'Unnamed:' trailing/spacer columns and all-NaN rows
+    keep_cols = [
+        i
+        for i, col in enumerate(work.columns)
+        if not (str(col).strip().lower().startswith("unnamed:") and bool(work.iloc[:, i].isna().all()))
+    ]
+    if keep_cols and len(keep_cols) < work.shape[1]:
+        work = work.iloc[:, keep_cols]
+    work = work.dropna(axis=0, how="all").reset_index(drop=True)
+
+    # 3. Ensure unique non-empty string column names
+    seen: dict[str, int] = {}
+    norm_cols: list[str] = []
+    for idx, raw_col in enumerate(work.columns):
+        base = str(raw_col).strip() if pd.notna(raw_col) else ""
+        if not base or base.lower().startswith("unnamed:"):
+            base = f"column_{idx + 1}"
+        count = seen.get(base, 0) + 1
+        seen[base] = count
+        norm_cols.append(base if count == 1 else f"{base}_{count}")
+    work.columns = pd.Index(norm_cols)
+
+    # 4. Coerce object columns that are genuinely numeric (e.g. formatted numbers or Excel '-'/'#N/A' sentinels)
+    for col in work.columns:
+        ser = work[col]
+        if pd.api.types.is_numeric_dtype(ser) or pd.api.types.is_datetime64_any_dtype(ser) or pd.api.types.is_bool_dtype(ser):
+            continue
+        non_na = ser.dropna()
+        if len(non_na) == 0:
+            continue
+        str_vals = non_na.astype(str).str.strip()
+        non_sentinel_mask = ~str_vals.str.lower().isin(_EXCEL_MISSING_SENTINELS)
+        candidate = str_vals[non_sentinel_mask]
+        if len(candidate) < 3:
+            continue
+        cleaned = (
+            candidate.str.replace(",", "", regex=False)
+            .str.replace("$", "", regex=False)
+            .str.replace("€", "", regex=False)
+            .str.replace("£", "", regex=False)
+        )
+        has_pct = bool(cleaned.str.endswith("%").all())
+        if has_pct:
+            cleaned = cleaned.str[:-1].str.strip()
+        coerced_cand = pd.to_numeric(cleaned, errors="coerce")
+        valid_ratio = float(coerced_cand.notna().mean())
+        if valid_ratio >= 0.8:
+            full_str = ser.astype("string").str.strip()
+            full_clean = full_str.mask(full_str.str.lower().isin(_EXCEL_MISSING_SENTINELS), pd.NA)
+            full_clean = (
+                full_clean.str.replace(",", "", regex=False)
+                .str.replace("$", "", regex=False)
+                .str.replace("€", "", regex=False)
+                .str.replace("£", "", regex=False)
+            )
+            if has_pct:
+                full_clean = full_clean.str.rstrip("%").str.strip()
+            work[col] = pd.to_numeric(full_clean, errors="coerce")
+
+    return work
+
+
 def read_excel_sheet(raw_bytes: bytes, sheet_name: str | int = 0) -> pd.DataFrame:
-    """Load a specific worksheet from an Excel workbook into a DataFrame."""
+    """Load a specific worksheet from an Excel workbook into a normalized DataFrame."""
     try:
-        return pd.read_excel(io.BytesIO(raw_bytes), sheet_name=sheet_name)
+        raw_df = pd.read_excel(io.BytesIO(raw_bytes), sheet_name=sheet_name)
+        return _normalize_excel_dataframe(raw_df)
     except Exception as exc:
         raise DataIngestionError(f"Failed to read Excel worksheet '{sheet_name}': {exc}") from exc
 

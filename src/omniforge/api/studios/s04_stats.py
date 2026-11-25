@@ -31,15 +31,36 @@ def s04_run_eda(x_session_id: str | None = Header(default="default")) -> dict[st
     state["uap_eda_report"] = eda
 
     num_cols = list(sample_df.select_dtypes(include=[np.number]).columns)[:12]
+    work_num_df = sample_df[num_cols].copy() if num_cols else pd.DataFrame(index=sample_df.index)
+    if len(num_cols) < 6:
+        for col in sample_df.columns:
+            if col in num_cols:
+                continue
+            ser = sample_df[col]
+            if pd.api.types.is_bool_dtype(ser) or pd.api.types.is_datetime64_any_dtype(ser):
+                continue
+            non_na = int(ser.notna().sum())
+            if non_na < 5:
+                continue
+            coerced = pd.to_numeric(
+                ser.astype("string").str.strip().str.replace(",", "", regex=False),
+                errors="coerce",
+            )
+            if float(coerced.notna().sum()) / max(non_na, 1) >= 0.7:
+                work_num_df[col] = coerced.astype(float)
+                num_cols.append(col)
+                if len(num_cols) >= 12:
+                    break
+
     distributions: list[dict[str, Any]] = []
     for c in num_cols[:6]:
-        vals = sample_df[c].dropna().to_numpy(dtype=float)
+        vals = work_num_df[c].dropna().to_numpy(dtype=float)
         vals = vals[np.isfinite(vals)]
         if len(vals) >= 5:
             counts, edges = np.histogram(vals, bins=18)
             distributions.append(
                 {
-                    "column": c,
+                    "column": str(c),
                     "mean": round(float(np.mean(vals)), 4),
                     "std": round(float(np.std(vals)), 4),
                     "min": round(float(np.min(vals)), 4),
@@ -47,12 +68,32 @@ def s04_run_eda(x_session_id: str | None = Header(default="default")) -> dict[st
                     "bins": [{"label": f"{edges[i]:.2g}", "count": int(counts[i])} for i in range(len(counts))],
                 }
             )
+
+    categorical_distributions: list[dict[str, Any]] = []
+    num_set = set(num_cols)
+    cat_candidates = [c for c in sample_df.columns if c not in num_set][:6]
+    for c in cat_candidates:
+        ser = sample_df[c].dropna().astype(str).str.strip()
+        ser = ser[ser != ""]
+        if len(ser) < 2:
+            continue
+        vc = ser.value_counts().head(12)
+        if len(vc) == 0:
+            continue
+        categorical_distributions.append(
+            {
+                "column": str(c),
+                "unique_count": int(ser.nunique()),
+                "top_values": [{"label": str(lbl)[:32], "count": int(cnt)} for lbl, cnt in vc.items()],
+            }
+        )
+
     corr_matrix: dict[str, Any] = {"columns": [], "values": []}
     if len(num_cols) >= 2:
         # Undefined correlations (e.g. constant columns) are not zero.
         # JSON serialization converts the resulting NaNs to null.
-        cm = sample_df[num_cols].corr(numeric_only=True)
-        corr_matrix = {"columns": list(cm.columns), "values": np.round(cm.to_numpy(dtype=float), 3).tolist()}
+        cm = work_num_df[num_cols].corr(numeric_only=True)
+        corr_matrix = {"columns": [str(col) for col in cm.columns], "values": np.round(cm.to_numpy(dtype=float), 3).tolist()}
 
     missing_bars = [
         {"column": str(c), "missing_pct": round(float(df[c].isna().mean() * 100.0), 2)}
@@ -70,6 +111,7 @@ def s04_run_eda(x_session_id: str | None = Header(default="default")) -> dict[st
             "n_rows_analyzed": len(sample_df),
             "insights": insights,
             "distributions": distributions,
+            "categorical_distributions": categorical_distributions,
             "correlation_matrix": corr_matrix,
             "missing_bars": missing_bars,
         },
