@@ -8,7 +8,7 @@ import pytest
 
 from omniforge.core.exceptions import EvaluationError
 from omniforge.evaluation.fairness import FairnessAuditor
-from omniforge.forecasting.engine import ForecastingEngine
+from omniforge.forecasting.engine import ForecastingEngine, _compare_rolling_interval_scores
 
 
 def test_clustered_fairness_does_not_count_duplicates_as_independent() -> None:
@@ -127,6 +127,7 @@ def test_multiple_evaluation_origins_keep_frozen_widths_and_pair_comparisons(mon
     result = engine.forecast(
         pd.DataFrame({"y": values}), target_col="y", horizon=3,
         interval_calibration_origins=9, interval_evaluation_origins=3,
+        compare_rolling_intervals=True,
     )
     facts = result.metadata["champion_interval_calibration"]
     assert result.champion_model == "Baseline_drift" and result.leaderboard[0]["rmse"] == 0
@@ -146,3 +147,27 @@ def test_multiple_evaluation_origins_keep_frozen_widths_and_pair_comparisons(mon
     assert evaluation["calibrated_mean_interval_score"] == pytest.approx(18)
     assert evaluation["native_mean_interval_score"] == pytest.approx(7)
     assert [row["observed_outcomes"] for row in evaluation["by_lead"]] == [2, 2, 1]
+    comparison = facts["rolling_comparison"]
+    assert comparison["paired_outcomes"] == 5
+    assert [row["start_position"] for row in comparison["by_origin"]] == [101, 104, 107]
+    assert comparison["by_origin"][1]["paired_outcomes"] == 0
+    assert comparison["fixed"]["coverage"] == evaluation["calibrated_coverage"]
+    np.testing.assert_allclose(result.forecast["yhat"], result.forecast["yhat_upper"])
+
+
+def test_trailing_interval_expands_after_shock_then_releases_it() -> None:
+    evaluation = np.ones((12, 2))
+    evaluation[0] = [20, 2]
+    evaluation[1, 1] = np.nan
+    result = _compare_rolling_interval_scores(np.ones((9, 2)), evaluation, np.ones(2), 0.10)
+    windows = result["by_origin"]
+
+    assert windows[0]["rolling_half_width_by_lead"] == [1, 1]
+    assert windows[0]["rolling"]["coverage"] == 0
+    assert windows[1]["rolling_half_width_by_lead"] == [20, 2]
+    assert windows[2]["retained_width_leads"] == [2]
+    assert windows[2]["rolling_half_width_by_lead"] == [20, 2]
+    assert windows[10]["rolling_half_width_by_lead"] == [1, 2]
+    assert windows[11]["rolling_half_width_by_lead"] == [1, 1]
+    assert result["paired_outcomes"] == 23
+    assert result["rolling"]["mean_width"] > result["fixed"]["mean_width"]

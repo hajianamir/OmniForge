@@ -198,3 +198,20 @@ The benchmark used a 95% nominal level, a four-step horizon, 30 calibration wind
 | Seeded seasonal series with a level shift | Gradient boosting | 90.0% | 67.5% | 99.194 | 83.352 |
 
 Calibration improved coverage on CO₂ and GDP, while only CO₂ reached the nominal target from below. On CO₂, the mean interval score worsened as coverage improved. The level shift produced the largest coverage shortfall, even though its calibrated interval score improved. Outcomes can remain dependent across windows, and interval scores use each series' units. Interpret these measurements within each series and date range. Reproduce the report with `python scripts/benchmark_forecast_intervals.py --out forecast-interval-benchmark.json`.
+
+## Held-out drift and rolling interval comparison
+
+The SDK can replay a trailing residual quantile beside the fixed interval on the same champion forecasts and observed outcomes. The rolling window is as long as the original calibration. Updates occur after a full forecast window has matured. If a lead has too few valid prior residuals for the requested quantile, the replay retains its latest valid width and records the lead. The returned forecast and Studio 08 continue to use the fixed calibration. The comparison measures empirical performance for the replayed windows.
+
+The benchmark uses a four-step horizon, a 95% nominal level, 30 initial calibration windows, and 36 held-out evaluation windows per seed. The three seeds share the same prefix across regimes. The level shift adds 16 units, and the volatility experiments increase the noise standard deviation from 2 to 7. The temporary change lasts eight windows. Changes begin with the first evaluation outcome, after model selection and initial calibration. Reproduce the comparison with `python scripts/benchmark_forecast_drift.py --out forecast-drift-benchmark.json`.
+
+| Simulated regime | Paired outcomes | Fixed coverage | Rolling coverage | Fixed mean width | Rolling mean width | Fixed mean interval score | Rolling mean interval score |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Stationary | 432 | 96.8% | 97.2% | 9.14 | 9.78 | 10.42 | 10.65 |
+| Persistent level shift | 432 | 91.0% | 97.2% | 9.14 | 29.16 | 29.44 | 42.22 |
+| Persistent volatility increase | 432 | 48.4% | 91.2% | 9.14 | 28.80 | 95.95 | 42.39 |
+| Temporary volatility increase | 432 | 86.3% | 93.8% | 9.14 | 25.21 | 32.87 | 35.36 |
+
+The persistent volatility increase was the only case where rolling widths improved both coverage and mean interval score. Coverage there reached 99.0% over the last eight windows after 66.7% in the first. Both methods missed all 12 first-window outcomes across the three level-shift seeds. After temporary volatility subsided, rolling intervals still averaged 26.69 units wide over the last eight windows, compared with 9.14 for fixed intervals. These results support keeping the comparison opt-in while testing methods that contract intervals faster after volatility subsides. The tested series are simulated.
+
+The earlier hosted browser chart fixture gate reported a failure. Local Chromium also reproduced missing cluster chart and mining controls in the fixture suite. This phase changed the SDK and benchmark, with Workbench source and packaged assets identical to the parent. [Prior hosted browser job](https://github.com/hajianamir/OmniForge/actions/runs/45680688184/job/139440121153)

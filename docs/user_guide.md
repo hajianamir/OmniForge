@@ -121,6 +121,8 @@ In Studio 08, **Interval calibration origins** enables rolling calibration for t
 
 At the default 95% level, calibration requires at least 19 usable error observations per lead. Each evaluation window uses another full forecast horizon, in addition to the history reserved for selection and calibration. Observed coverage describes those dates and can change under drift. The SDK exposes both controls as `ForecastingEngine.forecast(..., interval_calibration_origins=20, interval_evaluation_origins=3)`.
 
+For retrospective drift tests, add `compare_rolling_intervals=True` to the Python call. The calibration report includes a `rolling_comparison` with paired coverage, mean width, and interval score for fixed and rolling widths. Rolling widths use only completed windows, with a trailing window the same length as the original calibration. The returned forecast continues to use the fixed calibration.
+
 ### 2.4 Reproducible / Hash-Pinned Installs (Production)
 
 ```bash
