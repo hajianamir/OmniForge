@@ -113,6 +113,12 @@ The API and Workbench services share the named workspace volume at `/var/lib/omn
 
 To verify the installed Python packages in a locally built image against its platform lock and export a CycloneDX inventory, run `python scripts/generate_sbom.py --image omniforge-enterprise:4.0.0 --out docker-sbom.cdx.json`.
 
+### Repeated-unit fairness and forecast interval calibration
+
+In Studio 07, choose a **Cluster ID** column when multiple records belong to the same independent unit, such as a customer, device, or site. The automatic option uses the active Split Lock group. The Python equivalent is `FairnessAuditor.audit(..., cluster_ids=...)`. Clustered intervals allow dependence within each unit and assume independence between units. For evaluation on unseen units, use a group-disjoint split.
+
+In Studio 08, **Interval calibration origins** enables rolling calibration for the selected champion. Arrange the source rows in chronological order. At the default 95% level, calibration requires at least 19 usable error observations per lead plus a separate evaluation window and enough earlier history for model selection. Longer horizons consume more history. The result reports observed coverage on the reserved evaluation window. The SDK exposes the same option as `ForecastingEngine.forecast(..., interval_calibration_origins=20)`.
+
 ### 2.4 Reproducible / Hash-Pinned Installs (Production)
 
 ```bash

@@ -519,6 +519,7 @@ export const Studio07Responsible: React.FC<StudioProps> = ({ ws, studioCache, se
   const fairRes = studioCache.s07_fairness ?? null;
   const [rowIdx, setRowIdx] = useState(0);
   const [sensCol, setSensCol] = useState(ws.categorical_columns[0] || ws.columns[0] || '');
+  const [clusterCol, setClusterCol] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -533,7 +534,10 @@ export const Studio07Responsible: React.FC<StudioProps> = ({ ws, studioCache, se
   const runFair = async () => {
     setBusy(true); setErr(null);
     try {
-      const res = await apiPost<FairnessResponse>('/api/workbench/s07/fairness', { sensitive_col: sensCol || ws.columns[0] });
+      const res = await apiPost<FairnessResponse>('/api/workbench/s07/fairness', {
+        sensitive_col: sensCol || ws.columns[0],
+        cluster_col: clusterCol && clusterCol !== sensCol && ws.columns.includes(clusterCol) ? clusterCol : null,
+      });
       setStudioResult('s07_fairness', res);
     } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
@@ -612,13 +616,28 @@ export const Studio07Responsible: React.FC<StudioProps> = ({ ws, studioCache, se
         <div className="card">
           <div className="card-title">Fairness Audit &amp; Compliance Model Card</div>
           <div className="row" style={{ marginBottom: 12 }}>
-            <select value={sensCol} onChange={(e) => setSensCol(e.target.value)}>
-              {ws.columns.map((c) => <option key={c} value={c}>{c}</option>)}
-            </select>
+            <label className="field">Protected attribute
+              <select value={sensCol} onChange={(e) => { setSensCol(e.target.value); if (e.target.value === clusterCol) setClusterCol(''); }}>
+                {ws.columns.map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </label>
+            <label className="field">Cluster ID
+              <select value={clusterCol} onChange={(e) => setClusterCol(e.target.value)}>
+                <option value="">Automatic (use Split Lock group)</option>
+                {ws.columns.filter((c) => c !== sensCol).map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </label>
             <button className="btn btn-primary" disabled={busy || !ws.active_model_name} onClick={runFair}>Run Fairness Audit</button>
           </div>
           {fairRes && (
             <>
+              {fairRes.fairness?.cluster_attribute && <p>{fairRes.fairness.n_clusters} independent clusters assumed by {fairRes.fairness.cluster_attribute}.</p>}
+              {fairRes.fairness?.demographic_parity_ci_95 && (
+                <p>95% interval for the parity difference {fairRes.fairness.demographic_parity_ci_95.map((v) => v.toFixed(3)).join(' to ')}.</p>
+              )}
+              {fairRes.fairness?.assessment_status === 'insufficient_evidence' && (
+                <div className="alert alert-warning">Insufficient evidence. {fairRes.fairness.violations?.join(' ')}</div>
+              )}
               <div className="kpi-grid">
                 <div className="kpi-card"><div className="kpi-label">Demographic Parity Diff</div><div className="kpi-value">{Number(fairRes.fairness?.demographic_parity_diff ?? fairRes.fairness?.demographic_parity_difference ?? 0).toFixed(4)}</div></div>
                 <div className="kpi-card"><div className="kpi-label">Disparate Impact</div><div className="kpi-value">{Number(fairRes.fairness?.disparate_impact_ratio ?? 1).toFixed(3)}</div></div>
@@ -652,7 +671,10 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
   const [targetCol, setTargetCol] = useState(ws.numeric_columns[0] || '');
   const [deepArch, setDeepArch] = useState('tft');
   const [horizon, setHorizon] = useState(14);
+  const [calibrationOrigins, setCalibrationOrigins] = useState(0);
   const foreRes = studioCache.s08_forecast ?? null;
+  const classical = foreRes?.classical_summary;
+  const calibration = classical?.metadata?.champion_interval_calibration;
 
   const [treatCol, setTreatCol] = useState(ws.numeric_columns[0] || '');
   const [outCol, setOutCol] = useState(ws.numeric_columns[1] || ws.numeric_columns[0] || '');
@@ -665,7 +687,10 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
   const runForecast = async () => {
     setBusy(true); setErr(null);
     try {
-      const res = await apiPost<ForecastResponse>('/api/workbench/s08/forecast', { target_col: targetCol || ws.numeric_columns[0] || ws.columns[0], horizon, deep_arch: deepArch, epochs: 25 });
+      const res = await apiPost<ForecastResponse>('/api/workbench/s08/forecast', {
+        target_col: targetCol || ws.numeric_columns[0] || ws.columns[0],
+        horizon, deep_arch: deepArch, epochs: 25, interval_calibration_origins: calibrationOrigins,
+      });
       onSync(res.state);
       setStudioResult('s08_forecast', res);
     } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
@@ -711,6 +736,14 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
             <label className="field">Horizon
               <input type="number" min={3} max={60} value={horizon} onChange={(e) => setHorizon(Number(e.target.value))} style={{ width: 85 }} />
             </label>
+            <label className="field">Interval calibration origins
+              <select value={calibrationOrigins} onChange={(e) => setCalibrationOrigins(Number(e.target.value))}>
+                <option value={0}>Off</option>
+                <option value={20}>20</option>
+                <option value={30}>30</option>
+                <option value={40}>40</option>
+              </select>
+            </label>
             <button className="btn btn-primary" disabled={busy || !ws.has_dataset} onClick={runForecast}>
               {busy ? <span className="spinner" /> : null} Forecast Now
             </button>
@@ -719,6 +752,18 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
             <>
               <ForecastFanSVG history={foreRes.history || []} forecast={foreRes.deep_forecast || []} />
               <div style={{ marginTop: 12 }}><SimpleTable rows={foreRes.deep_forecast || []} /></div>
+              {calibration?.status === 'applied' && (
+                <div style={{ marginTop: 16 }}>
+                  <ForecastFanSVG history={foreRes.history || []} forecast={classical?.forecast || []}
+                    title={`${classical?.champion_model || 'Champion'} with calibrated intervals`} />
+                  {calibration.evaluation && (
+                    <p>Observed coverage {(100 * calibration.evaluation.calibrated_coverage).toFixed(1)}% across {calibration.evaluation.observed_outcomes} outcomes at the later evaluation origin.</p>
+                  )}
+                </div>
+              )}
+              {calibration && !['disabled', 'applied'].includes(calibration.status) && (
+                <p>Calibration unavailable. The champion retains its nominal intervals.</p>
+              )}
             </>
           )}
         </div>

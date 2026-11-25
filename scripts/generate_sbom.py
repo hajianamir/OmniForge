@@ -18,7 +18,23 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from omniforge.core.sbom import generate_cyclonedx_sbom, verify_lockfiles_provenance, write_cyclonedx_sbom  # noqa: E402
+_IMAGE_INVENTORY = """
+import importlib.metadata as metadata
+import json
+from pathlib import Path
+import sys
+import tempfile
+
+from omniforge.core.sbom import generate_cyclonedx_sbom
+
+with tempfile.TemporaryDirectory() as directory:
+    lock = Path(directory) / sys.argv[1]
+    lock.write_bytes(sys.stdin.buffer.read())
+    print(json.dumps({
+        "sbom": generate_cyclonedx_sbom(lock),
+        "distributions": [(d.metadata["Name"], d.version) for d in metadata.distributions()],
+    }))
+"""
 
 
 def write_verified_image_sbom(image: str, output: Path) -> None:
@@ -30,14 +46,14 @@ def write_verified_image_sbom(image: str, output: Path) -> None:
     if os_name != "linux" or architecture not in {"amd64", "arm64"}:
         raise ValueError(f"No runtime lock for {os_name}/{architecture}.")
     lock = PROJECT_ROOT / "docker" / f"requirements-{architecture}.lock"
-    sbom = generate_cyclonedx_sbom(lock)
-    distributions = json.loads(subprocess.check_output(
+    inventory = json.loads(subprocess.check_output(
         [
-            "docker", "run", "--rm", "--network", "none", "--entrypoint", "/opt/venv/bin/python", image_id,
-            "-c", 'import importlib.metadata as m, json; print(json.dumps([(d.metadata["Name"], d.version) for d in m.distributions()]))',
+            "docker", "run", "--rm", "-i", "--network", "none", "--entrypoint", "/opt/venv/bin/python", image_id,
+            "-c", _IMAGE_INVENTORY, lock.name,
         ],
-        text=True,
+        input=lock.read_bytes(),
     ))
+    sbom, distributions = inventory["sbom"], inventory["distributions"]
     installed = {re.sub(r"[-_.]+", "-", name.lower()): version for name, version in distributions}
     if len(installed) != len(distributions):
         raise ValueError("The image has duplicate installed distribution names.")
@@ -72,17 +88,21 @@ def main() -> int:
     mode.add_argument("--image", help="Verify the installed inventory of a local Docker image against its runtime lock.")
     args = parser.parse_args()
 
+    out_path = args.out or (PROJECT_ROOT / "sbom.cdx.json")
+    if args.image:
+        write_verified_image_sbom(args.image, out_path)
+        print(f"CycloneDX 1.5 SBOM written to {out_path}")
+        return 0
+
+    from omniforge.core.sbom import verify_lockfiles_provenance, write_cyclonedx_sbom
+
     locks_dir = PROJECT_ROOT / "locks"
     if args.verify:
         rep = verify_lockfiles_provenance(locks_dir)
         print(json.dumps(rep, indent=2))
         return 0 if rep["verified"] else 1
 
-    out_path = args.out or (PROJECT_ROOT / "sbom.cdx.json")
-    if args.image:
-        write_verified_image_sbom(args.image, out_path)
-    else:
-        write_cyclonedx_sbom(out_path, locks_dir=locks_dir, tier=args.tier)
+    write_cyclonedx_sbom(out_path, locks_dir=locks_dir, tier=args.tier)
     print(f"CycloneDX 1.5 SBOM written to {out_path}")
     return 0
 

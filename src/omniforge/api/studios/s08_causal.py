@@ -43,6 +43,7 @@ def s08_forecast(req: ForecastReq, x_session_id: str | None = Header(default="de
         target_col=req.target_col,
         time_col=req.time_col if (req.time_col and req.time_col in work_capped.columns) else None,
         horizon=req.horizon,
+        interval_calibration_origins=req.interval_calibration_origins,
     )
     causal_history, _ = _causal_impute_split(raw_capped)
     deep_f = DeepForecaster(architecture=cast(Any, req.deep_arch), epochs=req.epochs)

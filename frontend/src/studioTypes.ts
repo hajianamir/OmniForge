@@ -374,6 +374,11 @@ export interface FairnessReportPayload {
   equal_opportunity_diff?: number;
   equal_opportunity_difference?: number;
   group_metrics?: Record<string, JsonRow>;
+  assessment_status?: 'insufficient_evidence' | 'threshold_failed' | 'thresholds_met' | null;
+  cluster_attribute?: string | null;
+  n_clusters?: number | null;
+  demographic_parity_ci_95?: [number, number] | null;
+  violations?: string[];
   groups?: JsonRow[];
   [key: string]: unknown;
 }
@@ -406,7 +411,17 @@ export interface ForecastResponse extends StateEnvelope {
   history?: ForecastHistoryPoint[];
   deep_arch?: string;
   deep_forecast?: ForecastPoint[];
-  classical_summary?: JsonRow | null;
+  classical_summary?: {
+    champion_model?: string;
+    forecast?: ForecastPoint[];
+    metadata?: {
+      champion_interval_calibration?: {
+        status: string;
+        nominal_level: number;
+        evaluation?: { observed_outcomes: number; calibrated_coverage: number } | null;
+      };
+    };
+  } | null;
   [key: string]: unknown;
 }
 

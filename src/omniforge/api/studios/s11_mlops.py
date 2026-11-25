@@ -55,11 +55,16 @@ def s11_register(
         X_test, y_test = state.get("uap_active_X_test"), state.get("uap_active_y_test")
         full_df = state.get("uap_df")
         group = evidence.report.protected_attribute
+        cluster = evidence.report.cluster_attribute
         if not (
             isinstance(X_test, pd.DataFrame) and isinstance(y_test, pd.Series)
             and isinstance(full_df, pd.DataFrame) and group in full_df.columns and full_df.index.is_unique
             and X_test.index.isin(full_df.index).all()
-            and holdout_fingerprint(X_test, y_test, full_df[group].reindex(X_test.index)) == evidence.holdout_fingerprint
+            and (cluster is None or cluster in full_df.columns)
+            and holdout_fingerprint(
+                X_test, y_test, full_df[group].reindex(X_test.index),
+                clusters=full_df[cluster].reindex(X_test.index) if cluster is not None else None,
+            ) == evidence.holdout_fingerprint
         ):
             raise HTTPException(status_code=409, detail="The held-out data changed. Run the fairness audit again.")
     try:

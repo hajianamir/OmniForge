@@ -27,6 +27,9 @@ class FairnessReport(BaseModel):
     assessment_status: FairnessAssessmentStatus | None = None
     missing_sensitive_count: int = 0
     missing_outcome_count: int = 0
+    cluster_attribute: str | None = None
+    missing_cluster_count: int = 0
+    n_clusters: int | None = None
     disparate_impact_ci_95: tuple[float, float] | None = None
     demographic_parity_ci_95: tuple[float, float] | None = None
     selection_interval_method: str | None = None
@@ -82,8 +85,14 @@ class FairnessAuditor:
         *,
         attribute_name: str = "sensitive_group",
         positive_label: Any = 1,
+        cluster_ids: np.ndarray | pd.Series | None = None,
     ) -> FairnessReport:
-        """Compute group-level TPR, FPR, selection rate, disparate impact, and equalized odds."""
+        """Audit binary decisions with independent rows or explicitly independent clusters.
+
+        Clustered selection-rate bounds condition on the observed group counts per
+        cluster and allow arbitrary dependence within each cluster. Point estimates
+        and threshold decisions remain row-weighted.
+        """
         labels, predictions, sensitive = map(np.asarray, (y_true, y_pred, sensitive_features))
 
         if any(a.ndim != 1 for a in (labels, predictions, sensitive)) or not (
@@ -93,6 +102,9 @@ class FairnessAuditor:
         missing_sensitive = pd.isna(sensitive)
         missing_outcome = pd.isna(labels) | pd.isna(predictions)
         observed = ~(missing_sensitive | missing_outcome)
+        cluster_codes = None
+        n_clusters = None
+        n_missing_clusters = 0
         n_missing_sensitive = int(missing_sensitive.sum())
         n_missing_outcomes = int(missing_outcome.sum())
         insufficient: list[str] = []
@@ -100,6 +112,24 @@ class FairnessAuditor:
             insufficient.append(f"{n_missing_sensitive} row(s) lack protected group values.")
         if n_missing_outcomes:
             insufficient.append(f"{n_missing_outcomes} row(s) lack a label or prediction.")
+        if cluster_ids is not None:
+            units = np.asarray(cluster_ids)
+            if units.ndim != 1 or len(units) != len(labels) or (
+                isinstance(cluster_ids, pd.Series)
+                and any(
+                    isinstance(values, pd.Series) and not values.index.equals(cluster_ids.index)
+                    for values in (y_true, y_pred, sensitive_features)
+                )
+            ):
+                raise EvaluationError("Cluster IDs must be one-dimensional and aligned with the audited rows.")
+            missing_clusters = pd.isna(units)
+            n_missing_clusters = int(missing_clusters.sum())
+            if n_missing_clusters:
+                insufficient.append(f"{n_missing_clusters} row(s) lack a cluster ID.")
+            observed &= ~missing_clusters
+            cluster_codes, cluster_values = pd.factorize(units[observed], sort=False)
+            n_clusters = len(cluster_values)
+        cluster_attribute = str(cluster_ids.name) if isinstance(cluster_ids, pd.Series) and cluster_ids.name is not None else None
         yt = (labels[observed] == positive_label).astype(int)
         yp = (predictions[observed] == positive_label).astype(int)
         sf = sensitive[observed].astype(str)
@@ -117,6 +147,9 @@ class FairnessAuditor:
                 assessment_status="insufficient_evidence",
                 missing_sensitive_count=n_missing_sensitive,
                 missing_outcome_count=n_missing_outcomes,
+                cluster_attribute=cluster_attribute,
+                missing_cluster_count=n_missing_clusters,
+                n_clusters=n_clusters,
                 demographic_parity_diff=0.0,
                 disparate_impact_ratio=1.0,
                 equalized_odds_diff=None,
@@ -151,6 +184,11 @@ class FairnessAuditor:
                 "precision": round(prec, 6),
             }
             sel_rates.append(sel_rate)
+            if cluster_codes is not None:
+                _, sizes = np.unique(cluster_codes[mask], return_counts=True)
+                weights = sizes / sizes.sum()
+                group_metrics[grp]["cluster_count"] = float(len(sizes))
+                group_metrics[grp]["effective_cluster_count"] = float(1.0 / (weights @ weights))
             if tpr_val is not None:
                 tprs.append(tpr_val)
             if fpr_val is not None:
@@ -171,15 +209,44 @@ class FairnessAuditor:
         dp_ci: tuple[float, float] | None = None
         parity_p: float | None = None
         parity_test: str | None = None
+        interval_method: str | None = None
+        bounds: tuple[np.ndarray, np.ndarray] | None = None
         if len(groups) >= 2:
-            # Bonferroni simultaneous Clopper-Pearson intervals cover all population
-            # selection rates. Project the joint bounds onto their range and min/max
-            # ratio, so coverage does not depend on picking the observed extrema.
-            counts = np.array([[int(group_metrics[g]["selected_count"] or 0), int(group_metrics[g]["count"] or 0)] for g in groups])
-            selected, total = counts.T
             tail = 0.05 / (2.0 * len(groups))
-            lower = np.where(selected > 0, stats.beta.ppf(tail, selected, total - selected + 1), 0.0)
-            upper = np.where(selected < total, stats.beta.ppf(1.0 - tail, selected + 1, total - selected), 1.0)
+            if cluster_codes is not None:
+                if any((group_metrics[g]["cluster_count"] or 0) < 2 for g in groups):
+                    insufficient.append("Clustered comparisons require at least two independent clusters per protected group.")
+                else:
+                    # Weighted Hoeffding with Bonferroni across groups. Each cluster
+                    # contributes one bounded rate, even when it contains repeated rows.
+                    effective = np.array([group_metrics[g]["effective_cluster_count"] for g in groups], dtype=float)
+                    margin = np.sqrt(-math.log(tail) / (2 * effective))
+                    bounds = (np.maximum(0.0, sel_rates - margin), np.minimum(1.0, sel_rates + margin))
+                    interval_method = "bonferroni_weighted_hoeffding_independent_clusters"
+            else:
+                counts = np.array([[int(group_metrics[g]["selected_count"] or 0), int(group_metrics[g]["count"] or 0)] for g in groups])
+                selected, total = counts.T
+                bounds = (
+                    np.where(selected > 0, stats.beta.ppf(tail, selected, total - selected + 1), 0.0),
+                    np.where(selected < total, stats.beta.ppf(1.0 - tail, selected + 1, total - selected), 1.0),
+                )
+                interval_method = "bonferroni_clopper_pearson_independent_rows"
+                contingency = np.column_stack([selected, total - selected])
+                if np.all(contingency.sum(axis=0) > 0):
+                    if len(groups) == 2:
+                        parity_test = "fisher_exact"
+                        parity_p = float(stats.fisher_exact(contingency).pvalue)
+                    else:
+                        parity_test = "pearson_chi_square"
+                        result = stats.chi2_contingency(contingency, correction=False)
+                        if (result.expected_freq < 5).any():
+                            parity_test = "pearson_chi_square_monte_carlo"
+                            method = stats.MonteCarloMethod(n_resamples=9999, rng=np.random.default_rng(42))
+                            result = stats.chi2_contingency(contingency, correction=False, method=method)
+                        parity_p = float(result.pvalue)
+
+        if bounds is not None:
+            lower, upper = bounds
             dp_ci = (
                 math.floor(max(0.0, float(lower.max() - upper.min())) * 1e6) / 1e6,
                 math.ceil(float(upper.max() - lower.min()) * 1e6) / 1e6,
@@ -189,20 +256,6 @@ class FairnessAuditor:
                 math.floor(float(lower.min() / upper.max()) * 1e6) / 1e6,
                 math.ceil(di_upper * 1e6) / 1e6,
             )
-
-            contingency = np.column_stack([selected, total - selected])
-            if np.all(contingency.sum(axis=0) > 0):
-                if len(groups) == 2:
-                    parity_test = "fisher_exact"
-                    parity_p = float(stats.fisher_exact(contingency).pvalue)
-                else:
-                    parity_test = "pearson_chi_square"
-                    result = stats.chi2_contingency(contingency, correction=False)
-                    if (result.expected_freq < 5).any():
-                        parity_test = "pearson_chi_square_monte_carlo"
-                        method = stats.MonteCarloMethod(n_resamples=9999, rng=np.random.default_rng(42))
-                        result = stats.chi2_contingency(contingency, correction=False, method=method)
-                    parity_p = float(result.pvalue)
 
         # Speicher et al. (2018, KDD) Generalized Entropy Index (alpha=2) & Theil Index (alpha=1)
         # Benefit vector b_i = y_pred_i - y_true_i + 1 in {0, 1, 2}; E(2) = E_within(2) + E_between(2)
@@ -289,13 +342,16 @@ class FairnessAuditor:
             ),
             missing_sensitive_count=n_missing_sensitive,
             missing_outcome_count=n_missing_outcomes,
+            cluster_attribute=cluster_attribute,
+            missing_cluster_count=n_missing_clusters,
+            n_clusters=n_clusters,
             demographic_parity_diff=round(dp_diff, 6),
             disparate_impact_ratio=round(di_ratio, 6),
             equalized_odds_diff=round(eodds_diff, 6),
             equal_opportunity_diff=round(eopp_diff, 6),
             disparate_impact_ci_95=di_ci,
             demographic_parity_ci_95=dp_ci,
-            selection_interval_method="bonferroni_clopper_pearson_independent_rows" if di_ci is not None else None,
+            selection_interval_method=interval_method,
             statistical_parity_p_value=round(parity_p, 6) if parity_p is not None else None,
             statistical_parity_test=parity_test,
             statistically_significant_disparity=parity_p is not None and parity_p < 0.05,
