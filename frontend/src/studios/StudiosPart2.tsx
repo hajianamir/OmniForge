@@ -681,6 +681,9 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
 
   const [treatCol, setTreatCol] = useState(ws.numeric_columns[0] || '');
   const [outCol, setOutCol] = useState(ws.numeric_columns[1] || ws.numeric_columns[0] || '');
+  const [causalMethod, setCausalMethod] = useState('aipw');
+  const [postCol, setPostCol] = useState('');
+  const [causalCluster, setCausalCluster] = useState('');
   const causalRes = studioCache.s08_causal?.causal ?? null;
   const optRes = studioCache.s08_optimize?.optimization ?? null;
   const simRes = studioCache.s08_simulate?.simulation ?? null;
@@ -793,6 +796,12 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
       {tab === 'causal' && (
         <div className="card">
           <div className="row" style={{ marginBottom: 12 }}>
+            <label className="field">Causal method
+              <select value={causalMethod} onChange={(event) => setCausalMethod(event.target.value)}>
+                <option value="aipw">Adjusted treatment effect (AIPW)</option>
+                <option value="clustered_did">Clustered difference-in-differences</option>
+              </select>
+            </label>
             <label className="field">Treatment
               <select value={treatCol} onChange={(e) => setTreatCol(e.target.value)}>
                 {ws.columns.map((c) => <option key={c} value={c}>{c}</option>)}
@@ -803,18 +812,40 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
                 {ws.numeric_columns.map((c) => <option key={c} value={c}>{c}</option>)}
               </select>
             </label>
-            <button className="btn btn-primary" disabled={busy || !ws.has_dataset} onClick={async () => {
+            {causalMethod === 'clustered_did' && (
+              <>
+                <label className="field">Post-period indicator (0 or 1)
+                  <select value={postCol} onChange={(event) => setPostCol(event.target.value)}>
+                    <option value="">Select a column</option>
+                    {ws.columns.map((column) => <option key={column} value={column}>{column}</option>)}
+                  </select>
+                </label>
+                <label className="field">Independent cluster ID
+                  <select value={causalCluster} onChange={(event) => setCausalCluster(event.target.value)}>
+                    <option value="">Select a column</option>
+                    {ws.columns.map((column) => <option key={column} value={column}>{column}</option>)}
+                  </select>
+                </label>
+              </>
+            )}
+            <button className="btn btn-primary" disabled={busy || !ws.has_dataset || (causalMethod === 'clustered_did' && (!postCol || !causalCluster))} onClick={async () => {
               setBusy(true); setErr(null);
               try {
-                const r = await apiPost<CausalResponse>('/api/workbench/s08/causal', { treatment_col: treatCol || ws.columns[0], outcome_col: outCol || ws.numeric_columns[0] });
+                const r = await apiPost<CausalResponse>('/api/workbench/s08/causal', {
+                  treatment_col: treatCol || ws.columns[0], outcome_col: outCol || ws.numeric_columns[0],
+                  method: causalMethod, post_col: postCol || null, cluster_col: causalCluster || null,
+                });
                 if (r.state) onSync(r.state);
                 setStudioResult('s08_causal', r);
               } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
-            }}>Estimate Causal ATE</button>
+            }}>{causalMethod === 'clustered_did' ? 'Estimate Clustered DiD' : 'Estimate Causal ATE'}</button>
           </div>
+          {causalMethod === 'clustered_did' && <p>Use a binary treatment group that stays fixed within each cluster. Interpreting the estimate as causal requires parallel trends and no spillovers.</p>}
           {causalRes && (
             <>
-              <div className="grid-2" style={{ marginBottom: 12 }}>
+              {typeof causalRes.did_estimate === 'number' ? (
+                <p>Difference-in-differences estimate {causalRes.did_estimate.toFixed(4)}. {causalRes.inference_status === 'estimated' ? 'Clustered inference estimated.' : 'Clustered inference unavailable.'}</p>
+              ) : <div className="grid-2" style={{ marginBottom: 12 }}>
                 <BarChartSVG
                   title="Causal Average Treatment Effect (ATE) & Refutation Checks"
                   horizontal
@@ -840,7 +871,7 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
                     height={195}
                   />
                 )}
-              </div>
+              </div>}
               <pre className="code-block">{JSON.stringify(causalRes, null, 2)}</pre>
             </>
           )}

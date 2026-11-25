@@ -188,17 +188,16 @@ def _summarize_interval_scores(
     }
 
 
-def _compare_rolling_interval_scores(
-    calibration_errors: np.ndarray, evaluation_errors: np.ndarray, fixed_widths: np.ndarray, alpha: float,
-) -> dict[str, Any]:
-    """Replay rolling residual quantiles without using the current window's outcomes."""
-    window = len(calibration_errors)
-    errors = np.concatenate((calibration_errors, evaluation_errors), axis=0)
-    rolling_widths = np.empty_like(evaluation_errors)
-    last_widths = fixed_widths.copy()
+def _trailing_quantiles(
+    errors: np.ndarray, window: int, evaluation_size: int, alpha: float, initial_widths: np.ndarray,
+) -> tuple[np.ndarray, list[list[int]]]:
+    rolling_widths = np.empty((evaluation_size, errors.shape[1]))
+    last_widths = initial_widths.copy()
     retained_leads = []
-    for i in range(len(evaluation_errors)):
-        previous = errors[i : i + window]
+    start = len(errors) - evaluation_size
+    for i in range(evaluation_size):
+        end = start + i
+        previous = errors[max(0, end - window) : end]
         retained = []
         for lead, recent_errors in enumerate(previous.T):
             count = int(np.isfinite(recent_errors).sum())
@@ -210,20 +209,67 @@ def _compare_rolling_interval_scores(
             retained.append(lead + 1)
         retained_leads.append(retained)
         rolling_widths[i] = last_widths
+    return rolling_widths, retained_leads
+
+
+def _normalized_interval_widths(errors: np.ndarray, window: int, evaluation_size: int, alpha: float) -> np.ndarray | None:
+    """Score each residual against the scale available before its window starts."""
+    warmup = 5
+    scales = np.empty_like(errors)
+    initial = np.full(errors.shape[1], np.nan)
+    for lead, recent in enumerate(errors[:warmup].T):
+        observed = recent[np.isfinite(recent)]
+        if len(observed):
+            initial[lead] = np.median(observed)
+    if not np.isfinite(initial).all() or window <= warmup:
+        return None
+    floor = np.maximum(initial * 0.1, np.finfo(float).eps)
+    scale = np.maximum(initial, floor)
+    for i in range(warmup, len(errors)):
+        scales[i] = scale
+        score = errors[i]
+        scale = np.maximum(floor, np.where(np.isfinite(score), 0.7 * scale + 0.3 * score, scale))
+    normalized = errors.copy()
+    normalized[:warmup] = np.nan
+    normalized[warmup:] /= scales[warmup:]
+    initial_quantiles = []
+    for lead_errors in normalized[:window].T:
+        count = int(np.isfinite(lead_errors).sum())
+        if not count or (count + 1) * (1 - alpha) > count:
+            return None
+        quantile, estimable = split_conformal_quantile(lead_errors, alpha)
+        if not estimable:
+            return None
+        initial_quantiles.append(quantile)
+    quantiles, _ = _trailing_quantiles(normalized, window, evaluation_size, alpha, np.array(initial_quantiles))
+    quantiles *= scales[-evaluation_size:]
+    return quantiles
+
+
+def _compare_rolling_interval_scores(
+    calibration_errors: np.ndarray, evaluation_errors: np.ndarray, fixed_widths: np.ndarray, alpha: float,
+) -> dict[str, Any]:
+    """Replay rolling residual quantiles without using the current window's outcomes."""
+    window = len(calibration_errors)
+    errors = np.concatenate((calibration_errors, evaluation_errors), axis=0)
+    rolling_widths, retained_leads = _trailing_quantiles(errors, window, len(evaluation_errors), alpha, fixed_widths)
+    normalized = _normalized_interval_widths(errors, window, len(evaluation_errors), alpha)
 
     fixed = np.broadcast_to(fixed_widths, evaluation_errors.shape)
-    fixed_hits, fixed_scores = _interval_scores(evaluation_errors, -fixed, fixed, alpha)
-    rolling_hits, rolling_scores = _interval_scores(evaluation_errors, -rolling_widths, rolling_widths, alpha)
-    paired = np.isfinite(fixed_hits) & np.isfinite(rolling_hits)
+    widths_by_method = {"fixed": fixed, "rolling": rolling_widths}
+    if normalized is not None:
+        widths_by_method["normalized"] = normalized
+    scored = {
+        name: (*_interval_scores(evaluation_errors, -widths, widths, alpha), widths)
+        for name, widths in widths_by_method.items()
+    }
+    paired = np.logical_and.reduce([np.isfinite(hits) for hits, _, _ in scored.values()])
 
     def summarize(index: int | slice = slice(None)) -> dict[str, Any]:
         mask = paired[index]
         count = int(mask.sum())
         report: dict[str, Any] = {"paired_outcomes": count}
-        for name, hits, scores, widths in (
-            ("fixed", fixed_hits, fixed_scores, fixed),
-            ("rolling", rolling_hits, rolling_scores, rolling_widths),
-        ):
+        for name, (hits, scores, widths) in scored.items():
             report[name] = {
                 "coverage": float(hits[index][mask].mean()) if count else None,
                 "mean_interval_score": float(scores[index][mask].mean()) if count else None,
@@ -240,6 +286,7 @@ def _compare_rolling_interval_scores(
         })
     return {
         "method": "trailing_origin_absolute_error_order_statistic",
+        "normalized_status": "evaluated" if normalized is not None else "insufficient_calibration_errors",
         "window_origins": window,
         **summarize(),
         "by_origin": by_origin,

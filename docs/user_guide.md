@@ -123,6 +123,10 @@ At the default 95% level, calibration requires at least 19 usable error observat
 
 For retrospective drift tests, add `compare_rolling_intervals=True` to the Python call. The calibration report includes a `rolling_comparison` with paired coverage, mean width, and interval score for fixed and rolling widths. Rolling widths use only completed windows, with a trailing window the same length as the original calibration. The returned forecast continues to use the fixed calibration.
 
+In Studio 01, upload a **Trusted reference CSV**, select the record key shared by both datasets, and click **Compare with Trusted Reference**. Each dataset needs one observed, unique value per key. The audit displays the number of matched rows and comparable non-key values.
+
+In the Studio 08 causal tab, select **Clustered difference-in-differences** for a two-period study with a fixed treatment group within each independent cluster. Supply the cluster ID and binary post-period column. The result displays when clustered uncertainty cannot be estimated.
+
 ### 2.4 Reproducible / Hash-Pinned Installs (Production)
 
 ```bash

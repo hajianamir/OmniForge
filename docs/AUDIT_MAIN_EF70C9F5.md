@@ -215,3 +215,25 @@ The benchmark uses a four-step horizon, a 95% nominal level, 30 initial calibrat
 The persistent volatility increase was the only case where rolling widths improved both coverage and mean interval score. Coverage there reached 99.0% over the last eight windows after 66.7% in the first. Both methods missed all 12 first-window outcomes across the three level-shift seeds. After temporary volatility subsided, rolling intervals still averaged 26.69 units wide over the last eight windows, compared with 9.14 for fixed intervals. These results support keeping the comparison opt-in while testing methods that contract intervals faster after volatility subsides. The tested series are simulated.
 
 The earlier hosted browser chart fixture gate reported a failure. Local Chromium also reproduced missing cluster chart and mining controls in the fixture suite. This phase changed the SDK and benchmark, with Workbench source and packaged assets identical to the parent. [Prior hosted browser job](https://github.com/hajianamir/OmniForge/actions/runs/45680688184/job/139440121153)
+
+## Audit closeout
+
+The drift benchmark also compares volatility-normalized intervals. It uses a five-window scale warm-up, a per-lead exponentially weighted mean absolute error with update weight 0.30, and trailing quantiles of scaled errors. Each scale is available before the corresponding outcome arrives. The replay reports an unavailable comparison when initial residuals are insufficient. The SDK comparison remains opt-in and the returned forecast uses the existing fixed interval.
+
+| Simulated regime | Rolling coverage / mean width / score | Normalized coverage / mean width / score |
+|---|---:|---:|
+| Stationary | 97.2% / 9.78 / 10.65 | 97.9% / 14.76 / 15.78 |
+| Persistent level shift | 97.2% / 29.16 / 42.22 | 96.3% / 45.17 / 56.36 |
+| Persistent volatility | 91.2% / 28.80 / 42.39 | 96.1% / 63.59 / 67.80 |
+| Temporary volatility | 93.8% / 25.21 / 35.36 | 97.0% / 32.45 / 36.01 |
+
+Over the last eight windows after temporary volatility subsided, both rolling methods covered all 96 paired outcomes. Mean width fell from 26.69 to 15.40 with normalization. Over the complete replay, normalized intervals had a higher mean interval score in all four regimes. The benchmark supplies evidence for quicker contraction in the tested recovery and does not support switching the production default. Rerun with `python scripts/benchmark_forecast_drift.py --out forecast-drift-benchmark.json`.
+
+| Item | Closeout evidence or remaining dependency |
+|---|---|
+| A09 causal inference | Studio 08 and the SDK expose two-group, two-period difference-in-differences with cluster sandwich variance and an approximate t reference. The point contrast and covariance match a regression oracle. Inference is unavailable for a single cluster in either treatment arm or zero estimated cluster variance. Causal interpretation requires a defensible parallel-trends design, no spillovers, and stable composition. Staggered adoption and validation on real intervention data remain separate work. |
+| A11 trusted reference | Studio 01 accepts a bounded CSV and matches rows by a user-selected key. The profiler rejects missing and duplicate keys, excludes key columns from accuracy, and reports matched rows and comparable values. The reference upload leaves the active dataset in place. The SDK accepts multiple key columns. |
+| A13 and A14 validation | The latency benchmark uses an isolated temporary workspace, signing-key directory, and audit log. An incomplete chart catalog now leaves the rest of the studio usable. The 23 mocked Chromium cases passed after this repair. |
+| A19 image inventory | CI collects Debian packages from the running image in addition to verified Python versions. The combined CycloneDX document ties both inventories to the image ID. Local amd64 schema validation covered 103 Python and 87 Debian packages. Signed release attestations still require production publishing infrastructure and signing authority. |
+| A10 pretrained model accuracy | The earlier fallback behavior is verified. Claims about pretrained quality require the exact deployed checkpoints and suitable held-out evaluation sets. |
+| A17 energy accuracy | Physical accuracy remains unverified. This environment supplies no reference power meter or GPU for an independent device-attribution comparison. |

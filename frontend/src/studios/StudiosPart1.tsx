@@ -256,6 +256,8 @@ export const Studio01Data: React.FC<StudioProps & { sectionMode?: 'ingestion' | 
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const quality = studioCache.s01_quality ?? null;
+  const [referenceFile, setReferenceFile] = useState<File | null>(null);
+  const [referenceKey, setReferenceKey] = useState('');
   const [deletedLog, setDeletedLog] = useState<DeletedLogResponse | null>(null);
 
   // Excel multi-sheet upload state
@@ -408,10 +410,17 @@ export const Studio01Data: React.FC<StudioProps & { sectionMode?: 'ingestion' | 
     } catch (er: unknown) { setErr(toErrorMessage(er)); } finally { setBusy(false); }
   };
 
-  const runProfile = async () => {
+  const runProfile = async (withReference = false) => {
     setBusy(true); setErr(null);
     try {
-      const res = await apiPost<QualityResponse>('/api/workbench/s01/profile');
+      const form = new FormData();
+      if (withReference && referenceFile) {
+        form.append('file', referenceFile);
+        form.append('key_column', referenceKey);
+      }
+      const res = withReference
+        ? await apiUpload<QualityResponse>('/api/workbench/s01/profile-reference', form)
+        : await apiPost<QualityResponse>('/api/workbench/s01/profile');
       if (res.state) onSync(res.state);
       setStudioResult('s01_quality', res);
     }
@@ -751,9 +760,23 @@ export const Studio01Data: React.FC<StudioProps & { sectionMode?: 'ingestion' | 
             <button className="btn btn-primary" disabled={busy} onClick={() => runClean(false)}>
               {busy ? <span className="spinner" /> : null} Apply &amp; Commit Cleaning ({cleanMode.toUpperCase()})
             </button>
-            <button className="btn" disabled={busy} onClick={runProfile}>Run Deep 6D Quality Profile</button>
+            <button className="btn" disabled={busy} onClick={() => runProfile()}>Run Deep 6D Quality Profile</button>
             <button className="btn" onClick={() => apiGet<DeletedLogResponse>('/api/workbench/s01/deleted-log').then(setDeletedLog).catch(() => {})}>
               Deleted Records Audit ({ws.total_deleted_rows})
+            </button>
+          </div>
+          <div className="row" style={{ marginTop: 12 }}>
+            <label className="field">Trusted reference CSV
+              <input type="file" accept=".csv" onChange={(event) => setReferenceFile(event.target.files?.[0] ?? null)} />
+            </label>
+            <label className="field">Reference record key
+              <select value={referenceKey} onChange={(event) => setReferenceKey(event.target.value)}>
+                <option value="">Select a column</option>
+                {ws.columns.map((column) => <option key={column} value={column}>{column}</option>)}
+              </select>
+            </label>
+            <button className="btn" disabled={busy || !referenceFile || !ws.columns.includes(referenceKey)} onClick={() => runProfile(true)}>
+              Compare with Trusted Reference
             </button>
           </div>
 
@@ -840,6 +863,9 @@ export const Studio01Data: React.FC<StudioProps & { sectionMode?: 'ingestion' | 
             <span>6-Dimensional Enterprise Quality &amp; Format Audit</span>
             <span className="badge badge-green">Overall Score: {Number(quality.quality?.overall_score ?? 0).toFixed(1)} / 100</span>
           </div>
+          {quality.quality?.reference_matched_rows != null && (
+            <p>{quality.quality.reference_matched_rows} matched rows and {quality.quality.reference_comparisons ?? 0} comparable values using {quality.quality.reference_key_columns?.join(', ')}.</p>
+          )}
           <div className="kpi-grid">
             {Object.entries(quality.quality?.dimensions || {}).map(([k, v]) => (
               <div key={k} className="kpi-card">

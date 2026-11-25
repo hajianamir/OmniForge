@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import io
 import math
@@ -944,7 +945,42 @@ def s01_run_quality(x_session_id: str | None = Header(default="default")) -> dic
     sid = _sid(x_session_id)
     state = get_session_state(sid)
     df = _require_df(state)
-    q_report = DataQualityProfiler().profile(df)
+    return _respond_with_quality(state, sid, df)
+
+
+@router.post("/s01/profile-reference", dependencies=[Depends(require_permission("data:write"))])
+async def s01_profile_reference(
+    file: UploadFile = File(...),
+    key_column: str = Form(...),
+    x_session_id: str | None = Header(default="default"),
+) -> dict[str, Any]:
+    """Compare a bounded trusted CSV against the active dataset without replacing it."""
+    if Path(file.filename or "").suffix.lower() != ".csv":
+        raise HTTPException(status_code=400, detail="Upload a trusted reference in CSV format.")
+    raw = await read_upload_bounded(file)
+    sid = _sid(x_session_id)
+    state = get_session_state(sid)
+    df = _require_df(state)
+    if key_column not in df or not df.columns.is_unique:
+        raise HTTPException(status_code=400, detail="Select a unique key column from the active dataset.")
+    try:
+        dtype = {key_column: "string"} if pd.api.types.is_string_dtype(df[key_column]) else None
+        with io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8-sig", newline="") as stream:
+            header = next(csv.reader(stream), [])
+            if not header or len(set(header)) != len(header):
+                raise ValueError("Reference CSV must have unique header labels.")
+            stream.seek(0)
+            reference = pd.read_csv(stream, dtype=dtype, keep_default_na=False, na_values=[""])
+    except (csv.Error, UnicodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="The trusted CSV could not be read.") from exc
+    return _respond_with_quality(state, sid, df, reference=reference, reference_keys=[key_column])
+
+
+def _respond_with_quality(
+    state: dict[str, Any], sid: str, df: pd.DataFrame, *, reference: pd.DataFrame | None = None,
+    reference_keys: list[str] | None = None,
+) -> dict[str, Any]:
+    q_report = DataQualityProfiler().profile(df, reference_data=reference, reference_key_columns=reference_keys)
     state["uap_quality"] = q_report
     fmt = state.get("uap_format_audit") or run_format_audit(state, df)
     record_lineage(state, "Quality", "Ran Data Quality & Format Audit", f"Score={q_report.overall_score:.1f}/100")

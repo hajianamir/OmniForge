@@ -76,6 +76,15 @@ def s08_causal(req: CausalReq, x_session_id: str | None = Header(default="defaul
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
     df = _wb().get_analysis_dataframe(state, _wb()._require_df(state))
+    if req.method == "clustered_did":
+        if not req.post_col or not req.cluster_col:
+            raise HTTPException(status_code=400, detail="Clustered difference-in-differences requires a period and cluster column.")
+        out = CausalInferenceEngine().difference_in_differences(
+            df, group_col=req.treatment_col, post_col=req.post_col, outcome_col=req.outcome_col,
+            cluster_col=req.cluster_col,
+        )
+        state["uap_causal_result"] = out
+        return wb_cache_and_respond(state, sid, "s08_causal", {"causal": out})
     confs = [c for c in req.confounders if c in df.columns and c not in (req.treatment_col, req.outcome_col)]
     if not confs:
         confs = [c for c in df.select_dtypes(include=[np.number]).columns if c not in (req.treatment_col, req.outcome_col)][:5]
@@ -87,7 +96,7 @@ def s08_causal(req: CausalReq, x_session_id: str | None = Header(default="defaul
         method=req.method,
         instrument_col=req.instrument_col if (req.instrument_col and req.instrument_col in df.columns) else None,
     )
-    out = res.model_dump() if hasattr(res, "model_dump") else res
+    out = res.model_dump()
     state["uap_causal_result"] = out
     return wb_cache_and_respond(state, sid, "s08_causal", {"causal": out})
 

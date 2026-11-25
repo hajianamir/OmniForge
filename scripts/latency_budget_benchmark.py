@@ -23,7 +23,10 @@ import sys
 import time
 import tracemalloc
 from collections.abc import Callable
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -189,7 +192,16 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON report")
     args = parser.parse_args()
 
-    report = run(repeats=max(3, args.repeats), budget_scale=args.budget_scale)
+    with TemporaryDirectory(prefix="omniforge-latency-") as root:
+        fixture = Path(root)
+        env = {
+            "OMNIFORGE_ENVIRONMENT": "development",
+            "OMNIFORGE_KEY_DIR": str(fixture / "keys"),
+            "OMNIFORGE_PATHS__WORKSPACE_DIR": str(fixture / "workspace"),
+            "OMNIFORGE_PATHS__AUDIT_LOG_PATH": str(fixture / "workspace" / "audit.jsonl"),
+        }
+        with patch.dict("os.environ", env):
+            report = run(repeats=max(3, args.repeats), budget_scale=args.budget_scale)
     if args.json:
         print(json.dumps(report, indent=2))
     else:
