@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import re
 from pathlib import Path
 from typing import Any
 
@@ -203,8 +204,8 @@ class VisionFoundationHub:
         *,
         model_name: str = "ViT-B-32",
     ) -> dict[str, Any]:
-        """Perform Zero-Shot Image Classification via OpenCLIP (when installed) or calibrated visual-attribute heuristics."""
-        labels = [str(lb).strip() for lb in candidate_labels if str(lb).strip()]
+        """Perform Zero-Shot Image Classification via OpenCLIP (when installed) or rank supported labels using uncalibrated visual cues."""
+        labels = list(dict.fromkeys(str(lb).strip() for lb in candidate_labels if str(lb).strip()))
         if not labels:
             return {"backend": "none", "predictions": [], "top_label": None}
 
@@ -228,13 +229,15 @@ class VisionFoundationHub:
                     txt_f = model.encode_text(txt_t)
                     img_f /= img_f.norm(dim=-1, keepdim=True)
                     txt_f /= txt_f.norm(dim=-1, keepdim=True)
-                    probs = (100.0 * img_f @ txt_f.T).softmax(dim=-1).cpu().numpy()[0]
-                ranked = sorted(
-                    [{"label": lb, "probability": round(float(p), 5)} for lb, p in zip(labels, probs, strict=False)],
-                    key=lambda r: float(np.asarray(r["probability"], dtype=float)),
-                    reverse=True,
-                )
-                return {"backend": f"open_clip:{model_name}", "predictions": ranked, "top_label": ranked[0]["label"]}
+                    similarities = (img_f @ txt_f.T).cpu().numpy()[0]
+                ranked = sorted(zip(labels, similarities, strict=True), key=lambda item: float(item[1]), reverse=True)
+                return {
+                    "backend": f"open_clip:{model_name}",
+                    "score_kind": "cosine_similarity",
+                    "predictions": [{"label": label, "score": round(float(score), 5)} for label, score in ranked],
+                    "top_label": ranked[0][0],
+                    "calibrated": False,
+                }
             except Exception as exc:
                 logger.warning(
                     "vision_backend_failed",
@@ -244,43 +247,37 @@ class VisionFoundationHub:
                     fallback="native_visual_semantic_fallback",
                 )
 
-        # Calibrated visual-attribute semantic scoring fallback (color dominance, brightness, texture, edge complexity)
+        # These hand-weighted cues rank simple attributes. They do not identify objects.
         r_m, g_m, b_m = float(rgb[:, :, 0].mean()) / 255.0, float(rgb[:, :, 1].mean()) / 255.0, float(rgb[:, :, 2].mean()) / 255.0
         bright = (r_m + g_m + b_m) / 3.0
         sat = float(np.mean(np.max(rgb, axis=2) - np.min(rgb, axis=2))) / 255.0
         gray = self._base_cv._rgb_to_gray(rgb)
         edge_d = float(np.hypot(ndimage.sobel(gray, axis=1), ndimage.sobel(gray, axis=0)).mean()) / 255.0
 
-        raw_scores: list[float] = []
-        for lb in labels:
-            lo = lb.lower()
-            s = 0.2
-            if any(k in lo for k in ("sky", "ocean", "water", "sea", "blue", "ice")):
-                s += 1.6 * (b_m - 0.5 * r_m)
-            if any(k in lo for k in ("forest", "tree", "leaf", "plant", "grass", "nature", "green")):
-                s += 1.6 * (g_m - 0.5 * r_m)
-            if any(k in lo for k in ("fire", "sunset", "red", "warm", "heat", "rust", "brick")):
-                s += 1.6 * (r_m - 0.5 * b_m)
-            if any(k in lo for k in ("night", "dark", "shadow", "space", "black", "x-ray")):
-                s += 1.4 * (1.0 - bright)
-            if any(k in lo for k in ("snow", "white", "bright", "document", "text", "chart", "paper")):
-                s += 1.4 * bright + 0.5 * (1.0 - sat)
-            if any(k in lo for k in ("building", "city", "industrial", "circuit", "defect", "crack", "object", "car")):
-                s += 1.5 * edge_d
-            raw_scores.append(s)
-        arr = np.asarray(raw_scores, dtype=float)
-        ex = np.exp((arr - np.max(arr)) * 2.5)
-        probs = ex / np.sum(ex)
-        ranked = sorted(
-            [{"label": lb, "probability": round(float(p), 5)} for lb, p in zip(labels, probs, strict=False)],
-            key=lambda r: float(np.asarray(r["probability"], dtype=float)),
-            reverse=True,
+        cues = (
+            ({"sky", "ocean", "water", "sea", "blue", "ice"}, 1.6 * (b_m - 0.5 * r_m)),
+            ({"forest", "tree", "leaf", "plant", "grass", "nature", "green"}, 1.6 * (g_m - 0.5 * r_m)),
+            ({"fire", "sunset", "red", "warm", "heat", "rust", "brick"}, 1.6 * (r_m - 0.5 * b_m)),
+            ({"night", "dark", "shadow", "space", "black", "x-ray"}, 1.4 * (1.0 - bright)),
+            ({"snow", "white", "bright", "document", "text", "chart", "paper"}, 1.4 * bright + 0.5 * (1.0 - sat)),
+            ({"building", "city", "industrial", "circuit", "defect", "crack", "object", "car"}, 1.5 * edge_d),
         )
+        cue_scores: list[tuple[str, float]] = []
+        for label in labels:
+            words = set(re.findall(r"[\w-]+", label.lower()))
+            matched = [strength for terms, strength in cues if words & terms]
+            if matched:
+                cue_scores.append((label, round(sum(matched), 5)))
+        cue_scores.sort(key=lambda item: item[1], reverse=True)
+        best = cue_scores[0] if cue_scores else None
+        unique_top = best is not None and best[1] > 0 and (len(cue_scores) == 1 or best[1] > cue_scores[1][1])
         return {
             "backend": "native_visual_semantic_fallback",
-            "note": "Install `open-clip-torch` for CLIP/SigLIP neural zero-shot weights.",
-            "predictions": ranked,
-            "top_label": ranked[0]["label"],
+            "score_kind": "visual_cue_heuristic",
+            "calibrated": False,
+            "note": "Visual cues can describe simple image attributes. Use a trained backend for semantic classification.",
+            "predictions": [{"label": label, "score": score} for label, score in cue_scores],
+            "top_label": cue_scores[0][0] if unique_top else None,
             "visual_stats": {"brightness": round(bright, 4), "saturation": round(sat, 4), "edge_density": round(edge_d, 4)},
         }
 
@@ -315,7 +312,12 @@ class VisionFoundationHub:
                                 "height": int(xyxy[3] - xyxy[1]),
                             }
                         )
-                return {"backend": "ultralytics:yolov8n", "n_detections": len(dets), "detections": dets}
+                return {
+                    "backend": "ultralytics:yolov8n",
+                    "score_kind": "uncalibrated_model_confidence",
+                    "n_detections": len(dets),
+                    "detections": dets,
+                }
             except Exception as exc:
                 logger.warning(
                     "vision_backend_failed",
@@ -325,7 +327,7 @@ class VisionFoundationHub:
                     fallback="native_otsu_morphological",
                 )
 
-        # Offline multi-scale foreground region detector with confidence scoring
+        # Report the geometry of offline foreground regions.
         objs = self._base_cv.detect_objects(rgb, min_area=max(24, int(rgb.shape[0] * rgb.shape[1] * 0.005)))
         total_area = float(max(rgb.shape[0] * rgb.shape[1], 1))
         dets = []
@@ -335,7 +337,7 @@ class VisionFoundationHub:
             dets.append(
                 {
                     "label": f"region_{i + 1}",
-                    "confidence": round(float(min(0.99, 0.45 + 0.55 * min(area_val / (0.25 * total_area), 1.0))), 4),
+                    "area_fraction": round(area_val / total_area, 6),
                     "x": int(bbox[0]),
                     "y": int(bbox[1]),
                     "width": int(bbox[2]),
@@ -343,7 +345,12 @@ class VisionFoundationHub:
                     "area": int(round(area_val)),
                 }
             )
-        return {"backend": "native_otsu_morphological", "n_detections": len(dets), "detections": dets}
+        return {
+            "backend": "native_otsu_morphological",
+            "score_kind": "foreground_area_fraction",
+            "n_detections": len(dets),
+            "detections": dets,
+        }
 
     def segment_image(self, image_or_path: np.ndarray | str | Path, *, n_segments: int = 4) -> dict[str, Any]:
         """Semantic / superpixel region segmentation via spatial-color MiniBatchKMeans (or DeepLabV3 when installed)."""

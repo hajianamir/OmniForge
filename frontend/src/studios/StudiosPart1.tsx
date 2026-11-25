@@ -28,7 +28,6 @@ import type {
   HypothesisResponse,
   IntakeAuditPayload,
   MiningResponse,
-  QualityDimensionScores,
   SelectionResponse,
   StateEnvelope,
 } from '../studioTypes';
@@ -842,7 +841,7 @@ export const Studio01Data: React.FC<StudioProps & { sectionMode?: 'ingestion' | 
             {Object.entries(quality.quality?.dimensions || {}).map(([k, v]) => (
               <div key={k} className="kpi-card">
                 <div className="kpi-label">{k}</div>
-                <div className="kpi-value">{Number(v).toFixed(1)}%</div>
+                <div className="kpi-value">{typeof v === 'number' ? `${v.toFixed(1)}%` : 'Unavailable'}</div>
               </div>
             ))}
           </div>

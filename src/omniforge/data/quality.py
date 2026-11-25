@@ -9,8 +9,9 @@ import numpy as np
 import pandas as pd
 from pydantic import BaseModel, Field
 
+from omniforge.core.exceptions import DataValidationError
 from omniforge.core.logging import get_logger
-from omniforge.core.performance import GLOBAL_DF_CACHE
+from omniforge.core.performance import GLOBAL_DF_CACHE, compute_df_fingerprint
 
 logger = get_logger(__name__)
 
@@ -26,6 +27,11 @@ class ColumnQualityScore(BaseModel):
     consistency: float
     outlier_ratio: float
     overall_score: float
+    reference_accuracy: float | None = None
+    reference_comparisons: int = 0
+    rule_conformance: float | None = None
+    rule_checks: int = 0
+    statistical_plausibility: float | None = None
     issues: list[str] = Field(default_factory=list)
 
 
@@ -41,6 +47,10 @@ class DataQualityReport(BaseModel):
     missing_cell_ratio: float
     column_scores: list[ColumnQualityScore] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
+    effective_weights: dict[str, float] = Field(default_factory=dict)
+    reference_comparisons: int = 0
+    rule_conformance: float | None = None
+    rule_checks: int = 0
     profiled_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
 
 
@@ -68,6 +78,7 @@ class DataQualityProfiler:
         timestamp_column: str | None = None,
         max_freshness_days: float = 365.0,
         reference_rules: dict[str, tuple[float, float]] | None = None,
+        reference_data: pd.DataFrame | None = None,
         key_columns: list[str] | None = None,
     ) -> DataQualityReport:
         """Profile a DataFrame across all six enterprise data quality dimensions.
@@ -76,19 +87,32 @@ class DataQualityProfiler:
             df: Input DataFrame.
             timestamp_column: Optional datetime column used to score timeliness.
             max_freshness_days: Age threshold beyond which timeliness degrades.
-            reference_rules: Optional ``{column: (min_valid, max_valid)}`` domain accuracy ranges.
+            reference_rules: Optional inclusive numeric ranges for rule conformance.
+            reference_data: Trusted values keyed by matching index and column labels.
+                Only pairs with two observed values enter exact-match reference accuracy.
             key_columns: Optional primary key columns whose uniqueness is scored strictly.
 
         Returns:
             :class:`DataQualityReport` with scores on a 0–100 scale and recommendations.
         """
-        import hashlib as _hashlib
-        import json as _json
+        import json
 
-        rules_hash = _hashlib.sha256(
-            _json.dumps(reference_rules or {}, sort_keys=True).encode("utf-8")
-        ).hexdigest()[:16]
-        cache_params = f"{timestamp_column}|{max_freshness_days}|rules:{rules_hash}|{key_columns}"
+        if reference_data is not None and (
+            not df.index.is_unique or not reference_data.index.is_unique
+            or not df.columns.is_unique or not reference_data.columns.is_unique
+        ):
+            raise DataValidationError(
+                "Reference accuracy requires unique row identifiers and column labels.",
+                suggestions=["Index both frames by the same unique row identifier."],
+            )
+        cache_params = json.dumps({
+            "timestamp_column": timestamp_column,
+            "max_freshness_days": max_freshness_days,
+            "rules": reference_rules,
+            "reference": compute_df_fingerprint(reference_data) if reference_data is not None else None,
+            "key_columns": key_columns,
+            "weights": self.weights,
+        }, sort_keys=True)
         hit, cached = GLOBAL_DF_CACHE.get("data_quality", df, cache_params)
         if hit and isinstance(cached, DataQualityReport):
             return cached
@@ -98,7 +122,7 @@ class DataQualityProfiler:
             return DataQualityReport(
                 overall_score=0.0,
                 grade="F",
-                dimensions={k: 0.0 for k in self.weights},
+                dimensions={k: None for k in self.DEFAULT_WEIGHTS},
                 row_count=n_rows,
                 column_count=n_cols,
                 duplicate_row_ratio=0.0,
@@ -118,7 +142,9 @@ class DataQualityProfiler:
         col_scores: list[ColumnQualityScore] = []
         validity_parts: list[float] = []
         consistency_parts: list[float] = []
-        accuracy_parts: list[float] = []
+        reference_matches = reference_comparisons = 0
+        rule_passed = rule_checks = 0
+        outlier_columns: list[str] = []
         recommendations: list[str] = []
 
         rules = reference_rules or {}
@@ -141,7 +167,20 @@ class DataQualityProfiler:
             col_valid = 100.0
             outlier_ratio = 0.0
             col_consistency = 100.0
-            col_accuracy = 100.0
+            col_accuracy: float | None = None
+            col_plausibility: float | None = None
+            col_conformance: float | None = None
+            col_comparisons = col_rule_checks = 0
+
+            if reference_data is not None and col in reference_data:
+                trusted = reference_data[col].reindex(df.index)
+                comparable = series.notna() & trusted.notna()
+                col_comparisons = int(comparable.sum())
+                if col_comparisons:
+                    matches = int(series[comparable].astype(object).eq(trusted[comparable].astype(object)).sum())
+                    col_accuracy = matches / col_comparisons * 100.0
+                    reference_matches += matches
+                    reference_comparisons += col_comparisons
 
             if pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series):
                 vals = series.dropna().astype(float)
@@ -151,22 +190,27 @@ class DataQualityProfiler:
                     if inf_ratio > 0:
                         col_issues.append(f"Contains infinite values ({inf_ratio*100:.1f}%).")
 
-                    # Outlier density informs statistical accuracy
-                    q1, q3 = float(vals.quantile(0.25)), float(vals.quantile(0.75))
-                    iqr = q3 - q1
-                    if iqr > 0:
-                        out_mask = (vals < q1 - 3.0 * iqr) | (vals > q3 + 3.0 * iqr)
-                        outlier_ratio = float(out_mask.mean())
-                        col_accuracy = max(0.0, (1.0 - min(outlier_ratio * 2.0, 1.0)) * 100.0)
-                        if outlier_ratio > 0.05:
-                            col_issues.append(f"Extreme outlier density ({outlier_ratio*100:.1f}%).")
+                    finite = vals[np.isfinite(vals)]
+                    if len(finite) >= 4:
+                        q1, q3 = float(finite.quantile(0.25)), float(finite.quantile(0.75))
+                        iqr = q3 - q1
+                        if np.isfinite(iqr) and iqr > 0:
+                            out_mask = (finite < q1 - 3.0 * iqr) | (finite > q3 + 3.0 * iqr)
+                            outlier_ratio = float(out_mask.mean())
+                            col_plausibility = (1.0 - outlier_ratio) * 100.0
+                            if outlier_ratio > 0.05:
+                                outlier_columns.append(col_name)
+                                col_issues.append(f"Extreme outlier density ({outlier_ratio*100:.1f}%).")
 
                     if col_name in rules:
                         low, high = rules[col_name]
-                        in_range = float(((vals >= low) & (vals <= high)).mean()) * 100.0
-                        col_accuracy = min(col_accuracy, in_range)
-                        if in_range < 100.0:
-                            col_issues.append(f"Domain range [{low}, {high}] violated by {100-in_range:.1f}% of values.")
+                        passed = int((np.isfinite(vals) & vals.between(low, high)).sum())
+                        col_rule_checks = len(vals)
+                        col_conformance = passed / col_rule_checks * 100.0
+                        rule_passed += passed
+                        rule_checks += col_rule_checks
+                        if col_conformance < 100.0:
+                            col_issues.append(f"Domain range [{low}, {high}] violated by {100-col_conformance:.1f}% of values.")
             elif pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
                 non_null = series.dropna()
                 if len(non_null) > 25_000:
@@ -187,10 +231,9 @@ class DataQualityProfiler:
 
             validity_parts.append(col_valid)
             consistency_parts.append(col_consistency)
-            accuracy_parts.append(col_accuracy)
-
+            col_total = 0.35 * col_comp + 0.25 * col_valid + 0.20 * col_consistency
             col_overall = round(
-                0.35 * col_comp + 0.25 * col_valid + 0.20 * col_consistency + 0.20 * col_accuracy, 2
+                col_total / 0.80 if col_accuracy is None else col_total + 0.20 * col_accuracy, 2
             )
             col_scores.append(
                 ColumnQualityScore(
@@ -202,13 +245,18 @@ class DataQualityProfiler:
                     consistency=round(col_consistency, 2),
                     outlier_ratio=round(outlier_ratio, 4),
                     overall_score=col_overall,
+                    reference_accuracy=round(col_accuracy, 2) if col_accuracy is not None else None,
+                    reference_comparisons=col_comparisons,
+                    rule_conformance=round(col_conformance, 2) if col_conformance is not None else None,
+                    rule_checks=col_rule_checks,
+                    statistical_plausibility=round(col_plausibility, 2) if col_plausibility is not None else None,
                     issues=col_issues,
                 )
             )
 
         validity = float(np.mean(validity_parts)) if validity_parts else 100.0
         consistency = float(np.mean(consistency_parts)) if consistency_parts else 100.0
-        accuracy = float(np.mean(accuracy_parts)) if accuracy_parts else 100.0
+        accuracy = reference_matches / reference_comparisons * 100.0 if reference_comparisons else None
         timeliness = self._compute_timeliness(df, timestamp_column, max_freshness_days)
 
         dimensions: dict[str, Any] = {
@@ -216,15 +264,16 @@ class DataQualityProfiler:
             "uniqueness": round(uniqueness, 2),
             "validity": round(validity, 2),
             "consistency": round(consistency, 2),
-            "accuracy": round(accuracy, 2),
+            "accuracy": round(accuracy, 2) if accuracy is not None else None,
             "timeliness": round(timeliness, 2) if timeliness is not None else None,
         }
         evaluable_weights = {
             k: w for k, w in self.weights.items() if dimensions.get(k) is not None
         }
         total_w = sum(evaluable_weights.values()) or 1.0
+        effective_weights = {k: w / total_w for k, w in evaluable_weights.items()}
         overall = round(
-            sum(float(dimensions[k]) * (w / total_w) for k, w in evaluable_weights.items()),
+            sum(float(dimensions[k]) * w for k, w in effective_weights.items()),
             2,
         )
         grade = self._score_to_grade(overall)
@@ -241,16 +290,18 @@ class DataQualityProfiler:
             recommendations.append(
                 "String casing/whitespace inconsistencies found. Enable string cleaning and normalization."
             )
-        if accuracy < 92.0:
-            recommendations.append(
-                "Elevated extreme outlier density or range violations detected. Apply IQR/IsolationForest handling."
-            )
+        if outlier_columns:
+            recommendations.append("Review extreme observations in the columns flagged for statistical plausibility.")
+        if rule_passed < rule_checks:
+            recommendations.append("Review observed values that violate configured domain ranges.")
+        if accuracy is not None and accuracy < 100.0:
+            recommendations.append("Investigate disagreements with the trusted reference data.")
         if timeliness is not None and timeliness < 85.0:
             recommendations.append(
                 "Dataset freshness is below threshold. Schedule incremental ingestion or check pipeline SLA."
             )
         if not recommendations:
-            recommendations.append("Dataset passes all enterprise quality gates cleanly.")
+            recommendations.append("No remediation was suggested by the checks that could be evaluated.")
 
         report = DataQualityReport(
             overall_score=overall,
@@ -261,6 +312,10 @@ class DataQualityProfiler:
             duplicate_row_ratio=round(dup_ratio, 4),
             missing_cell_ratio=round(missing_cell_ratio, 4),
             column_scores=col_scores,
+            effective_weights=effective_weights,
+            reference_comparisons=reference_comparisons,
+            rule_conformance=round(rule_passed / rule_checks * 100.0, 2) if rule_checks else None,
+            rule_checks=rule_checks,
             recommendations=recommendations,
         )
         logger.info("data_quality_profiled", overall_score=overall, grade=grade)

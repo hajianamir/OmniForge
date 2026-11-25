@@ -106,6 +106,9 @@ test('small Studio 04 results and exclusions survive Studio 01 cleaning', async 
   await expect(page.getByRole('button', { name: 'Exclusions (1)' })).toBeVisible();
 
   await page.locator('[data-studio="01"]').click();
+  await page.getByRole('button', { name: 'Run Deep 6D Quality Profile' }).click();
+  const accuracy = page.locator('.kpi-card:visible').filter({ has: page.getByText('accuracy', { exact: true }) });
+  await expect(accuracy).toContainText('Unavailable');
   await page.getByRole('button', { name: /Apply & Commit Cleaning/ }).click();
   await expect(page.getByText(/Cleaning \(.*\) committed/)).toBeVisible();
   await expect(page.getByRole('button', { name: 'Exclusions (1)' })).toBeVisible();

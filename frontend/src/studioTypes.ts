@@ -67,7 +67,7 @@ export interface CleanResponse extends StateEnvelope {
 
 export interface QualityDimensionScores {
   overall_score?: number;
-  dimensions?: Record<string, number>;
+  dimensions?: Record<string, number | null>;
   column_scores?: JsonRow[];
 }
 
@@ -454,7 +454,13 @@ export interface BackendsProbeResponse {
 export interface VisionResponse extends StateEnvelope {
   detections?: { n_detections?: number; detections?: JsonRow[]; [key: string]: unknown } | null;
   segmentation?: { n_segments?: number; regions?: JsonRow[]; [key: string]: unknown } | null;
-  zero_shot?: { backend?: string; predictions?: { label: string; probability: number }[]; [key: string]: unknown } | null;
+  zero_shot?: {
+    backend?: string;
+    score_kind?: string;
+    top_label?: string | null;
+    note?: string;
+    predictions?: { label: string; score?: number; probability?: number }[];
+  } | null;
   embedding?: { dim?: number; image_shape?: unknown } | null;
   [key: string]: unknown;
 }
