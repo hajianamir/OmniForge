@@ -6,11 +6,13 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Depends, Header
 
+from omniforge.api.auth import authorize_principal, require_permission
 from omniforge.api.studios.schemas import DAGRunReq, wb_cache_and_respond
 from omniforge.automl.backends import AutoMLBackendHub
 from omniforge.core.performance import compute_df_fingerprint
+from omniforge.core.types import Principal
 from omniforge.features.engineering import FeatureConfig, FeatureEngineeringPipeline
 from omniforge.pipelines.builder import PipelineBuilder
 from omniforge.pipelines.executor import PipelineExecutor
@@ -24,29 +26,34 @@ def _wb() -> Any:
     return wb
 
 
-def _initial_split_frames(state: dict[str, Any], df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _initial_split_frames(state: dict[str, Any], active_df: pd.DataFrame, df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Extract active Split-Lock train/test frames or deterministic 80/20 holdout frames for leak-free DAG execution."""
+    train_df, test_df, _ = _wb().get_active_split_frames(state, active_df)
+    if test_df is not None:
+        return train_df.loc[:, df.columns], test_df.loc[:, df.columns]
     n = len(df)
     if n < 5:
         return df.copy(), pd.DataFrame(columns=df.columns)
-    if state.get("uap_split_lock_active"):
-        tr_idx = [i for i in (state.get("uap_split_train_indices") or []) if 0 <= int(i) < n]
-        te_idx = [i for i in (state.get("uap_split_test_indices") or []) if 0 <= int(i) < n]
-        if tr_idx and te_idx:
-            return df.iloc[tr_idx].reset_index(drop=True), df.iloc[te_idx].reset_index(drop=True)
     cut = max(2, int(round(0.8 * n)))
     return df.iloc[:cut].reset_index(drop=True), df.iloc[cut:].reset_index(drop=True)
 
 
 @router.post("/s10/run")
-def s10_run_dag(req: DAGRunReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
+def s10_run_dag(
+    req: DAGRunReq,
+    x_session_id: str | None = Header(default="default"),
+    principal: Principal = Depends(require_permission("pipeline:execute")),
+) -> dict[str, Any]:
+    if "automl" in req.stages:
+        authorize_principal(principal, "model:train")
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
-    df = _wb().get_analysis_dataframe(state, _wb()._require_df(state))
+    active_df = _wb()._require_df(state)
+    df = _wb().get_analysis_dataframe(state, active_df)
     targets = _wb().get_selected_targets(state, df)
     target = req.target if (req.target and req.target in df.columns) else (targets[0] if targets else None)
 
-    init_train, init_test = _initial_split_frames(state, df)
+    init_train, init_test = _initial_split_frames(state, active_df, df)
 
     builder = PipelineBuilder(name="OmniForge_DAG_Workflow")
     prev: str | None = None
@@ -142,14 +149,13 @@ def s10_run_dag(req: DAGRunReq, x_session_id: str | None = Header(default="defau
         elif stage == "automl" and target:
 
             def _run_fast(ctx: Any, tgt: str = target) -> dict[str, Any]:
-                cur_df: pd.DataFrame = ctx.get("data")
-                if tgt not in cur_df.columns:
+                train_df: pd.DataFrame = ctx.get("train_df")
+                if tgt not in train_df.columns:
                     return {"stage": "automl", "status": "skipped_missing_target"}
-                X_d, y_d, t_d = _wb()._prepare_xy(cur_df, tgt)
+                X_d, y_d, t_d = _wb()._prepare_xy(train_df, tgt, raw_features=True)
                 w_df = X_d.copy()
                 w_df[tgt] = y_d.to_numpy()
-                # Cleaning/feature fitting above was already leak-safe (fit on train only),
-                # so AutoMLBackendHub's own internal leakage-safe split is sound here.
+                # Keep the reserved test rows out of model selection.
                 r = AutoMLBackendHub.run(
                     w_df,
                     target_col=tgt,
@@ -160,7 +166,9 @@ def s10_run_dag(req: DAGRunReq, x_session_id: str | None = Header(default="defau
                 return {
                     "best_model": r.best_model_name,
                     "score": r.best_score,
+                    "score_partition": "validation",
                     "lift": r.lift_over_best_baseline,
+                    "reserved_test_rows": len(ctx.get("test_df")),
                     "upstream_data_fingerprint": compute_df_fingerprint(w_df),
                 }
 

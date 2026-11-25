@@ -841,11 +841,14 @@ class AutoMLBackendHub:
         groups: pd.Series | np.ndarray | None = None,
         time_values: pd.Series | np.ndarray | None = None,
         gap: int = 0,
+        holdout: tuple[pd.DataFrame, pd.Series] | None = None,
     ) -> MultiBackendAutoMLResult:
         """Run any selected AutoML engine with baseline comparison and optional native fallback."""
         if target_col not in df.columns:
             raise AutoMLError(f"Target column '{target_col}' not found in DataFrame.")
         req_backend = str(backend).lower().strip()
+        if holdout is not None and req_backend != "omniforge_native":
+            raise AutoMLError("A supplied holdout is supported by the OmniForge native backend.")
         clean_df = df.dropna(subset=[target_col]).copy()
         y_all = clean_df[target_col]
         X_all = clean_df.drop(columns=[target_col])
@@ -867,7 +870,7 @@ class AutoMLBackendHub:
                 random_seed=random_seed,
                 max_carbon_grams_co2e=max_carbon_grams_co2e,
                 max_inference_latency_ms=max_inference_latency_ms,
-            ).fit(X_all, y_all, groups=aligned_groups, time_values=aligned_times)
+            ).fit(X_all, y_all, groups=aligned_groups, time_values=aligned_times, holdout=holdout)
             return MultiBackendAutoMLResult(
                 requested_backend=req_backend,
                 executed_backend="omniforge_native",

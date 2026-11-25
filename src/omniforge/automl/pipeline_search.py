@@ -294,8 +294,13 @@ class AutoMLPipelineSearch:
         *,
         groups: pd.Series | np.ndarray | None = None,
         time_values: pd.Series | np.ndarray | None = None,
+        holdout: tuple[pd.DataFrame, pd.Series] | None = None,
     ) -> AutoMLResult:
-        """Execute leakage-safe splitting, fold-isolated Pipeline CV, baselines, candidate screening, HPO, and ensembling."""
+        """Search on development data and evaluate on the supplied or internally reserved holdout.
+
+        A supplied holdout must be reserved independently by the caller. Returned
+        test positions refer to those held-out rows, appended after the development rows.
+        """
         t0 = time.perf_counter()
         X_work = X.reset_index(drop=True).copy()
         y_arr = np.asarray(y)
@@ -320,8 +325,8 @@ class AutoMLPipelineSearch:
 
         split_cfg = SplitConfig(
             strategy=self.split_strategy,
-            test_size=0.20,
-            val_size=0.20,
+            test_size=0.25 if holdout is not None else 0.20,
+            val_size=0.0 if holdout is not None else 0.20,
             cv_folds=self.cv_folds,
             group_col=eff_group_col if (eff_group_col and eff_group_col in split_frame.columns) else None,
             time_col=eff_time_col if (eff_time_col and eff_time_col in split_frame.columns) else None,
@@ -333,6 +338,12 @@ class AutoMLPipelineSearch:
         tr_idx = split_res.train_indices
         va_idx = split_res.val_indices
         te_idx = split_res.test_indices
+        if holdout is not None:
+            X_holdout, y_holdout = holdout
+            if X_holdout.empty or not X_holdout.columns.equals(X_work.columns) or not X_holdout.index.equals(y_holdout.index):
+                raise AutoMLError("The holdout requires observed targets, aligned rows, and the development predictor schema.")
+            va_idx = split_res.test_indices
+            te_idx = np.arange(len(X_work), len(X_work) + len(X_holdout))
         if len(va_idx) == 0:
             raise AutoMLError(
                 "AutoML requires separate training, validation and test partitions.",
@@ -662,8 +673,11 @@ class AutoMLPipelineSearch:
             development_indices = np.concatenate([tr_idx, va_idx])
             X_dev = X_work.iloc[development_indices].reset_index(drop=True)
             y_dev = y_arr[development_indices]
-            X_test = X_work.iloc[te_idx].reset_index(drop=True)
-            y_test = y_arr[te_idx]
+            X_test, y_test = (
+                (holdout[0].reset_index(drop=True), holdout[1].to_numpy())
+                if holdout is not None
+                else (X_work.iloc[te_idx].reset_index(drop=True), y_arr[te_idx])
+            )
 
             best_model = copy.deepcopy(best_cand_model).fit(X_dev, y_dev)
             best_test_score = _score_model(best_model, X_test, y_test)
@@ -740,6 +754,7 @@ class AutoMLPipelineSearch:
                 "evaluation": {
                     "leaderboard_partition": "validation",
                     "best_score_partition": "test",
+                    "test_partition_source": "supplied_holdout" if holdout is not None else "internal_split",
                     "validation_score": round(best_val_score, 6),
                     "test_baseline_score": best_bl_score,
                     "validation_baseline_score": (max if is_clf else min)(

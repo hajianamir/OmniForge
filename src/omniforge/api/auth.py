@@ -358,14 +358,19 @@ def require_workbench_auth(
     return principal
 
 
+def authorize_principal(principal: Principal, permission: str) -> None:
+    """Enforce an action permission when it depends on the request payload."""
+    try:
+        access_controller.authorize(principal, permission)
+    except AuthorizationError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=exc.message) from exc
+
+
 def require_permission(permission: str) -> Callable[..., Principal]:
     """FastAPI dependency enforcing RBAC/ABAC permission checks for protected endpoints."""
 
     def _checker(principal: Principal = Depends(get_current_principal)) -> Principal:
-        try:
-            access_controller.authorize(principal, permission)
-        except AuthorizationError as exc:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=exc.message) from exc
+        authorize_principal(principal, permission)
         return principal
 
     return _checker

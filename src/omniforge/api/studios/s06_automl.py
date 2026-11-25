@@ -7,9 +7,10 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter, File, Header, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 
+from omniforge.api.auth import require_permission
 from omniforge.api.jobs import JobCancellationToken, JobQueueFullError
 from omniforge.api.studios.schemas import (
     AutoMLRunReq,
@@ -20,6 +21,7 @@ from omniforge.api.studios.schemas import (
 )
 from omniforge.automl.backends import AutoMLBackendHub, probe_automl_backends
 from omniforge.core.utils import to_json_object
+from omniforge.data.splitting import LeakageSafeSplitter, SplitConfig
 from omniforge.evaluation.equations import ModelEquationExtractor
 from omniforge.features.inference import WorkbenchInputPreprocessor
 from omniforge.models.baselines import BaselineBenchmarkSuite
@@ -41,12 +43,23 @@ def _wb() -> Any:
     return wb
 
 
+def _prepare_holdout(
+    frame: pd.DataFrame | None, target: str, preprocessor: WorkbenchInputPreprocessor
+) -> tuple[pd.DataFrame, pd.Series] | None:
+    if frame is None:
+        return None
+    observed = frame.dropna(subset=[target])
+    if observed.empty:
+        raise HTTPException(status_code=400, detail=f"The locked test partition has no observed values for '{target}'.")
+    return preprocessor.transform(observed.drop(columns=[target])), observed[target]
+
+
 @router.get("/s06/backends")
 def s06_list_backends() -> dict[str, Any]:
     return to_json_object({"automl_backends": probe_automl_backends()})
 
 
-@router.post("/s06/automl")
+@router.post("/s06/automl", dependencies=[Depends(require_permission("model:train"))])
 def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
@@ -59,12 +72,14 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
     target = active_targets[0]
 
     # Honor Split Lock: train only on train partition when lock is active
-    train_df, _test_df, lock = _wb().get_active_split_frames(state, active_df)
+    train_df, test_df, lock = _wb().get_active_split_frames(state, active_df)
     automl_source = train_df.loc[:, df.columns]
+    holdout_source = test_df.loc[:, df.columns] if test_df is not None else None
+    native_backend = req.backend.strip().lower() == "omniforge_native"
     strategy = lock.get("strategy", "auto") if lock else None
 
     def split_options(target_name: str) -> dict[str, Any]:
-        if not lock or req.backend.strip().lower() != "omniforge_native":
+        if not lock or not native_backend:
             return {}
         rows = train_df.loc[train_df[target_name].notna()]
         options: dict[str, Any] = {"split_strategy": strategy}
@@ -77,6 +92,15 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
             options["gap"] = lock.get("gap", 0)
         return options
 
+    def sources_for(target_name: str) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+        if native_backend or holdout_source is not None:
+            return automl_source, holdout_source
+        observed = automl_source.dropna(subset=[target_name])
+        if len(observed) < 13:
+            return observed, None  # Preserve the minimum 10 development rows needed by the adapter.
+        reserved = LeakageSafeSplitter(SplitConfig(test_size=0.2)).split(observed, target_col=target_name)
+        return observed.iloc[reserved.train_indices], observed.iloc[reserved.test_indices]
+
     def _execute(*, cancellation_token: JobCancellationToken | None = None) -> dict[str, Any]:
         multi_target_summary: list[dict[str, Any]] = []
         if len(active_targets) > 1:
@@ -84,7 +108,9 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
                 if cancellation_token is not None:
                     cancellation_token.checkpoint()
                 try:
-                    Xt, yt, tt = _wb()._prepare_xy(automl_source, extra_t, raw_features=True)
+                    extra_source, extra_test = sources_for(extra_t)
+                    Xt, yt, tt, extra_preprocessor = _wb()._prepare_xy_fitted(extra_source, extra_t, raw_features=True)
+                    extra_holdout = _prepare_holdout(extra_test, extra_t, extra_preprocessor) if native_backend else None
                     wdf_t = Xt.copy()
                     wdf_t[extra_t] = yt.to_numpy()
                     res_t = AutoMLBackendHub.run(
@@ -96,6 +122,7 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
                         cv_folds=req.cv_folds,
                         max_carbon_grams_co2e=req.max_carbon_grams_co2e,
                         max_inference_latency_ms=req.max_inference_latency_ms,
+                        holdout=extra_holdout,
                         **split_options(extra_t),
                     )
                     multi_target_summary.append(
@@ -110,7 +137,9 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
                     multi_target_summary.append({"target": extra_t, "task_type": "error", "best_model": None, "best_score": None})
         if cancellation_token is not None:
             cancellation_token.checkpoint()
-        X, y, task, input_preprocessor = _wb()._prepare_xy_fitted(automl_source, target, raw_features=True)
+        fit_source, test_source = sources_for(target)
+        X, y, task, input_preprocessor = _wb()._prepare_xy_fitted(fit_source, target, raw_features=True)
+        holdout = _prepare_holdout(test_source, target, input_preprocessor)
         work_df = X.copy()
         work_df[target] = y.to_numpy()
         res = AutoMLBackendHub.run(
@@ -122,6 +151,7 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
             cv_folds=req.cv_folds,
             max_carbon_grams_co2e=req.max_carbon_grams_co2e,
             max_inference_latency_ms=req.max_inference_latency_ms,
+            holdout=holdout if native_backend else None,
             **split_options(target),
         )
         if cancellation_token is not None:
@@ -177,7 +207,9 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
         state["uap_active_feature_cols"] = list(X.columns)
         state["uap_active_input_preprocessor"] = input_preprocessor
         evaluation_indices = getattr(res, "evaluation_indices", None)
-        if evaluation_indices is not None:
+        if holdout is not None:
+            state["uap_active_X_test"], state["uap_active_y_test"] = holdout
+        elif evaluation_indices is not None and evaluation:
             state["uap_active_X_test"] = X.iloc[evaluation_indices]
             state["uap_active_y_test"] = y.iloc[evaluation_indices]
         else:
@@ -296,19 +328,22 @@ def s06_export_external_formula(
     )
 
 
-@router.post("/s06/nonparametric")
+@router.post("/s06/nonparametric", dependencies=[Depends(require_permission("model:train"))])
 def s06_run_nonparametric_analytical(
     req: NonParametricRunReq, x_session_id: str | None = Header(default="default")
 ) -> dict[str, Any]:
     """Benchmark all Non-Parametric Analytical Models (Spline GAM, Nadaraya-Watson, RBF Kernel Ridge, Weighted k-NN, Isotonic) vs. Parametric Linear."""
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
-    df = _wb().get_analysis_dataframe(state, _wb()._require_df(state))
+    active_df = _wb()._require_df(state)
+    df = _wb().get_analysis_dataframe(state, active_df)
     targets = _wb().get_selected_targets(state, df)
     target = req.target if (req.target and req.target in df.columns) else (targets[0] if targets else None)
     if not target:
         raise HTTPException(status_code=400, detail="Select a target column first.")
-    X, y, task, input_preprocessor = _wb()._prepare_xy_fitted(df, target)
+    train_df, test_df, _ = _wb().get_active_split_frames(state, active_df)
+    X, y, task, input_preprocessor = _wb()._prepare_xy_fitted(train_df.loc[:, df.columns], target)
+    holdout = _prepare_holdout(test_df.loc[:, df.columns] if test_df is not None else None, target, input_preprocessor)
     if len(X) < 12 or X.shape[1] < 1:
         raise HTTPException(status_code=400, detail="Non-parametric analytical modeling requires at least 12 rows and 1 predictor.")
 
@@ -357,8 +392,7 @@ def s06_run_nonparametric_analytical(
         }
         state["uap_active_feature_cols"] = feat_cols
         state["uap_active_input_preprocessor"] = input_preprocessor
-        state["uap_active_X_test"] = X.iloc[-min(len(X), 400) :]
-        state["uap_active_y_test"] = y.iloc[-min(len(y), 400) :]
+        state["uap_active_X_test"], state["uap_active_y_test"] = holdout if holdout is not None else (None, None)
 
     _wb().record_lineage(
         state,
@@ -369,7 +403,7 @@ def s06_run_nonparametric_analytical(
     return wb_cache_and_respond(state, sid, "s06_nonparametric", dict(res))
 
 
-@router.post("/s06/deep-learning")
+@router.post("/s06/deep-learning", dependencies=[Depends(require_permission("model:train"))])
 def s06_run_deep_benchmark(req: DeepBenchReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     """Benchmark Paper-Grade Deep Learning Architectures (FT-Transformer, TabNet, ResNet-Tabular, MLP, 1D-CNN, GNN) vs. Baselines."""
     sid = _wb()._sid(x_session_id)

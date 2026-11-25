@@ -500,8 +500,7 @@ double-submit `omniforge_csrf` cookie to equal the `X-CSRF-Token` header. Princi
 ->- No credentials 401 with `WWW-Authenticate: Bearer`. Never add an anonymous fallback.
 - `get_current_principal` is `async def` **on purpose**, so the `ContextVar` it sets is visible to sync path 
 operations (anyio copies the context into worker threads). **Do not make it sync.**
-- `require_workbench_auth` guards every `/api/workbench/*` route and **authenticates only**. Any valid 
-principal, including a `viewer` JWT, can reach every workbench route except `POST /s11/promote`, which adds `require_permission("model:promote")`. **Fine-grained RBAC is not applied across the workbench.**
+- `require_workbench_auth` authenticates every `/api/workbench/*` route. Studio 01 data writes and workspace restore require `data:write`. Studio 06 training requires `model:train`. Studio 10 requires `pipeline:execute` and additionally `model:train` for AutoML. Studio 11 registration requires `mlops:write`. Direct Production registration, promotion, and rollback also require `model:promote`. Review other routes individually.
 
 - `require_permission(perm)` calls the shared `access_controller`. The app **refuses to boot** 
 (`RuntimeError`) if the audit path is unusable.
@@ -514,8 +513,7 @@ therefore aborts import, which is the intended fail-closed behaviour.
  - **Mitigation:** set `OMNIFORGE_ENVIRONMENT=production`, or `OMNIFORGE_SECURITY__AUTO_BOOTSTRAP_LOCAL_UI=false`, or bind `127.0.0.1`, for anything beyond a single-user machine.
 - `POST /api/v1/auth/token` mints JWTs. It requires a valid API key (header or body) or an admin Bearer 
 token. A tenant-scoped admin cannot mint `platform_admin` tokens or tokens for another tenant.
-- [!] **RBAC inconsistency (D4) [V].** `/api/v1/registry/{name}/v{n}/stage` requires only `model:deploy` (`api/main.py:496`), yet 
-it can move a model to Production. `/s11/promote` requires `model:promote` (`api/studios/s11_mlops.py:72`). The Copilot `promote_model` tool applies no principal check. The registry's fairness gate applies on all three paths, but the RBAC permission does not.
+- **Production registry transitions.** The REST transition route requires `model:deploy` and additionally `model:promote` for Production. The Workbench promotion route requires `model:promote`. Request-scoped Copilot tools enforce their own stage-specific permissions.
 - **Session namespacing (OWASP API1/BOLA):** `_sid(x_session_id)` returns `ws:<sha256(tenant NUL 
 subject)[:16]>:<raw id>`. It falls back to the raw id only when there is no authenticated principal, which does not happen on workbench routes. **Limit:** every cookie and API-key caller has the **same** (tenant, subject) pair. For those callers the unguessable session id is the only separator. Isolation by identity is real only for JWT principals with distinct subjects.
 - **Jobs:** `BackgroundJobManager` (`ThreadPoolExecutor`, `max_workers=4`, `max_history=128`) 

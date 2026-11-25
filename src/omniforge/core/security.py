@@ -778,7 +778,6 @@ _ALLOWED_UNPICKLE_BUILTINS: frozenset[str] = frozenset(
 
 _ALLOWED_UNPICKLE_MODULE_PREFIXES: tuple[str, ...] = (
     "omniforge",
-    "test_third_party_claims",
     "numpy",
     "pandas",
     "pyarrow",
@@ -1470,6 +1469,8 @@ def _verify_anchor_records(
     verify_mac: Callable[[dict[str, Any]], bool],
 ) -> tuple[bool, int, str]:
     """Shared consistency check for anchor checkpoints against the parsed log hashes."""
+    if hashes and not checkpoint_lines:
+        return False, 0, "anchor is empty; no checkpoint covers the non-empty audit log"
     checked = 0
     last_seq = 0
     max_covered = 0

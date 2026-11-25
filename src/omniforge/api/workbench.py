@@ -19,7 +19,7 @@ import pandas as pd
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 
-from omniforge.api.auth import require_workbench_auth
+from omniforge.api.auth import require_permission, require_workbench_auth
 from omniforge.api.jobs import job_manager
 from omniforge.core.logging import get_logger
 from omniforge.core.performance import (
@@ -649,7 +649,7 @@ def save_workspace_uap(
     )
 
 
-@router.post("/workspace/load")
+@router.post("/workspace/load", dependencies=[Depends(require_permission("data:write"))])
 async def load_workspace_uap(
     file: UploadFile = File(...),
     x_session_id: str | None = Header(default="default"),
@@ -736,7 +736,7 @@ async def s01_excel_sheets(file: UploadFile = File(...)) -> dict[str, Any]:
     return to_json_object({"filename": file.filename or "workbook.xlsx", "sheets": sheets})
 
 
-@router.post("/s01/upload")
+@router.post("/s01/upload", dependencies=[Depends(require_permission("data:write"))])
 async def s01_upload_dataset(
     file: UploadFile = File(...),
     sheet_name: str | None = Form(default=None),
@@ -795,7 +795,7 @@ def s01_sql_inspect(req: SQLInspectReq) -> dict[str, Any]:
     return to_json_object(sql_inspect_database(req.connection_url))
 
 
-@router.post("/s01/sql/load")
+@router.post("/s01/sql/load", dependencies=[Depends(require_permission("data:write"))])
 def s01_sql_load(req: SQLLoadReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _sid(x_session_id)
     state = get_session_state(sid)
@@ -818,7 +818,7 @@ def s01_access_inspect(req: AccessInspectReq) -> dict[str, Any]:
     return to_json_object(access_inspect_database(req.file_path))
 
 
-@router.post("/s01/access/load")
+@router.post("/s01/access/load", dependencies=[Depends(require_permission("data:write"))])
 def s01_access_load(req: AccessLoadReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _sid(x_session_id)
     state = get_session_state(sid)
@@ -835,7 +835,7 @@ def s01_access_load(req: AccessLoadReq, x_session_id: str | None = Header(defaul
     )
 
 
-@router.post("/s01/load-sample")
+@router.post("/s01/load-sample", dependencies=[Depends(require_permission("data:write"))])
 def s01_load_sample(req: LoadSampleReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _sid(x_session_id)
     state = get_session_state(sid)
@@ -950,7 +950,7 @@ def s01_run_quality(x_session_id: str | None = Header(default="default")) -> dic
     return _cache_and_respond(state, sid, "s01_quality", {"quality": q_report.model_dump(), "format_audit": fmt})
 
 
-@router.post("/s01/clean")
+@router.post("/s01/clean", dependencies=[Depends(require_permission("data:write"))])
 def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _sid(x_session_id)
     state = get_session_state(sid)
@@ -1273,7 +1273,7 @@ def s01_export_clean_dataset(fmt: str, x_session_id: str | None = Header(default
     )
 
 
-@router.post("/s01/undo")
+@router.post("/s01/undo", dependencies=[Depends(require_permission("data:write"))])
 def s01_undo(x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _sid(x_session_id)
     state = get_session_state(sid)
@@ -1281,8 +1281,8 @@ def s01_undo(x_session_id: str | None = Header(default="default")) -> dict[str, 
     return {"undone": ok, "state": _state_summary(state, sid)}
 
 
-@router.post("/s01/reset-raw")
-@router.post("/s01/revert")
+@router.post("/s01/reset-raw", dependencies=[Depends(require_permission("data:write"))])
+@router.post("/s01/revert", dependencies=[Depends(require_permission("data:write"))])
 def s01_reset_raw(x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _sid(x_session_id)
     state = get_session_state(sid)

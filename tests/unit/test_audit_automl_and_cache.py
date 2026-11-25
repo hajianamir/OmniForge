@@ -165,3 +165,29 @@ def test_pipeline_concurrent_publish_keeps_complete_cache_entries(tmp_path: Path
     assert len(list(tmp_path.iterdir())) == 1
     warm = executor.execute(dag)
     assert warm.step_records[0].cache_hit and warm.context.get("value") == 9
+
+
+def test_supplied_holdout_labels_do_not_change_automl_selection() -> None:
+    rng = np.random.default_rng(42)
+    X = pd.DataFrame({"x": rng.normal(size=60)})
+    y = pd.Series((X["x"] > 0).astype(int))
+    X_test = pd.DataFrame({"x": [-4.0, -2.0, 2.0, 4.0]}, index=[100, 101, 102, 103])
+    y_test = pd.Series([0, 0, 1, 1], index=X_test.index)
+
+    def run(labels: pd.Series) -> Any:
+        return AutoMLPipelineSearch(
+            task_type=TaskType.BINARY_CLASSIFICATION,
+            include_deep=False,
+            enable_ensembling=False,
+            use_cv_pipeline=False,
+            tune_trials=1,
+            tune_top_k=1,
+        ).fit(X, y, holdout=(X_test, labels))
+
+    correct = run(y_test)
+    flipped = run(1 - y_test)
+    assert correct.best_model_name == flipped.best_model_name
+    assert correct.metadata["evaluation"]["validation_score"] == flipped.metadata["evaluation"]["validation_score"]
+    np.testing.assert_array_equal(correct.best_model.predict(X_test), flipped.best_model.predict(X_test))
+    assert correct.best_score != flipped.best_score
+    assert correct.metadata["evaluation"]["test_partition_source"] == "supplied_holdout"

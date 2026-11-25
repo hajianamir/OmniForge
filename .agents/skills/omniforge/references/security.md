@@ -14,8 +14,9 @@ requires a valid API key or an existing admin token; tenant admins cannot mint
 platform-admin or other-tenant tokens. The workbench router globally requires
 a principal (`src/omniforge/api/workbench.py`), but **many workbench handlers have no
 additional per-action permission dependency**. Studio 11 promotion uses
-`require_permission("model:promote")`; the registration and rollback handlers
-shown next to it do not. Audit authorization route by route, including
+`require_permission("model:promote")`; registration now requires `mlops:write`
+and additionally `model:promote` for Production, and rollback requires
+`model:promote`. Audit authorization route by route, including
 `/api/v1` handlers (`src/omniforge/api/main.py`).
 
 `_sid` namespaces a supplied session ID by tenant and subject. Job status is
