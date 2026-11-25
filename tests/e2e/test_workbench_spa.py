@@ -100,8 +100,13 @@ def test_spa_static_bundle_gzip_and_all_13_studios_e2e() -> None:
     assert r_exp.status_code == 200 and "global_importance" in r_exp.json()
 
     # 9. Studio 08: Deep Forecasting (TFT) + Portfolio Optimization + Monte Carlo
-    r_fc = client.post("/api/workbench/s08/forecast", json={"target_col": num_cols[0], "horizon": 6, "deep_arch": "tft", "epochs": 8}, headers=hdr)
+    r_fc = client.post("/api/workbench/s08/forecast", json={
+        "target_col": num_cols[0], "horizon": 6, "deep_arch": "tft", "epochs": 8, "interval_calibration_origins": 1,
+    }, headers=hdr)
     assert r_fc.status_code == 200 and len(r_fc.json()["deep_forecast"]) == 6
+    classical = r_fc.json()["classical_summary"]
+    assert classical["champion_model"] and len(classical["forecast"]) == 6
+    assert classical["metadata"]["champion_interval_calibration"]["status"] == "insufficient_history_or_origins"
     r_opt = client.post("/api/workbench/s08/optimize", json={}, headers=hdr)
     assert r_opt.status_code == 200
     r_sim = client.post("/api/workbench/s08/simulate", json={"target_col": num_cols[0], "n_simulations": 400}, headers=hdr)

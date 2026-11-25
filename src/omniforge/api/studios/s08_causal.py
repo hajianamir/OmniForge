@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import Any, cast
 
 import numpy as np
@@ -51,7 +52,7 @@ def s08_forecast(req: ForecastReq, x_session_id: str | None = Header(default="de
     deep_df = deep_f.predict(req.horizon)
 
     hist_tail = raw_capped.tail(80).to_numpy(dtype=float)
-    cl_dump: dict[str, Any] = to_json_object(classical_res)
+    cl_dump = to_json_object(asdict(classical_res))
     fc_record = {"classical": cl_dump, "deep_arch": req.deep_arch, "deep_forecast": deep_df.to_dict(orient="records")}
     state["uap_forecast_report"] = fc_record
     state["uap_forecast_result"] = fc_record
