@@ -30,7 +30,13 @@ from omniforge.mlops.root_cause import DriftRootCauseAnalyzer
 from omniforge.mlops.supervisory_monitor import SupervisoryPredictionMonitor
 from omniforge.models.deep import FTTransformerModel, MLPModel, ResNetTabularModel, TabNetModel
 from omniforge.models.nonparametric import NadarayaWatsonKernelModel, PenalizedSplineGAMModel
-from omniforge.ui.state import get_analysis_dataframe, get_selected_targets, get_session_state, record_lineage
+from omniforge.ui.state import (
+    get_analysis_dataframe,
+    get_selected_targets,
+    get_session_state,
+    record_active_holdout,
+    record_lineage,
+)
 
 router: APIRouter = APIRouter(tags=["workbench-s14"])
 
@@ -216,8 +222,7 @@ def s14_quick_train(req: SupervisoryQuickTrainReq, x_session_id: str | None = He
         state["uap_active_feature_cols"] = list(X_tr.columns)
         state["uap_active_input_preprocessor"] = input_preprocessor
         state["uap_active_X_test"], state["uap_active_y_test"] = X_te, y_te
-        state["uap_fairness_result"] = None
-        state["uap_model_card"] = None
+        record_active_holdout(state)
 
     record_lineage(state, "Supervisory Monitor", f"Quick-trained {label}", f"{metric_name}={score:.4f}")
     raw_models = SupervisoryPredictionMonitor.catalog_available_models(state)

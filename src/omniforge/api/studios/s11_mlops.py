@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import pandas as pd
 from fastapi import APIRouter, Depends, Header, HTTPException
 
 from omniforge.api.auth import authorize_principal, require_permission
@@ -13,6 +14,7 @@ from omniforge.core.exceptions import MLOpsError
 from omniforge.core.types import ModelStage, Principal
 from omniforge.core.utils import to_json_object
 from omniforge.mlops.drift import DriftDetector
+from omniforge.mlops.fairness_evidence import FairnessEvidence, holdout_fingerprint
 from omniforge.mlops.root_cause import DriftRootCauseAnalyzer
 
 router = APIRouter(tags=["workbench-s11"])
@@ -47,7 +49,19 @@ def s11_register(
     if model is None:
         raise HTTPException(status_code=400, detail="No trained model in active workspace. Run Studio 06 first.")
     reg = _wb().get_tenant_registry()
-    fairness_res = state.get("uap_fairness_result")
+    evidence = None
+    if state.get("uap_fairness_evidence") is not None:
+        evidence = FairnessEvidence.model_validate(state["uap_fairness_evidence"])
+        X_test, y_test = state.get("uap_active_X_test"), state.get("uap_active_y_test")
+        full_df = state.get("uap_df")
+        group = evidence.report.protected_attribute
+        if not (
+            isinstance(X_test, pd.DataFrame) and isinstance(y_test, pd.Series)
+            and isinstance(full_df, pd.DataFrame) and group in full_df.columns and full_df.index.is_unique
+            and X_test.index.isin(full_df.index).all()
+            and holdout_fingerprint(X_test, y_test, full_df[group].reindex(X_test.index)) == evidence.holdout_fingerprint
+        ):
+            raise HTTPException(status_code=409, detail="The held-out data changed. Run the fairness audit again.")
     try:
         ver = reg.register_model(
             model=model,
@@ -61,12 +75,12 @@ def s11_register(
             intended_use=req.intended_use,
             approved_domains=req.approved_domains,
             risk_tier=req.risk_tier,
-            fairness_report=fairness_res,
+            fairness_evidence=evidence,
             override_reason=req.override_reason,
             stage=stage,
         )
     except MLOpsError as exc:
-        if "fairness gate" in str(exc):
+        if "fairness" in str(exc).lower():
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         raise
     payload = to_json_object(
@@ -78,20 +92,17 @@ def s11_register(
 
 @router.post("/s11/promote", dependencies=[Depends(require_permission("model:promote"))])
 def s11_promote(req: PromoteModelReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
-    state = _wb().get_session_state(_wb()._sid(x_session_id))
     reg = _wb().get_tenant_registry()
     stage = _wb().parse_model_stage(req.stage, error_status=400)
-    fairness_res = state.get("uap_fairness_result")
     try:
         updated = reg.transition_stage(
             req.model_name,
             req.version,
             stage,
-            fairness_report=fairness_res,
             override_reason=req.override_reason,
         )
     except MLOpsError as exc:
-        if "fairness gate" in str(exc):
+        if "fairness" in str(exc).lower():
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         raise
     return to_json_object(

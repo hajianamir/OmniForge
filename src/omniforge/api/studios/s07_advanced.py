@@ -9,11 +9,13 @@ import pandas as pd
 from fastapi import APIRouter, Header, HTTPException
 
 from omniforge.api.studios.schemas import ExplainReq, FairnessReq
+from omniforge.core.exceptions import MLOpsError
 from omniforge.core.types import ModelMetadata
 from omniforge.core.utils import to_json_object
 from omniforge.evaluation.fairness import FairnessAuditor
 from omniforge.evaluation.interpretability import InterpretabilityEngine
 from omniforge.evaluation.model_cards import ModelCardGenerator
+from omniforge.mlops.fairness_evidence import FairnessEvidence, holdout_fingerprint
 
 router = APIRouter(tags=["workbench-s07"])
 
@@ -59,10 +61,13 @@ def s07_fairness(req: FairnessReq, x_session_id: str | None = Header(default="de
         raise HTTPException(status_code=400, detail="Train a model and select a valid sensitive attribute column.")
     if not isinstance(X_te, pd.DataFrame) or X_te.empty:
         raise HTTPException(status_code=400, detail="Fairness auditing requires held-out data. Enable Split Lock and retrain.")
-    _sens = sens_source[req.sensitive_col].reindex(X_te.index)
-    if isinstance(_sens.dtype, pd.CategoricalDtype) and "Missing" not in _sens.cat.categories:
-        _sens = _sens.cat.add_categories(["Missing"])
-    sens = _sens.fillna("Missing").astype(str).to_numpy()
+    if (
+        not isinstance(y_te, pd.Series) or not X_te.index.equals(y_te.index) or not X_te.index.is_unique
+        or not sens_source.index.is_unique or not X_te.index.isin(sens_source.index).all()
+    ):
+        raise HTTPException(status_code=400, detail="Fairness auditing requires aligned held-out data.")
+    raw_sensitive = sens_source[req.sensitive_col].reindex(X_te.index)
+    sens = raw_sensitive.astype("string").fillna("Missing").to_numpy(dtype=str)
     preds = np.asarray(model.predict(X_te))
     y_arr = np.asarray(y_te)
     if np.issubdtype(y_arr.dtype, np.number) and len(np.unique(y_arr)) > 2:
@@ -86,6 +91,13 @@ def s07_fairness(req: FairnessReq, x_session_id: str | None = Header(default="de
             )
         except Exception:
             recommended_thresholds = {}
+    evidence = None
+    if state.get("uap_active_holdout_fingerprint") == holdout_fingerprint(X_te, y_te):
+        try:
+            evidence = FairnessEvidence.capture(model, X_te, y_te, raw_sensitive, report)
+        except MLOpsError as exc:
+            _wb().logger.warning("fairness_binding_unavailable", error_type=type(exc).__name__)
+    state["uap_fairness_evidence"] = evidence.model_dump(mode="json") if evidence is not None else None
     state["uap_fairness_result"] = report.model_dump()
     meta = getattr(model, "metadata_", None)
     if not isinstance(meta, ModelMetadata):
@@ -104,6 +116,8 @@ def s07_fairness(req: FairnessReq, x_session_id: str | None = Header(default="de
     payload = to_json_object(
         {
             "fairness": report.model_dump(),
+            "promotion_evidence": {"holdout_fingerprint": evidence.holdout_fingerprint,
+                                   "n_holdout_rows": evidence.n_holdout_rows} if evidence is not None else None,
             "recommended_thresholds": recommended_thresholds,
             "model_card_markdown": card.to_markdown(),
         }

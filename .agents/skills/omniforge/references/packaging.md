@@ -87,25 +87,18 @@ clean environment. Do not infer offline behavior from installer comments.
 | SBOM | `src/omniforge/core/sbom.py`, `scripts/generate_sbom.py`, `omniforge sbom` | Inspect generated provenance; `--verify` checks hash pinning, not runtime security. |
 | Containers | `docker/Dockerfile`, `docker/docker-compose.yml`, `docker/entrypoint.sh` | Non-root Python 3.12 image; API, UI, monitor worker and CLI modes; API defaults to one worker. |
 
-The Docker build resolves project extras (`[api,ui,reporting,data,forecasting]`)
-into wheels; it does not install from the hash-pinned runtime lock.
+The Docker build pins the Python base image and installs hash-verified
+Linux amd64 and arm64 dependency locks. The project wheel builds offline.
+Regenerate the locks with `bash scripts/build_docker_locks.sh`.
 
-The Compose file starts separate API and UI processes on ports 8000/8501 and
-mounts a workspace volume at `/var/lib/omniforge`; sharing that volume does
-**not** make their in-memory workspaces shared. More importantly, setting
-`OMNIFORGE_PATHS__WORKSPACE_DIR` does not rebase every path: default
-`ModelRegistry` and `ExperimentTracker` use relative
-`./.omniforge_workspace/...` paths, non-default tenant registry/tracker paths
-are also constructed relative to the working directory, and individual
-`PathsSettings` defaults remain separate. In the shipped image those paths
-may be under `/app`, outside the mounted volume. The `OMNIFORGE_API_BASE_URL`
-set by Compose has no corresponding use found in `src` or `frontend`; browser
-API calls are relative to the UI's own origin. Verify actual per-service DB,
-artifact, audit, feature-store and project paths, mount/back them up explicitly,
-and test recreation/recovery instead of assuming all data lives in the named
-volume. Sources: `src/omniforge/api/main.py`, `src/omniforge/api/workbench.py`,
-`src/omniforge/mlops/registry.py`, `src/omniforge/mlops/tracking.py`, and
-`src/omniforge/config/settings.py`.
+The Compose file starts separate API and UI processes on ports 8000 and 8501
+and mounts a shared workspace volume at `/var/lib/omniforge`. Registry and
+tracking defaults derive from `OMNIFORGE_PATHS__WORKSPACE_DIR`, and tenant
+stores live under its `tenants` directory. Explicit path overrides keep their
+configured location. Workbench sessions remain in memory per process.
+`scripts/smoke_docker_registry.py` verifies registry records and signed artifacts
+after container replacement. Back up the database, artifacts, and signing keys
+together before moving an existing workspace.
 
 `.github/workflows/windows-installer.yml` is a separate manual/tag workflow,
 not an ordinary PR check. It builds the installer and exercises Simple and

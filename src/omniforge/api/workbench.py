@@ -21,6 +21,7 @@ from fastapi.responses import Response
 
 from omniforge.api.auth import require_permission, require_workbench_auth
 from omniforge.api.jobs import job_manager
+from omniforge.config.settings import get_settings
 from omniforge.core.logging import get_logger
 from omniforge.core.performance import (
     compact_scatter_payload,
@@ -121,7 +122,7 @@ def get_tenant_registry(principal: Principal | None = None) -> ModelRegistry:
             _TENANT_REGISTRIES.move_to_end(tenant)
             return _TENANT_REGISTRIES[tenant]
         slug = _tenant_slug(tenant)
-        base = Path("./.omniforge_workspace/tenants") / slug
+        base = get_settings().paths.workspace_dir / "tenants" / slug
         reg = ModelRegistry(
             db_path=base / "model_registry.db",
             artifact_dir=base / "artifacts" / "registry",
@@ -143,7 +144,7 @@ def get_tenant_tracker(principal: Principal | None = None) -> ExperimentTracker:
             _TENANT_TRACKERS.move_to_end(tenant)
             return _TENANT_TRACKERS[tenant]
         slug = _tenant_slug(tenant)
-        base = Path("./.omniforge_workspace/tenants") / slug
+        base = get_settings().paths.workspace_dir / "tenants" / slug
         trk = ExperimentTracker(
             db_path=base / "mlops_tracking.db",
             artifact_root=base / "artifacts",

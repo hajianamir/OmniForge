@@ -475,6 +475,14 @@ def test_registry_governance_fairness_gate_and_automated_rollback(tmp_path: Path
         passed=False,
     )
 
+    from omniforge.mlops.fairness_evidence import FairnessEvidence
+
+    X_holdout = X_m.iloc[48:]
+    y_holdout = y_m.iloc[48:]
+    protected = pd.Series(["A", "B"] * 6, index=X_holdout.index, name="gender")
+    m_v1.fit(X_m.iloc[:48], y_m.iloc[:48])
+    evidence = FairnessEvidence.capture(m_v1, X_holdout, y_holdout, protected, fair_pass)
+
     v1 = reg.register_model(
         m_v1,
         "credit_scorer",
@@ -482,7 +490,7 @@ def test_registry_governance_fairness_gate_and_automated_rollback(tmp_path: Path
         intended_use="Retail credit underwriting",
         approved_domains=["finance", "retail"],
         risk_tier="high",
-        fairness_report=fair_pass,
+        fairness_evidence=evidence,
         stage=ModelStage.PRODUCTION,
     )
     assert v1.version == 1 and v1.stage == ModelStage.PRODUCTION

@@ -137,3 +137,11 @@ jobs:
           pip install -e ".[dev,api,ui,reporting,data,forecasting]"
       - name: Enforce latency & memory budgets (p95)
         run: python scripts/latency_budget_benchmark.py
+  docker-registry-persistence:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the hash-locked image
+        run: docker build -f docker/Dockerfile -t omniforge:ci-registry .
+      - name: Replace the container and verify registry data and fairness evidence
+        run: python3 scripts/smoke_docker_registry.py omniforge:ci-registry

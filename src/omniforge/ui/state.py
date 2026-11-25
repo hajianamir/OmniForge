@@ -36,6 +36,7 @@ _DOWNSTREAM_KEYS: tuple[str, ...] = (
     "uap_active_input_preprocessor",
     "uap_active_X_test",
     "uap_active_y_test",
+    "uap_active_holdout_fingerprint",
     "uap_model_equations",
     "uap_baseline_equations",
     "uap_dl_benchmark_df",
@@ -44,6 +45,7 @@ _DOWNSTREAM_KEYS: tuple[str, ...] = (
     "uap_future_source_type",
     "uap_shap_result",
     "uap_fairness_result",
+    "uap_fairness_evidence",
     "uap_model_card",
     "uap_forecast_report",
     "uap_forecast_result",
@@ -166,8 +168,10 @@ def default_workspace_dict() -> dict[str, Any]:
         "uap_active_input_preprocessor": None,
         "uap_active_X_test": None,
         "uap_active_y_test": None,
+        "uap_active_holdout_fingerprint": None,
         "uap_shap_result": None,
         "uap_fairness_result": None,
+        "uap_fairness_evidence": None,
         "uap_model_card": None,
         "uap_forecast_report": None,
         "uap_causal_result": None,
@@ -596,6 +600,25 @@ def get_all_deleted_records_df(state: dict[str, Any]) -> pd.DataFrame:
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True, sort=False)
+
+
+def record_active_holdout(state: dict[str, Any]) -> None:
+    """Record the holdout for a newly published champion and invalidate old evidence."""
+    from omniforge.mlops.fairness_evidence import holdout_fingerprint
+
+    X_test, y_test = state.get("uap_active_X_test"), state.get("uap_active_y_test")
+    state["uap_active_holdout_fingerprint"] = (
+        holdout_fingerprint(X_test, y_test)
+        if isinstance(X_test, pd.DataFrame) and isinstance(y_test, pd.Series) and not X_test.empty
+        and X_test.index.is_unique and X_test.index.equals(y_test.index) and not y_test.isna().any()
+        else None
+    )
+    for key in ("uap_fairness_result", "uap_fairness_evidence", "uap_model_card", "uap_shap_result"):
+        state[key] = None
+    results = state.get("uap_studio_results")
+    if isinstance(results, dict):
+        for key in ("s07_fairness", "s07_explain"):
+            results.pop(key, None)
 
 
 def get_selected_targets(state: dict[str, Any], df: pd.DataFrame | None = None) -> list[str]:

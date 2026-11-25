@@ -165,9 +165,15 @@ def test_cli_validation_and_docker_spa_invariants(tmp_path: Path) -> None:
 
     repo_root = Path(__file__).resolve().parents[2]
     dockerfile = (repo_root / "docker" / "Dockerfile").read_text(encoding="utf-8")
-    assert "python:3.12-slim" in dockerfile
-    assert "python:3.15" not in dockerfile
-    assert ".[api,ui,reporting,data,forecasting]" in dockerfile
+    assert "python:3.12-slim@sha256:" in dockerfile
+    assert "--require-hashes --only-binary=:all:" in dockerfile
+    assert "RUN --network=none python -m pip wheel" in dockerfile
+    lock_generator = (repo_root / "scripts" / "build_docker_locks.sh").read_text(encoding="utf-8")
+    for extra in ("api", "ui", "reporting", "data", "forecasting"):
+        assert f"--extra {extra}" in lock_generator
+    for arch in ("amd64", "arm64"):
+        lock = (repo_root / "docker" / f"requirements-{arch}.lock").read_text(encoding="utf-8")
+        assert "fastapi==" in lock and "--hash=sha256:" in lock
 
     dockerignore = (repo_root / ".dockerignore").read_text(encoding="utf-8")
     for pattern in (".git", ".env", ".venv*", "frontend/node_modules/"):
