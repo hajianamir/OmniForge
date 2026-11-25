@@ -69,6 +69,11 @@ def s07_fairness(req: FairnessReq, x_session_id: str | None = Header(default="de
     ):
         raise HTTPException(status_code=400, detail="Fairness auditing requires aligned held-out data with observed labels.")
     raw_sensitive = sens_source[req.sensitive_col].reindex(X_te.index)
+    lock = state.get("uap_split_lock") or {}
+    cluster_col = req.cluster_col or (lock.get("group_col") if lock.get("active") else None)
+    if cluster_col is not None and (cluster_col == req.sensitive_col or cluster_col not in full_df.columns):
+        raise HTTPException(status_code=400, detail="Select a valid cluster ID column distinct from the protected column.")
+    clusters = full_df[cluster_col].reindex(X_te.index) if cluster_col is not None else None
     preds = np.asarray(model.predict(X_te))
     if preds.shape != (len(X_te),):
         raise HTTPException(status_code=400, detail="Fairness auditing requires one prediction per held-out row.")
@@ -93,7 +98,7 @@ def s07_fairness(req: FairnessReq, x_session_id: str | None = Header(default="de
         y_bin = (y_arr == pos_val).astype(int)
         p_bin[observed] = preds[observed] == pos_val
         outcome_definition = {"method": "label_equals", "positive_label": pos_val}
-    report = FairnessAuditor().audit(y_bin, p_bin, raw_sensitive, attribute_name=req.sensitive_col)
+    report = FairnessAuditor().audit(y_bin, p_bin, raw_sensitive, attribute_name=req.sensitive_col, cluster_ids=clusters)
     if not fixed_binary_outcome:
         report = report.model_copy(update={
             "passed": False,
@@ -118,7 +123,7 @@ def s07_fairness(req: FairnessReq, x_session_id: str | None = Header(default="de
     evidence = None
     if state.get("uap_active_holdout_fingerprint") == holdout_fingerprint(X_te, y_te):
         try:
-            evidence = FairnessEvidence.capture(model, X_te, y_te, raw_sensitive, report)
+            evidence = FairnessEvidence.capture(model, X_te, y_te, raw_sensitive, report, clusters=clusters)
         except MLOpsError as exc:
             _wb().logger.warning("fairness_binding_unavailable", error_type=type(exc).__name__)
     state["uap_fairness_evidence"] = evidence.model_dump(mode="json") if evidence is not None else None

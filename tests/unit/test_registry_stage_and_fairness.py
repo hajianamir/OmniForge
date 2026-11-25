@@ -130,7 +130,8 @@ def test_workbench_fairness_is_bound_to_trained_holdout_and_registration(tmp_pat
     principal = Principal(subject="api_key_principal", roles=["admin"], tenant_id=get_settings().default_tenant_id)
     state = wb.get_session_state(wb._sid(session, principal))
     data = pd.DataFrame({"x": [-6, 6, -5, 5, -4, 4, -3, 3], "target": [0, 1] * 4,
-                         "group": ["A", "B", "A", "B", "A", "A", "B", "B"]})
+                         "group": ["A", "B", "A", "B", "A", "A", "B", "B"],
+                         "unit": [1, 2, 1, 2, 3, 4, 3, 4]})
     load_new_dataset(state, data, "evidence", "test", default_target="target")
     train, test = data.iloc[:4], data.iloc[4:]
     state["uap_active_model"] = LogisticRegression().fit(train[["x"]], train["target"])
@@ -156,6 +157,20 @@ def test_workbench_fairness_is_bound_to_trained_holdout_and_registration(tmp_pat
     promoted = client.post("/api/workbench/s11/promote", json={"model_name": "credit", "version": 1, "stage": "Production"})
     assert promoted.status_code == 200, promoted.text
     assert promoted.json()["updated"]["fairness_passed"] is True
+
+    clustered = client.post("/api/workbench/s07/fairness", json={"sensitive_col": "group", "cluster_col": "unit"})
+    assert clustered.status_code == 200, clustered.text
+    assert clustered.json()["fairness"]["n_clusters"] == 2
+    assert clustered.json()["promotion_evidence"]["holdout_fingerprint"] != evidence["holdout_fingerprint"]
+    state["uap_df"].loc[test.index[0], "unit"] = 5
+    stale = client.post("/api/workbench/s11/register", json={"model_name": "clustered"})
+    assert stale.status_code == 409, stale.text
+    state["uap_df"].loc[test.index[0], "unit"] = 3
+    clustered_version = client.post("/api/workbench/s11/register", json={"model_name": "clustered"})
+    assert clustered_version.status_code == 200, clustered_version.text
+    clustered_evidence = clustered_version.json()["registered"]["fairness_evidence"]
+    assert clustered_evidence["cluster_attribute"] == "unit"
+    assert clustered_evidence["n_clusters"] == 2
 
     state["uap_active_model"] = LinearRegression().fit(train[["x"]], train["target"])
     diagnostic = client.post("/api/workbench/s07/fairness", json={"sensitive_col": "group"})

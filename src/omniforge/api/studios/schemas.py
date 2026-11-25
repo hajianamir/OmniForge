@@ -190,6 +190,7 @@ class ExplainReq(BaseModel):
 
 class FairnessReq(BaseModel):
     sensitive_col: str
+    cluster_col: str | None = None
 
 
 class ForecastReq(BaseModel):
@@ -198,6 +199,7 @@ class ForecastReq(BaseModel):
     horizon: int = Field(default=14, ge=3, le=120)
     deep_arch: str = "nbeats"  # nbeats | patchtst | tft | lstm
     epochs: int = Field(default=30, ge=5, le=120)
+    interval_calibration_origins: int = Field(default=0, ge=0, le=40)
 
 
 class CausalReq(BaseModel):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import Any, cast
 
 import numpy as np
@@ -43,6 +44,7 @@ def s08_forecast(req: ForecastReq, x_session_id: str | None = Header(default="de
         target_col=req.target_col,
         time_col=req.time_col if (req.time_col and req.time_col in work_capped.columns) else None,
         horizon=req.horizon,
+        interval_calibration_origins=req.interval_calibration_origins,
     )
     causal_history, _ = _causal_impute_split(raw_capped)
     deep_f = DeepForecaster(architecture=cast(Any, req.deep_arch), epochs=req.epochs)
@@ -50,7 +52,7 @@ def s08_forecast(req: ForecastReq, x_session_id: str | None = Header(default="de
     deep_df = deep_f.predict(req.horizon)
 
     hist_tail = raw_capped.tail(80).to_numpy(dtype=float)
-    cl_dump: dict[str, Any] = to_json_object(classical_res)
+    cl_dump = to_json_object(asdict(classical_res))
     fc_record = {"classical": cl_dump, "deep_arch": req.deep_arch, "deep_forecast": deep_df.to_dict(orient="records")}
     state["uap_forecast_report"] = fc_record
     state["uap_forecast_result"] = fc_record

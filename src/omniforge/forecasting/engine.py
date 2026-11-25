@@ -14,6 +14,7 @@ from omniforge.core.carbon import CarbonTracker
 from omniforge.core.exceptions import ForecastingError
 from omniforge.core.logging import get_logger
 from omniforge.core.types import CarbonReport
+from omniforge.evaluation.robustness import split_conformal_quantile
 from omniforge.models.baselines import BaselineBenchmarkSuite
 from omniforge.models.time_series.deep_forecast import DeepForecaster
 from omniforge.models.time_series.foundation import FoundationForecaster
@@ -197,6 +198,7 @@ class ForecastingEngine:
         time_col: str | None = None,
         horizon: int = 14,
         validation_horizon: int | None = None,
+        interval_calibration_origins: int = 0,
     ) -> ForecastingReport:
         """Run causal split, baseline benchmarks, TimeSeriesSplit rolling CV, model tournament, and future forecasts."""
         if target_col not in df.columns:
@@ -206,13 +208,46 @@ class ForecastingEngine:
             if (time_col and time_col in df.columns)
             else df.reset_index(drop=True)
         )
-        raw_series = pd.to_numeric(work[target_col], errors="coerce")
-        if len(raw_series) < 20:
+        all_history = pd.to_numeric(work[target_col], errors="coerce")
+        if len(all_history) < 20:
             raise ForecastingError("ForecastingEngine requires at least 20 observations.")
+        if horizon < 1 or (validation_horizon is not None and validation_horizon < 1):
+            raise ForecastingError("Forecast and validation horizons must be positive.")
+        if not 0 <= interval_calibration_origins <= 40:
+            raise ForecastingError("Choose between zero and 40 interval calibration origins.")
+        if not 0 < self.confidence_level < 1:
+            raise ForecastingError("The interval level must lie strictly between zero and one.")
+
+        reserve = (interval_calibration_origins + 1) * horizon + 2 * self.gap
+        min_selection = max(20, (validation_horizon or 0) + self.gap + 2)
+        calibration: dict[str, Any] = {
+            "status": "disabled",
+            "requested_origins": interval_calibration_origins,
+            "nominal_level": self.confidence_level,
+        }
+        calibration_start = None
+        raw_series = all_history
+        if interval_calibration_origins:
+            if (
+                (interval_calibration_origins + 1) * self.confidence_level > interval_calibration_origins
+                or len(all_history) - reserve < min_selection
+            ):
+                calibration["status"] = "insufficient_history_or_origins"
+            else:
+                cut = len(all_history) - reserve
+                candidate_history = all_history.iloc[:cut]
+                validation_size = validation_horizon or min(horizon, max(4, cut // 5))
+                usable = np.isfinite(candidate_history.to_numpy(dtype=float, na_value=np.nan))
+                if usable[:cut - validation_size - self.gap].sum() >= 2 and usable[-validation_size:].any():
+                    raw_series = candidate_history
+                    calibration_start = cut + self.gap
+                    calibration["selection_end_position"] = cut
+                else:
+                    calibration["status"] = "insufficient_selection_outcomes"
 
         val_h = validation_horizon if validation_horizon is not None else min(horizon, max(4, len(raw_series) // 5))
         train_end = len(raw_series) - val_h - self.gap
-        if horizon < 1 or val_h < 1 or train_end < 2:
+        if train_end < 2:
             raise ForecastingError(
                 "Forecast and validation horizons and the embargo must leave at least two training observations.",
                 suggestions=["Choose a shorter horizon or embargo, or provide more history."],
@@ -225,7 +260,7 @@ class ForecastingEngine:
                 "Forecast validation needs at least two usable training points and one observed validation outcome.",
                 suggestions=["Check the target column and adjust the validation horizon."],
             )
-        full_causal_series, _ = _causal_impute_split(raw_series, None)
+        full_causal_series, _ = _causal_impute_split(all_history, None)
 
         with CarbonTracker("forecasting_tournament") as tracker:
             baseline_scores = BaselineBenchmarkSuite.run_forecasting(
@@ -344,8 +379,18 @@ class ForecastingEngine:
                                 }
                             )
 
-            # Refit champion on full causal series
+            widths = None
+            if calibration_start is not None:
+                widths, evidence = self._calibrate_intervals(
+                    all_history, champion_name, fitted_builders, calibration_start, interval_calibration_origins, horizon
+                )
+                calibration.update(evidence)
+
+            # The operational refit can use all observations after retrospective scoring.
             future_fc = self._refit_and_predict(champion_name, fitted_builders, full_causal_series, horizon)
+            if widths is not None:
+                future_fc["yhat_lower"] = future_fc["yhat"] - widths
+                future_fc["yhat_upper"] = future_fc["yhat"] + widths
 
             # Build approximate normal bounds from within-model spread and between-model disagreement.
             top_models = [r["model"] for r in non_baseline[:3]]
@@ -426,10 +471,70 @@ class ForecastingEngine:
                 "causal_imputation_verified": True,
                 "ensemble_variance_method": "law_of_total_variance_mixture",
                 "ensemble_interval_method": "approximate_normal_moment_bounds" if ensemble_fc is not None else None,
+                "champion_interval_calibration": calibration,
                 "rolling_cv_results": rolling_cv_results,
                 "diebold_mariano_vs_runner_up": dm_summary,
             },
         )
+
+    def _calibrate_intervals(
+        self, history: pd.Series, champion: str, builders: dict[str, Any], start: int, origins: int, horizon: int,
+    ) -> tuple[np.ndarray | None, dict[str, Any]]:
+        """Calibrate lead-specific errors and score the intervals at one later origin."""
+        evidence: dict[str, Any] = {
+            "status": "calibration_unavailable",
+            "method": "rolling_origin_absolute_error_order_statistic",
+            "calibration_start_position": start,
+            "calibration_end_position": start + origins * horizon,
+            "evaluation_start_position": len(history) - horizon,
+            "evaluation": None,
+        }
+
+        def observed_forecast(origin: int) -> tuple[np.ndarray, pd.DataFrame]:
+            train, observed = _causal_impute_split(history.iloc[:origin], history.iloc[origin: origin + horizon])
+            assert observed is not None
+            return observed, self._refit_and_predict(champion, builders, train, horizon)
+
+        scores = np.full((origins, horizon), np.nan)
+        for i in range(origins):
+            try:
+                observed, forecast = observed_forecast(start + i * horizon)
+                scores[i] = np.abs(observed - forecast["yhat"].to_numpy(dtype=float))
+            except Exception as exc:
+                logger.warning("interval_calibration_origin_failed", error_type=type(exc).__name__)
+        counts = np.isfinite(scores).sum(axis=0)
+        evidence["usable_origins_by_lead"] = counts.tolist()
+        if np.any((counts + 1) * self.confidence_level > counts):
+            evidence["status"] = "insufficient_finite_calibration_errors"
+            return None, evidence
+        widths = np.array([split_conformal_quantile(col, 1 - self.confidence_level)[0] for col in scores.T])
+        evidence["status"] = "applied"
+        evidence["half_width_by_lead"] = widths.tolist()
+        try:
+            observed, forecast = observed_forecast(len(history) - horizon)
+            point = forecast["yhat"].to_numpy(dtype=float)
+            usable = np.isfinite(observed) & np.isfinite(point)
+            if usable.any():
+                absolute_error = np.abs(observed[usable] - point[usable])
+                half_width = widths[usable]
+                interval_score = 2 * half_width + 2 / (1 - self.confidence_level) * np.maximum(0, absolute_error - half_width)
+                evaluation: dict[str, Any] = {
+                    "observed_outcomes": int(usable.sum()),
+                    "calibrated_coverage": float(np.mean(absolute_error <= half_width)),
+                    "calibrated_mean_interval_score": float(interval_score.mean()),
+                }
+                if {"yhat_lower", "yhat_upper"} <= set(forecast.columns):
+                    native = _forecast_metrics(
+                        observed[usable], point[usable],
+                        forecast["yhat_lower"].to_numpy(dtype=float)[usable],
+                        forecast["yhat_upper"].to_numpy(dtype=float)[usable],
+                    )
+                    evaluation["native_coverage"] = native.get("interval_coverage")
+                    evaluation["native_coverage_count"] = native.get("interval_coverage_n", 0)
+                evidence["evaluation"] = evaluation
+        except Exception as exc:
+            logger.warning("interval_calibration_evaluation_failed", error_type=type(exc).__name__)
+        return widths, evidence
 
     def _patch_forecaster(self) -> FoundationForecaster:
         tail = (1.0 - self.confidence_level) / 2.0
