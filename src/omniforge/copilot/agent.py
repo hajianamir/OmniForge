@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from omniforge.copilot.memory import CopilotMemory
 from omniforge.copilot.prompts import SYSTEM_PROMPT, TOOL_CALLING_INSTRUCTION
 from omniforge.copilot.tools import CopilotToolRegistry
+from omniforge.core.exceptions import SecurityError
 from omniforge.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -67,6 +68,8 @@ class OmniForgeCopilotAgent:
                 response = self._chat_with_llm(user_message)
                 self.memory.add_turn("assistant", response.reply)
                 return response
+            except SecurityError:
+                raise
             except Exception as exc:
                 logger.warning("copilot_llm_fallback_to_local", provider=self.provider, reason=str(exc))
 
@@ -197,7 +200,38 @@ class OmniForgeCopilotAgent:
         target_col = target_match.group(1) if target_match else "target"
 
         try:
-            if _contains_word(msg, ("domain", "industry", "plugin")):
+            if _contains_word(msg, ("register model", "model registry", "promote model", "model promotion")):
+                if _contains_word(msg, ("promote model", "model promotion")):
+                    res = self.tools.invoke("promote_model", {"model_name": "copilot_champion", "version": 1, "stage": "Production"})
+                    executed.append({"tool": "promote_model", "arguments": {"model_name": "copilot_champion", "version": 1, "stage": "Production"}, "result": res})
+                    reply_parts.append(f"Model promotion result: {res}.")
+                    next_steps = ["Configure drift monitoring", "Verify serving endpoint"]
+                else:
+                    res = self.tools.invoke("register_model", {"model_name": "copilot_champion", "stage": "Staging"})
+                    executed.append({"tool": "register_model", "arguments": {"model_name": "copilot_champion", "stage": "Staging"}, "result": res})
+                    reply_parts.append(f"Model registered to MLOps Registry (Staging): {res.get('registered', {}).get('version', 'n/a')}.")
+                    next_steps = ["Promote to Production", "Configure drift monitoring"]
+
+            elif _contains_word(msg, ("pareto", "green-ai", "carbon budget", "latency budget", "green automl")):
+                _require_dataset()
+                res = self.tools.invoke("pareto_automl", {"target_column": target_col, "time_budget_seconds": 25.0})
+                executed.append({"tool": "pareto_automl", "arguments": {"target_column": target_col, "time_budget_seconds": 25.0}, "result": res})
+                reply_parts.append(
+                    f"C3 Green-AI Pareto AutoML: champion={res.get('best_algorithm')} "
+                    f"({res.get('primary_metric')}={res.get('best_score')}, "
+                    f"carbon={res.get('carbon_gco2e'):.6f} gCO2eq). Pareto frontier: {len(res.get('pareto_frontier', []))} candidates."
+                )
+                next_steps = ["Inspect Pareto frontier trade-offs", "Register Pareto champion", "Promote to Production"]
+
+            elif _contains_word(msg, ("domain validate", "domain_validation", "validate domain")):
+                _require_dataset()
+                domain_name = target_col
+                res = self.tools.invoke("domain_validate", {"domain": domain_name, "dataset_name": None})
+                executed.append({"tool": "domain_validate", "arguments": {"domain": domain_name, "dataset_name": None}, "result": res})
+                reply_parts.append(f"Domain validation for '{domain_name}': {res.get('note', 'checks completed')}.")
+                next_steps = ["Address domain compliance gaps", "Generate Model Card"]
+
+            elif _contains_word(msg, ("domain", "industry", "plugin")):
                 res = self.tools.invoke("list_domains")
                 executed.append({"tool": "list_domains", "arguments": {}, "result": res})
                 names = [d["display_name"] for d in res["domains"]]
@@ -358,29 +392,6 @@ class OmniForgeCopilotAgent:
                     f"columns={', '.join(res.get('pii_columns', [])) or 'none'}, cells={res.get('pii_cells_total', 0)}."
                 )
                 next_steps = ["Inspect guarded output dataset", "Re-audit with policy=block to fail-closed"]
-
-            elif _contains_word(msg, ("pareto", "green-ai", "carbon budget", "latency budget", "green automl")):
-                res = self.tools.invoke("pareto_automl", {"target_column": target_col, "time_budget_seconds": 25.0})
-                executed.append({"tool": "pareto_automl", "arguments": {"target_column": target_col, "time_budget_seconds": 25.0}, "result": res})
-                reply_parts.append(
-                    f"C3 Green-AI Pareto AutoML: champion={res.get('best_algorithm')} "
-                    f"({res.get('primary_metric')}={res.get('best_score')}, "
-                    f"carbon={res.get('carbon_gco2e'):.6f} gCO2eq). Pareto frontier: {len(res.get('pareto_frontier', []))} candidates."
-                )
-                next_steps = ["Inspect Pareto frontier trade-offs", "Register Pareto champion", "Promote to Production"]
-
-            elif _contains_word(msg, ("domain validate", "domain_validation", "industry domain", "compliance")):
-                domain_name = target_col
-                res = self.tools.invoke("domain_validate", {"domain": domain_name, "dataset_name": None})
-                executed.append({"tool": "domain_validate", "arguments": {"domain": domain_name, "dataset_name": None}, "result": res})
-                reply_parts.append(f"Domain validation for '{domain_name}': {res.get('note', 'checks completed')}.")
-                next_steps = ["Address domain compliance gaps", "Generate Model Card"]
-
-            elif _contains_word(msg, ("register model", "model registry", "promote model", "model promotion")):
-                res = self.tools.invoke("register_model", {"model_name": "copilot_champion", "stage": "Staging"})
-                executed.append({"tool": "register_model", "arguments": {"model_name": "copilot_champion", "stage": "Staging"}, "result": res})
-                reply_parts.append(f"Model registered to MLOps Registry (Staging): {res.get('registered', {}).get('version', 'n/a')}.")
-                next_steps = ["Promote to Production", "Configure drift monitoring"]
 
             elif _contains_word(msg, ("list studios", "studios", "studio overview")):
                 res = self.tools.invoke("list_studios", {})

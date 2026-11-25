@@ -764,69 +764,97 @@ class DataIngestionEngine:
         max_redirects: int = _MAX_HTTP_REDIRECTS,
         max_bytes: int = _MAX_HTTP_RESPONSE_BYTES,
     ) -> tuple[bytes, str]:
-        """Fetch an HTTP(S) resource enforcing SSRF validation on every redirect hop and response size bounds."""
-        from omniforge.data.connectors import validate_outbound_http_url
+        """Fetch an HTTP(S) resource enforcing per-hop DNS-pinned SSRF validation and response size bounds."""
+        from omniforge.data.connectors import resolve_and_validate_outbound_http_url
 
-        current_url = validate_outbound_http_url(url)
-        orig_parsed = urlparse(current_url)
-        orig_scheme = orig_parsed.scheme.lower()
-        orig_origin = (
-            orig_scheme,
-            (orig_parsed.hostname or "").lower(),
-            orig_parsed.port or (443 if orig_scheme == "https" else 80),
-        )
+        target = resolve_and_validate_outbound_http_url(url)
+        orig_origin = (target.scheme, target.hostname, target.effective_port)
         cur_headers = dict(headers or {})
         cur_params: dict[str, Any] | None = dict(params) if params else None
 
         for _hop in range(max_redirects + 1):
-            with client.stream("GET", current_url, headers=cur_headers, params=cur_params) as resp:
-                if resp.status_code in (301, 302, 303, 307, 308):
-                    location = resp.headers.get("location", "").strip()
-                    if not location:
-                        raise DataIngestionError(
-                            f"HTTP redirect ({resp.status_code}) missing Location header for '{cls._sanitize_uri(url)}'."
-                        )
-                    next_url = validate_outbound_http_url(urljoin(str(resp.request.url), location))
-                    next_parsed = urlparse(next_url)
-                    next_scheme = next_parsed.scheme.lower()
-                    next_origin = (
-                        next_scheme,
-                        (next_parsed.hostname or "").lower(),
-                        next_parsed.port or (443 if next_scheme == "https" else 80),
-                    )
-                    if next_origin != orig_origin and cur_headers:
-                        cur_headers = {
-                            k: v
-                            for k, v in cur_headers.items()
-                            if k.lower() not in _CROSS_ORIGIN_SENSITIVE_HEADERS
-                        }
-                    current_url = next_url
-                    cur_params = None
-                    continue
+            logical_url = httpx.URL(target.url)
+            if cur_params:
+                logical_url = logical_url.copy_merge_params(cur_params)
+                cur_params = None
 
-                resp.raise_for_status()
-                content_length = resp.headers.get("content-length")
-                if content_length is not None:
-                    try:
-                        declared_len = int(content_length)
-                    except ValueError:
-                        declared_len = -1
-                    if declared_len > max_bytes:
-                        raise DataIngestionError(
-                            f"HTTP response Content-Length ({declared_len} bytes) exceeds safety limit ({max_bytes} bytes)."
-                        )
+            attempt_ips = (target.hostname,) if target.is_ip_literal else target.pinned_ips
+            redirected = False
 
-                chunks: list[bytes] = []
-                total = 0
-                for chunk in resp.iter_bytes():
-                    total += len(chunk)
-                    if total > max_bytes:
-                        raise DataIngestionError(
-                            f"HTTP response body exceeded safety limit ({max_bytes} bytes)."
-                        )
-                    chunks.append(chunk)
-                content_type = resp.headers.get("content-type", "").lower()
-                return b"".join(chunks), content_type
+            for idx, pinned_ip in enumerate(attempt_ips):
+                hop_headers = {
+                    k: v for k, v in cur_headers.items() if k.lower() != "host"
+                }
+                hop_headers["Host"] = target.host_header
+                extensions: dict[str, Any] = {}
+                if target.is_ip_literal:
+                    connect_url = logical_url
+                else:
+                    connect_url = logical_url.copy_with(host=pinned_ip)
+                    if target.scheme == "https":
+                        extensions["sni_hostname"] = target.hostname
+
+                try:
+                    with client.stream(
+                        "GET",
+                        connect_url,
+                        headers=hop_headers,
+                        extensions=extensions,
+                    ) as resp:
+                        if resp.status_code in (301, 302, 303, 307, 308):
+                            location = resp.headers.get("location", "").strip()
+                            if not location:
+                                raise DataIngestionError(
+                                    f"HTTP redirect ({resp.status_code}) missing Location header for '{cls._sanitize_uri(url)}'."
+                                )
+                            next_target = resolve_and_validate_outbound_http_url(
+                                urljoin(str(logical_url), location)
+                            )
+                            next_origin = (
+                                next_target.scheme,
+                                next_target.hostname,
+                                next_target.effective_port,
+                            )
+                            if next_origin != orig_origin and cur_headers:
+                                cur_headers = {
+                                    k: v
+                                    for k, v in cur_headers.items()
+                                    if k.lower() not in _CROSS_ORIGIN_SENSITIVE_HEADERS
+                                }
+                            target = next_target
+                            redirected = True
+                            break
+
+                        resp.raise_for_status()
+                        content_length = resp.headers.get("content-length")
+                        if content_length is not None:
+                            try:
+                                declared_len = int(content_length)
+                            except ValueError:
+                                declared_len = -1
+                            if declared_len > max_bytes:
+                                raise DataIngestionError(
+                                    f"HTTP response Content-Length ({declared_len} bytes) exceeds safety limit ({max_bytes} bytes)."
+                                )
+
+                        chunks: list[bytes] = []
+                        total = 0
+                        for chunk in resp.iter_bytes():
+                            total += len(chunk)
+                            if total > max_bytes:
+                                raise DataIngestionError(
+                                    f"HTTP response body exceeded safety limit ({max_bytes} bytes)."
+                                )
+                            chunks.append(chunk)
+                        content_type = resp.headers.get("content-type", "").lower()
+                        return b"".join(chunks), content_type
+                except (httpx.ConnectError, httpx.ConnectTimeout):
+                    if idx + 1 < len(attempt_ips):
+                        continue
+                    raise
+
+            if redirected:
+                continue
 
         raise DataIngestionError(
             f"Exceeded maximum HTTP redirects ({max_redirects}) for '{cls._sanitize_uri(url)}'."
@@ -847,7 +875,12 @@ class DataIngestionEngine:
     ) -> pd.DataFrame:
         """Download a validated HTTP(S) file into an isolated temp directory and parse via ``_ingest_file``."""
         try:
-            with httpx.Client(timeout=timeout, follow_redirects=False, transport=_transport) as client:
+            with httpx.Client(
+                timeout=timeout,
+                follow_redirects=False,
+                trust_env=False,
+                transport=_transport,
+            ) as client:
                 body, _ = self._fetch_http_safe(
                     client,
                     url,
@@ -891,7 +924,12 @@ class DataIngestionEngine:
         all_frames: list[pd.DataFrame] = []
         base_params = dict(params or {})
         try:
-            with httpx.Client(timeout=timeout, follow_redirects=False, transport=_transport) as client:
+            with httpx.Client(
+                timeout=timeout,
+                follow_redirects=False,
+                trust_env=False,
+                transport=_transport,
+            ) as client:
                 for page in range(1, max_pages + 1):
                     req_params = dict(base_params)
                     if max_pages > 1:

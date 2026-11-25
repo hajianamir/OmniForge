@@ -10,8 +10,11 @@ import os
 import re
 import secrets
 import stat
+import tempfile
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -22,6 +25,20 @@ from omniforge.core.constants import RBAC_ROLE_PERMISSIONS
 from omniforge.core.exceptions import AuthorizationError, ComplianceError, SecurityError
 from omniforge.core.logging import get_logger, get_trace_id
 from omniforge.core.types import AuditEvent, Principal
+
+fcntl: Any = None
+msvcrt: Any = None
+try:  # pragma: no cover - POSIX
+    import fcntl as _fcntl_mod
+
+    fcntl = _fcntl_mod
+except ImportError:  # pragma: no cover - Windows
+    try:
+        import msvcrt as _msvcrt_mod
+
+        msvcrt = _msvcrt_mod
+    except ImportError:
+        pass
 
 # Optional dependencies are bound through explicit ``ModuleType``-free sentinels so the
 # module type-checks identically whether or not pyjwt/cryptography are installed (they are
@@ -101,22 +118,135 @@ def _salt_strength_ok(raw: bytes, *, minimum: int) -> bool:
     return not any(marker in lowered for marker in _INSECURE_PLACEHOLDER_MARKERS)
 
 
+_FILE_LOCK_REGISTRY_GUARD = threading.Lock()
+_FILE_LOCK_REGISTRY: dict[str, tuple[threading.RLock, list[int]]] = {}
+
+
+def _get_path_rlock(resolved_key: str) -> tuple[threading.RLock, list[int]]:
+    with _FILE_LOCK_REGISTRY_GUARD:
+        entry = _FILE_LOCK_REGISTRY.get(resolved_key)
+        if entry is None:
+            entry = (threading.RLock(), [0])
+            _FILE_LOCK_REGISTRY[resolved_key] = entry
+        return entry
+
+
+@contextmanager
+def _locked_file_path(target_path: Path) -> Iterator[None]:
+    """Serialize in-process threads and OS processes operating on ``target_path``."""
+    resolved = target_path.resolve()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = resolved.parent / f".{resolved.name}.lock"
+    rlock, depth_holder = _get_path_rlock(str(resolved))
+    with rlock:
+        if depth_holder[0] > 0:
+            depth_holder[0] += 1
+            try:
+                yield
+            finally:
+                depth_holder[0] -= 1
+            return
+
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        locked_os = False
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                locked_os = True
+            elif msvcrt is not None:  # pragma: no cover - Windows
+                if os.fstat(fd).st_size == 0:
+                    os.write(fd, b"\x00")
+                deadline = time.monotonic() + 30.0
+                while True:
+                    try:
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                        locked_os = True
+                        break
+                    except OSError as exc:
+                        if time.monotonic() >= deadline:
+                            raise SecurityError(
+                                f"Timed out acquiring file lock on {lock_path}: {exc}"
+                            ) from exc
+                        time.sleep(0.01)
+            depth_holder[0] = 1
+            yield
+        finally:
+            depth_holder[0] = 0
+            try:
+                if locked_os:
+                    if fcntl is not None:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    elif msvcrt is not None:  # pragma: no cover - Windows
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            finally:
+                os.close(fd)
+
+
+@contextmanager
+def _maybe_locked_read_path(target_path: Path) -> Iterator[None]:
+    """Acquire ``_locked_file_path`` when ``target_path`` exists on writable storage, falling back cleanly if read-only."""
+    if not target_path.exists():
+        yield
+        return
+    try:
+        lock_ctx = _locked_file_path(target_path)
+    except OSError:
+        yield
+        return
+    try:
+        lock_ctx.__enter__()
+    except OSError:
+        yield
+        return
+    try:
+        yield
+    finally:
+        lock_ctx.__exit__(None, None, None)
+
+
+def _persist_keyfile_atomic(key_file: Path, secret_text: str) -> bytes:
+    """Persist ``secret_text`` to ``key_file`` race-freely across threads and processes."""
+    with _locked_file_path(key_file):
+        if key_file.is_file():
+            existing = key_file.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing.encode("utf-8")
+        key_file.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(key_file.parent), prefix=f".{key_file.name}.", suffix=".tmp"
+        )
+        tmp_path = Path(tmp_name)
+        closed = False
+        try:
+            os.write(fd, secret_text.encode("utf-8"))
+            os.fsync(fd)
+            os.close(fd)
+            closed = True
+            try:
+                os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR)
+            except OSError:
+                pass
+            os.replace(tmp_path, key_file)
+        except Exception:
+            if not closed:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            tmp_path.unlink(missing_ok=True)
+            raise
+        return secret_text.encode("utf-8")
+
+
 def _dev_persisted_tenant_salt(tenant_id: str) -> bytes:
     """Non-production fallback: a per-tenant random 0600 keyfile (never a public constant)."""
     scope = _sanitize_tenant_for_env(tenant_id)
     key_dir = _default_key_store_dir()
     key_file = key_dir / f"pseudonym-salt-{scope}.key"
     try:
-        if key_file.is_file():
-            existing = key_file.read_text(encoding="utf-8").strip()
-            if existing:
-                return existing.encode("utf-8")
-        key_dir.mkdir(parents=True, exist_ok=True)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        fd = os.open(key_file, flags, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(secrets.token_urlsafe(48))
-        return key_file.read_text(encoding="utf-8").strip().encode("utf-8")
+        return _persist_keyfile_atomic(key_file, secrets.token_urlsafe(48))
     except OSError:
         # Read-only key store: derive an ephemeral process-local salt instead of failing.
         # Such pseudonyms are not stable across restarts — surface that honestly in the docs.
@@ -409,31 +539,11 @@ def _resolve_or_persist_secret(
         )
 
     # Local/development/test persistence: generate once with 0600 permissions so keys survive restarts
-    # and remain consistent across independent manager instances (fixes R12 & S4).
+    # and remain consistent across independent manager instances and OS worker processes (fixes R12 & S4).
     key_dir = _default_key_store_dir()
     key_file = key_dir / f"{key_name}.key"
     try:
-        if key_file.is_file():
-            existing = key_file.read_text(encoding="utf-8").strip()
-            if existing:
-                return existing.encode("utf-8")
-        key_dir.mkdir(parents=True, exist_ok=True)
-        generated = secrets.token_urlsafe(48)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        try:
-            fd = os.open(str(key_file), flags, stat.S_IRUSR | stat.S_IWUSR)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(generated)
-        except FileExistsError:
-            existing = key_file.read_text(encoding="utf-8").strip()
-            if existing:
-                return existing.encode("utf-8")
-            key_file.write_text(generated, encoding="utf-8")
-        try:
-            os.chmod(key_file, stat.S_IRUSR | stat.S_IWUSR)
-        except OSError:
-            pass
-        return generated.encode("utf-8")
+        return _persist_keyfile_atomic(key_file, secrets.token_urlsafe(48))
     except OSError:
         # Fallback if filesystem is strictly read-only: keep process-wide stable secret in env.
         generated = secrets.token_urlsafe(48)
@@ -830,8 +940,16 @@ def safe_joblib_load_bytes(payload_bytes: bytes, *, filename: str = "") -> Any:
         return unpickler.load()
 
 
+_ALLOWED_JWT_HMAC_ALGORITHMS: frozenset[str] = frozenset({"HS256", "HS384", "HS512"})
+_STDLIB_JWT_HASHES: dict[str, Any] = {
+    "HS256": hashlib.sha256,
+    "HS384": hashlib.sha384,
+    "HS512": hashlib.sha512,
+}
+
+
 class JWTManager:
-    """JWT issuance and verification manager supporting PyJWT and stdlib HS256 fallback."""
+    """JWT issuance and verification manager supporting PyJWT and stdlib HMAC fallback."""
 
     def __init__(
         self,
@@ -839,6 +957,15 @@ class JWTManager:
         algorithm: str = "HS256",
         expiration_minutes: int = 60,
     ) -> None:
+        norm_alg = (algorithm or "").strip().upper()
+        if norm_alg not in _ALLOWED_JWT_HMAC_ALGORITHMS:
+            raise SecurityError(
+                f"Unsupported or insecure JWT algorithm '{algorithm}'. Allowed: {sorted(_ALLOWED_JWT_HMAC_ALGORITHMS)}."
+            )
+        if isinstance(expiration_minutes, bool) or int(expiration_minutes) < 1:
+            raise SecurityError(
+                f"JWT expiration_minutes must be >= 1, got {expiration_minutes!r}."
+            )
         secret_bytes = _resolve_or_persist_secret(
             key_name="jwt_secret",
             explicit=secret_key,
@@ -846,8 +973,8 @@ class JWTManager:
             min_length=32,
         )
         self._secret_key = secret_bytes.decode("utf-8", errors="replace")
-        self._algorithm = algorithm
-        self._expiration_minutes = expiration_minutes
+        self._algorithm = norm_alg
+        self._expiration_minutes = int(expiration_minutes)
 
     def create_token(
         self,
@@ -855,8 +982,11 @@ class JWTManager:
         expires_minutes: int | None = None,
     ) -> str:
         """Mint a signed JWT for ``principal``."""
+        ttl = self._expiration_minutes if expires_minutes is None else int(expires_minutes)
+        if ttl < 1:
+            raise SecurityError(f"JWT expires_minutes must be >= 1, got {expires_minutes!r}.")
         now = datetime.now(UTC)
-        exp = now + timedelta(minutes=expires_minutes or self._expiration_minutes)
+        exp = now + timedelta(minutes=ttl)
         payload: dict[str, Any] = {
             "sub": principal.subject,
             "roles": principal.roles,
@@ -868,35 +998,57 @@ class JWTManager:
         }
         if _HAS_PYJWT and jwt is not None:
             return str(jwt.encode(payload, self._secret_key, algorithm=self._algorithm))
-        header_b64 = self._b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode("utf-8"))
+        digest_fn = _STDLIB_JWT_HASHES[self._algorithm]
+        header_b64 = self._b64url(json.dumps({"alg": self._algorithm, "typ": "JWT"}).encode("utf-8"))
         payload_b64 = self._b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
         signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
-        sig = hmac.new(self._secret_key.encode("utf-8"), signing_input, hashlib.sha256).digest()
+        sig = hmac.new(self._secret_key.encode("utf-8"), signing_input, digest_fn).digest()
         return f"{header_b64}.{payload_b64}.{self._b64url(sig)}"
 
     def verify_token(self, token: str) -> Principal:
-        """Verify JWT signature and expiration and reconstruct a :class:`Principal`."""
+        """Verify JWT signature, required claims (``exp``, ``sub``), and reconstruct a :class:`Principal`."""
         try:
             if _HAS_PYJWT and jwt is not None:
-                payload = jwt.decode(token, self._secret_key, algorithms=[self._algorithm])
+                payload = jwt.decode(
+                    token,
+                    self._secret_key,
+                    algorithms=[self._algorithm],
+                    options={"require": ["exp", "sub"]},
+                )
             else:
                 parts = token.split(".")
                 if len(parts) != 3:
                     raise ValueError("Malformed JWT token.")
+                header = json.loads(self._b64url_decode(parts[0]).decode("utf-8"))
+                if not isinstance(header, dict) or header.get("alg") != self._algorithm:
+                    raise ValueError("JWT header algorithm mismatch.")
+                digest_fn = _STDLIB_JWT_HASHES[self._algorithm]
                 signing_input = f"{parts[0]}.{parts[1]}".encode("ascii")
                 expected_sig = self._b64url(
                     hmac.new(
-                        self._secret_key.encode("utf-8"), signing_input, hashlib.sha256
+                        self._secret_key.encode("utf-8"), signing_input, digest_fn
                     ).digest()
                 )
                 if not hmac.compare_digest(parts[2], expected_sig):
                     raise ValueError("Invalid JWT signature.")
                 payload = json.loads(self._b64url_decode(parts[1]).decode("utf-8"))
-                if int(payload.get("exp", 0)) < int(datetime.now(UTC).timestamp()):
+                if not isinstance(payload, dict):
+                    raise ValueError("Malformed JWT payload.")
+                exp_val = payload.get("exp")
+                if exp_val is None or isinstance(exp_val, bool) or not isinstance(exp_val, (int, float)):
+                    raise ValueError("JWT token is missing a valid 'exp' claim.")
+                if datetime.now(UTC).timestamp() >= float(exp_val):
                     raise ValueError("JWT token has expired.")
 
+            exp_claim = payload.get("exp")
+            if exp_claim is None or isinstance(exp_claim, bool) or not isinstance(exp_claim, (int, float)):
+                raise ValueError("JWT token is missing a valid 'exp' claim.")
+            sub_claim = payload.get("sub")
+            if not isinstance(sub_claim, str) or not sub_claim.strip():
+                raise ValueError("JWT token is missing a non-empty 'sub' claim.")
+
             return Principal(
-                subject=str(payload["sub"]),
+                subject=sub_claim,
                 roles=list(payload.get("roles", ["viewer"])),
                 tenant_id=str(payload.get("tenant_id", "default-tenant")),
                 attributes=dict(payload.get("attributes", {})),
@@ -1472,20 +1624,24 @@ class AuditCheckpointAnchor:
 
     def anchor_event(self, *, record_count: int, head_hash: str) -> dict[str, Any]:
         """Append a MACed checkpoint covering ``record_count`` records with head ``head_hash``."""
-        seq = self._last_seq + 1
-        fields = {
-            "version": self.VERSION,
-            "seq": seq,
-            "record_count": int(record_count),
-            "head_hash": str(head_hash),
-            "timestamp": datetime.now(UTC).isoformat(),
-        }
-        record = {**fields, "mac": self._mac(fields)}
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        with self._path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
-        self._last_seq = seq
-        return record
+        with _locked_file_path(self._path):
+            self._last_seq = self._load_last_seq()
+            seq = self._last_seq + 1
+            fields = {
+                "version": self.VERSION,
+                "seq": seq,
+                "record_count": int(record_count),
+                "head_hash": str(head_hash),
+                "timestamp": datetime.now(UTC).isoformat(),
+            }
+            record = {**fields, "mac": self._mac(fields)}
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with self._path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            self._last_seq = seq
+            return record
 
     def verify_log(self, log_path: str | Path) -> tuple[bool, int, str]:
         """Verify this anchor against ``log_path`` (uses the anchor's own checkpoint key). Returns ``(ok, checkpoints_checked, detail)``."""
@@ -1525,7 +1681,6 @@ class AuditCheckpointAnchor:
         return verifier.verify_log(log_path)
 
 
-
 class AuditLogger:
     """Hash-chained, HMAC-signed, tamper-evident enterprise audit trail persisted as JSONL.
 
@@ -1551,8 +1706,12 @@ class AuditLogger:
         self._path = Path(log_path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._audit_signer: ArtifactSigner | None = None
-        self._last_hash = self._load_last_hash()
-        self._record_count = self._count_records()
+        self._last_hash = "0" * 64
+        self._record_count = 0
+        self._verified_offset = 0
+        self._verified_hasher = hashlib.sha256()
+        with _locked_file_path(self._path):
+            self._sync_chain_state()
         # Out-of-band checkpoint anchor (audit P1-11/anchor item). Opt-in: set
         # OMNIFORGE_AUDIT__ANCHOR_PATH (or pass anchor_path=) to a separate append-only file;
         # explicitly disabled with 0/false/off/none. Unset by default so local runs are unchanged.
@@ -1576,6 +1735,11 @@ class AuditLogger:
                 suggestions=["Set OMNIFORGE_AUDIT__ANCHOR_EVERY to a positive integer (1 = anchor every event)."],
             )
         self._anchor_every = anchor_every
+        if anchor_path and Path(anchor_path).resolve() == self._path.resolve():
+            raise SecurityError(
+                "Audit checkpoint anchor_path must be distinct from log_path.",
+                suggestions=["Configure OMNIFORGE_AUDIT__ANCHOR_PATH to point to a separate checkpoint file."],
+            )
         self._anchor: AuditCheckpointAnchor | None = (
             AuditCheckpointAnchor(anchor_path, checkpoint_key) if anchor_path else None
         )
@@ -1648,31 +1812,93 @@ class AuditLogger:
         except (ValueError, TypeError):
             return False
 
-    def _load_last_hash(self) -> str:
-        if not self._path.exists() or self._path.stat().st_size == 0:
-            return "0" * 64
-        last_line = ""
-        with self._path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                if line.strip():
-                    last_line = line
-        if not last_line:
-            return "0" * 64
-        try:
-            record = json.loads(last_line)
-        except json.JSONDecodeError:
+    def _sync_chain_state(self) -> None:
+        """Synchronize ``_last_hash`` and ``_record_count`` with on-disk log state (caller holds path lock)."""
+        if not self._path.exists():
+            self._last_hash = "0" * 64
+            self._record_count = 0
+            self._verified_offset = 0
+            self._verified_hasher = hashlib.sha256()
+            return
+
+        with self._path.open("rb") as handle:
+            raw_bytes = handle.read()
+
+        if not raw_bytes:
+            if self._verified_offset > 0:
+                raise SecurityError(
+                    "Audit log was unexpectedly truncated; refusing to extend a tampered chain.",
+                    suggestions=["Restore the audit log from an external checkpoint/backup before continuing."],
+                )
+            self._last_hash = "0" * 64
+            self._record_count = 0
+            self._verified_offset = 0
+            self._verified_hasher = hashlib.sha256()
+            return
+
+        if len(raw_bytes) < self._verified_offset:
             raise SecurityError(
-                "Audit log's last record is not valid JSON; refusing to extend an unverifiable chain.",
-                suggestions=["Restore the audit log from a trusted backup or archive it before continuing."],
-            ) from None
-        if not AuditLogger._verify_record(record, self._signer()):
-            raise SecurityError(
-                "Audit log's last record fails integrity verification (hash/MAC mismatch).",
-                suggestions=[
-                    "Treat the audit log as tampered. Investigate, then restore from an external checkpoint/backup."
-                ],
+                "Audit log shrunk below verified offset; refusing to extend a truncated chain.",
+                suggestions=["Restore the audit log from an external checkpoint/backup before continuing."],
             )
-        return str(record.get("event_hash", "0" * 64))
+
+        signer = self._signer()
+        if self._verified_offset > 0:
+            prefix_digest = hashlib.sha256(raw_bytes[: self._verified_offset]).digest()
+            if not hmac.compare_digest(prefix_digest, self._verified_hasher.digest()):
+                raise SecurityError(
+                    "Audit log historical prefix was modified; refusing to extend a tampered chain.",
+                    suggestions=["Treat the audit log as tampered. Restore from an external checkpoint/backup."],
+                )
+            tail_bytes = raw_bytes[self._verified_offset :]
+            expected_prev = self._last_hash
+            count = self._record_count
+            hasher = self._verified_hasher.copy()
+        else:
+            tail_bytes = raw_bytes
+            expected_prev = "0" * 64
+            count = 0
+            hasher = hashlib.sha256()
+
+        if not tail_bytes:
+            return
+
+        for raw_line in tail_bytes.splitlines(keepends=True):
+            hasher.update(raw_line)
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            try:
+                record = json.loads(stripped.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise SecurityError(
+                    "Audit log contains an invalid JSON record; refusing to extend an unverifiable chain.",
+                    suggestions=["Restore the audit log from a trusted backup or archive it before continuing."],
+                ) from None
+            if not isinstance(record, dict) or record.get("previous_hash") != expected_prev:
+                raise SecurityError(
+                    "Audit log hash-chain continuity failed (previous_hash mismatch); refusing to extend a forked chain.",
+                    suggestions=["Treat the audit log as tampered. Restore from an external checkpoint/backup."],
+                )
+            if not AuditLogger._verify_record(record, signer):
+                raise SecurityError(
+                    "Audit log record fails integrity verification (hash/MAC mismatch).",
+                    suggestions=[
+                        "Treat the audit log as tampered. Investigate, then restore from an external checkpoint/backup."
+                    ],
+                )
+            expected_prev = str(record.get("event_hash") or "")
+            count += 1
+
+        self._last_hash = expected_prev
+        self._record_count = count
+        self._verified_offset = len(raw_bytes)
+        self._verified_hasher = hasher
+
+    def _load_last_hash(self) -> str:
+        with _locked_file_path(self._path):
+            self._sync_chain_state()
+            return self._last_hash
 
     def log_event(
         self,
@@ -1687,37 +1913,46 @@ class AuditLogger:
         details: dict[str, Any] | None = None,
     ) -> AuditEvent:
         """Append a cryptographically chained, HMAC-signed audit event to the audit log."""
-        event = AuditEvent(
-            tenant_id=tenant_id,
-            actor=actor,
-            role=role,
-            action=action,
-            resource_type=resource_type,
-            resource_id=resource_id,
-            status=status,
-            trace_id=get_trace_id(),
-            details=details or {},
-            previous_hash=self._last_hash,
-        )
-        event.event_hash = hashlib.sha256(self._canonical_payload(self._event_fields(event))).hexdigest()
-        event.chain_mac = self._signer().sign_bytes(bytes.fromhex(event.event_hash), context=_AUDIT_HMAC_CONTEXT)
-        self._last_hash = event.event_hash
+        with _locked_file_path(self._path):
+            self._sync_chain_state()
+            event = AuditEvent(
+                tenant_id=tenant_id,
+                actor=actor,
+                role=role,
+                action=action,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                status=status,
+                trace_id=get_trace_id(),
+                details=details or {},
+                previous_hash=self._last_hash,
+            )
+            event.event_hash = hashlib.sha256(self._canonical_payload(self._event_fields(event))).hexdigest()
+            event.chain_mac = self._signer().sign_bytes(bytes.fromhex(event.event_hash), context=_AUDIT_HMAC_CONTEXT)
 
-        with self._path.open("a", encoding="utf-8") as handle:
-            handle.write(event.model_dump_json() + "\n")
-        self._record_count += 1
-        if self._anchor is not None and self._record_count % self._anchor_every == 0:
-            try:
-                self._anchor.anchor_event(record_count=self._record_count, head_hash=event.event_hash)
-            except OSError as exc:
-                raise SecurityError(
-                    "Audit checkpoint anchor could not be written; the event remains in the log but is unanchored.",
-                    suggestions=[
-                        "Check that OMNIFORGE_AUDIT__ANCHOR_PATH points at a writable, preferably external, location.",
-                        "Re-run verification (AuditLogger.verify_with_anchor) and investigate the coverage gap.",
-                    ],
-                ) from exc
-        return event
+            line_bytes = (event.model_dump_json() + "\n").encode("utf-8")
+            with self._path.open("ab") as handle:
+                handle.write(line_bytes)
+                handle.flush()
+                os.fsync(handle.fileno())
+
+            self._last_hash = event.event_hash
+            self._record_count += 1
+            self._verified_offset += len(line_bytes)
+            self._verified_hasher.update(line_bytes)
+
+            if self._anchor is not None and self._record_count % self._anchor_every == 0:
+                try:
+                    self._anchor.anchor_event(record_count=self._record_count, head_hash=event.event_hash)
+                except OSError as exc:
+                    raise SecurityError(
+                        "Audit checkpoint anchor could not be written; the event remains in the log but is unanchored.",
+                        suggestions=[
+                            "Check that OMNIFORGE_AUDIT__ANCHOR_PATH points at a writable, preferably external, location.",
+                            "Re-run verification (AuditLogger.verify_with_anchor) and investigate the coverage gap.",
+                        ],
+                    ) from exc
+            return event
 
     @classmethod
     def verify_file(cls, log_path: str | Path) -> tuple[bool, int]:
@@ -1730,7 +1965,7 @@ class AuditLogger:
             return True, 0
         records: list[dict[str, Any]] = []
         try:
-            with path.open("r", encoding="utf-8") as handle:
+            with _maybe_locked_read_path(path), path.open("r", encoding="utf-8") as handle:
                 for line in handle:
                     if line.strip():
                         records.append(json.loads(line))
@@ -1757,7 +1992,6 @@ class AuditLogger:
         """
         return AuditLogger.verify_file(self._path)
 
-
     @property
     def anchor_enabled(self) -> bool:
         """True when out-of-band checkpoint anchoring is configured for this log."""
@@ -1771,21 +2005,24 @@ class AuditLogger:
         """
         if self._anchor is None:
             return True, 0, "anchor not configured (in-band integrity only)"
-        return self._anchor.verify_log(self._path)
+        with _maybe_locked_read_path(self._path):
+            return self._anchor.verify_log(self._path)
 
     def verify_with_anchor(self) -> tuple[bool, int, str]:
         """Verify the in-band chain AND the out-of-band anchor. Returns ``(ok, events_checked, detail)``."""
-        chain_ok, count = self.verify_chain()
-        if not chain_ok:
-            return False, count, "audit chain integrity failed"
-        anchor_ok, _checked, detail = self.verify_anchor()
-        return anchor_ok, count, detail
+        with _maybe_locked_read_path(self._path):
+            chain_ok, count = self.verify_chain()
+            if not chain_ok:
+                return False, count, "audit chain integrity failed"
+            anchor_ok, _checked, detail = self.verify_anchor()
+            return anchor_ok, count, detail
 
     def read_events(self, limit: int = 100) -> list[AuditEvent]:
         """Read the most recent ``limit`` audit events."""
         if not self._path.exists():
             return []
-        lines = [ln for ln in self._path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        with _maybe_locked_read_path(self._path):
+            lines = [ln for ln in self._path.read_text(encoding="utf-8").splitlines() if ln.strip()]
         return [AuditEvent.model_validate_json(ln) for ln in lines[-limit:]]
 
 

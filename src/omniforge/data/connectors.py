@@ -26,6 +26,7 @@ import shutil
 import socket
 import sqlite3
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import quote, urlparse
@@ -458,13 +459,35 @@ def _validate_remote_db_host(host: str | None, port: int | None) -> None:
         )
 
 
-def validate_outbound_http_url(url: str) -> str:
-    """Validate an outbound HTTP(S) URL against SSRF, cloud metadata, and control-char injection."""
+@dataclass(frozen=True)
+class ResolvedOutboundHTTPTarget:
+    """Validated outbound HTTP(S) target with vetted, DNS-pinned IP addresses."""
+
+    url: str
+    scheme: str
+    hostname: str
+    port: int | None
+    host_header: str
+    pinned_ips: tuple[str, ...]
+    is_ip_literal: bool
+
+    @property
+    def effective_port(self) -> int:
+        if self.port is not None:
+            return self.port
+        return 443 if self.scheme == "https" else 80
+
+
+def resolve_and_validate_outbound_http_url(url: str) -> ResolvedOutboundHTTPTarget:
+    """Validate an outbound HTTP(S) URL and return vetted, DNS-pinned IPs against DNS rebinding."""
     if not isinstance(url, str) or not url.strip():
         raise DataIngestionError("HTTP URL cannot be empty.")
     cleaned = url.strip()
     if any(ch in cleaned for ch in ("\x00", "\r", "\n")):
         raise SecurityError("Control characters (NUL/CR/LF) are forbidden in outbound HTTP URLs.")
+    authority_and_path = cleaned.split("?", 1)[0].split("#", 1)[0]
+    if "\\" in authority_and_path:
+        raise SecurityError("Backslashes are forbidden in outbound HTTP URL authority/path.")
 
     parsed = urlparse(cleaned)
     scheme = parsed.scheme.lower()
@@ -495,18 +518,29 @@ def validate_outbound_http_url(url: str) -> str:
         "yes",
     }
 
+    default_port = 443 if scheme == "https" else 80
     resolved_ips: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    is_ip_literal = False
+    wire_host = norm_host
     try:
-        resolved_ips.append(ipaddress.ip_address(norm_host))
+        literal_ip = ipaddress.ip_address(norm_host)
+        resolved_ips.append(literal_ip)
+        is_ip_literal = True
     except ValueError:
         try:
-            default_port = 443 if scheme == "https" else 80
-            addr_info = socket.getaddrinfo(norm_host, port or default_port, type=socket.SOCK_STREAM)
+            wire_host = norm_host.encode("idna").decode("ascii")
+        except UnicodeError as exc:
+            raise SecurityError(f"Invalid internationalized HTTP hostname '{norm_host}': {exc}") from exc
+        try:
+            addr_info = socket.getaddrinfo(wire_host, port or default_port, type=socket.SOCK_STREAM)
             for info in addr_info:
                 ip_str = str(info[4][0]).split("%", 1)[0]
                 resolved_ips.append(ipaddress.ip_address(ip_str))
         except OSError as exc:
             raise DataIngestionError(f"Unable to resolve HTTP host '{norm_host}': {exc}") from exc
+
+    if not resolved_ips:
+        raise DataIngestionError(f"Unable to resolve HTTP host '{norm_host}': no addresses returned.")
 
     for ip in resolved_ips:
         _assert_ip_not_ssrf(
@@ -519,7 +553,27 @@ def validate_outbound_http_url(url: str) -> str:
             private_env="OMNIFORGE_ALLOW_PRIVATE_HTTP_HOSTS",
         )
 
-    return cleaned
+    deduped_ips = tuple(dict.fromkeys(str(ip) for ip in resolved_ips))
+    formatted_host = f"[{wire_host}]" if (is_ip_literal and ":" in wire_host) else wire_host
+    host_header = (
+        f"{formatted_host}:{port}"
+        if (port is not None and port != default_port)
+        else formatted_host
+    )
+    return ResolvedOutboundHTTPTarget(
+        url=cleaned,
+        scheme=scheme,
+        hostname=wire_host,
+        port=port,
+        host_header=host_header,
+        pinned_ips=deduped_ips,
+        is_ip_literal=is_ip_literal,
+    )
+
+
+def validate_outbound_http_url(url: str) -> str:
+    """Validate an outbound HTTP(S) URL against SSRF, cloud metadata, and control-char injection."""
+    return resolve_and_validate_outbound_http_url(url).url
 
 
 def _normalize_sql_url(connection_url: str) -> str:

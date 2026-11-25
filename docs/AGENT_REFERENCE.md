@@ -458,9 +458,8 @@ register_model, promote_model, list_studios, studio_overview`.
  - The README claims "26+ tools / 12 Phase 6". The code has 24, and the Phase-6 group is 10.
 - **Ingest path confinement (`_validate_copilot_ingest_source`)** **[V]**. Keep it intact: reject 
 empty/NUL and `..`; allow `http(s)` URLs (which still pass SSRF validation), otherwise only `file`/no scheme; resolve against `OMNIFORGE_COPILOT_INGEST_ROOT` (default CWD); reject `/etc /proc /sys /root /dev /var/run`; require the path to be inside the root; reject any dot-prefixed component.
-- [!] **`tool_list_studios` returns routes that do not exist (D5) [V].** Verified at HEAD (`copilot/tools.py:622`): it advertises `/s00/ingest`, `/s02/mine`, `/s03/eda`, `/s04/diagnostics`, `/s05/features`, `/s06/run`, `/s07/advanced`, `/s10/rai`, `/s12/report`, etc., none of which match the route table in 14.5. Do not trust its output; fix the handler to derive routes from the routers.
-- [!] The `promote_model` tool defaults to `stage="Production"`. The agent has no `Principal`, so the 
-`model:promote` RBAC check is not applied there (see D4).
+- **`tool_list_studios` OpenAPI-verified routes (D5 resolved).** Advertises canonical `/api/workbench/sXX/*` endpoints and dynamically discovers studio endpoints from `omniforge.api.workbench.router`.
+- The `promote_model` and `register_model` tools enforce RBAC (`model:promote`, `model:deploy`, `mlops:write`) whenever an HTTP request `Principal` is active via `get_request_principal()` (see D4).
 ---
 ## 13. Domain plugins
 - `plugin_sdk.py` **[V]**:
@@ -469,12 +468,12 @@ recommended_models, default_target, config_file`.
  - `BaseDomainPlugin` has abstract `engineer_domain_features`, `compute_domain_kpis(df, *, 
 predictions=None)` and `generate_sample_dataset(n_samples=200, random_state=42)`. It also has `get_validation_rules()`, `summary()` and `load_config()`.
  - `DomainPluginRegistry` has `register`, `get`, `list_plugins`, `list_names` and `discover_entry_points`.
-- `domains/__init__.py` imports 18 vertical modules and registers each module-level `plugin` **instance**
-in `_BUILTIN_PLUGINS` order **[V]**.
-- [!] **Entry points are inert (D7).** `pyproject.toml` maps `[project.entry-points."omniforge.domains"]` 
-to **classes** (e.g. `...finance:FinanceDomainPlugin`). `discover_entry_points` registers an entry point only if it is an `isinstance` of `BaseDomainPlugin`, so a class never qualifies. In addition, `discover_entry_points` is **never called**. Third-party plugin discovery therefore does not work today **[V]**.
+- `domains/__init__.py` imports 18 vertical modules, registers each module-level `plugin` **instance**
+in `_BUILTIN_PLUGINS` order, and calls `default_domain_registry.discover_entry_points(skip_existing=True)` **[V]**.
+- **Entry-point discovery (D7 resolved).** `pyproject.toml` maps `[project.entry-points."omniforge.domains"]`
+to **classes** (e.g. `...finance:FinanceDomainPlugin`), and `discover_entry_points` instantiates concrete `BaseDomainPlugin` subclasses as well as pre-instantiated objects.
 - **Add a built-in domain:** create `domains/<slug>.py` with `<Name>DomainPlugin` and a 
-module-level `plugin = <Name>DomainPlugin()`; import it and add it to `_BUILTIN_PLUGINS`; add `configs/domains/<slug>.yaml`; update the count assertions (`launcher.run_environment_check` requires `>= 18`, and README/tests assume 18); optionally add the slug to `BUILTIN_DOMAINS` (informational only) and a `pyproject` entry point (currently inert).
+module-level `plugin = <Name>DomainPlugin()`; import it and add it to `_BUILTIN_PLUGINS`; add `configs/domains/<slug>.yaml`; update the count assertions (`launcher.run_environment_check` requires `>= 18`, and README/tests assume 18); optionally add the slug to `BUILTIN_DOMAINS` (informational only) and a `pyproject` entry point.
 ---
 
 ## 14. API layer
@@ -484,7 +483,7 @@ upload/quality/clean, EDA, AutoML, forecast, causal, optimization, serving, regi
 - **`/api/workbench/*`** is the SPA's API (`api/workbench.py` plus `api/studios/*`).
 - `/docs`, `/redoc` and `/openapi.json` are unauthenticated.
 - **There is no Prometheus metrics endpoint**, although `prometheus-client` is a declared dependency 
-**[V]**. There is no `/api/system/capabilities` route, although `capabilities.py` mentions it **[V][!]**.
+**[V]**. `GET /api/system/capabilities` (aliased at `/api/v1/system/capabilities`) exposes `probe_runtime_capabilities()` behind `require_permission("data:read")` (D14 resolved).
 ->- **Middleware stack** (innermost outermost): CORS (explicit methods and headers, including 
 `X-Session-ID` and `X-CSRF-Token`); GZip (≥ 500 bytes); `RequestBodySizeLimitMiddleware`; `SlidingWindowRateLimitMiddleware`; security-headers middleware (sets `X-Content-Type-Options`, `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy: same-origin`, `Content-Security-Policy-Report-Only`, HSTS).
 - **SPA serving:** `GET /{path}` serves files from `ui/static_app`, confined with `is_relative_to`. Falls back
@@ -702,33 +701,23 @@ Reuse `_fetch_http_safe` and the read-only SQL helpers. Add a `DependencyMissing
 Severity is an assessment. Items marked **[X]** were reproduced by execution in a previous review. Items marked **[P]** need confirmation before you rely on them. D1, D4 and D5 were promoted from [P] to [V] in the 2026-11-24 revision.
 | ID | Sev | Finding |
 |---|---|---|
-| **D1** | High **[V]** | **Audit chain forks with multiple writers.** `AuditLogger` (`core/security.py:1506`) caches `_last_hash` and takes no lock; `log_event()` does not re-read the tail. `registry`/`continuous_training` create a fresh instance per event while `api/auth.py` keeps one long-lived instance. Re-read the tail under a lock (and an inter-process file lock) on every append. |
-| **D2** | High **[V]** | **MPC analytic gradient does not match the objective** (§11). |
-| **D3** | High **[V]** | **Auto-bootstrap (when enabled) hands admin cookies to any client that can reach the port** in non-production. Code default is `False`; `.env.example` enables it and `launcher.main()` loads `.env`. `make run-api`/`run-ui` bind `0.0.0.0`; CLI `serve`/`ui` default to `127.0.0.1`. The cookie is nonce + 8-hour expiry, but the **unauthenticated grant remains when enabled**. |
-| **D4** | Medium **[V]** | **RBAC is inconsistent.** Workbench routes authenticate only. 
-`/api/v1/registry/.../stage` needs `model:deploy` to reach Production, whereas `/s11/promote` needs `model:promote`. The Copilot `promote_model` tool has no principal. `Principal.scopes` grants permissions directly. |
-| **D5** | Medium **[V]** | **Copilot `list_studios` advertises routes that do not exist** (`copilot/tools.py:622`). Compare against §14.5; do not trust its output. |
-| **D6** | Medium **[V]** | **SSRF checks resolve DNS once with no pinning**, so DNS rebinding can 
-race the check (§8.1). |
-| **D7** | Medium **[V]** | **Domain entry points are inert.** `discover_entry_points` registers 
-instances, `pyproject.toml` maps classes, and discovery is never called (§13). |
-| **D8** | Medium **[V]** | **Model `save()` is documented as atomic but is not.** The HMAC covers the 
-artifact only, and artifacts are not portable across hosts without configured keys (§9.1, §6.6). |
-| **D9** | Medium **[V]** | **Many settings are dead.** `load_config` and the YAML files are never used at runtime, and `.env` is loaded only by `launcher.main()` (§7). Exceptions: `jobs.*` and `paths.feature_store_dir` are consumed (see 7.2). |
-| **D10** | Medium **[C]** | **Gates were red at the previously reviewed commit**: 19 ruff findings and 1 
-
-failing e2e test. Re-run before starting. |
-| **D11** | Low **[V]** | The unpickler allow-list contains a test module name, depends on private joblib 
-symbols, and allows `torch` broadly (§6.6). |
-| **D12** | Low **[V]** | Importing `omniforge.ui.*` builds the whole API app as a side effect (§5). |
-| **D13** | Low **[V]** | `launcher check` treats optional extras as required (`fastapi`, `uvicorn`, `pyarrow`, `duckdb`, `sqlalchemy`, `statsmodels`, `docx`/`pptx`/`reportlab`). `requirements-build.in` header says v3.0.1 (runtime `requirements.in` says v4.0.0). The README says to compile `requirements.txt`. (`docker-build` tag staleness is resolved: now `4.0.0`.) |
-| **D14** | Low **[C]** | Capabilities drift: `pillow` placement, the SIMPLE-tier comment, and a 
-non-existent `/api/system/capabilities` (§16). |
-| **D15** | Low **[V]** | PyJWT path does not require `exp` (stdlib fallback treats missing `exp` as expired). `to_dict()` returns `context` and `cause` to clients via the `OmniForgeError` handler (`api/main.py:174`). |
-| **D16** | Low **[C]** | README inconsistencies: "26+ tools / 12 Phase 6" versus 24 / 10; "15 studios" 
-versus 14 UI studios; the s03/s04 labels are swapped; the `omniferge automl` typo; a test named "all_13_studios"; and the README's ports and URLs. |
-| **D17** | Info **[V]** | `frontend` has no lint or test script. The CI `static_app` freshness check does not 
-catch newly added untracked files. |
+| **D1** | Resolved | **Audit chain multi-writer synchronization.** `AuditLogger` and `AuditCheckpointAnchor` now coordinate across threads and OS processes via `_locked_file_path` (`RLock` + `fcntl`/`msvcrt`), verify historical prefix SHA-256 + newly appended records before signing, and `fsync` writes. |
+| **D2** | Resolved | **MPC analytic gradient, initial-step dynamics & soft state constraints.** `_objective_grad` matches finite differences, `_dynamics_constraints` enforces $x_1 = A x_0 + B u_0$, and Stage 2 softens state bounds via non-negative slack variables with exact $\ell_1 + \ell_2^2$ penalty. |
+| **D3** | Mitigated | **Auto-bootstrap defaults aligned to safe off/loopback.** `.env.example` now defaults `OMNIFORGE_SECURITY__AUTO_BOOTSTRAP_LOCAL_UI=false` and `Makefile` `run-api`/`run-ui` default `HOST ?= 127.0.0.1`. Note: when explicitly enabled by an operator, auto-bootstrap still grants local admin cookies in non-production. |
+| **D4** | Mitigated | **RBAC promotion & JWT settings alignment.** `/api/v1/registry/.../stage` now enforces `model:promote` for `Production` transitions; `CopilotToolRegistry` `register_model`/`promote_model` enforce RBAC when a request `Principal` is active; `api/auth.py` wires `settings.security.jwt_*`. General workbench routes remain authenticated via `require_workbench_auth`. |
+| **D5** | Resolved | **Copilot `list_studios` & `studio_overview` routes.** Updated to canonical OpenAPI-verified `/api/workbench/sXX/*` endpoints with dynamic router discovery. |
+| **D6** | Resolved | **SSRF DNS-rebinding protection.** `resolve_and_validate_outbound_http_url` + `_fetch_http_safe` pin vetted IPs per redirect hop while preserving `Host` headers and TLS `sni_hostname` SAN verification. |
+| **D7** | Resolved | **Domain plugin entry points.** `discover_entry_points` instantiates concrete `BaseDomainPlugin` subclasses as well as instances, and `omniforge.domains` auto-discovers external entry points (`skip_existing=True`). |
+| **D8** | Mitigated | **Atomic encrypted `BaseOmniForgeModel.save()`.** Serializes and encrypts in memory so plaintext never touches disk, stages `fsync`-ed sibling `.tmp` files, swaps via `os.replace` with metadata rollback on failure, and verifies both HMAC and SHA-256 on `load()`. Keys remain host-local unless configured via env. |
+| **D9** | Open **[V]** | **Some YAML/config settings remain declarative.** `jobs.*`, `security.jwt_*`, and `paths.*` are consumed; unused YAML keys remain non-authoritative at runtime (§7). |
+| **D10** | Resolved | **Quality gates green.** `pytest`, `ruff`, `mypy`, and `pip check` pass cleanly. |
+| **D11** | Open **[V]** | `_RestrictedNumpyUnpickler` retains `"test_third_party_claims"` (required by `tests/unit/test_third_party_claims.py`), uses `joblib.numpy_pickle`, and permits `torch` after mandatory HMAC verification (§6.6). |
+| **D12** | Resolved | **Decoupled `omniforge.ui` imports.** `ui/__init__.py` uses lazy `__getattr__` and `ui/app.py` defers `create_app` inside `create_workbench_app()`. |
+| **D13** | Mitigated | `requirements-build.in` header updated to `v4.0.0` and `README.md` lock compile command updated to `requirements.in` (`run_environment_check()["required_modules"]` keys preserved for `tests/unit/test_packaging_and_launcher.py`). |
+| **D14** | Mitigated | Added pure-stdlib `probe_runtime_capabilities()` and authenticated `GET /api/system/capabilities` (`/api/v1/system/capabilities`). |
+| **D15** | Resolved | `JWTManager.verify_token` requires `exp` and `sub` in both PyJWT and stdlib backends (with algorithm allowlist `HS256`/`HS384`/`HS512`), and FastAPI's `OmniForgeError` handler omits internal `context` and `cause` via `to_dict(include_internal=False)`. |
+| **D16** | Resolved | Fixed `omniforge automl` CLI typo, aligned `README.md` 15-studio table with actual studio routers, and removed nonexistent `/s14/root-cause` reference. |
+| **D17** | Mitigated | CI `static_app` freshness check now uses `git status --porcelain -- src/omniforge/ui/static_app` so newly generated untracked Vite chunks are caught alongside modified files. |
 ---
 ## 21. Areas not examined in depth
 Read these fully before editing them. Nothing above should be treated as authoritative for them.

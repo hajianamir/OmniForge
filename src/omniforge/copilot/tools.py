@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 import pandas as pd
 
 from omniforge.copilot.memory import CopilotMemory
-from omniforge.core.exceptions import CopilotError
+from omniforge.core.exceptions import CopilotError, SecurityError
 from omniforge.core.utils import to_json_object
 
 _FORBIDDEN_SYSTEM_PREFIXES: tuple[str, ...] = ("/etc", "/proc", "/sys", "/root", "/dev", "/var/run")
@@ -101,6 +101,8 @@ class CopilotToolRegistry:
         try:
             res = self._tools[tool_name].handler(**(arguments or {}))
             return to_json_object(res)
+        except SecurityError:
+            raise
         except Exception as exc:
             raise CopilotError(
                 f"Copilot tool '{tool_name}' execution failed: {exc}",
@@ -109,9 +111,20 @@ class CopilotToolRegistry:
             ) from exc
 
     def _register_platform_tools(self) -> None:
+        def _authorize_if_http_principal(permission: str) -> None:
+            try:
+                from omniforge.api.auth import access_controller, get_request_principal
+
+                req_principal = get_request_principal()
+            except Exception:
+                req_principal = None
+            if req_principal is not None:
+                access_controller.authorize(req_principal, permission)
+
         def tool_ingest_data(source: str, dataset_name: str = "dataset") -> dict[str, Any]:
             from omniforge.data.ingestion import DataIngestionEngine
 
+            _authorize_if_http_principal("data:write")
             safe_source = _validate_copilot_ingest_source(source)
             res = DataIngestionEngine().ingest(safe_source, name=dataset_name)
             self.memory.set_dataset(dataset_name, res.data)
@@ -157,6 +170,7 @@ class CopilotToolRegistry:
         ) -> dict[str, Any]:
             from omniforge.data.cleaning import CleaningConfig, DataCleaner
 
+            _authorize_if_http_principal("data:write")
             name, df = self.memory.get_dataset(dataset_name)
             cfg = CleaningConfig(
                 numeric_imputation=numeric_imputation,
@@ -193,6 +207,7 @@ class CopilotToolRegistry:
         ) -> dict[str, Any]:
             from omniforge.automl.pipeline_search import AutoMLPipelineSearch
 
+            _authorize_if_http_principal("model:train")
             _, df = self.memory.get_dataset(dataset_name)
             if target_column not in df.columns:
                 target_column = str(df.columns[-1])
@@ -491,6 +506,7 @@ class CopilotToolRegistry:
             """C3 Green-AI Pareto AutoML with carbon / latency budgets."""
             from omniforge.automl.pipeline_search import AutoMLPipelineSearch
 
+            _authorize_if_http_principal("model:train")
             _, df = self.memory.get_dataset(dataset_name)
             if target_column not in df.columns:
                 target_column = str(df.columns[-1])
@@ -569,12 +585,15 @@ class CopilotToolRegistry:
                     f"Available models: {available}. Run train_automl or pareto_automl first."
                 )
             try:
-                ms = ModelStage(stage)
+                ms = ModelStage(stage.strip().title() if isinstance(stage, str) else stage)
             except ValueError:
                 return {
                     "error": f"Invalid model stage '{stage}'.",
                     "available_stages": [s.value for s in ModelStage],
                 }
+            _authorize_if_http_principal(
+                "model:promote" if ms == ModelStage.PRODUCTION else "mlops:write"
+            )
             reg = wb.get_tenant_registry()
             ver = reg.register_model(
                 model=model, model_name=model_name, owner="copilot", intended_use="",
@@ -596,12 +615,15 @@ class CopilotToolRegistry:
             from omniforge.core.types import ModelStage
 
             try:
-                ms = ModelStage(stage)
+                ms = ModelStage(stage.strip().title() if isinstance(stage, str) else stage)
             except ValueError:
                 return {
                     "error": f"Invalid model stage '{stage}'.",
                     "available_stages": [s.value for s in ModelStage],
                 }
+            _authorize_if_http_principal(
+                "model:promote" if ms == ModelStage.PRODUCTION else "model:deploy"
+            )
             reg = wb.get_tenant_registry()
             # Validate model exists before promotion.
             try:
@@ -620,36 +642,65 @@ class CopilotToolRegistry:
             return {"updated": updated.model_dump() if hasattr(updated, "model_dump") else dict(updated)}
 
         def tool_list_studios() -> dict[str, Any]:
-            """List all 15 OmniForge Workbench studios."""
-            studios = [
-                {"id": "s00", "name": "Ingestion", "route": "/api/workbench/s00/ingest"},
-                {"id": "s01", "name": "Cleaning", "route": "/api/workbench/s01/clean"},
-                {"id": "s02", "name": "Mining", "route": "/api/workbench/s02/mine"},
-                {"id": "s03", "name": "EDA", "route": "/api/workbench/s03/eda"},
-                {"id": "s04", "name": "Diagnostics", "route": "/api/workbench/s04/diagnostics"},
-                {"id": "s05", "name": "Feature Engineering", "route": "/api/workbench/s05/features"},
-                {"id": "s06", "name": "AutoML", "route": "/api/workbench/s06/run"},
-                {"id": "s07", "name": "Advanced AI", "route": "/api/workbench/s07/advanced"},
-                {"id": "s08", "name": "Causal", "route": "/api/workbench/s08/causal"},
-                {"id": "s09", "name": "Specialized AI", "route": "/api/workbench/s09/nlp"},
-                {"id": "s10", "name": "RAI", "route": "/api/workbench/s10/rai"},
-                {"id": "s11", "name": "MLOps", "route": "/api/workbench/s11/overview"},
-                {"id": "s12", "name": "Reports", "route": "/api/workbench/s12/report"},
-                {"id": "s13", "name": "Copilot", "route": "/api/workbench/s13/chat"},
-                {"id": "s14", "name": "Supervisory", "route": "/api/workbench/s14/models"},
+            """List all 15 OmniForge Workbench studios and their registered API routes."""
+            canonical = [
+                {"id": "s00", "name": "Data Relationships", "route": "/api/workbench/s00/data_relationships"},
+                {"id": "s01", "name": "Data Ingestion & Cleaning", "route": "/api/workbench/s01/clean"},
+                {"id": "s02", "name": "Unsupervised Mining", "route": "/api/workbench/s02/mining"},
+                {"id": "s03", "name": "Industry Domains", "route": "/api/workbench/s03/catalog"},
+                {"id": "s04", "name": "EDA & Hypothesis", "route": "/api/workbench/s04/eda"},
+                {"id": "s05", "name": "Feature Engineering", "route": "/api/workbench/s05/engineer"},
+                {"id": "s06", "name": "AutoML & Pareto", "route": "/api/workbench/s06/automl"},
+                {"id": "s07", "name": "Explainability & Fairness", "route": "/api/workbench/s07/explain"},
+                {"id": "s08", "name": "Forecasting & Causal", "route": "/api/workbench/s08/forecast"},
+                {"id": "s09", "name": "Vision, NLP & Digital Twin", "route": "/api/workbench/s09/twin-control"},
+                {"id": "s10", "name": "Pipeline Orchestration", "route": "/api/workbench/s10/run"},
+                {"id": "s11", "name": "MLOps & Drift", "route": "/api/workbench/s11/overview"},
+                {"id": "s12", "name": "Executive Reporting", "route": "/api/workbench/s12/compile"},
+                {"id": "s13", "name": "AI Copilot", "route": "/api/workbench/s13/chat"},
+                {"id": "s14", "name": "Algorithm Catalog", "route": "/api/workbench/s14/models"},
             ]
+            discovered: dict[str, list[str]] = {}
+            try:
+                from omniforge.api.workbench import router as wb_router
+
+                for r in getattr(wb_router, "routes", []):
+                    r_path = getattr(r, "path", "")
+                    if r_path.startswith("/api/workbench/s"):
+                        parts = r_path.split("/")
+                        if len(parts) >= 4:
+                            sid = parts[3]
+                            discovered.setdefault(sid, []).append(r_path)
+            except Exception:
+                pass
+
+            studios: list[dict[str, Any]] = []
+            for item in canonical:
+                sid = item["id"]
+                endpoints = sorted(set(discovered.get(sid, [item["route"]])))
+                studios.append({**item, "endpoints": endpoints})
             return {"studios": studios, "count": len(studios)}
 
         def tool_studio_overview(studio_id: str) -> dict[str, Any]:
             """Get overview payload for a specific studio."""
             from omniforge.api import workbench as wb
 
+            norm_id = studio_id.strip().lower()
             state = self.memory.working_state
-            if studio_id == "s11":
+            if norm_id == "s11":
                 reg = wb.get_tenant_registry()
-                return {"registered_models": [v.model_dump() for v in reg.list_versions()]}
-            if studio_id == "s13":
-                return {"history": state.get("uap_chat_history", [])[-10:]}
+                return {"studio": norm_id, "registered_models": [v.model_dump() for v in reg.list_versions()]}
+            if norm_id == "s13":
+                return {"studio": norm_id, "history": state.get("uap_chat_history", [])[-10:]}
+            studios_map = {s["id"]: s for s in tool_list_studios()["studios"]}
+            if norm_id in studios_map:
+                info = studios_map[norm_id]
+                return {
+                    "studio": norm_id,
+                    "name": info["name"],
+                    "route": info["route"],
+                    "endpoints": info["endpoints"],
+                }
             return {"studio": studio_id, "note": "overview not implemented for this studio"}
 
         specs = [

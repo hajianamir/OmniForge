@@ -2,6 +2,7 @@
 
 PYTHON ?= python3
 PIP ?= pip
+HOST ?= 127.0.0.1
 
 help:
 	@echo "OmniForge - Make Targets"
@@ -48,10 +49,10 @@ format:
 	ruff format src tests
 
 run-api:
-	uvicorn omniforge.api.main:app --host 0.0.0.0 --port 8000 --reload
+	uvicorn omniforge.api.main:app --host $(HOST) --port 8000 --reload
 
 run-ui:
-	python -m omniforge.launcher --mode ui --host 0.0.0.0 --ui-port 8501 --no-browser
+	python -m omniforge.launcher --mode ui --host $(HOST) --ui-port 8501 --no-browser
 
 docker-build:
 	docker build -f docker/Dockerfile -t omniforge-enterprise:4.0.0 .

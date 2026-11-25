@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from omniforge.api.auth import (
+    access_controller,
     issue_local_workbench_cookies,
     jwt_manager,
     require_permission,
@@ -43,7 +44,7 @@ from omniforge.causal.inference import CausalInferenceEngine
 from omniforge.config.settings import get_settings
 from omniforge.copilot.agent import OmniForgeCopilotAgent
 from omniforge.core.constants import RBAC_ROLE_PERMISSIONS
-from omniforge.core.exceptions import OmniForgeError, SecurityError
+from omniforge.core.exceptions import AuthorizationError, OmniForgeError, SecurityError
 from omniforge.core.logging import get_logger
 from omniforge.core.security import RequestBodySizeLimitMiddleware, SlidingWindowRateLimitMiddleware
 from omniforge.core.types import ModelStage, Principal
@@ -174,7 +175,17 @@ def create_app() -> FastAPI:
     @app.exception_handler(OmniForgeError)
     async def uap_error_handler(request: Request, exc: OmniForgeError) -> JSONResponse:
         status_code = 403 if isinstance(exc, SecurityError) else 400
-        return JSONResponse(status_code=status_code, content=to_json_safe(exc.to_dict()))
+        logger.warning(
+            "omniforge_api_error",
+            path=str(request.url.path),
+            error_code=exc.error_code,
+            trace_id=exc.trace_id,
+            cause=f"{type(exc.cause).__name__}: {exc.cause}" if exc.cause is not None else None,
+        )
+        return JSONResponse(
+            status_code=status_code,
+            content=to_json_safe(exc.to_dict(include_internal=False)),
+        )
 
     @app.exception_handler(Exception)
     async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
@@ -277,6 +288,15 @@ def create_app() -> FastAPI:
         principal = Principal(subject=req.username, roles=[req.role], tenant_id=req.tenant_id)
         token = jwt_manager.create_token(principal)
         return TokenResponse(access_token=token, role=req.role, tenant_id=req.tenant_id)
+
+    @app.get("/api/system/capabilities", tags=["System"])
+    @app.get("/api/v1/system/capabilities", tags=["System"])
+    def system_capabilities(
+        _principal: Principal = Depends(require_permission("data:read")),
+    ) -> dict[str, Any]:
+        from omniforge.capabilities import probe_runtime_capabilities
+
+        return to_json_object(probe_runtime_capabilities())
 
     @app.get("/api/v1/domains", tags=["Domains"])
     def list_domains(
@@ -495,8 +515,13 @@ def create_app() -> FastAPI:
         req: StageTransitionRequest,
         _principal: Principal = Depends(require_permission("model:deploy")),
     ) -> dict[str, Any]:
-        reg, _ = _get_api_mlops(_principal)
         stage = parse_model_stage(req.target_stage, error_status=422)
+        if stage == ModelStage.PRODUCTION:
+            try:
+                access_controller.authorize(_principal, "model:promote")
+            except AuthorizationError as exc:
+                raise HTTPException(status_code=403, detail=exc.message) from exc
+        reg, _ = _get_api_mlops(_principal)
         ver = reg.transition_stage(model_name, version, stage)
         return to_json_object(ver.model_dump())
 

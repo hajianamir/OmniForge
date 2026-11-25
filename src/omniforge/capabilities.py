@@ -16,6 +16,7 @@ Consumers:
 
 from __future__ import annotations
 
+import importlib.util
 from dataclasses import dataclass, field
 from typing import Final, Literal
 
@@ -348,4 +349,43 @@ def profile_summary(tier: Tier, extra_packs: list[str] | tuple[str, ...] = ()) -
         "requirements": requirements_for(packs),
         "imports": imports_for(packs),
         "unlocks": {p.id: p.unlocks for p in packs if p.unlocks},
+    }
+
+
+def probe_runtime_capabilities() -> dict[str, object]:
+    """Probe installed capability packs without eagerly importing heavy native libraries."""
+    pack_status: dict[str, dict[str, object]] = {}
+    available_packs: list[str] = []
+    for pack in ALL_PACKS:
+        missing_imports = [
+            mod_name for mod_name in pack.imports if importlib.util.find_spec(mod_name) is None
+        ]
+        installed = len(missing_imports) == 0
+        if installed:
+            available_packs.append(pack.id)
+        pack_status[pack.id] = {
+            "id": pack.id,
+            "title": pack.title,
+            "description": pack.description,
+            "kind": pack.kind,
+            "approx_mb": pack.approx_mb,
+            "installed": installed,
+            "missing_imports": missing_imports,
+            "unlocks": pack.unlocks,
+        }
+
+    features: dict[str, dict[str, object]] = {}
+    for feat_key, (pack_id, label) in FEATURE_UPGRADES.items():
+        p_info = pack_status[pack_id]
+        features[feat_key] = {
+            "pack_id": pack_id,
+            "label": label,
+            "native_available": bool(p_info["installed"]),
+            "description": p_info["description"],
+        }
+
+    return {
+        "available_packs": available_packs,
+        "packs": pack_status,
+        "features": features,
     }

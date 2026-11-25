@@ -2,10 +2,11 @@
 
 Constrained receding-horizon MPC:
 
-    u*_{t:t+H} = argmin  sum_{k=0}^{H-1} || H xhat_{t+k|t} - r_{t+k} ||_Q^2
+    u*_{t:t+H} = argmin  sum_{k=0}^{H-1} || xhat_{t+k+1|t} - r_{t+k} ||_Q^2
                              + || u_{t+k} ||_R^2
-    subject to  u_min <= u <= u_max
-                x_min <= xhat <= x_max        (state safety bounds)
+    subject to  u_min <= u_{t+k} <= u_max
+                x_min <= xhat_{t+k+1|t} <= x_max   (state safety bounds; softened via slack if infeasible)
+                xhat_{t+1|t}   = A xhat_{t|t} + B u_t
                 xhat_{t+k+1|t} = A xhat_{t+k|t} + B u_{t+k}
 
 Solved with :func:`scipy.optimize.minimize` (SLSQP). Deterministic, offline, and safe
@@ -123,6 +124,14 @@ class ClosedLoopMPCController:
             raise SimulationError("Q must be shape (n_x, n_x).")
         if self.R.shape != (self.n_u, self.n_u):
             raise SimulationError("R must be shape (n_u, n_u).")
+        if self.u_min.shape != (self.n_u,) or self.u_max.shape != (self.n_u,):
+            raise SimulationError(f"u_min and u_max must have length {self.n_u}.")
+        if self.x_min.shape != (self.n_x,) or self.x_max.shape != (self.n_x,):
+            raise SimulationError(f"x_min and x_max must have length {self.n_x}.")
+        if np.any(self.u_min > self.u_max):
+            raise SimulationError("u_min cannot exceed u_max.")
+        if np.any(self.x_min > self.x_max):
+            raise SimulationError("x_min cannot exceed x_max.")
 
     # -- decision-vector helpers -----------------------------------------------
     def _unpack(self, z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -134,41 +143,56 @@ class ClosedLoopMPCController:
     def _pack(self, U: np.ndarray, X: np.ndarray) -> np.ndarray:
         return np.concatenate([U.ravel(), X.ravel()])
 
+    def _rollout_open_loop(self, x0: np.ndarray, U: np.ndarray) -> np.ndarray:
+        """Roll state dynamics forward from ``x0`` under control sequence ``U`` -> ``X`` (H, n_x)."""
+        X = np.empty((self.horizon, self.n_x), dtype=float)
+        prev = x0
+        for k in range(self.horizon):
+            prev = self.twin.A @ prev + self.twin.B @ U[k]
+            X[k] = prev
+        return X
+
+    @staticmethod
+    def _to_scipy_bounds(lo: np.ndarray, hi: np.ndarray, horizon: int) -> list[tuple[float | None, float | None]]:
+        step_bounds = [
+            (
+                float(lo_j) if np.isfinite(lo_j) else None,
+                float(hi_j) if np.isfinite(hi_j) else None,
+            )
+            for lo_j, hi_j in zip(lo, hi, strict=False)
+        ]
+        return step_bounds * horizon
+
     # -- objective -------------------------------------------------------------
     def _objective(self, z: np.ndarray, r_path: np.ndarray) -> float:
         U, X = self._unpack(z)
-        cost = 0.0
-        for k in range(self.horizon):
-            tracking = X[k] - r_path[k]
-            cost += float(tracking @ self.Q @ tracking)
-            cost += float(U[k] @ self.R @ U[k])
-        return cost
+        tracking = X - r_path
+        q_cost = float(np.sum((tracking @ self.Q) * tracking))
+        r_cost = float(np.sum((U @ self.R) * U))
+        return q_cost + r_cost
 
     def _objective_grad(self, z: np.ndarray, r_path: np.ndarray) -> np.ndarray:
+        """Exact analytic gradient of ``_objective`` wrt independent decision coordinates ``(U, X)``."""
         U, X = self._unpack(z)
-        grad_U = np.zeros_like(U)
-        grad_X = np.zeros_like(X)
-        for k in range(self.horizon):
-            tracking = X[k] - r_path[k]
-            grad_X[k] += 2.0 * (self.Q @ tracking)
-            grad_U[k] += 2.0 * (self.R @ U[k])
-        # Dynamics coupling: x_{k+1} = A x_k + B u_k enters objective via x_{k+1}
-        for k in range(self.horizon - 1):
-            x_next_pred = self.twin.A @ X[k] + self.twin.B @ U[k]
-            tracking_next = x_next_pred - r_path[k + 1]
-            grad_X[k] += 2.0 * (self.twin.A.T @ (self.Q @ tracking_next))
-            grad_U[k] += 2.0 * (self.twin.B.T @ (self.Q @ tracking_next))
+        tracking = X - r_path
+        grad_X = tracking @ (self.Q + self.Q.T)
+        grad_U = U @ (self.R + self.R.T)
         return self._pack(grad_U, grad_X)
 
     # -- constraints -----------------------------------------------------------
-    def _dynamics_constraints(self, z: np.ndarray) -> np.ndarray:
-        """Equality: x_{k+1} - (A x_k + B u_k) = 0 for k = 0..H-2."""
+    def _dynamics_constraints(self, z: np.ndarray, x0: np.ndarray | None = None) -> np.ndarray:
+        """Equality: x_1 = A x_0 + B u_0 and x_{k+1} = A x_k + B u_k for k = 1..H-1."""
         U, X = self._unpack(z)
-        residuals: list[float] = []
-        for k in range(self.horizon - 1):
-            x_next_pred = self.twin.A @ X[k] + self.twin.B @ U[k]
-            residuals.extend((X[k + 1] - x_next_pred).tolist())
-        return np.asarray(residuals, dtype=float)
+        x0_vec = (
+            np.asarray(self.twin.x, dtype=float).ravel()
+            if x0 is None
+            else np.asarray(x0, dtype=float).ravel()
+        )
+        residuals = np.empty((self.horizon, self.n_x), dtype=float)
+        residuals[0] = X[0] - (self.twin.A @ x0_vec + self.twin.B @ U[0])
+        for k in range(1, self.horizon):
+            residuals[k] = X[k] - (self.twin.A @ X[k - 1] + self.twin.B @ U[k])
+        return residuals.ravel()
 
     def solve(
         self,
@@ -180,10 +204,11 @@ class ClosedLoopMPCController:
     ) -> MPCSolveResult:
         """Solve one MPC step from current state ``x0`` over setpoint path ``r_path``.
 
-        Uses constraint softening (slack variables) when hard bounds make the QP
-        infeasible, progressively relaxing bounds as a fallback. Slack variables
-        allow the solver to find a near-feasible solution rather than failing
-        completely when safety bounds are too tight.
+        Enforces hard input bounds ``u_min <= u_k <= u_max`` and attempts hard state
+        safety bounds first. When disturbances drive the plant outside the 1-step
+        reachable safe set, Stage 2 softens state bounds via non-negative slack
+        variables ``x_min - eps <= x_k <= x_max + eps`` with an exact L1 + smooth L2
+        penalty (Scokaert & Rawlings 1999; Kerrigan & Maciejowski 2000).
         """
         n_x, n_u, H = self.n_x, self.n_u, self.horizon
         if r_path is None:
@@ -198,74 +223,56 @@ class ClosedLoopMPCController:
         if x0.shape != (n_x,):
             raise SimulationError(f"x0 must be shape ({n_x},), got {x0.shape}.")
 
-        # Initial guess: hold previous control, steady-state prediction.
-        if warm_start is not None and warm_start.size == H * (n_u + n_x):
-            z0 = warm_start.copy()
+        n_z_base = H * (n_u + n_x)
+        # Dynamically consistent initial guess so equality constraints hold at iteration 0.
+        if warm_start is not None and warm_start.size == n_z_base:
+            U_ws, _ = self._unpack(np.asarray(warm_start, dtype=float).ravel())
+            U0 = np.clip(U_ws, self.u_min, self.u_max)
         else:
-            U0 = np.clip(np.zeros((H, n_u)), self.u_min, self.u_max)
-            X0 = np.tile(x0, (H, 1))
-            z0 = self._pack(U0, X0)
+            U0 = np.clip(np.zeros((H, n_u), dtype=float), self.u_min, self.u_max)
+        X0 = self._rollout_open_loop(x0, U0)
 
-        # Decision vector: z = [U (H*n_u), X (H*n_x), slack_u (H*n_u), slack_x (H*n_x)]
-        slack_size = H * (n_u + n_x)
+        # Stage-2 decision vector: z_s = [U (H*n_u), X (H*n_x), slack_x (H*n_x)]
+        slack_size = H * n_x
+        eff_penalty = max(float(slack_penalty), 1.0)
 
-        def _objective_with_slack(z: np.ndarray, r_path: np.ndarray) -> float:
-            U, X = self._unpack(z[: H * (n_u + n_x)])
-            cost = 0.0
-            for k in range(self.horizon):
-                tracking = X[k] - r_path[k]
-                cost += float(tracking @ self.Q @ tracking)
-                cost += float(U[k] @ self.R @ U[k])
-            # Slack penalty: large weight to discourage slack usage.
-            slack = z[H * (n_u + n_x):]
-            cost += float(slack_penalty * np.sum(slack ** 2))
-            return cost
+        def _objective_with_slack(z: np.ndarray, r_ref: np.ndarray) -> float:
+            base_cost = self._objective(z[:n_z_base], r_ref)
+            slack = z[n_z_base:]
+            return base_cost + float(eff_penalty * (np.sum(slack) + np.sum(slack * slack)))
 
-        def _objective_grad_with_slack(z: np.ndarray, r_path: np.ndarray) -> np.ndarray:
-            grad = np.zeros_like(z)
-            U, X = self._unpack(z[: H * (n_u + n_x)])
-            for k in range(self.horizon):
-                tracking = X[k] - r_path[k]
-                grad_X = 2.0 * (self.Q @ tracking)
-                grad_U = 2.0 * (self.R @ U[k])
-                # Dynamics coupling.
-                for kk in range(self.horizon - 1):
-                    x_next_pred = self.twin.A @ X[kk] + self.twin.B @ U[kk]
-                    tracking_next = x_next_pred - r_path[kk + 1]
-                    grad_X[kk] += 2.0 * (self.twin.A.T @ (self.Q @ tracking_next))
-                    grad_U[kk] += 2.0 * (self.twin.B.T @ (self.Q @ tracking_next))
-            grad[: H * n_u] = np.array([grad_U[k] for k in range(H)]).ravel()
-            grad[H * n_u : H * (n_u + n_x)] = np.array([grad_X[k] for k in range(H)]).ravel()
-            # Slack gradient.
-            grad[H * (n_u + n_x):] = 2.0 * slack_penalty * z[H * (n_u + n_x):]
-            return grad
+        def _objective_grad_with_slack(z: np.ndarray, r_ref: np.ndarray) -> np.ndarray:
+            grad_base = self._objective_grad(z[:n_z_base], r_ref)
+            slack = z[n_z_base:]
+            grad_slack = eff_penalty * (1.0 + 2.0 * slack)
+            return np.concatenate([grad_base, grad_slack])
 
         def _dynamics_constraints_with_slack(z: np.ndarray) -> np.ndarray:
-            U, X = self._unpack(z[: H * (n_u + n_x)])
-            residuals: list[float] = []
-            for k in range(self.horizon - 1):
-                x_next_pred = self.twin.A @ X[k] + self.twin.B @ U[k]
-                residuals.extend((X[k + 1] - x_next_pred).tolist())
-            return np.asarray(residuals, dtype=float)
+            return self._dynamics_constraints(z[:n_z_base], x0)
 
         def _dynamics_jacobian_with_slack(z: np.ndarray) -> np.ndarray:
-            n_x, n_u, H = self.n_x, self.n_u, self.horizon
-            n_dyn = (H - 1) * n_x
-            n_z_base = H * (n_u + n_x)
-            n_z_total = n_z_base + slack_size
-            J = np.zeros((n_dyn, n_z_total), dtype=float)
-            for k in range(H - 1):
-                row = k * n_x
-                J[row : row + n_x, k * n_u : (k + 1) * n_u] = -self.twin.B
-                J[
-                    row : row + n_x,
-                    H * n_u + k * n_x : H * n_u + (k + 1) * n_x,
-                ] = -self.twin.A
-                J[
-                    row : row + n_x,
-                    H * n_u + (k + 1) * n_x : H * n_u + (k + 2) * n_x,
-                ] = np.eye(n_x)
-            return J
+            J_base = self._dynamics_jacobian(z[:n_z_base], x0)
+            return np.hstack([J_base, np.zeros((J_base.shape[0], slack_size), dtype=float)])
+
+        def _build_soft_state_inequalities(
+            x_lo: np.ndarray, x_hi: np.ndarray
+        ) -> tuple[list[tuple[int, int, float, float]], np.ndarray]:
+            """Build linear inequalities c(z_s) >= 0 softening x_lo - s <= X <= x_hi + s."""
+            specs: list[tuple[int, int, float, float]] = []
+            # Each spec: (x_idx, s_idx, x_sign, bound_offset) where x_sign*z[x_idx] + z[s_idx] + bound_offset >= 0
+            for k in range(H):
+                for j in range(n_x):
+                    x_idx = H * n_u + k * n_x + j
+                    s_idx = n_z_base + k * n_x + j
+                    if np.isfinite(x_lo[j]):
+                        specs.append((x_idx, s_idx, 1.0, -float(x_lo[j])))
+                    if np.isfinite(x_hi[j]):
+                        specs.append((x_idx, s_idx, -1.0, float(x_hi[j])))
+            J_ineq = np.zeros((len(specs), n_z_base + slack_size), dtype=float)
+            for row_i, (x_idx, s_idx, x_sign, _offset) in enumerate(specs):
+                J_ineq[row_i, x_idx] = x_sign
+                J_ineq[row_i, s_idx] = 1.0
+            return specs, J_ineq
 
         def _solve_with_bounds(
             u_lo: np.ndarray,
@@ -274,47 +281,63 @@ class ClosedLoopMPCController:
             x_hi: np.ndarray,
             use_slack: bool = False,
         ) -> Any:
+            u_step = np.clip(U0, u_lo, u_hi)
+            x_step = self._rollout_open_loop(x0, u_step)
+            z_init = self._pack(u_step, x_step)
             if use_slack:
-                # Decision vector includes slack variables (bounded >= 0).
-                bds = []
-                for _ in range(H):
-                    bds.extend(list(zip(u_lo, u_hi, strict=False)))
-                for _ in range(H):
-                    bds.extend(list(zip(x_lo, x_hi, strict=False)))
-                for _ in range(slack_size):
-                    bds.append((0.0, None))
-                z0_slack = np.concatenate([z0, np.zeros(slack_size)])
+                bds: list[tuple[float | None, float | None]] = []
+                bds.extend(self._to_scipy_bounds(u_lo, u_hi, H))
+                bds.extend([(None, None)] * (H * n_x))
+                bds.extend([(0.0, None)] * slack_size)
+
+                low_viol = np.where(np.isfinite(x_lo), np.maximum(0.0, x_lo - x_step), 0.0)
+                high_viol = np.where(np.isfinite(x_hi), np.maximum(0.0, x_step - x_hi), 0.0)
+                s_init = np.maximum(low_viol, high_viol).ravel() + 1e-9
+                z0_slack = np.concatenate([z_init, s_init])
+
+                ineq_specs, J_ineq = _build_soft_state_inequalities(x_lo, x_hi)
+                constraints: list[dict[str, Any]] = [
+                    {
+                        "type": "eq",
+                        "fun": _dynamics_constraints_with_slack,
+                        "jac": _dynamics_jacobian_with_slack,
+                    }
+                ]
+                if ineq_specs:
+                    x_indices = np.array([sp[0] for sp in ineq_specs], dtype=int)
+                    s_indices = np.array([sp[1] for sp in ineq_specs], dtype=int)
+                    x_signs = np.array([sp[2] for sp in ineq_specs], dtype=float)
+                    offsets = np.array([sp[3] for sp in ineq_specs], dtype=float)
+                    constraints.append(
+                        {
+                            "type": "ineq",
+                            "fun": lambda z: x_signs * z[x_indices] + z[s_indices] + offsets,
+                            "jac": lambda _z: J_ineq,
+                        }
+                    )
+
                 return minimize(
                     fun=lambda z: _objective_with_slack(z, r_path),
                     x0=z0_slack,
                     jac=lambda z: _objective_grad_with_slack(z, r_path),
                     method="SLSQP",
                     bounds=bds,
-                    constraints=[
-                        {
-                            "type": "eq",
-                            "fun": lambda z: _dynamics_constraints_with_slack(z),
-                            "jac": lambda z: _dynamics_jacobian_with_slack(z),
-                        }
-                    ],
+                    constraints=constraints,
                     options={"maxiter": 300, "ftol": 1e-8, "disp": False},
                 )
-            bds = []
-            for _ in range(H):
-                bds.extend(list(zip(u_lo, u_hi, strict=False)))
-            for _ in range(H):
-                bds.extend(list(zip(x_lo, x_hi, strict=False)))
+
+            bds_hard = self._to_scipy_bounds(u_lo, u_hi, H) + self._to_scipy_bounds(x_lo, x_hi, H)
             return minimize(
                 fun=lambda z: self._objective(z, r_path),
-                x0=z0,
+                x0=z_init,
                 jac=lambda z: self._objective_grad(z, r_path),
                 method="SLSQP",
-                bounds=bds,
+                bounds=bds_hard,
                 constraints=[
                     {
                         "type": "eq",
-                        "fun": lambda z: self._dynamics_constraints(z),
-                        "jac": lambda z: self._dynamics_jacobian(z),
+                        "fun": lambda z: self._dynamics_constraints(z, x0),
+                        "jac": lambda z: self._dynamics_jacobian(z, x0),
                     }
                 ],
                 options={"maxiter": 200, "ftol": 1e-9, "disp": False},
@@ -324,42 +347,82 @@ class ClosedLoopMPCController:
 
         # Stage 1: Try hard constraints without slack.
         result = _solve_with_bounds(self.u_min, self.u_max, self.x_min, self.x_max)
+        U, X = self._unpack(result.x) if getattr(result, "x", None) is not None else (U0, X0)
+        dyn_residual = float(np.max(np.abs(self._dynamics_constraints(self._pack(U, X), x0))))
+        hard_bounds_ok = bool(
+            np.all(U >= self.u_min - 1e-5)
+            and np.all(U <= self.u_max + 1e-5)
+            and np.all(X >= self.x_min - 1e-5)
+            and np.all(X <= self.x_max + 1e-5)
+        )
+        hard_ok = bool(result.success) and dyn_residual <= 1e-5 and hard_bounds_ok
 
-        # Stage 2: If failed, try with slack variables (constraint softening).
+        # Stage 2: If hard bounds are infeasible, soften state safety bounds with slack variables.
         slack_used = 0.0
-        if not result.success:
+        if not hard_ok:
             result_slack = _solve_with_bounds(
                 self.u_min, self.u_max, self.x_min, self.x_max, use_slack=True
             )
             if result_slack.success:
-                # Extract slack from solution.
                 z_slack = result_slack.x
-                slack_vals = z_slack[H * (n_u + n_x):]
-                slack_used = float(np.max(slack_vals)) if slack_vals.size > 0 else 0.0
-                result = result_slack
-                # Rebuild U, X from the slack solution (first part of decision vector).
-                U, X = self._unpack(z_slack[: H * (n_u + n_x)])
-            else:
-                U, X = self._unpack(result.x)
-        else:
-            U, X = self._unpack(result.x)
+                U_s, X_s = self._unpack(z_slack[:n_z_base])
+                u_bounds_ok = bool(
+                    np.all(U_s >= self.u_min - 1e-4) and np.all(U_s <= self.u_max + 1e-4)
+                )
+                if (
+                    u_bounds_ok
+                    and float(np.max(np.abs(self._dynamics_constraints(self._pack(U_s, X_s), x0))))
+                    <= 1e-4
+                ):
+                    U_s = np.clip(U_s, self.u_min, self.u_max)
+                    X_s = self._rollout_open_loop(x0, U_s)
+                    slack_vals = np.maximum(0.0, z_slack[n_z_base:])
+                    slack_used = float(np.max(slack_vals)) if slack_vals.size > 0 else 0.0
+                    result = result_slack
+                    U, X = U_s, X_s
+                    hard_ok = True
 
-        # Stage 3: Bound relaxation fallback (last resort, limited to 1.2x).
+        # Stage 3: Outward bound-expansion fallback (last resort, widens finite intervals up to +20%).
         relax = 1.0
-        while not result.success and relax < 1.2:
-            relax += 0.05
-            u_lo = self.u_min * relax
-            u_hi = self.u_max * relax
-            x_lo = self.x_min * relax
-            x_hi = self.x_max * relax
+        while not hard_ok and relax < 1.2:
+            relax = round(relax + 0.05, 4)
+            margin = relax - 1.0
+            u_lo = np.where(
+                np.isfinite(self.u_min),
+                self.u_min - margin * np.maximum(np.abs(self.u_min), 1.0),
+                -np.inf,
+            )
+            u_hi = np.where(
+                np.isfinite(self.u_max),
+                self.u_max + margin * np.maximum(np.abs(self.u_max), 1.0),
+                np.inf,
+            )
+            x_lo = np.where(
+                np.isfinite(self.x_min),
+                self.x_min - margin * np.maximum(np.abs(self.x_min), 1.0),
+                -np.inf,
+            )
+            x_hi = np.where(
+                np.isfinite(self.x_max),
+                self.x_max + margin * np.maximum(np.abs(self.x_max), 1.0),
+                np.inf,
+            )
             result = _solve_with_bounds(u_lo, u_hi, x_lo, x_hi)
             if result.success:
-                U, X = self._unpack(result.x)
+                U_r, X_r = self._unpack(result.x)
+                if float(np.max(np.abs(self._dynamics_constraints(self._pack(U_r, X_r), x0)))) <= 1e-4:
+                    U, X = U_r, X_r
+                    hard_ok = True
+
+        if not hard_ok:
+            # Guarantee returned trajectory remains physically consistent with applied controls.
+            U = np.clip(U, self.u_min, self.u_max)
+            X = self._rollout_open_loop(x0, U)
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0
 
         violations: list[str] = []
-        if not result.success:
+        if not hard_ok:
             violations.append(f"solver did not converge: {result.message}")
         # Explicit bound check against ORIGINAL (unrelaxed) bounds.
         for k in range(H):
@@ -374,30 +437,35 @@ class ClosedLoopMPCController:
                         f"x[{k}][{j}]={X[k, j]:.6f} outside [{self.x_min[j]}, {self.x_max[j]}]"
                     )
 
+        traj_cost = self._objective(self._pack(U, X), r_path) if hard_ok else float("inf")
         return MPCSolveResult(
             optimal_control=U[0].copy(),
             full_control_sequence=U.copy(),
             state_trajectory=np.vstack([x0.reshape(1, -1), X]),
-            cost=float(result.fun) if result.success else float("inf"),
-            success=bool(result.success),
+            cost=traj_cost,
+            success=hard_ok,
             solver_message=str(result.message),
             constraint_violations=violations,
             solve_time_ms=round(elapsed_ms, 2),
             slack_used=round(slack_used, 6),
         )
 
-    def _dynamics_jacobian(self, z: np.ndarray) -> np.ndarray:
-        """Analytic Jacobian of the dynamics equality constraints."""
+    def _dynamics_jacobian(self, z: np.ndarray, x0: np.ndarray | None = None) -> np.ndarray:
+        """Analytic Jacobian of the initial-state + horizon dynamics equality constraints."""
+        _ = (z, x0)
         n_x, n_u, H = self.n_x, self.n_u, self.horizon
-        n_dyn = (H - 1) * n_x
+        n_dyn = H * n_x
         n_z = H * (n_u + n_x)
         J = np.zeros((n_dyn, n_z), dtype=float)
-        for k in range(H - 1):
+        # k = 0: X[0] - (A x0 + B U[0]) = 0
+        J[0:n_x, 0:n_u] = -self.twin.B
+        J[0:n_x, H * n_u : H * n_u + n_x] = np.eye(n_x)
+        # k = 1..H-1: X[k] - (A X[k-1] + B U[k]) = 0
+        for k in range(1, H):
             row = k * n_x
-            # d/d u_k: -B   | d/d x_k: -A   | d/d x_{k+1}: I
             J[row : row + n_x, k * n_u : (k + 1) * n_u] = -self.twin.B
-            J[row : row + n_x, H * n_u + k * n_x : H * n_u + (k + 1) * n_x] = -self.twin.A
-            J[row : row + n_x, H * n_u + (k + 1) * n_x : H * n_u + (k + 2) * n_x] = np.eye(n_x)
+            J[row : row + n_x, H * n_u + (k - 1) * n_x : H * n_u + k * n_x] = -self.twin.A
+            J[row : row + n_x, H * n_u + k * n_x : H * n_u + (k + 1) * n_x] = np.eye(n_x)
         return J
 
     # -- closed-loop simulation ------------------------------------------------
@@ -472,14 +540,13 @@ class ClosedLoopMPCController:
             state_traj.append(predicted.tolist())
             self.twin.assimilate(meas[t], control=u_applied)
 
-            # Build warm-start for next step: shift control sequence and state trajectory.
-            next_controls = solve_res.full_control_sequence[1:]  # drop u_0, keep u_1..u_{H-1}
-            next_states = solve_res.state_trajectory[1:]  # drop x_0, keep x_1..x_H
-            warm_start = np.concatenate(
-                [next_controls.ravel(), next_states.ravel()]
-            )
-            if warm_start.size != self.horizon * (self.n_u + self.n_x):
-                warm_start = None
+            # Build warm-start for next step: shift control sequence and state trajectory,
+            # padding the terminal control/state so warm_start matches H * (n_u + n_x).
+            u_tail = solve_res.full_control_sequence[-1:]
+            next_controls = np.vstack([solve_res.full_control_sequence[1:], u_tail])
+            x_terminal_next = (self.twin.A @ solve_res.state_trajectory[-1] + self.twin.B @ u_tail[0]).reshape(1, -1)
+            next_states = np.vstack([solve_res.state_trajectory[2:], x_terminal_next])
+            warm_start = self._pack(next_controls, next_states)
 
             # Checkpoint twin state + controller warm-start for session persistence.
             if state is not None and state_key is not None:
@@ -508,6 +575,8 @@ class ClosedLoopMPCController:
             "twin_x": self.twin.x.tolist(),
             "twin_P": self.twin.P.tolist(),
             "horizon": self.horizon,
+            "Q": self.Q.tolist(),
+            "R": self.R.tolist(),
             "warm_start": warm_start.tolist() if warm_start is not None else None,
             "u_min": self.u_min.tolist(),
             "u_max": self.u_max.tolist(),
@@ -528,6 +597,8 @@ class ClosedLoopMPCController:
         ctrl = ClosedLoopMPCController(
             twin,
             horizon=int(payload.get("horizon", 10)),
+            Q=np.asarray(payload["Q"], dtype=float) if payload.get("Q") is not None else None,
+            R=np.asarray(payload["R"], dtype=float) if payload.get("R") is not None else None,
             u_min=np.asarray(payload["u_min"], dtype=float),
             u_max=np.asarray(payload["u_max"], dtype=float),
             x_min=np.asarray(payload["x_min"], dtype=float),
