@@ -182,3 +182,19 @@ Further validation remains for clustered fairness inference, intervention or qua
 - A native arm64 CI run on the merged audit branch built the locked image and verified same-volume registry replacement. The image inventory step required OmniForge dependencies in the host Python environment. The revised generator reads the lock and verifies installed metadata inside the image with networking disabled. Pushes to `ci/**` exercise both platform jobs before integration. [Native arm64 job](https://github.com/hajianamir/OmniForge/actions/runs/45644205053/job/139310643230)
 
 Both native Docker jobs passed the locked build, registry replacement, installed package comparison and SBOM upload after the generator correction. A live Workbench check also exposed an empty Studio 08 champion summary. The route now serializes the report explicitly, and the API regression checks the returned forecast and calibration status. [arm64](https://github.com/hajianamir/OmniForge/actions/runs/45677895058/job/139430244014) · [amd64](https://github.com/hajianamir/OmniForge/actions/runs/45677895058/job/139430244274)
+
+## Multi-origin forecast interval validation
+
+The SDK accepts `interval_evaluation_origins` and defaults to one for existing callers. Studio 08 defaults to three when calibration is enabled. Calibration widths are fixed before the later evaluation windows. The champion is refitted from the history available at each window, and the evaluation outcomes from that window enter history only for later fits. The report includes outcome counts, coverage, and mean interval scores overall, by window, and by lead. Native and calibrated comparisons use the same valid outcome pairs. Missing outcomes, absent native bounds, and failed windows have explicit counts or status. Lower interval scores reward narrower bounds while penalizing misses. [Interval score reference](https://doi.org/10.1198/016214506000001437)
+
+The benchmark used a 95% nominal level, a four-step horizon, 30 calibration windows and 10 later evaluation windows per case. The candidate set used baseline, statistical and machine-learning models. Each row had 40 paired evaluation outcomes. The synthetic shift begins at the first evaluation window. [Statsmodels packaged datasets](https://www.statsmodels.org/stable/datasets/index.html)
+
+| Series | Champion | Native coverage | Calibrated coverage | Native mean interval score | Calibrated mean interval score |
+|---|---|---:|---:|---:|---:|
+| Weekly atmospheric CO₂ | ETS Holt–Winters | 92.5% | 97.5% | 2.551 | 3.011 |
+| Quarterly real GDP | Drift baseline | 80.0% | 85.0% | 1748.647 | 1450.027 |
+| Annual sunspots | Gradient boosting | 100.0% | 97.5% | 218.571 | 166.852 |
+| Seeded seasonal series | Gradient boosting | 100.0% | 97.5% | 14.043 | 10.691 |
+| Seeded seasonal series with a level shift | Gradient boosting | 90.0% | 67.5% | 99.194 | 83.352 |
+
+Calibration improved coverage on CO₂ and GDP, while only CO₂ reached the nominal target from below. On CO₂, the mean interval score worsened as coverage improved. The level shift produced the largest coverage shortfall, even though its calibrated interval score improved. Outcomes can remain dependent across windows, and interval scores use each series' units. Interpret these measurements within each series and date range. Reproduce the report with `python scripts/benchmark_forecast_intervals.py --out forecast-interval-benchmark.json`.

@@ -117,7 +117,9 @@ To verify the installed Python packages in a locally built image against its pla
 
 In Studio 07, choose a **Cluster ID** column when multiple records belong to the same independent unit, such as a customer, device, or site. The automatic option uses the active Split Lock group. The Python equivalent is `FairnessAuditor.audit(..., cluster_ids=...)`. Clustered intervals allow dependence within each unit and assume independence between units. For evaluation on unseen units, use a group-disjoint split.
 
-In Studio 08, **Interval calibration origins** enables rolling calibration for the selected champion. Arrange the source rows in chronological order. At the default 95% level, calibration requires at least 19 usable error observations per lead plus a separate evaluation window and enough earlier history for model selection. Longer horizons consume more history. The result reports observed coverage on the reserved evaluation window. The SDK exposes the same option as `ForecastingEngine.forecast(..., interval_calibration_origins=20)`.
+In Studio 08, **Interval calibration origins** enables rolling calibration for the selected champion. Arrange the source rows in chronological order. Use **Evaluation windows** to choose how many later non-overlapping windows to assess. The report shows coverage and counts by forecast lead. Native and calibrated comparisons use the same observed outcomes with valid bounds for both.
+
+At the default 95% level, calibration requires at least 19 usable error observations per lead. Each evaluation window uses another full forecast horizon, in addition to the history reserved for selection and calibration. Observed coverage describes those dates and can change under drift. The SDK exposes both controls as `ForecastingEngine.forecast(..., interval_calibration_origins=20, interval_evaluation_origins=3)`.
 
 ### 2.4 Reproducible / Hash-Pinned Installs (Production)
 

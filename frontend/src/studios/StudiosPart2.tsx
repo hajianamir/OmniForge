@@ -672,9 +672,12 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
   const [deepArch, setDeepArch] = useState('tft');
   const [horizon, setHorizon] = useState(14);
   const [calibrationOrigins, setCalibrationOrigins] = useState(0);
+  const [evaluationOrigins, setEvaluationOrigins] = useState(3);
   const foreRes = studioCache.s08_forecast ?? null;
   const classical = foreRes?.classical_summary;
   const calibration = classical?.metadata?.champion_interval_calibration;
+  const evaluation = calibration?.evaluation;
+  const percent = (value: number | null | undefined) => value == null ? '—' : `${(100 * value).toFixed(1)}%`;
 
   const [treatCol, setTreatCol] = useState(ws.numeric_columns[0] || '');
   const [outCol, setOutCol] = useState(ws.numeric_columns[1] || ws.numeric_columns[0] || '');
@@ -690,6 +693,7 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
       const res = await apiPost<ForecastResponse>('/api/workbench/s08/forecast', {
         target_col: targetCol || ws.numeric_columns[0] || ws.columns[0],
         horizon, deep_arch: deepArch, epochs: 25, interval_calibration_origins: calibrationOrigins,
+        interval_evaluation_origins: evaluationOrigins,
       });
       onSync(res.state);
       setStudioResult('s08_forecast', res);
@@ -744,6 +748,13 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
                 <option value={40}>40</option>
               </select>
             </label>
+            {calibrationOrigins > 0 && (
+              <label className="field">Evaluation windows
+                <select value={evaluationOrigins} onChange={(e) => setEvaluationOrigins(Number(e.target.value))}>
+                  {[1, 3, 5, 10].map((count) => <option key={count} value={count}>{count}</option>)}
+                </select>
+              </label>
+            )}
             <button className="btn btn-primary" disabled={busy || !ws.has_dataset} onClick={runForecast}>
               {busy ? <span className="spinner" /> : null} Forecast Now
             </button>
@@ -756,8 +767,18 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
                 <div style={{ marginTop: 16 }}>
                   <ForecastFanSVG history={foreRes.history || []} forecast={classical?.forecast || []}
                     title={`${classical?.champion_model || 'Champion'} with calibrated intervals`} />
-                  {calibration.evaluation && (
-                    <p>Observed coverage {(100 * calibration.evaluation.calibrated_coverage).toFixed(1)}% across {calibration.evaluation.observed_outcomes} outcomes at the later evaluation origin.</p>
+                  {evaluation && (
+                    <p>Observed coverage {percent(evaluation.calibrated_coverage)} across {evaluation.observed_outcomes} outcomes in {evaluation.scored_origins ?? 1} of {evaluation.requested_origins ?? 1} evaluation windows.</p>
+                  )}
+                  {evaluation?.by_lead && evaluation.observed_outcomes > 0 && (
+                    <SimpleTable rows={evaluation.by_lead.map((lead) => ({
+                      Lead: lead.lead,
+                      Outcomes: lead.observed_outcomes,
+                      Calibrated: percent(lead.calibrated_coverage),
+                      'Paired outcomes': lead.native_coverage_count,
+                      'Paired calibrated': percent(lead.paired_calibrated_coverage),
+                      'Paired native': percent(lead.native_coverage),
+                    }))} />
                   )}
                 </div>
               )}
