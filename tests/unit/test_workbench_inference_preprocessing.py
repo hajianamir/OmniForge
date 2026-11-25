@@ -210,3 +210,40 @@ def test_real_automl_scores_raw_categorical_and_datetime_records() -> None:
     )
     assert batch.status_code == 200, batch.text
     assert [row["predicted_target"] for row in batch.json()["preview"]] == expected
+
+
+def test_native_automl_respects_chronological_split_lock_and_excluded_date() -> None:
+    n = 80
+    frame = pd.DataFrame({
+        "amount": np.arange(n, dtype=float),
+        "when": pd.date_range("2024-01-01", periods=n, freq="D"),
+        "target": [i % 2 for i in range(n)],
+    })
+    session = f"locked-{uuid.uuid4().hex}"
+    principal = Principal(subject="api_key_principal", roles=["admin"], tenant_id=get_settings().default_tenant_id)
+    state = get_session_state(wb._sid(session, principal))
+    load_new_dataset(state, frame, "test", "test", default_target="target")
+    client = TestClient(create_app(), headers={"X-API-Key": get_api_key(), "X-Session-ID": session})
+    excluded = client.post("/api/workbench/exclusions", json={"excluded_columns": ["when"]})
+    assert excluded.status_code == 200, excluded.text
+    locked = client.post(
+        "/api/workbench/split-lock",
+        json={"strategy": "time_series", "time_col": "when", "gap": 2, "test_size": 0.2, "cv_folds": 2},
+    )
+    assert locked.status_code == 200, locked.text
+    result = client.post(
+        "/api/workbench/s06/automl",
+        json={"target": "target", "backend": "omniforge_native", "time_budget_seconds": 10, "cv_folds": 2},
+    )
+    assert result.status_code == 200, result.text
+    payload = result.json()
+    evaluation = payload["metadata"]["evaluation"]
+    assert evaluation["best_score_partition"] == "test"
+    assert evaluation["leaderboard_partition"] == "validation"
+    train_rows, lock_test, _ = wb.get_active_split_frames(state, frame)
+    assert lock_test is not None
+    held_out = state["uap_active_X_test"]
+    pd.testing.assert_index_equal(held_out.index, train_rows.tail(evaluation["n_test"]).index)
+    assert set(held_out.index).isdisjoint(lock_test.index)
+    assert list(held_out.columns) == ["amount"]
+    assert payload["state"]["excluded_columns"] == ["when"]

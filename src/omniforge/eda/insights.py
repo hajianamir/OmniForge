@@ -114,7 +114,7 @@ class InsightGenerator:
                         evidence={"top_drivers": dict(top_drivers)},
                     )
                 )
-            elif target_series.nunique() <= 20:
+            elif 1 < target_series.nunique() <= 20:
                 vc = target_series.value_counts(normalize=True)
                 minority = float(vc.min())
                 insights.append(

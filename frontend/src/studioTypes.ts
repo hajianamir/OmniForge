@@ -230,8 +230,9 @@ export interface EDAResponse extends StateEnvelope {
 export interface HypothesisSingleResult {
   mode?: string;
   test_name?: string;
-  statistic?: number;
-  p_value?: number;
+  statistic?: number | null;
+  p_value?: number | null;
+  evaluable?: boolean;
   significant?: boolean;
   alpha?: number;
   interpretation?: string;
@@ -243,6 +244,7 @@ export interface HypothesisResponse extends StateEnvelope {
   mode?: string;
   result?: HypothesisSingleResult;
   battery?: JsonRow[];
+  skipped?: JsonRow[];
   total_tests?: number;
   significant_tests?: number;
 }
@@ -308,6 +310,13 @@ export interface AutoMLResponse extends StateEnvelope {
   elapsed_seconds?: number;
   leaderboard?: JsonRow[];
   equation?: EquationPayload | null;
+  metadata?: {
+    evaluation?: {
+      leaderboard_partition?: string;
+      best_score_partition?: string;
+      n_test?: number;
+    };
+  };
 }
 
 export interface NonParametricResponse extends StateEnvelope {

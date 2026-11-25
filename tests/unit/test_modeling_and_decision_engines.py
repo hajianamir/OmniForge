@@ -6,11 +6,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from omniforge.causal.inference import CausalInferenceEngine
 from omniforge.core.types import TaskType
 from omniforge.data.cleaning import DataCleaner
-from omniforge.forecasting.engine import ForecastingEngine
+from omniforge.forecasting.engine import ForecastingEngine, diebold_mariano_test
 from omniforge.models.anomaly.detector import AnomalyDetector
 from omniforge.models.baselines import BaselineBenchmarkSuite
 from omniforge.models.classical import ClassicalMLModel
@@ -138,7 +139,9 @@ def test_forecasting_causal_optimization_simulation_and_specialized(
     coords = np.array([(0.0, 0.0), (1.0, 2.0), (2.0, 1.0), (-1.0, 2.0)])
     dist_mat = np.sqrt(((coords[:, None, :] - coords[None, :, :]) ** 2).sum(axis=-1))
     vrp = opt.solve_vrp_savings(dist_mat, [0, 3, 4, 2], vehicle_capacity=6)
-    assert vrp.optimal is True
+    assert vrp.status == "heuristic_feasible"
+    assert not vrp.optimal
+    assert sorted(customer for route in vrp.solution["routes"] for customer in route[1:-1]) == [1, 2, 3]
 
     # Simulation
     mc_res, _ = MonteCarloSimulator(n_simulations=500).run(
@@ -363,3 +366,55 @@ def test_model_equations_and_future_target_prediction_manual_file_sql(tmp_path) 
     assert len(reloaded) == 10 and "future_yield_out" in reloaded.columns
 
 
+
+
+
+def test_forecast_rolling_cv_predicts_through_embargo(monkeypatch: pytest.MonkeyPatch) -> None:
+    class ExactLinearForecaster:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def fit(self, y):
+            self.last = y[-1]
+
+        def predict(self, horizon):
+            values = self.last + np.arange(1, horizon + 1)
+            return pd.DataFrame({"yhat": values, "yhat_lower": values, "yhat_upper": values})
+
+    monkeypatch.setattr("omniforge.forecasting.engine.StatisticalForecaster", ExactLinearForecaster)
+    monkeypatch.setattr("omniforge.forecasting.engine.MLForecaster", ExactLinearForecaster)
+    values = np.arange(60, dtype=float)
+    values[:2] = np.nan
+    values[-3] = np.nan
+    report = ForecastingEngine(gap=3, include_deep=False, include_foundation=False).forecast(
+        pd.DataFrame({"y": values}), target_col="y", horizon=6,
+    )
+    assert report.metadata["n_history"] == 58
+    assert report.metadata["validation_observed"] == 5
+    assert report.metadata["validation_missing"] == 1
+    assert report.metadata["validation_gap"] == 3
+    assert report.baseline_benchmarks["Baseline_drift"]["rmse"] == 0
+    assert report.champion_model == "Baseline_drift"
+    assert report.forecast["yhat"].tolist() == list(range(60, 66))
+    assert report.leaderboard[0]["rmse"] == 0
+    assert report.metadata["diebold_mariano_vs_runner_up"]["evaluable"] is False
+    scores = report.metadata["rolling_cv_results"]
+    assert scores and all(row["cv_rmse_mean"] == 0 for row in scores)
+
+
+def test_dm_constant_nonzero_loss_difference_has_no_p_value() -> None:
+    result = diebold_mariano_test(np.zeros(8), np.zeros(8), np.ones(8))
+    assert result["evaluable"] is False
+    assert result["p_value"] is None
+    assert result["mean_loss_diff"] == -1
+    assert result["preferred_model"] == "model_1"
+
+
+def test_nonlinear_solver_reports_local_convergence() -> None:
+    def objective(x: np.ndarray) -> float:
+        return float((x[0] ** 2 - 1) ** 2 + 0.4 * x[0])
+
+    result = OptimizationEngine().solve_nonlinear(objective, [1.0])
+    assert result.status == "locally_converged"
+    assert not result.optimal
+    assert result.objective_value > objective(np.array([-1.0]))

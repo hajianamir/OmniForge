@@ -419,8 +419,8 @@ class OptimizationEngine:
 
         return OptimizationResult(
             problem_type="capacitated_vrp",
-            status="heuristic_optimal",
-            optimal=True,
+            status="heuristic_feasible",
+            optimal=False,
             objective_value=round(total_dist, 4),
             solution={"routes": final_routes},
             solver="clarke_wright_savings_2opt",
@@ -441,10 +441,11 @@ class OptimizationEngine:
             raise OptimizationError(f"Nonlinear optimization failed: {res.message}")
         return OptimizationResult(
             problem_type="nonlinear_programming",
-            status=str(res.message),
-            optimal=bool(res.success),
+            status="locally_converged",
+            optimal=False,
             objective_value=round(float(res.fun), 6),
             solution=[round(float(v), 6) for v in res.x],
             solver="scipy_slsqp",
             iterations=int(res.nit),
+            details={"solver_message": str(res.message)},
         )

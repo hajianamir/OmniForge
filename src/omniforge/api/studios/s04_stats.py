@@ -24,11 +24,12 @@ def _wb() -> Any:
 def s04_run_eda(x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
-    df = _wb().get_analysis_dataframe(state, _wb()._require_df(state))
-    targets = _wb().get_selected_targets(state, df)
-    sample_df, was_sampled = smart_sample_df(df, max_rows=25_000, stratify_col=targets[0] if targets else None)
-    eda = AutomatedEDA().run(sample_df, target_column=targets[0] if targets else None, generate_figures=False)
-    state["uap_eda_report"] = eda
+    active_df = _wb()._require_df(state)
+    df = _wb().get_analysis_dataframe(state, active_df).replace([np.inf, -np.inf], np.nan)
+    targets = _wb().get_selected_targets(state, active_df)
+    target = targets[0] if targets else None
+    sample_df, was_sampled = smart_sample_df(df, max_rows=25_000, stratify_col=target)
+    eda = AutomatedEDA().run(sample_df, target_column=target, generate_figures=False)
 
     num_cols = list(sample_df.select_dtypes(include=[np.number]).columns)[:12]
     work_num_df = sample_df[num_cols].copy() if num_cols else pd.DataFrame(index=sample_df.index)
@@ -40,7 +41,7 @@ def s04_run_eda(x_session_id: str | None = Header(default="default")) -> dict[st
             if pd.api.types.is_bool_dtype(ser) or pd.api.types.is_datetime64_any_dtype(ser):
                 continue
             non_na = int(ser.notna().sum())
-            if non_na < 5:
+            if non_na == 0:
                 continue
             coerced = pd.to_numeric(
                 ser.astype("string").str.strip().str.replace(",", "", regex=False),
@@ -56,16 +57,26 @@ def s04_run_eda(x_session_id: str | None = Header(default="default")) -> dict[st
     for c in num_cols[:6]:
         vals = work_num_df[c].dropna().to_numpy(dtype=float)
         vals = vals[np.isfinite(vals)]
-        if len(vals) >= 5:
-            counts, edges = np.histogram(vals, bins=18)
+        if len(vals):
+            lo, hi = float(vals.min()), float(vals.max())
+            if lo == hi:
+                bins = [{"label": f"{lo:.6g}", "count": len(vals)}]
+            else:
+                # Bin a scaled copy to keep very large finite ranges representable.
+                scale = max(abs(lo), abs(hi))
+                counts, edges = np.histogram(vals / scale, bins=min(18, len(vals)))
+                bins = [
+                    {"label": f"{edges[i] * scale:.6g}", "count": int(count)}
+                    for i, count in enumerate(counts)
+                ]
             distributions.append(
                 {
                     "column": str(c),
                     "mean": round(float(np.mean(vals)), 4),
                     "std": round(float(np.std(vals)), 4),
-                    "min": round(float(np.min(vals)), 4),
-                    "max": round(float(np.max(vals)), 4),
-                    "bins": [{"label": f"{edges[i]:.2g}", "count": int(counts[i])} for i in range(len(counts))],
+                    "min": round(lo, 4),
+                    "max": round(hi, 4),
+                    "bins": bins,
                 }
             )
 
@@ -75,7 +86,7 @@ def s04_run_eda(x_session_id: str | None = Header(default="default")) -> dict[st
     for c in cat_candidates:
         ser = sample_df[c].dropna().astype(str).str.strip()
         ser = ser[ser != ""]
-        if len(ser) < 2:
+        if ser.empty:
             continue
         vc = ser.value_counts().head(12)
         if len(vc) == 0:
@@ -101,6 +112,7 @@ def s04_run_eda(x_session_id: str | None = Header(default="default")) -> dict[st
         if df[c].isna().any()
     ][:20]
     insights = [i.model_dump() if hasattr(i, "model_dump") else i for i in getattr(eda, "insights", [])]
+    state["uap_eda_report"] = eda
     _wb().record_lineage(state, "EDA", "Completed Automated EDA", f"Numeric={len(num_cols)} | Sampled={was_sampled}")
     return wb_cache_and_respond(
         state,
@@ -229,7 +241,9 @@ def _run_single_stat_test(
                 continue
         # Rank by Akaike Information Criterion (Akaike 1974) to penalize parameter complexity fairly
         fits.sort(key=lambda r: (float(r["aic"]), float(r["ks_stat"])))
-        best: dict[str, Any] = fits[0] if fits else {"distribution": "Normal", "aic": 0.0, "bic": 0.0, "ks_stat": 0.0, "p_value": 1.0}
+        if not fits:
+            raise HTTPException(status_code=400, detail="None of the candidate distributions could be fitted.")
+        best = fits[0]
         return {
             "test_name": f"Distribution Goodness-of-Fit ({col_a})",
             "statistic": best["ks_stat"],
@@ -313,9 +327,11 @@ def _run_single_stat_test(
             "interpretation": f"Stat={stat:.4f}, p={pval:.4g} ({'significant difference' if pval < alpha else 'no significant difference'}).",
         }
     if col_b and col_b in df.columns:
-        uniq = df[col_b].dropna().unique()[:2]
-        if len(uniq) < 2:
-            raise HTTPException(status_code=400, detail=f"Group column '{col_b}' needs at least 2 distinct values.")
+        if t not in ("welch_t", "mann_whitney"):
+            raise HTTPException(status_code=400, detail="Unknown statistical test.")
+        uniq = df[col_b].dropna().unique()
+        if len(uniq) != 2:
+            raise HTTPException(status_code=400, detail=f"Group column '{col_b}' must have exactly two distinct values.")
         g1 = df.loc[df[col_b] == uniq[0], col_a].dropna()
         g2 = df.loc[df[col_b] == uniq[1], col_a].dropna()
         res = StatisticalAnalyzer.two_sample_test(g1, g2, parametric=(t != "mann_whitney"), alpha=alpha)
@@ -323,67 +339,93 @@ def _run_single_stat_test(
     raise HTTPException(status_code=400, detail="Select both Column A and Column B for two-variable tests.")
 
 
+def _evaluate_stat_test(
+    df: pd.DataFrame, test: str, col_a: str, col_b: str | None, alpha: float
+) -> dict[str, Any]:
+    single_column = test.lower() in {"shapiro", "ks_normality", "anderson", "dagostino", "distribution_fit"}
+    if single_column:
+        values = pd.to_numeric(df[col_a], errors="coerce").dropna()
+        if not values.empty and values.min() == values.max():
+            return {
+                "test_name": test,
+                "statistic": None,
+                "p_value": None,
+                "alpha": alpha,
+                "evaluable": False,
+                "significant": False,
+                "interpretation": "The selected column has no numeric variation.",
+            }
+    elif col_b not in df.columns or col_b == col_a:
+        raise HTTPException(status_code=400, detail="Select two distinct columns included in the current study.")
+    try:
+        result = _run_single_stat_test(df, test, col_a, col_b, alpha)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="The selected data do not meet this test's requirements.") from exc
+    p_value = result.get("p_value")
+    if p_value is None or not np.isfinite(float(p_value)):
+        return {
+            **result,
+            "evaluable": False,
+            "significant": False,
+            "interpretation": (
+                result["interpretation"]
+                if result.get("test_name") == "not_evaluable"
+                else "This test did not produce a finite p-value for the selected data."
+            ),
+        }
+    result["evaluable"] = True
+    result["significant"] = float(p_value) < alpha
+    return result
+
+
 @router.post("/s04/hypothesis")
 def s04_run_hypothesis(req: HypothesisReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
-    df = _wb().get_analysis_dataframe(state, _wb()._require_df(state))
+    df = _wb().get_analysis_dataframe(state, _wb()._require_df(state)).replace([np.inf, -np.inf], np.nan)
     mode = req.mode.lower()
 
     if mode in ("auto", "complete"):
-        num_cols = list(df.select_dtypes(include=[np.number]).columns)[:6]
-        cat_cols = [c for c in df.columns if c not in num_cols and 2 <= df[c].nunique(dropna=True) <= 15][:4]
+        numeric = list(df.select_dtypes(include=[np.number]).columns)
+        num_cols = numeric[:6]
+        cat_cols = [c for c in df.columns if c not in numeric and 2 <= df[c].nunique(dropna=True) <= 15][:4]
         battery: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+
+        def evaluate(test: str, col_a: str, col_b: str | None, scope: str) -> None:
+            entry = {"scope": scope, "test_type": test}
+            try:
+                result = _evaluate_stat_test(df, test, col_a, col_b, req.alpha)
+            except HTTPException as exc:
+                if exc.status_code != 400:
+                    raise
+                skipped.append({**entry, "reason": exc.detail})
+                return
+            if not result["evaluable"]:
+                skipped.append({**entry, "reason": result["interpretation"]})
+                return
+            battery.append({**entry, **{k: v for k, v in result.items() if k != "extra_table"}})
+
         tests_norm = ["shapiro", "dagostino", "anderson", "distribution_fit"] if mode == "complete" else ["shapiro", "distribution_fit"]
         for nc in num_cols[:4]:
             for tt in tests_norm:
-                try:
-                    r = _run_single_stat_test(df, tt, nc, None, req.alpha)
-                    battery.append({"scope": nc, "test_type": tt, **{k: v for k, v in r.items() if k != "extra_table"}})
-                except Exception:
-                    continue
-        if len(num_cols) >= 2:
-            corr_tests = ["pearson", "spearman", "kendall", "ks_2samp"] if mode == "complete" else ["spearman"]
-            for i in range(min(3, len(num_cols))):
-                for j in range(i + 1, min(4, len(num_cols))):
-                    for tt in corr_tests:
-                        try:
-                            r = _run_single_stat_test(df, tt, num_cols[i], num_cols[j], req.alpha)
-                            battery.append({"scope": f"{num_cols[i]} vs {num_cols[j]}", "test_type": tt, **{k: v for k, v in r.items() if k != "extra_table"}})
-                        except Exception:
-                            continue
+                evaluate(tt, nc, None, nc)
+        corr_tests = ["pearson", "spearman", "kendall", "ks_2samp"] if mode == "complete" else ["spearman"]
+        for i, col_a in enumerate(num_cols[:3]):
+            for col_b in num_cols[i + 1 : 4]:
+                for tt in corr_tests:
+                    evaluate(tt, col_a, col_b, f"{col_a} vs {col_b}")
+        grp_tests = ["anova", "kruskal", "levene"] if mode == "complete" else ["kruskal"]
         for nc in num_cols[:3]:
             for cc in cat_cols[:2]:
-                grp_tests = ["anova", "kruskal", "levene"] if mode == "complete" else ["kruskal"]
                 for tt in grp_tests:
-                    try:
-                        r = _run_single_stat_test(df, tt, nc, cc, req.alpha)
-                        battery.append({"scope": f"{nc} by {cc}", "test_type": tt, **{k: v for k, v in r.items() if k != "extra_table"}})
-                    except Exception:
-                        continue
+                    evaluate(tt, nc, cc, f"{nc} by {cc}")
         if len(cat_cols) >= 2:
-            try:
-                r = _run_single_stat_test(df, "chi_square", cat_cols[0], cat_cols[1], req.alpha)
-                battery.append({"scope": f"{cat_cols[0]} x {cat_cols[1]}", "test_type": "chi_square", **{k: v for k, v in r.items() if k != "extra_table"}})
-            except Exception:
-                pass
-        # Benjamini-Hochberg FDR correction across the entire hypothesis battery
-        m_tests = len(battery)
-        if m_tests > 0:
-            indexed_p = sorted(
-                ((i, float(r.get("p_value", 1.0) or 1.0)) for i, r in enumerate(battery)),
-                key=lambda x: x[1],
-            )
-            bh_adj = [1.0] * m_tests
-            running_min = 1.0
-            for rank_rev in range(m_tests - 1, -1, -1):
-                orig_idx, p_val = indexed_p[rank_rev]
-                adj = min(running_min, (p_val * m_tests) / (rank_rev + 1))
-                running_min = adj
-                bh_adj[orig_idx] = min(1.0, max(0.0, adj))
-            for i, r in enumerate(battery):
-                r["p_value_fdr"] = round(bh_adj[i], 6)
-                r["significant_fdr"] = bool(bh_adj[i] < req.alpha)
+            evaluate("chi_square", cat_cols[0], cat_cols[1], f"{cat_cols[0]} x {cat_cols[1]}")
+        adjusted = StatisticalAnalyzer.adjust_p_values([float(row["p_value"]) for row in battery])
+        for row, p_adj in zip(battery, adjusted, strict=True):
+            row["p_value_fdr"] = p_adj
+            row["significant_fdr"] = p_adj < req.alpha
         state["uap_hypothesis_battery"] = battery
         return wb_cache_and_respond(
             state,
@@ -394,13 +436,14 @@ def s04_run_hypothesis(req: HypothesisReq, x_session_id: str | None = Header(def
                 "total_tests": len(battery),
                 "significant_tests": sum(1 for r in battery if r.get("significant")),
                 "battery": battery,
+                "skipped": skipped,
                 "result": battery[0] if battery else None,
             },
         )
 
     if not req.col_a or req.col_a not in df.columns:
-        raise HTTPException(status_code=400, detail=f"Column '{req.col_a}' not found.")
-    result = _run_single_stat_test(df, req.test_type, req.col_a, req.col_b, req.alpha)
+        raise HTTPException(status_code=400, detail="Select a Column A included in the current study.")
+    result = _evaluate_stat_test(df, req.test_type, req.col_a, req.col_b, req.alpha)
     return wb_cache_and_respond(state, sid, "s04_hypothesis", {"mode": "custom", "result": result})
 
 

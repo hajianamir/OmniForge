@@ -28,7 +28,7 @@ import { ProvenancePill, type StudioProps } from './StudiosPart1';
 export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCache, setStudioResult, openHelp }) => {
   const [tab, setTab] = useState<'automl' | 'nonparametric' | 'deep' | 'predict'>('automl');
   const [backends, setBackends] = useState<BackendInfo[]>([]);
-  const [selectedBackend, setSelectedBackend] = useState('native_stacking');
+  const [selectedBackend, setSelectedBackend] = useState('omniforge_native');
   const [budget, setBudget] = useState(25);
   const [cvFolds, setCvFolds] = useState(3);
   const automlRes = studioCache.s06_automl ?? null;
@@ -205,10 +205,13 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
               {automlRes.fallback_reason && <div className="alert alert-warn">{automlRes.fallback_reason}</div>}
               <div className="kpi-grid">
                 <div className="kpi-card"><div className="kpi-label">Best Model</div><div className="kpi-value" style={{ fontSize: 16 }}>{automlRes.best_model_name}</div></div>
-                <div className="kpi-card"><div className="kpi-label">{automlRes.primary_metric}</div><div className="kpi-value">{Number(automlRes.best_score).toFixed(4)}</div></div>
+                <div className="kpi-card"><div className="kpi-label">{automlRes.metadata?.evaluation?.best_score_partition === 'test' ? 'Test ' : ''}{automlRes.primary_metric}</div><div className="kpi-value">{Number(automlRes.best_score).toFixed(4)}</div></div>
                 <div className="kpi-card"><div className="kpi-label">Strong Baseline</div><div className="kpi-value">{Number(automlRes.baseline_score).toFixed(4)}</div></div>
                 <div className="kpi-card"><div className="kpi-label">Runtime</div><div className="kpi-value">{automlRes.elapsed_seconds}s</div></div>
               </div>
+              {automlRes.metadata?.evaluation?.best_score_partition === 'test' && (
+                <p>The champion and baseline scores use {automlRes.metadata.evaluation.n_test} held-out rows. The leaderboard shows validation scores used during selection.</p>
+              )}
               {(automlRes.leaderboard?.length ?? 0) > 0 && (
                 <div style={{ marginBottom: 14 }}>
                   <BarChartSVG
@@ -219,7 +222,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
                       const rawVal = Number(row[metricKey] ?? row.score ?? row.cv_score ?? row.primary_score ?? NaN);
                       const label = String(row.model ?? row.model_name ?? `Model ${idx + 1}`);
                       return Number.isFinite(rawVal)
-                        ? [{ label, value: rawVal, color: idx === 0 ? '#34d399' : String(row.family || '').toLowerCase().includes('baseline') ? '#a78bfa' : '#38bdf8' }]
+                        ? [{ label, value: rawVal, color: label === automlRes.best_model_name ? '#34d399' : String(row.family || '').toLowerCase().includes('baseline') ? '#a78bfa' : '#38bdf8' }]
                         : [];
                     })}
                   />
@@ -239,10 +242,12 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
                       primary_score: automlRes.best_score,
                       naive_floor_score: automlRes.baseline_score,
                       lift_over_naive: automlRes.lift_over_baseline,
-                      selection_criterion: `Max CV ${automlRes.primary_metric ?? ''} + Positive Lift over Strong Baseline (${Number(automlRes.baseline_score).toFixed(4)})`,
+                      selection_criterion: automlRes.metadata?.evaluation?.leaderboard_partition === 'validation'
+                        ? `Selected by validation ${automlRes.primary_metric ?? 'score'}`
+                        : 'Selected by the active AutoML backend',
                       acceptance_status: Number(automlRes.lift_over_baseline ?? 0) >= 0 ? 'ACCEPTED — AUTOML CHAMPION' : 'ACCEPTED — BEST AVAILABLE',
                       acceptance_reasons: [
-                        `Ranked #1 across ${(automlRes.leaderboard || []).length} candidate pipelines in ${automlRes.elapsed_seconds}s using ${automlRes.backend_used}.`,
+                        `Selected by ${automlRes.backend_used} in ${automlRes.elapsed_seconds}s.`,
                         `Achieved ${automlRes.primary_metric ?? ''}=${Number(automlRes.best_score).toFixed(4)} vs strong baseline ${Number(automlRes.baseline_score).toFixed(4)} (lift ${Number(automlRes.lift_over_baseline ?? 0) >= 0 ? '+' : ''}${Number(automlRes.lift_over_baseline ?? 0).toFixed(4)}).`,
                       ],
                     }}
