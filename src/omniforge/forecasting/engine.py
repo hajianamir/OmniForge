@@ -154,6 +154,40 @@ def diebold_mariano_test(
     }
 
 
+def _interval_scores(
+    observed: np.ndarray, lower: np.ndarray, upper: np.ndarray, alpha: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return per-outcome coverage indicators and interval scores with missing values preserved."""
+    usable = np.isfinite(observed) & np.isfinite(lower) & np.isfinite(upper) & (lower <= upper)
+    hits = np.full(observed.shape, np.nan)
+    scores = np.full_like(hits, np.nan)
+    actual, lo, hi = observed[usable], lower[usable], upper[usable]
+    hits[usable] = (lo <= actual) & (actual <= hi)
+    miss = np.maximum(0.0, lo - actual) + np.maximum(0.0, actual - hi)
+    scores[usable] = hi - lo + 2 / alpha * miss
+    return hits, scores
+
+
+def _summarize_interval_scores(
+    calibrated_hits: np.ndarray, calibrated_scores: np.ndarray, native_hits: np.ndarray, native_scores: np.ndarray,
+) -> dict[str, Any]:
+    """Report point-weighted estimates and compare both procedures on identical outcomes."""
+    usable = np.isfinite(calibrated_hits)
+    paired = usable & np.isfinite(native_hits)
+    n_observed = int(usable.sum())
+    n_paired = int(paired.sum())
+    return {
+        "observed_outcomes": n_observed,
+        "calibrated_coverage": float(calibrated_hits[usable].mean()) if n_observed else None,
+        "calibrated_mean_interval_score": float(calibrated_scores[usable].mean()) if n_observed else None,
+        "native_coverage_count": n_paired,
+        "native_coverage": float(native_hits[paired].mean()) if n_paired else None,
+        "native_mean_interval_score": float(native_scores[paired].mean()) if n_paired else None,
+        "paired_calibrated_coverage": float(calibrated_hits[paired].mean()) if n_paired else None,
+        "paired_calibrated_mean_interval_score": float(calibrated_scores[paired].mean()) if n_paired else None,
+    }
+
+
 @dataclass
 class ForecastingReport:
     """Complete result from running :class:`ForecastingEngine`."""
@@ -199,6 +233,7 @@ class ForecastingEngine:
         horizon: int = 14,
         validation_horizon: int | None = None,
         interval_calibration_origins: int = 0,
+        interval_evaluation_origins: int = 1,
     ) -> ForecastingReport:
         """Run causal split, baseline benchmarks, TimeSeriesSplit rolling CV, model tournament, and future forecasts."""
         if target_col not in df.columns:
@@ -215,14 +250,17 @@ class ForecastingEngine:
             raise ForecastingError("Forecast and validation horizons must be positive.")
         if not 0 <= interval_calibration_origins <= 40:
             raise ForecastingError("Choose between zero and 40 interval calibration origins.")
+        if interval_evaluation_origins < 1:
+            raise ForecastingError("Choose at least one interval evaluation origin.")
         if not 0 < self.confidence_level < 1:
             raise ForecastingError("The interval level must lie strictly between zero and one.")
 
-        reserve = (interval_calibration_origins + 1) * horizon + 2 * self.gap
+        reserve = (interval_calibration_origins + interval_evaluation_origins) * horizon + 2 * self.gap
         min_selection = max(20, (validation_horizon or 0) + self.gap + 2)
         calibration: dict[str, Any] = {
             "status": "disabled",
             "requested_origins": interval_calibration_origins,
+            "requested_evaluation_origins": interval_evaluation_origins,
             "nominal_level": self.confidence_level,
         }
         calibration_start = None
@@ -382,7 +420,8 @@ class ForecastingEngine:
             widths = None
             if calibration_start is not None:
                 widths, evidence = self._calibrate_intervals(
-                    all_history, champion_name, fitted_builders, calibration_start, interval_calibration_origins, horizon
+                    all_history, champion_name, fitted_builders, calibration_start,
+                    interval_calibration_origins, interval_evaluation_origins, horizon,
                 )
                 calibration.update(evidence)
 
@@ -478,22 +517,27 @@ class ForecastingEngine:
         )
 
     def _calibrate_intervals(
-        self, history: pd.Series, champion: str, builders: dict[str, Any], start: int, origins: int, horizon: int,
+        self, history: pd.Series, champion: str, builders: dict[str, Any], start: int,
+        origins: int, evaluation_origins: int, horizon: int,
     ) -> tuple[np.ndarray | None, dict[str, Any]]:
-        """Calibrate lead-specific errors and score the intervals at one later origin."""
+        """Freeze lead-specific widths before evaluating later non-overlapping windows."""
+        evaluation_start = len(history) - evaluation_origins * horizon
         evidence: dict[str, Any] = {
             "status": "calibration_unavailable",
             "method": "rolling_origin_absolute_error_order_statistic",
             "calibration_start_position": start,
             "calibration_end_position": start + origins * horizon,
-            "evaluation_start_position": len(history) - horizon,
+            "evaluation_start_position": evaluation_start,
             "evaluation": None,
         }
 
         def observed_forecast(origin: int) -> tuple[np.ndarray, pd.DataFrame]:
             train, observed = _causal_impute_split(history.iloc[:origin], history.iloc[origin: origin + horizon])
             assert observed is not None
-            return observed, self._refit_and_predict(champion, builders, train, horizon)
+            forecast = self._refit_and_predict(champion, builders, train, horizon)
+            if len(forecast) != horizon:
+                raise ForecastingError("The champion did not return all requested forecast leads.")
+            return observed, forecast
 
         scores = np.full((origins, horizon), np.nan)
         for i in range(origins):
@@ -510,30 +554,47 @@ class ForecastingEngine:
         widths = np.array([split_conformal_quantile(col, 1 - self.confidence_level)[0] for col in scores.T])
         evidence["status"] = "applied"
         evidence["half_width_by_lead"] = widths.tolist()
-        try:
-            observed, forecast = observed_forecast(len(history) - horizon)
-            point = forecast["yhat"].to_numpy(dtype=float)
-            usable = np.isfinite(observed) & np.isfinite(point)
-            if usable.any():
-                absolute_error = np.abs(observed[usable] - point[usable])
-                half_width = widths[usable]
-                interval_score = 2 * half_width + 2 / (1 - self.confidence_level) * np.maximum(0, absolute_error - half_width)
-                evaluation: dict[str, Any] = {
-                    "observed_outcomes": int(usable.sum()),
-                    "calibrated_coverage": float(np.mean(absolute_error <= half_width)),
-                    "calibrated_mean_interval_score": float(interval_score.mean()),
-                }
+        calibrated_hits = np.full((evaluation_origins, horizon), np.nan)
+        calibrated_scores = np.full_like(calibrated_hits, np.nan)
+        native_hits = np.full_like(calibrated_hits, np.nan)
+        native_scores = np.full_like(calibrated_hits, np.nan)
+        alpha = 1 - self.confidence_level
+        by_origin: list[dict[str, Any]] = []
+        for i in range(evaluation_origins):
+            position = evaluation_start + i * horizon
+            try:
+                observed, forecast = observed_forecast(position)
+                point = forecast["yhat"].to_numpy(dtype=float)
+                calibrated_hits[i], calibrated_scores[i] = _interval_scores(observed, point - widths, point + widths, alpha)
                 if {"yhat_lower", "yhat_upper"} <= set(forecast.columns):
-                    native = _forecast_metrics(
-                        observed[usable], point[usable],
-                        forecast["yhat_lower"].to_numpy(dtype=float)[usable],
-                        forecast["yhat_upper"].to_numpy(dtype=float)[usable],
+                    lower = pd.to_numeric(forecast["yhat_lower"], errors="coerce").to_numpy(dtype=float, na_value=np.nan)
+                    upper = pd.to_numeric(forecast["yhat_upper"], errors="coerce").to_numpy(dtype=float, na_value=np.nan)
+                    native_hits[i], native_scores[i] = _interval_scores(
+                        observed, lower, upper, alpha,
                     )
-                    evaluation["native_coverage"] = native.get("interval_coverage")
-                    evaluation["native_coverage_count"] = native.get("interval_coverage_n", 0)
-                evidence["evaluation"] = evaluation
-        except Exception as exc:
-            logger.warning("interval_calibration_evaluation_failed", error_type=type(exc).__name__)
+                status = "scored" if np.isfinite(calibrated_hits[i]).any() else "no_evaluable_outcomes"
+            except Exception as exc:
+                status = "forecast_unavailable"
+                calibrated_hits[i] = calibrated_scores[i] = native_hits[i] = native_scores[i] = np.nan
+                logger.warning("interval_calibration_evaluation_failed", error_type=type(exc).__name__)
+            by_origin.append({
+                "start_position": position,
+                "status": status,
+                **_summarize_interval_scores(calibrated_hits[i], calibrated_scores[i], native_hits[i], native_scores[i]),
+            })
+        evidence["evaluation"] = {
+            "requested_origins": evaluation_origins,
+            "scored_origins": sum(row["status"] == "scored" for row in by_origin),
+            **_summarize_interval_scores(calibrated_hits, calibrated_scores, native_hits, native_scores),
+            "by_origin": by_origin,
+            "by_lead": [
+                {
+                    "lead": i + 1,
+                    **_summarize_interval_scores(calibrated_hits[:, i], calibrated_scores[:, i], native_hits[:, i], native_scores[:, i]),
+                }
+                for i in range(horizon)
+            ],
+        }
         return widths, evidence
 
     def _patch_forecaster(self) -> FoundationForecaster:

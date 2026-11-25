@@ -418,7 +418,23 @@ export interface ForecastResponse extends StateEnvelope {
       champion_interval_calibration?: {
         status: string;
         nominal_level: number;
-        evaluation?: { observed_outcomes: number; calibrated_coverage: number } | null;
+        evaluation?: {
+          observed_outcomes: number;
+          calibrated_coverage: number | null;
+          scored_origins?: number;
+          requested_origins?: number;
+          native_coverage_count?: number;
+          native_coverage?: number | null;
+          paired_calibrated_coverage?: number | null;
+          by_lead?: Array<{
+            lead: number;
+            observed_outcomes: number;
+            calibrated_coverage: number | null;
+            native_coverage: number | null;
+            native_coverage_count: number;
+            paired_calibrated_coverage: number | null;
+          }>;
+        } | null;
       };
     };
   } | null;

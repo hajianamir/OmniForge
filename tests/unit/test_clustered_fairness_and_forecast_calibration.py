@@ -100,3 +100,49 @@ def test_short_series_keeps_nominal_bounds_when_calibration_is_requested(monkeyp
     requested = engine.forecast(history, target_col="y", horizon=4, interval_calibration_origins=20)
     pd.testing.assert_frame_equal(default.forecast, requested.forecast)
     assert requested.metadata["champion_interval_calibration"]["status"] == "insufficient_history_or_origins"
+
+
+def test_multiple_evaluation_origins_keep_frozen_widths_and_pair_comparisons(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("omniforge.forecasting.engine.StatisticalForecaster", _LinearForecaster)
+    monkeypatch.setattr("omniforge.forecasting.engine.MLForecaster", _LinearForecaster)
+    engine = ForecastingEngine(confidence_level=0.9, gap=2, include_deep=False, include_foundation=False, n_cv_splits=0)
+    fit_history = []
+
+    def predict(name, builders, train: np.ndarray, horizon: int) -> pd.DataFrame:
+        if name == "Baseline_drift":
+            fit_history.append((len(train), train[-1]))
+            if len(train) == 104:
+                raise ValueError("unavailable evaluation fold")
+        point = np.arange(len(train), len(train) + horizon, dtype=float)
+        upper = point + 1
+        if len(train) == 107:
+            upper = upper.astype(object)
+            upper[1] = "unavailable"
+        return pd.DataFrame({"step": np.arange(1, horizon + 1), "yhat": point, "yhat_lower": point - 1, "yhat_upper": upper})
+
+    monkeypatch.setattr(engine, "_refit_and_predict", predict)
+    values = np.arange(110, dtype=float)
+    values[[102, 107, 108]] += [2, 0.5, 2]
+    values[103] = np.nan
+    result = engine.forecast(
+        pd.DataFrame({"y": values}), target_col="y", horizon=3,
+        interval_calibration_origins=9, interval_evaluation_origins=3,
+    )
+    facts = result.metadata["champion_interval_calibration"]
+    assert result.champion_model == "Baseline_drift" and result.leaderboard[0]["rmse"] == 0
+    assert facts["selection_end_position"] == 70
+    assert facts["calibration_end_position"] == 99
+    assert facts["half_width_by_lead"] == [0, 0, 0]
+    evaluation = facts["evaluation"]
+    assert [(row["start_position"], row["status"]) for row in evaluation["by_origin"]] == [
+        (101, "scored"), (104, "forecast_unavailable"), (107, "scored"),
+    ]
+    assert fit_history[-4:] == [(101, 100), (104, 104), (107, 106), (110, 109)]
+    assert evaluation["scored_origins"] == 2
+    assert evaluation["observed_outcomes"] == 5 and evaluation["native_coverage_count"] == 4
+    assert evaluation["calibrated_coverage"] == pytest.approx(0.4)
+    assert evaluation["paired_calibrated_coverage"] == pytest.approx(0.5)
+    assert evaluation["native_coverage"] == pytest.approx(0.75)
+    assert evaluation["calibrated_mean_interval_score"] == pytest.approx(18)
+    assert evaluation["native_mean_interval_score"] == pytest.approx(7)
+    assert [row["observed_outcomes"] for row in evaluation["by_lead"]] == [2, 2, 1]

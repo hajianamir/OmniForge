@@ -200,6 +200,7 @@ class ForecastReq(BaseModel):
     deep_arch: str = "nbeats"  # nbeats | patchtst | tft | lstm
     epochs: int = Field(default=30, ge=5, le=120)
     interval_calibration_origins: int = Field(default=0, ge=0, le=40)
+    interval_evaluation_origins: int = Field(default=1, ge=1, le=12)
 
 
 class CausalReq(BaseModel):
