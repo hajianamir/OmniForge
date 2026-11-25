@@ -577,7 +577,7 @@ def set_theme(payload: dict[str, str], x_session_id: str | None = Header(default
     return {"theme": state["uap_theme"]}
 
 
-@router.post("/targets")
+@router.post("/targets", dependencies=[Depends(require_permission("data:write"))])
 def update_targets(req: TargetsReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _sid(x_session_id)
     state = get_session_state(sid)
@@ -586,7 +586,7 @@ def update_targets(req: TargetsReq, x_session_id: str | None = Header(default="d
     return {"targets": valid, "state": _state_summary(state, sid)}
 
 
-@router.post("/exclusions")
+@router.post("/exclusions", dependencies=[Depends(require_permission("data:write"))])
 def update_exclusions(req: ExclusionsReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _sid(x_session_id)
     state = get_session_state(sid)
@@ -597,7 +597,7 @@ def update_exclusions(req: ExclusionsReq, x_session_id: str | None = Header(defa
     return {"excluded_columns": updated, "state": _state_summary(state, sid)}
 
 
-@router.post("/split-lock")
+@router.post("/split-lock", dependencies=[Depends(require_permission("data:write"))])
 def apply_split_lock(req: SplitLockReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _sid(x_session_id)
     state = get_session_state(sid)
@@ -616,7 +616,7 @@ def apply_split_lock(req: SplitLockReq, x_session_id: str | None = Header(defaul
     return to_json_object({"split_lock": lock, "state": _state_summary(state, sid)})
 
 
-@router.delete("/split-lock")
+@router.delete("/split-lock", dependencies=[Depends(require_permission("data:write"))])
 def unlock_split(x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _sid(x_session_id)
     state = get_session_state(sid)
@@ -624,7 +624,7 @@ def unlock_split(x_session_id: str | None = Header(default="default")) -> dict[s
     return {"state": _state_summary(state, sid)}
 
 
-@router.post("/workspace/clear")
+@router.post("/workspace/clear", dependencies=[Depends(require_permission("data:write"))])
 def reset_workspace(x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _sid(x_session_id)
     state = get_session_state(sid)
@@ -720,7 +720,7 @@ def s01_catalog() -> dict[str, Any]:
     return to_json_object({"benchmarks": benchmarks, "domains": domains})
 
 
-@router.delete("/dataset")
+@router.delete("/dataset", dependencies=[Depends(require_permission("data:write"))])
 def delete_active_dataset(x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     """Clear the active dataset and reset session workspace state."""
     sid = _sid(x_session_id)
@@ -1532,7 +1532,7 @@ def s02_run_clustering(req: ClusterReq, x_session_id: str | None = Header(defaul
     )
 
 
-@router.post("/s02/clustering/commit")
+@router.post("/s02/clustering/commit", dependencies=[Depends(require_permission("data:write"))])
 def s02_commit_clustering(req: ClusterCommitReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _sid(x_session_id)
     state = get_session_state(sid)
@@ -1760,7 +1760,7 @@ def s02_run_anomaly(req: AnomalyReq, x_session_id: str | None = Header(default="
     )
 
 
-@router.post("/s02/anomaly/commit")
+@router.post("/s02/anomaly/commit", dependencies=[Depends(require_permission("data:write"))])
 def s02_commit_anomaly(req: AnomalyCommitReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _sid(x_session_id)
     state = get_session_state(sid)

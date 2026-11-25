@@ -116,8 +116,10 @@ Blind rotation or deleting development keys can make data inaccessible.
   `OMNIFORGE_COPILOT_INGEST_ROOT` (default current directory), rejects
   traversal/dotfiles, and allows HTTP(S) through the ingestion path. Test
   symlinks, redirects and tenant boundaries when modifying this code.
-- `DataFramePIIGuard` and `PIIRedactor` use patterns/heuristics, not exhaustive
-  PII detection. The guard's `block` and `pseudonymize` policies apply to
+- `DataFramePIIGuard` and `PIIRedactor` screen for patterns and column indicators.
+  `PIIRedactor.scan_dataframe_report` gives row coverage and can inspect all
+  rows when requested. `ComplianceValidator` reports missing evidence,
+  unsupported profiles, and the outcome of limited checks. The guard's `block` and `pseudonymize` policies apply to
   recognized cells when invoked; `off` leaves data unchanged, but the guard
   still resolves a salt on construction. Pseudonyms include the tenant ID;
   `resolve_pseudonym_salt` can use per-tenant salts or a global fallback. Its

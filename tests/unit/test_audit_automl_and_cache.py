@@ -191,3 +191,22 @@ def test_supplied_holdout_labels_do_not_change_automl_selection() -> None:
     np.testing.assert_array_equal(correct.best_model.predict(X_test), flipped.best_model.predict(X_test))
     assert correct.best_score != flipped.best_score
     assert correct.metadata["evaluation"]["test_partition_source"] == "supplied_holdout"
+
+
+def test_specialized_automl_scores_external_holdout_with_matching_baseline() -> None:
+    from omniforge.automl.backends import AutoMLBackendHub
+
+    rng = np.random.default_rng(17)
+    data = pd.DataFrame({"x": rng.normal(size=60)})
+    data["label"] = (data["x"] > 0).astype(int)
+    X_test = pd.DataFrame({"x": [-4.0, -2.0, 2.0, 4.0]}, index=[100, 101, 102, 103])
+    y_test = pd.Series([0, 0, 1, 1], index=X_test.index)
+    result = AutoMLBackendHub.run(data, "label", backend="meta_bayesian", cv_folds=2, holdout=(X_test, y_test))
+    evaluation = result.extra["evaluation"]
+    assert evaluation["best_score_partition"] == "test"
+    assert evaluation["n_train"] + evaluation["n_validation"] == len(data)
+    assert evaluation["n_test"] == len(X_test)
+    expected = f1_score(y_test, result.best_model.predict(X_test), average="macro")
+    assert result.best_score == round(expected, 6)
+    strongest = max(metrics["f1_macro"] for metrics in result.baseline_benchmarks.values())
+    assert result.lift_over_best_baseline == pytest.approx(expected - strongest, abs=1e-6)

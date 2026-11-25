@@ -275,7 +275,6 @@ urlsafe-b64(`b"OF2GCM\x01"` + nonce + ciphertext). Legacy Fernet tokens (`gAAAAA
 `OMNIFORGE_ARTIFACT_SIGNING_KEY`, `OMNIFORGE_SECURITY__ARTIFACT_SIGNING_KEY`, with `OMNIFORGE_JWT_SECRET_KEY` as fallback. Contexts: `omniforge:model:v1`, `omniforge:workspace:v2`, `omniforge-audit-event-v2`, `omniforge-audit-checkpoint-v1`.
 - **`safe_joblib_load_bytes`:** restricted `NumpyUnpickler` subclass. Enforces a module allow-list plus a 
 denylist of root modules, submodules and symbol names. Call it **after** HMAC verification.
- - [!] The allow-list contains the test module name `test_third_party_claims` **[V]**.
  - [!] It imports the private joblib names `NumpyUnpickler` and `_validate_fileobject_and_memmap`, 
 which can break on a joblib upgrade.
  - [!] `torch` is allow-listed broadly, apart from a few submodules.
@@ -288,8 +287,7 @@ Aborts with the internal `_PayloadTooLarge(BaseException)`, deliberately derivin
 - **`SlidingWindowRateLimitMiddleware`:** keyed by the ASGI client host, **not** `X-Forwarded-For`. 
 Returns 429 + `Retry-After`. Exempts `/health` and `/api/v1/health` only. A value of 0 disables it.
 - **`AuditLogger` (`core/security.py:1506`) [V]:** hash-chained, HMAC-signed JSONL audit trail. `__init__` caches `_last_hash` via `_load_last_hash()` and `_record_count` via `_count_records()`; `log_event()` builds the next event from the cached `self._last_hash` and appends without re-reading the tail and without a lock. The chain-fork defect (D1) is therefore **confirmed**: concurrent writers (e.g. a fresh `AuditLogger` per event in `mlops/registry.py` / `mlops/continuous_training.py` alongside the long-lived instance in `api/auth.py`) can fork the chain. Fix by re-reading the tail under a lock (plus an inter-process file lock) on every append. The prior draft's "could not locate" note was a search miss and is superseded.
-- **`ComplianceValidator(profiles=["GDPR","SOX"])`:** `evaluate_dataset(df, *, strict, 
-has_consent_record, encryption_enabled)` returns `compliant`, `violations`, `warnings`, `pii_columns_detected`. Implements GDPR Art. 6/5, HIPAA safe-harbour + encryption, SOX empty-dataset warning. The EU AI Act appears in the docstring only.
+- **`ComplianceValidator`** screens a limited set of GDPR, HIPAA and SOX indicators. It reports unsupported profiles, missing evidence, PII scan coverage and an assessment status. Strict mode requires the implemented checks to pass with sufficient evidence. A passed screen leaves the legal compliance conclusion unknown.
 ### 6.7 `carbon.py` **[V]**
 - CPU power = `TDP*(0.15 + 0.85*util)`. RAM power = `max(0.2, rss_gb*0.3725)`. GPU power = `0.6*TDP` 
 when CUDA is available.

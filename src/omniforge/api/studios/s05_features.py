@@ -6,9 +6,11 @@ from typing import Any, cast
 
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 
+from omniforge.api.auth import authorize_principal, require_permission
 from omniforge.api.studios.schemas import FeatureEngReq, FeatureSelReq, wb_cache_and_respond
+from omniforge.core.types import Principal
 from omniforge.features import FeatureConfig, FeatureEngineeringPipeline, FeatureSelector
 
 router = APIRouter(tags=["workbench-s05"])
@@ -20,7 +22,13 @@ def _wb() -> Any:
 
 
 @router.post("/s05/engineer")
-def s05_engineer_features(req: FeatureEngReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
+def s05_engineer_features(
+    req: FeatureEngReq,
+    x_session_id: str | None = Header(default="default"),
+    principal: Principal = Depends(require_permission("data:read")),
+) -> dict[str, Any]:
+    if req.commit:
+        authorize_principal(principal, "data:write")
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
     df = _wb()._require_df(state)
@@ -100,7 +108,13 @@ def s05_engineer_features(req: FeatureEngReq, x_session_id: str | None = Header(
 
 
 @router.post("/s05/select")
-def s05_select_features(req: FeatureSelReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
+def s05_select_features(
+    req: FeatureSelReq,
+    x_session_id: str | None = Header(default="default"),
+    principal: Principal = Depends(require_permission("data:read")),
+) -> dict[str, Any]:
+    if req.commit:
+        authorize_principal(principal, "data:write")
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
     df = _wb().get_analysis_dataframe(state, _wb()._require_df(state))

@@ -110,7 +110,7 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
                 try:
                     extra_source, extra_test = sources_for(extra_t)
                     Xt, yt, tt, extra_preprocessor = _wb()._prepare_xy_fitted(extra_source, extra_t, raw_features=True)
-                    extra_holdout = _prepare_holdout(extra_test, extra_t, extra_preprocessor) if native_backend else None
+                    extra_holdout = _prepare_holdout(extra_test, extra_t, extra_preprocessor)
                     wdf_t = Xt.copy()
                     wdf_t[extra_t] = yt.to_numpy()
                     res_t = AutoMLBackendHub.run(
@@ -151,7 +151,7 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
             cv_folds=req.cv_folds,
             max_carbon_grams_co2e=req.max_carbon_grams_co2e,
             max_inference_latency_ms=req.max_inference_latency_ms,
-            holdout=holdout if native_backend else None,
+            holdout=holdout,
             **split_options(target),
         )
         if cancellation_token is not None:
@@ -184,7 +184,7 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
                 r_copy["acceptance_status"] = "ACCEPTED (CHAMPION)" if res.lift_over_best_baseline >= 0 else "ACCEPTED (BEST AVAILABLE)"
             else:
                 r_copy["acceptance_status"] = "BENCHMARKED"
-            if evaluation and raw_score is not None:
+            if evaluation.get("leaderboard_partition") == "validation" and raw_score is not None:
                 r_score = float(raw_score)
                 validation_baseline = evaluation.get("validation_baseline_score")
                 r_copy["selection_criterion"] = f"Validation {res.primary_metric} ({'lower' if regression else 'higher'} is better)"
@@ -209,7 +209,7 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
         evaluation_indices = getattr(res, "evaluation_indices", None)
         if holdout is not None:
             state["uap_active_X_test"], state["uap_active_y_test"] = holdout
-        elif evaluation_indices is not None and evaluation:
+        elif evaluation_indices is not None and evaluation.get("best_score_partition") == "test":
             state["uap_active_X_test"] = X.iloc[evaluation_indices]
             state["uap_active_y_test"] = y.iloc[evaluation_indices]
         else:

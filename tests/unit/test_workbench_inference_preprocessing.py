@@ -279,3 +279,31 @@ def test_studio10_automl_reserves_the_locked_rows(monkeypatch: pytest.MonkeyPatc
     step = result.json()["execution"]["step_outputs"]["step_1_automl"]
     assert step["score_partition"] == "validation"
     assert step["reserved_test_rows"] == len(test)
+
+
+def test_studio14_uses_locked_holdout_and_reuses_training_preprocessing() -> None:
+    frame = pd.DataFrame({
+        "amount": np.arange(30, dtype=float),
+        "category": ["train"] * 24 + ["held_out"] * 6,
+        "target": np.arange(30, dtype=float) * 1.5,
+    })
+    session = f"supervisory-lock-{uuid.uuid4().hex}"
+    principal = Principal(subject="api_key_principal", roles=["admin"], tenant_id=get_settings().default_tenant_id)
+    state = get_session_state(wb._sid(session, principal))
+    load_new_dataset(state, frame, "test", "test", default_target="target")
+    client = TestClient(create_app(), headers={"X-API-Key": get_api_key(), "X-Session-ID": session})
+    locked = client.post("/api/workbench/split-lock", json={"strategy": "time_series", "test_size": 0.2})
+    assert locked.status_code == 200, locked.text
+    trained = client.post("/api/workbench/s14/quick-train", json={"target": "target", "method": "ridge"})
+    assert trained.status_code == 200, trained.text
+    payload = trained.json()
+    assert payload["evaluation"] == {"partition": "test", "source": "split_lock", "n_train": 24, "n_test": 6}
+    entry = state["uap_baseline_models"]["target"][payload["trained_model"]]
+    assert entry["input_preprocessor"].categories["category"] == ["train"]
+    obs = pd.DataFrame({"amount": [22.0], "category": ["train"]})
+    ranked_entry = next(model for model in wb.SupervisoryPredictionMonitor.catalog_available_models(state)
+                        if model["_estimator"] is entry["model"])
+    pd.testing.assert_frame_equal(
+        wb.SupervisoryPredictionMonitor._model_input(obs, ranked_entry, frame),
+        entry["input_preprocessor"].transform(obs),
+    )
