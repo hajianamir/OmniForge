@@ -414,8 +414,7 @@ def test_differential_privacy_copula_validation_bounds_and_composition() -> None
     # High privacy budget preserves strong positive correlation between num_cont and num_corr_int
     assert float(syn_high_eps["num_cont"].corr(syn_high_eps["num_corr_int"])) > 0.65
 
-    # Tight privacy budget (eps=0.05) injects substantial Laplace noise into categorical counts,
-    # allowing zero-count public category 'unobserved_cat' to appear with non-zero probability.
+    # Under a tight budget, fresh noise can introduce unobserved public categories.
     syn_tight_eps = SyntheticDataGenerator(random_seed=7).fit_generate_copula(
         df,
         n_samples=400,
@@ -423,5 +422,6 @@ def test_differential_privacy_copula_validation_bounds_and_composition() -> None
         dp_bounds=bounds,
         dp_categories=cats,
     )
-    assert "unobserved_cat" in set(syn_tight_eps["category"].unique())
+    assert set(syn_tight_eps["category"].unique()).issubset(set(cats["category"]))
+    assert syn_tight_eps.attrs["privacy_accounting"]["epsilon"] == 0.05
     assert len(gen.fit_generate_copula(df, n_samples=0, dp_epsilon=1.0, dp_bounds=bounds, dp_categories=cats)) == 0

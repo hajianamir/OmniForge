@@ -5,8 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 import pandas as pd
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Depends, Header
 
+from omniforge.api.auth import require_permission
 from omniforge.api.studios.schemas import CopilotReq
 from omniforge.copilot import OmniForgeCopilotAgent
 from omniforge.core.utils import to_json_object
@@ -20,7 +21,7 @@ def _wb() -> Any:
     return wb
 
 
-@router.post("/s13/chat")
+@router.post("/s13/chat", dependencies=[Depends(require_permission("copilot:use"))])
 def s13_chat(req: CopilotReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)

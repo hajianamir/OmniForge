@@ -210,3 +210,100 @@ def test_real_automl_scores_raw_categorical_and_datetime_records() -> None:
     )
     assert batch.status_code == 200, batch.text
     assert [row["predicted_target"] for row in batch.json()["preview"]] == expected
+
+
+def test_native_automl_respects_chronological_split_lock_and_excluded_date() -> None:
+    n = 80
+    frame = pd.DataFrame({
+        "amount": np.arange(n, dtype=float),
+        "when": pd.date_range("2024-01-01", periods=n, freq="D"),
+        "target": [i % 2 for i in range(n)],
+    })
+    session = f"locked-{uuid.uuid4().hex}"
+    principal = Principal(subject="api_key_principal", roles=["admin"], tenant_id=get_settings().default_tenant_id)
+    state = get_session_state(wb._sid(session, principal))
+    load_new_dataset(state, frame, "test", "test", default_target="target")
+    client = TestClient(create_app(), headers={"X-API-Key": get_api_key(), "X-Session-ID": session})
+    excluded = client.post("/api/workbench/exclusions", json={"excluded_columns": ["when"]})
+    assert excluded.status_code == 200, excluded.text
+    locked = client.post(
+        "/api/workbench/split-lock",
+        json={"strategy": "time_series", "time_col": "when", "gap": 2, "test_size": 0.2, "cv_folds": 2},
+    )
+    assert locked.status_code == 200, locked.text
+    result = client.post(
+        "/api/workbench/s06/automl",
+        json={"target": "target", "backend": "omniforge_native", "time_budget_seconds": 10, "cv_folds": 2},
+    )
+    assert result.status_code == 200, result.text
+    payload = result.json()
+    evaluation = payload["metadata"]["evaluation"]
+    assert evaluation["best_score_partition"] == "test"
+    assert evaluation["test_partition_source"] == "supplied_holdout"
+    assert evaluation["leaderboard_partition"] == "validation"
+    train_rows, lock_test, _ = wb.get_active_split_frames(state, frame)
+    assert lock_test is not None
+    held_out = state["uap_active_X_test"]
+    pd.testing.assert_index_equal(held_out.index, lock_test.index)
+    pd.testing.assert_series_equal(state["uap_active_y_test"], lock_test["target"])
+    assert evaluation["n_test"] == len(lock_test)
+    assert set(held_out.index).isdisjoint(train_rows.index)
+    assert list(held_out.columns) == ["amount"]
+    assert payload["state"]["excluded_columns"] == ["when"]
+
+
+def test_studio10_automl_reserves_the_locked_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omniforge.automl.backends import AutoMLBackendHub
+
+    frame = pd.DataFrame({"row": np.arange(60), "target": np.tile([0, 1], 30)})
+    session = f"dag-lock-{uuid.uuid4().hex}"
+    principal = Principal(subject="api_key_principal", roles=["admin"], tenant_id=get_settings().default_tenant_id)
+    state = get_session_state(wb._sid(session, principal))
+    load_new_dataset(state, frame, "test", "test", default_target="target")
+    client = TestClient(create_app(), headers={"X-API-Key": get_api_key(), "X-Session-ID": session})
+    locked = client.post("/api/workbench/split-lock", json={"strategy": "stratified", "test_size": 0.25, "cv_folds": 2})
+    assert locked.status_code == 200, locked.text
+    train, test, _ = wb.get_active_split_frames(state, frame)
+    assert test is not None
+    seen: list[int] = []
+
+    def record_input(data: pd.DataFrame, **options: object) -> SimpleNamespace:
+        seen.extend(data["row"].tolist())
+        return SimpleNamespace(best_model_name="fixture", best_score=0.8, lift_over_best_baseline=0.1)
+
+    monkeypatch.setattr(AutoMLBackendHub, "run", record_input)
+    result = client.post("/api/workbench/s10/run", json={"target": "target", "stages": ["automl"]})
+    assert result.status_code == 200, result.text
+    assert seen == train["row"].tolist()
+    assert set(seen).isdisjoint(test["row"])
+    step = result.json()["execution"]["step_outputs"]["step_1_automl"]
+    assert step["score_partition"] == "validation"
+    assert step["reserved_test_rows"] == len(test)
+
+
+def test_studio14_uses_locked_holdout_and_reuses_training_preprocessing() -> None:
+    frame = pd.DataFrame({
+        "amount": np.arange(30, dtype=float),
+        "category": ["train"] * 24 + ["held_out"] * 6,
+        "target": np.arange(30, dtype=float) * 1.5,
+    })
+    session = f"supervisory-lock-{uuid.uuid4().hex}"
+    principal = Principal(subject="api_key_principal", roles=["admin"], tenant_id=get_settings().default_tenant_id)
+    state = get_session_state(wb._sid(session, principal))
+    load_new_dataset(state, frame, "test", "test", default_target="target")
+    client = TestClient(create_app(), headers={"X-API-Key": get_api_key(), "X-Session-ID": session})
+    locked = client.post("/api/workbench/split-lock", json={"strategy": "time_series", "test_size": 0.2})
+    assert locked.status_code == 200, locked.text
+    trained = client.post("/api/workbench/s14/quick-train", json={"target": "target", "method": "ridge"})
+    assert trained.status_code == 200, trained.text
+    payload = trained.json()
+    assert payload["evaluation"] == {"partition": "test", "source": "split_lock", "n_train": 24, "n_test": 6}
+    entry = state["uap_baseline_models"]["target"][payload["trained_model"]]
+    assert entry["input_preprocessor"].categories["category"] == ["train"]
+    obs = pd.DataFrame({"amount": [22.0], "category": ["train"]})
+    ranked_entry = next(model for model in wb.SupervisoryPredictionMonitor.catalog_available_models(state)
+                        if model["_estimator"] is entry["model"])
+    pd.testing.assert_frame_equal(
+        wb.SupervisoryPredictionMonitor._model_input(obs, ranked_entry, frame),
+        entry["input_preprocessor"].transform(obs),
+    )

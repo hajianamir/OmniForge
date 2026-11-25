@@ -120,7 +120,7 @@ def test_studio12_compile_and_export_preserve_section_titles_and_narratives(
     client = TestClient(create_app())
     tok = client.post(
         "/api/v1/auth/token",
-        json={"username": "rep-user", "role": "analyst", "tenant_id": "t-rep"},
+        json={"username": "rep-user", "role": "data_scientist", "tenant_id": "t-rep"},
         headers={"X-API-Key": get_api_key()},
     ).json()["access_token"]
     hdrs = {"Authorization": f"Bearer {tok}", "X-Session-Id": "s12-nar"}

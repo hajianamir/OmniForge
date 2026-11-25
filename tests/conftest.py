@@ -3,19 +3,25 @@
 from __future__ import annotations
 
 import os
-
-# The suite issues well over 300 requests/minute to the shared in-process app; the
-# SlidingWindowRateLimitMiddleware would 429 later tests. Disable the limiter for tests
-# (the limiter itself is unit-tested directly in tests/unit/test_request_limits.py).
-os.environ.setdefault("OMNIFORGE_API__RATE_LIMIT_PER_MINUTE", "0")
-
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pandas as pd
 import pytest
 
 from omniforge.core.utils import set_global_seed
 from omniforge.data.synthetic import SyntheticDataGenerator
+
+# Set these during conftest import because the API initializes its audit trail
+# at test-module import time, before any pytest fixture can run.
+_test_runtime = TemporaryDirectory(prefix="omniforge-pytest-")
+_runtime_dir = Path(_test_runtime.name)
+os.environ.setdefault("OMNIFORGE_KEY_DIR", str(_runtime_dir / "keys"))
+os.environ.setdefault("OMNIFORGE_PATHS__WORKSPACE_DIR", str(_runtime_dir / "workspace"))
+os.environ.setdefault("OMNIFORGE_PATHS__AUDIT_LOG_PATH", str(_runtime_dir / "workspace" / "audit.jsonl"))
+
+# Full API tests routinely exceed the production request rate.
+os.environ.setdefault("OMNIFORGE_API__RATE_LIMIT_PER_MINUTE", "0")
 
 
 @pytest.fixture(autouse=True)

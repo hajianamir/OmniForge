@@ -7,8 +7,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
-from omniforge.core.sbom import generate_cyclonedx_sbom, verify_lockfiles_provenance
+from omniforge.core.exceptions import OmniForgeError
+from omniforge.core.sbom import generate_cyclonedx_sbom, parse_uv_lockfile, verify_lockfiles_provenance
 from omniforge.data.feature_store import LocalFeatureStore
 from omniforge.models.mining.miner import AssociationRuleMiner
 
@@ -155,16 +157,20 @@ def test_feature_store_delete_entity_data(tmp_path: Path) -> None:
     assert (offline["entity_id"] == "survivor").sum() == 1
 
 
-def test_sbom_generate_verify_deterministic() -> None:
+def test_sbom_generate_verify_deterministic(monkeypatch: pytest.MonkeyPatch) -> None:
     """CycloneDX 1.5 SBOM generation is deterministic and lockfiles are fully hash-pinned (RR-022)."""
     rep = verify_lockfiles_provenance()
     assert rep["verified"] is True
     assert rep["lockfile_count"] >= 1
     assert rep["unpinned_packages"] == []
 
+    monkeypatch.delenv("SOURCE_DATE_EPOCH", raising=False)
     doc_a = generate_cyclonedx_sbom(tier="everything")
     doc_b = generate_cyclonedx_sbom(tier="everything")
-    assert doc_a == doc_b  # byte-deterministic (timestamp derived from lockfile hash)
+    assert doc_a == doc_b
+    assert "timestamp" not in doc_a["metadata"]
+    monkeypatch.setenv("SOURCE_DATE_EPOCH", "1704067200")
+    assert generate_cyclonedx_sbom(tier="everything")["metadata"]["timestamp"] == "2024-01-01T00:00:00+00:00"
     assert doc_a["bomFormat"] == "CycloneDX"
     assert doc_a["specVersion"] == "1.5"
     assert doc_a["metadata"]["component"]["version"] == "4.0.0"
@@ -182,3 +188,20 @@ def test_sbom_generate_verify_deterministic() -> None:
     # Round-trip through JSON is stable.
     serialized = json.dumps(doc_a, sort_keys=True)
     assert json.loads(serialized)["specVersion"] == "1.5"
+
+
+
+@pytest.mark.parametrize("bad_line", ["another>=1", "another==1.*", "--hash=sha256:" + "a" * 65])
+def test_sbom_verification_reports_unsupported_records(tmp_path: Path, bad_line: str) -> None:
+    lock = tmp_path / "tier.lock"
+    lock.write_text(f"pkg==1.0 --hash=sha256:{'a' * 64}\n{bad_line}\n", encoding="utf-8")
+    report = verify_lockfiles_provenance(tmp_path)
+    assert report["verified"] is False
+    assert report["unsupported_records"] == [{"lockfile": "tier.lock", "line": 2}]
+    with pytest.raises(OmniForgeError, match="unsupported records"):
+        parse_uv_lockfile(lock)
+
+
+def test_sbom_verification_rejects_empty_inventory(tmp_path: Path) -> None:
+    (tmp_path / "empty.lock").write_text("# no dependency records\n", encoding="utf-8")
+    assert verify_lockfiles_provenance(tmp_path)["verified"] is False

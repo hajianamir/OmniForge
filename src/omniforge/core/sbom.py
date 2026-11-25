@@ -8,15 +8,18 @@ import os
 import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from omniforge.core.exceptions import OmniForgeError
 from omniforge.version import __version__, get_version_info
 
-_PIN_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]+\])?==([^\s\\]+)")
-_HASH_RE = re.compile(r"--hash=sha256:([0-9a-fA-F]{64})")
+_PIN_RE = re.compile(
+    r"([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[A-Za-z0-9_,.-]+\])?\s*==\s*([vV]?[0-9][A-Za-z0-9.!+_-]*)"
+    r"(?:\s*;\s*[^#]+)?"
+)
+_HASH_RE = re.compile(r"(?:^|(?<=\s))--hash=sha256:([0-9a-fA-F]{64})(?=\s|$)")
 _NORM_PKG_RE = re.compile(r"[-_.]+")
 
 
@@ -49,10 +52,21 @@ def _default_locks_dir() -> Path:
 def parse_uv_lockfile(lock_path: str | Path) -> list[LockedPackage]:
     """Parse a hash-pinned ``locks/*.lock`` file into structured ``LockedPackage`` records."""
     path = Path(lock_path)
+    packages, unsupported = _scan_lockfile(path)
+    if unsupported or not packages:
+        raise OmniForgeError(
+            f"Lockfile '{path.name}' has no usable inventory or contains unsupported records.",
+            context={"unsupported_lines": unsupported, "package_count": len(packages)},
+        )
+    return packages
+
+
+def _scan_lockfile(path: Path) -> tuple[list[LockedPackage], list[int]]:
     if not path.is_file():
-        raise OmniForgeError(f"Lockfile not found: '{path}'.")
+        raise OmniForgeError(f"Lockfile not found: '{path.name}'.")
 
     packages: list[LockedPackage] = []
+    unsupported: list[int] = []
     cur_name: str | None = None
     cur_ver: str | None = None
     cur_hashes: list[str] = []
@@ -76,7 +90,8 @@ def parse_uv_lockfile(lock_path: str | Path) -> list[LockedPackage]:
         cur_via = []
         in_via_block = False
 
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    continuing = False
+    for line_no, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         stripped = raw_line.strip()
         if not stripped:
             in_via_block = False
@@ -96,17 +111,26 @@ def parse_uv_lockfile(lock_path: str | Path) -> list[LockedPackage]:
             continue
 
         in_via_block = False
-        pin_match = _PIN_RE.match(stripped)
-        if pin_match:
+        next_continues = stripped.endswith("\\")
+        content = stripped.removesuffix("\\").strip()
+        hashes = _HASH_RE.findall(content)
+        non_hash = _HASH_RE.sub("", content).strip()
+        pin_match = _PIN_RE.fullmatch(non_hash) if "--hash" not in non_hash else None
+        if pin_match and not continuing:
             _flush()
-            cur_name = pin_match.group(1)
-            cur_ver = pin_match.group(2)
-        for h_match in _HASH_RE.finditer(stripped):
-            cur_hashes.append(h_match.group(1))
+            cur_name, cur_ver = pin_match.groups()
+        elif not (continuing and cur_name and hashes and not non_hash):
+            unsupported.append(line_no)
+            _flush()
+        if cur_name:
+            cur_hashes.extend(hashes)
+        continuing = next_continues
+    if continuing:
+        unsupported.append(line_no)
 
     _flush()
     packages.sort(key=lambda p: (p.name, p.version))
-    return packages
+    return packages, sorted(set(unsupported))
 
 
 def generate_cyclonedx_sbom(
@@ -130,17 +154,10 @@ def generate_cyclonedx_sbom(
     lock_sha256 = hashlib.sha256(lock_bytes).hexdigest()
     locked_pkgs = parse_uv_lockfile(target_lock)
 
-    # Deterministic build timestamp: honor SOURCE_DATE_EPOCH (reproducible builds);
-    # otherwise derive a stable timestamp from the lockfile content hash so that
-    # repeated generations of the same lockfile produce byte-identical SBOMs.
     source_date_epoch = os.environ.get("SOURCE_DATE_EPOCH")
-    if source_date_epoch:
-        resolved_ts = datetime.fromtimestamp(int(source_date_epoch), tz=UTC)
-    else:
-        resolved_ts = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(
-            seconds=int(lock_sha256[:12], 16) % (365 * 10 * 24 * 3600)
-        )
-    resolved_timestamp = resolved_ts.isoformat()
+    resolved_timestamp = timestamp
+    if resolved_timestamp is None and source_date_epoch:
+        resolved_timestamp = datetime.fromtimestamp(int(source_date_epoch), tz=UTC).isoformat()
 
     ver_info = get_version_info()
     root_ref = f"pkg:pypi/omniforge@{__version__}"
@@ -183,7 +200,7 @@ def generate_cyclonedx_sbom(
         "serialNumber": f"urn:uuid:{det_uuid}",
         "version": 1,
         "metadata": {
-            "timestamp": timestamp or resolved_timestamp,
+            **({"timestamp": resolved_timestamp} if resolved_timestamp is not None else {}),
             "tools": [
                 {
                     "vendor": "OmniForge",
@@ -203,6 +220,7 @@ def generate_cyclonedx_sbom(
                 {"name": "omniforge:lockfile:name", "value": target_lock.name},
                 {"name": "omniforge:lockfile:sha256", "value": lock_sha256},
                 {"name": "omniforge:component_count", "value": str(len(components))},
+                {"name": "omniforge:inventory_source", "value": "dependency_lockfile"},
             ],
         },
         "components": components,
@@ -222,9 +240,11 @@ def verify_lockfiles_provenance(locks_dir: str | Path | None = None) -> dict[str
 
     manifests: list[dict[str, Any]] = []
     unpinned_packages: list[str] = []
+    unsupported_records: list[dict[str, Any]] = []
     for lf in lock_files:
         digest = hashlib.sha256(lf.read_bytes()).hexdigest()
-        pkgs = parse_uv_lockfile(lf)
+        pkgs, unsupported = _scan_lockfile(lf)
+        unsupported_records.extend({"lockfile": lf.name, "line": line} for line in unsupported)
         missing = [f"{lf.name}:{p.name}=={p.version}" for p in pkgs if len(p.sha256_hashes) == 0]
         unpinned_packages.extend(missing)
         manifests.append(
@@ -233,14 +253,16 @@ def verify_lockfiles_provenance(locks_dir: str | Path | None = None) -> dict[str
                 "sha256": digest,
                 "package_count": len(pkgs),
                 "total_wheel_hashes": sum(len(p.sha256_hashes) for p in pkgs),
-                "all_packages_hash_pinned": len(missing) == 0,
+                "all_packages_hash_pinned": bool(pkgs) and not missing and not unsupported,
             }
         )
 
     return {
-        "verified": len(unpinned_packages) == 0 and len(manifests) > 0,
+        "verified": all(row["all_packages_hash_pinned"] for row in manifests),
+        "verification_scope": "lockfile_pin_and_hash_presence",
         "lockfile_count": len(manifests),
         "unpinned_packages": unpinned_packages,
+        "unsupported_records": unsupported_records,
         "lockfiles": manifests,
     }
 

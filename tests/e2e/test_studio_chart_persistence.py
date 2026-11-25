@@ -490,3 +490,52 @@ def test_compiled_static_spa_ships_studio_charts_across_lifecycle() -> None:
     for marker in expected_markers:
         assert marker in combined_js, f"Missing compiled chart marker in static_app bundle: {marker}"
 
+
+
+def test_small_eda_and_hypothesis_keep_exclusions_after_cleaning() -> None:
+    client, headers = _client()
+    df = pd.DataFrame({"Skip Me": [None] * 4, "Load Value": [1e30] * 4, "Group Label": ["a", "b", "a", "b"]})
+    uploaded = client.post(
+        "/api/workbench/s01/upload", headers=headers,
+        files={"file": ("small.csv", df.to_csv(index=False).encode(), "text/csv")},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    excluded = client.post("/api/workbench/exclusions", headers=headers, json={"excluded_columns": ["Skip Me"]})
+    assert excluded.json()["state"]["excluded_columns"] == ["Skip Me"]
+    eda = client.post("/api/workbench/s04/eda", headers=headers)
+    assert eda.status_code == 200, eda.text
+    assert eda.json()["state"]["excluded_columns"] == ["Skip Me"]
+    assert eda.json()["distributions"][0]["bins"] == [{"label": "1e+30", "count": 4}]
+    assert eda.json()["categorical_distributions"][0]["column"] == "Group Label"
+
+    for preview in (True, False):
+        cleaned = client.post(
+            "/api/workbench/s01/clean", headers=headers,
+            json={"preview_only": preview, "standardize_column_names": True, "drop_duplicates": False},
+        )
+        assert cleaned.status_code == 200, cleaned.text
+        assert cleaned.json()["state"]["excluded_columns"] == (["Skip Me"] if preview else ["skip_me"])
+
+    for mode in ("custom", "auto", "complete"):
+        hyp = client.post(
+            "/api/workbench/s04/hypothesis", headers=headers,
+            json={"mode": mode, "test_type": "shapiro", "col_a": "load_value"},
+        )
+        assert hyp.status_code == 200, hyp.text
+        result = hyp.json()
+        assert result["state"]["excluded_columns"] == ["skip_me"]
+        if mode == "custom":
+            assert result["result"]["p_value"] is None
+            assert result["result"]["evaluable"] is False
+        else:
+            assert any(row["test_type"] == "shapiro" for row in result["skipped"])
+
+    denied = client.post(
+        "/api/workbench/s04/hypothesis", headers=headers,
+        json={"mode": "custom", "test_type": "pearson", "col_a": "load_value", "col_b": "skip_me"},
+    )
+    assert denied.status_code == 400
+    rerun = client.post("/api/workbench/s04/eda", headers=headers)
+    assert rerun.status_code == 200, rerun.text
+    assert rerun.json()["state"]["excluded_columns"] == ["skip_me"]
+    assert "skip_me" not in [row["column"] for row in rerun.json()["missing_bars"]]

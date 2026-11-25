@@ -94,16 +94,8 @@ class ModelCard(BaseModel):
             )
 
         if self.carbon_footprint is not None:
-            cf = self.carbon_footprint
-            md.extend(
-                [
-                    "",
-                    "## Green AI — Carbon Footprint",
-                    f"- **Energy Consumed**: `{cf.energy_kwh:.8f} kWh`",
-                    f"- **Emissions**: `{cf.emissions_g_co2eq:.6f} gCO2eq` ({cf.country_iso} grid)",
-                    f"- **Green Score**: `{cf.green_score}/100`",
-                ]
-            )
+            md.extend(["", "## Green AI — Carbon Footprint"])
+            md.extend(f"- **{label}**: {value}" for label, value in self._carbon_rows())
 
         if self.limitations_and_risks:
             md.extend(["", "## Known Limitations & Risks"])
@@ -111,6 +103,18 @@ class ModelCard(BaseModel):
                 md.append(f"- {lim}")
 
         return "\n".join(md) + "\n"
+
+    def _carbon_rows(self) -> list[tuple[str, str]]:
+        cf = self.carbon_footprint
+        if cf is None or cf.tracker_backend == "disabled":
+            return [("Status", "Unmeasured (tracking disabled)")]
+        energy_source = cf.metadata.get("energy_source", cf.tracker_backend)
+        emissions_source = cf.metadata.get("emissions_source", cf.tracker_backend)
+        return [
+            ("Energy (kWh)", f"{cf.energy_kwh:.8f} ({energy_source})"),
+            ("Emissions (gCO2eq)", f"{cf.emissions_g_co2eq:.6f} ({emissions_source})"),
+            ("Green score", f"{cf.green_score}/100"),
+        ]
 
     def save_markdown(self, path: str | Path) -> Path:
         """Write rendered Markdown Model Card to disk."""
@@ -266,19 +270,8 @@ class ModelCard(BaseModel):
                 story.append(table(["Measurement", "Value"], robustness_rows, col_ratios=[2.4, 1.4]))
 
         if self.carbon_footprint is not None:
-            cf = self.carbon_footprint
             story.append(Paragraph("Green AI — Carbon Footprint", s_h1))
-            story.append(
-                table(
-                    ["Measurement", "Value"],
-                    [
-                        ["Energy consumed (kWh)", f"{cf.energy_kwh:.8f}"],
-                        ["Emissions (gCO2eq)", f"{cf.emissions_g_co2eq:.6f} ({cf.country_iso} grid)"],
-                        ["Green score", f"{cf.green_score}/100"],
-                    ],
-                    col_ratios=[2.2, 1.8],
-                )
-            )
+            story.append(table(["Measurement", "Value"], [list(row) for row in self._carbon_rows()], col_ratios=[2.2, 1.8]))
 
         if self.limitations_and_risks:
             story.append(Paragraph("Known Limitations &amp; Risks", s_h1))

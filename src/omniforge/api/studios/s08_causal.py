@@ -11,7 +11,7 @@ from fastapi import APIRouter, Header, HTTPException
 from omniforge.api.studios.schemas import CausalReq, ForecastReq, OptimizeReq, SimulateReq, wb_cache_and_respond
 from omniforge.causal import CausalInferenceEngine
 from omniforge.core.utils import to_json_object
-from omniforge.forecasting.engine import ForecastingEngine
+from omniforge.forecasting.engine import ForecastingEngine, _causal_impute_split
 from omniforge.models.time_series.deep_forecast import DeepForecaster
 from omniforge.optimization import OptimizationEngine
 from omniforge.simulation import MonteCarloSimulator
@@ -33,26 +33,23 @@ def s08_forecast(req: ForecastReq, x_session_id: str | None = Header(default="de
     if req.target_col not in df.columns:
         raise HTTPException(status_code=400, detail=f"Column '{req.target_col}' not found.")
     work = df.sort_values(req.time_col, kind="mergesort").reset_index(drop=True) if (req.time_col and req.time_col in df.columns) else df.reset_index(drop=True)
-    y_raw = pd.to_numeric(work[req.target_col], errors="coerce")
-    if int(y_raw.notna().sum()) < 20:
-        raise HTTPException(status_code=400, detail="Forecasting requires at least 20 numeric observations.")
+    work_capped = work.tail(2000).reset_index(drop=True)
+    raw_capped = pd.to_numeric(work_capped[req.target_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    if int(raw_capped.notna().sum()) < 20:
+        raise HTTPException(status_code=400, detail="Forecasting requires at least 20 finite numeric observations in the analysis window.")
 
-    work_capped = work.iloc[: min(len(work), 2000)].reset_index(drop=True)
-    raw_capped = pd.to_numeric(work_capped[req.target_col], errors="coerce")
     classical_res = ForecastingEngine().forecast(
         work_capped,
         target_col=req.target_col,
         time_col=req.time_col if (req.time_col and req.time_col in work_capped.columns) else None,
         horizon=req.horizon,
     )
-    # Pass raw_capped directly (never .dropna()) so DeepForecaster preserves exact temporal grid spacing
+    causal_history, _ = _causal_impute_split(raw_capped)
     deep_f = DeepForecaster(architecture=cast(Any, req.deep_arch), epochs=req.epochs)
-    deep_f.fit(raw_capped)
+    deep_f.fit(causal_history)
     deep_df = deep_f.predict(req.horizon)
 
-    first_v = float(raw_capped.dropna().iloc[0])
-    causal_hist = raw_capped.ffill().fillna(first_v)
-    hist_tail = causal_hist.tail(min(80, len(causal_hist))).to_list()
+    hist_tail = raw_capped.tail(80).to_numpy(dtype=float)
     cl_dump: dict[str, Any] = to_json_object(classical_res)
     fc_record = {"classical": cl_dump, "deep_arch": req.deep_arch, "deep_forecast": deep_df.to_dict(orient="records")}
     state["uap_forecast_report"] = fc_record
@@ -63,7 +60,7 @@ def s08_forecast(req: ForecastReq, x_session_id: str | None = Header(default="de
         sid,
         "s08_forecast",
         {
-            "history": [{"step": i - len(hist_tail) + 1, "actual": round(float(v), 5)} for i, v in enumerate(hist_tail)],
+            "history": [{"step": i - len(hist_tail) + 1, "actual": round(float(v), 5) if np.isfinite(v) else None} for i, v in enumerate(hist_tail)],
             "deep_arch": req.deep_arch,
             "deep_forecast": deep_df.to_dict(orient="records"),
             "classical_summary": cl_dump,

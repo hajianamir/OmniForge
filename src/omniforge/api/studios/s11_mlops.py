@@ -7,9 +7,10 @@ from typing import Any
 import numpy as np
 from fastapi import APIRouter, Depends, Header, HTTPException
 
-from omniforge.api.auth import require_permission
+from omniforge.api.auth import authorize_principal, require_permission
 from omniforge.api.studios.schemas import DriftReq, PromoteModelReq, RegisterModelReq, RollbackModelReq, RootCauseReq
 from omniforge.core.exceptions import MLOpsError
+from omniforge.core.types import ModelStage, Principal
 from omniforge.core.utils import to_json_object
 from omniforge.mlops.drift import DriftDetector
 from omniforge.mlops.root_cause import DriftRootCauseAnalyzer
@@ -33,13 +34,19 @@ def s11_overview() -> dict[str, Any]:
 
 
 @router.post("/s11/register")
-def s11_register(req: RegisterModelReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
+def s11_register(
+    req: RegisterModelReq,
+    x_session_id: str | None = Header(default="default"),
+    principal: Principal = Depends(require_permission("mlops:write")),
+) -> dict[str, Any]:
+    stage = _wb().parse_model_stage(req.stage, error_status=400)
+    if stage == ModelStage.PRODUCTION:
+        authorize_principal(principal, "model:promote")
     state = _wb().get_session_state(_wb()._sid(x_session_id))
     model = state.get("uap_active_model")
     if model is None:
         raise HTTPException(status_code=400, detail="No trained model in active workspace. Run Studio 06 first.")
     reg = _wb().get_tenant_registry()
-    stage = _wb().parse_model_stage(req.stage, error_status=400)
     fairness_res = state.get("uap_fairness_result")
     try:
         ver = reg.register_model(
@@ -92,7 +99,7 @@ def s11_promote(req: PromoteModelReq, x_session_id: str | None = Header(default=
     )
 
 
-@router.post("/s11/rollback")
+@router.post("/s11/rollback", dependencies=[Depends(require_permission("model:promote"))])
 def s11_rollback(req: RollbackModelReq) -> dict[str, Any]:
     reg = _wb().get_tenant_registry()
     try:

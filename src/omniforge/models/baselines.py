@@ -409,21 +409,28 @@ class BaselineBenchmarkSuite:
         y_train: np.ndarray | pd.Series,
         y_val: np.ndarray | pd.Series,
         seasonal_period: int = 7,
+        *,
+        gap: int = 0,
     ) -> tuple[dict[str, dict[str, float]], dict[str, ForecastingBaseline]]:
         """Run all forecasting baselines and return both metrics and fitted baseline models."""
         y_true = np.asarray(y_val, dtype=float).ravel()
         horizon = len(y_true)
+        observed = np.isfinite(y_true)
+        if not observed.any():
+            return {}, {}
+        y_observed = y_true[observed]
+        gap = max(0, gap)
         results: dict[str, dict[str, float]] = {}
         fitted_models: dict[str, ForecastingBaseline] = {}
         for method in ("naive", "seasonal_naive", "drift", "moving_average"):
             bl = ForecastingBaseline(method=method, seasonal_period=seasonal_period).fit(y_train)
-            preds = np.asarray(bl.predict(horizon), dtype=float)
-            denom = (np.abs(y_true) + np.abs(preds)) / 2.0 + 1e-9
-            smape = float(np.mean(np.abs(y_true - preds) / denom) * 100.0)
+            preds = np.asarray(bl.predict(horizon + gap), dtype=float)[gap:][observed]
+            denom = (np.abs(y_observed) + np.abs(preds)) / 2.0 + 1e-9
+            smape = float(np.mean(np.abs(y_observed - preds) / denom) * 100.0)
             key = f"Baseline_{method}"
             results[key] = {
-                "rmse": round(float(root_mean_squared_error(y_true, preds)), 6),
-                "mae": round(float(mean_absolute_error(y_true, preds)), 6),
+                "rmse": round(float(root_mean_squared_error(y_observed, preds)), 6),
+                "mae": round(float(mean_absolute_error(y_observed, preds)), 6),
                 "smape": round(smape, 4),
             }
             fitted_models[key] = bl
@@ -434,9 +441,11 @@ class BaselineBenchmarkSuite:
         y_train: np.ndarray | pd.Series,
         y_val: np.ndarray | pd.Series,
         seasonal_period: int = 7,
+        *,
+        gap: int = 0,
     ) -> dict[str, dict[str, float]]:
         """Run all forecasting baselines and return RMSE/MAE/sMAPE scores."""
         results, _ = BaselineBenchmarkSuite.run_forecasting_detailed(
-            y_train, y_val, seasonal_period=seasonal_period
+            y_train, y_val, seasonal_period=seasonal_period, gap=gap
         )
         return results

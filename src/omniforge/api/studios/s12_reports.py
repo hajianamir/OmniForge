@@ -8,9 +8,10 @@ from pathlib import Path
 from typing import Any, cast
 
 import pandas as pd
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import StreamingResponse
 
+from omniforge.api.auth import require_permission
 from omniforge.api.studios.schemas import ReportCompileReq, wb_cache_and_respond
 from omniforge.core.performance import downsample_table_for_plot
 from omniforge.core.utils import to_json_object
@@ -242,7 +243,7 @@ def _compile_report_payload(state: dict[str, Any], req: ReportCompileReq) -> dic
     return cast(dict[str, Any], payload)
 
 
-@router.post("/s12/compile")
+@router.post("/s12/compile", dependencies=[Depends(require_permission("report:generate"))])
 def s12_compile_report(req: ReportCompileReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)

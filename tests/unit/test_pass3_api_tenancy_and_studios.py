@@ -213,7 +213,7 @@ def test_studio13_copilot_extracts_reply_and_suggested_actions(monkeypatch: pyte
 
     app = create_app()
     client = TestClient(app)
-    hdrs = {**_mint(client, username="analyst-1", role="analyst", tenant_id="t-s13"), "X-Session-Id": "sess-s13"}
+    hdrs = {**_mint(client, username="analyst-1", role="data_scientist", tenant_id="t-s13"), "X-Session-Id": "sess-s13"}
 
     r_load = client.post(
         "/api/workbench/s01/load-sample",
@@ -246,7 +246,7 @@ def test_studios_s04_s08_s12_s14_regressions(monkeypatch: pytest.MonkeyPatch, tm
 
     app = create_app()
     client = TestClient(app)
-    hdrs = {**_mint(client, username="analyst-2", role="analyst", tenant_id="t-studios"), "X-Session-Id": "sess-studios"}
+    hdrs = {**_mint(client, username="analyst-2", role="data_scientist", tenant_id="t-studios"), "X-Session-Id": "sess-studios"}
 
     rng = np.random.default_rng(12345)
     df_norm = pd.DataFrame(
@@ -312,7 +312,7 @@ def test_studios_s04_s08_s12_s14_regressions(monkeypatch: pytest.MonkeyPatch, tm
 
     # Small 10-row dataset works cleanly in Studio 14 quick-train without empty test split (old max(10, 8)=10 bug)
     hdrs_small = {
-        **_mint(client, username="analyst-2", role="analyst", tenant_id="t-studios"),
+        **_mint(client, username="analyst-2", role="data_scientist", tenant_id="t-studios"),
         "X-Session-Id": "sess-small10",
     }
     small_df = df_norm.iloc[:10].copy()

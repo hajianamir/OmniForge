@@ -22,9 +22,11 @@ class FairnessReport(BaseModel):
     disparate_impact_ratio: float
     equalized_odds_diff: float | None
     equal_opportunity_diff: float | None
-    disparate_impact_ci_95: tuple[float, float] = (0.0, 1.0)
-    demographic_parity_ci_95: tuple[float, float] = (0.0, 1.0)
-    statistical_parity_p_value: float = 1.0
+    disparate_impact_ci_95: tuple[float, float] | None = None
+    demographic_parity_ci_95: tuple[float, float] | None = None
+    selection_interval_method: str | None = None
+    statistical_parity_p_value: float | None = None
+    statistical_parity_test: str | None = None
     statistically_significant_disparity: bool = False
     generalized_entropy_index: float = 0.0
     within_group_gei: float = 0.0
@@ -75,21 +77,23 @@ class FairnessAuditor:
         yp = (np.asarray(y_pred) == positive_label).astype(int)
         sf = np.asarray(sensitive_features).astype(str)
 
+        if any(values.ndim != 1 for values in (yt, yp, sf)) or len(yt) != len(yp) or len(yt) != len(sf):
+            raise EvaluationError("Fairness auditing requires aligned, one-dimensional labels, predictions and groups.")
         groups = sorted(np.unique(sf).tolist())
         group_metrics: dict[str, dict[str, float | None]] = {}
         sel_rates: list[float] = []
         tprs: list[float] = []
         fprs: list[float] = []
 
-        # Empty input or single group cannot be meaningfully evaluated
+        # An empty input has no evaluable comparisons.
         if len(yt) == 0 or len(groups) == 0:
             return FairnessReport(
                 protected_attribute=attribute_name,
                 passed=False,
                 demographic_parity_diff=0.0,
                 disparate_impact_ratio=1.0,
-                equalized_odds_diff=0.0,
-                equal_opportunity_diff=0.0,
+                equalized_odds_diff=None,
+                equal_opportunity_diff=None,
                 violations=["Insufficient data: empty input or no groups to compare"],
                 recommendations=[
                     "Provide non-empty predictions with at least two sensitive groups."
@@ -111,6 +115,9 @@ class FairnessAuditor:
             group_metrics[grp] = {
                 "count": float(int(np.sum(mask))),
                 "selection_rate": round(sel_rate, 6),
+                "selected_count": float(g_yp.sum()),
+                "positive_count": float(pos_mask.sum()),
+                "negative_count": float(neg_mask.sum()),
                 "tpr": round(tpr_val, 6) if tpr_val is not None else None,
                 "fpr": round(fpr_val, 6) if fpr_val is not None else None,
                 "accuracy": round(acc, 6),
@@ -133,55 +140,42 @@ class FairnessAuditor:
         fpr_diff = float(max(fprs) - min(fprs)) if len(fprs) >= 2 else 0.0
         eodds_diff = max(eopp_diff, fpr_diff)
 
-        # Statistical inference on selection parity: Katz (1978) log-RR CI, Agresti-Caffo (2000) CI & Fisher/Chi2 test
-        di_ci: tuple[float, float] = (round(di_ratio, 6), round(di_ratio, 6))
-        dp_ci: tuple[float, float] = (round(dp_diff, 6), round(dp_diff, 6))
-        parity_p = 1.0
-        if len(groups) >= 2 and len(yp) > 0:
-            group_counts = [(grp, int(np.sum(yp[sf == grp] == 1)), int(np.sum(sf == grp))) for grp in groups]
-            min_grp = min(group_counts, key=lambda t: (t[1] / max(t[2], 1), t[2]))
-            max_grp = max(group_counts, key=lambda t: (t[1] / max(t[2], 1), -t[2]))
-            a1, n1 = min_grp[1], min_grp[2]
-            a2, n2 = max_grp[1], max_grp[2]
-            if n1 > 0 and n2 > 0:
-                # Katz et al. (1978, Biometrics) 95% CI with Haldane-Anscombe +0.5 continuity correction on zero cells
-                use_cc = a1 in (0, n1) or a2 in (0, n2)
-                c1 = a1 + (0.5 if use_cc else 0.0)
-                m1 = n1 + (1.0 if use_cc else 0.0)
-                c2 = a2 + (0.5 if use_cc else 0.0)
-                m2 = n2 + (1.0 if use_cc else 0.0)
-                p1_rr = c1 / m1
-                p2_rr = c2 / m2
-                if p1_rr > 0.0 and p2_rr > 0.0:
-                    se_log_rr = float(np.sqrt(max(0.0, (1.0 - p1_rr) / c1 + (1.0 - p2_rr) / c2)))
-                    log_rr = float(np.log(p1_rr / p2_rr))
-                    z95 = 1.959963984540054
-                    di_ci = (
-                        round(float(np.exp(np.clip(log_rr - z95 * se_log_rr, -20.0, 20.0))), 6),
-                        round(float(np.exp(np.clip(log_rr + z95 * se_log_rr, -20.0, 20.0))), 6),
-                    )
-                # Agresti & Caffo (2000, American Statistician) +1/+2 95% CI for risk difference (p_max - p_min)
-                p1_ac = (a1 + 1.0) / (n1 + 2.0)
-                p2_ac = (a2 + 1.0) / (n2 + 2.0)
-                diff_ac = p2_ac - p1_ac
-                se_ac = float(np.sqrt(p1_ac * (1.0 - p1_ac) / (n1 + 2.0) + p2_ac * (1.0 - p2_ac) / (n2 + 2.0)))
-                dp_ci = (
-                    round(float(np.clip(diff_ac - 1.959963984540054 * se_ac, -1.0, 1.0)), 6),
-                    round(float(np.clip(diff_ac + 1.959963984540054 * se_ac, -1.0, 1.0)), 6),
-                )
+        di_ci: tuple[float, float] | None = None
+        dp_ci: tuple[float, float] | None = None
+        parity_p: float | None = None
+        parity_test: str | None = None
+        if len(groups) >= 2:
+            # Bonferroni simultaneous Clopper-Pearson intervals cover all population
+            # selection rates. Project the joint bounds onto their range and min/max
+            # ratio, so coverage does not depend on picking the observed extrema.
+            counts = np.array([[int(group_metrics[g]["selected_count"] or 0), int(group_metrics[g]["count"] or 0)] for g in groups])
+            selected, total = counts.T
+            tail = 0.05 / (2.0 * len(groups))
+            lower = np.where(selected > 0, stats.beta.ppf(tail, selected, total - selected + 1), 0.0)
+            upper = np.where(selected < total, stats.beta.ppf(1.0 - tail, selected + 1, total - selected), 1.0)
+            dp_ci = (
+                math.floor(max(0.0, float(lower.max() - upper.min())) * 1e6) / 1e6,
+                math.ceil(float(upper.max() - lower.min()) * 1e6) / 1e6,
+            )
+            di_upper = min(1.0, float(upper.min() / lower.max())) if lower.max() > 0 else 1.0
+            di_ci = (
+                math.floor(float(lower.min() / upper.max()) * 1e6) / 1e6,
+                math.ceil(di_upper * 1e6) / 1e6,
+            )
 
-            # Exact Fisher test for 2x2 table or Pearson chi-square test for Gx2 contingency table
-            contingency = np.array([[a, n - a] for _, a, n in group_counts if n > 0], dtype=int)
-            if contingency.shape[0] >= 2 and np.all(contingency.sum(axis=0) > 0):
-                try:
-                    if contingency.shape[0] == 2:
-                        _, p_raw = stats.fisher_exact(contingency, alternative="two-sided")
-                    else:
-                        _, p_raw, _, _ = stats.chi2_contingency(contingency)
-                    if np.isfinite(p_raw):
-                        parity_p = float(p_raw)
-                except Exception:
-                    parity_p = 1.0
+            contingency = np.column_stack([selected, total - selected])
+            if np.all(contingency.sum(axis=0) > 0):
+                if len(groups) == 2:
+                    parity_test = "fisher_exact"
+                    parity_p = float(stats.fisher_exact(contingency).pvalue)
+                else:
+                    parity_test = "pearson_chi_square"
+                    result = stats.chi2_contingency(contingency, correction=False)
+                    if (result.expected_freq < 5).any():
+                        parity_test = "pearson_chi_square_monte_carlo"
+                        method = stats.MonteCarloMethod(n_resamples=9999, rng=np.random.default_rng(42))
+                        result = stats.chi2_contingency(contingency, correction=False, method=method)
+                    parity_p = float(result.pvalue)
 
         # Speicher et al. (2018, KDD) Generalized Entropy Index (alpha=2) & Theil Index (alpha=1)
         # Benefit vector b_i = y_pred_i - y_true_i + 1 in {0, 1, 2}; E(2) = E_within(2) + E_between(2)
@@ -210,6 +204,9 @@ class FairnessAuditor:
 
         violations: list[str] = []
         recommendations: list[str] = []
+        if len(groups) < 2:
+            violations.append("Group fairness requires at least two observed groups.")
+            eopp_diff = eodds_diff = float("nan")
 
         # Equalized odds requires comparable TPR and FPR across >= 2 groups.
         # If some groups lack positives or negatives (null TPR/FPR), the metric
@@ -231,7 +228,7 @@ class FairnessAuditor:
 
         if di_ratio < self.disparate_impact_min:
             violations.append(
-                f"Disparate impact ratio ({di_ratio:.3f}, 95% CI [{di_ci[0]:.3f}, {di_ci[1]:.3f}]) below 4/5ths threshold ({self.disparate_impact_min:.2f})."
+                f"Observed disparate impact ratio ({di_ratio:.3f}) below the configured threshold ({self.disparate_impact_min:.2f})."
             )
             recommendations.append("Apply Kamiran-Calders reweighing or group threshold optimization.")
         if dp_diff > self.demographic_parity_max:
@@ -250,7 +247,7 @@ class FairnessAuditor:
                 )
             else:
                 recommendations.append(
-                    "Model satisfies all configured demographic and equalized odds gates."
+                    "Observed selection and error rates met the configured thresholds for this sample."
                 )
 
         return FairnessReport(
@@ -262,8 +259,10 @@ class FairnessAuditor:
             equal_opportunity_diff=round(eopp_diff, 6),
             disparate_impact_ci_95=di_ci,
             demographic_parity_ci_95=dp_ci,
-            statistical_parity_p_value=round(parity_p, 6),
-            statistically_significant_disparity=bool(parity_p < 0.05),
+            selection_interval_method="bonferroni_clopper_pearson_independent_rows" if di_ci is not None else None,
+            statistical_parity_p_value=round(parity_p, 6) if parity_p is not None else None,
+            statistical_parity_test=parity_test,
+            statistically_significant_disparity=parity_p is not None and parity_p < 0.05,
             generalized_entropy_index=round(max(0.0, gei_total), 6),
             within_group_gei=round(max(0.0, gei_within), 6),
             between_group_gei=round(max(0.0, gei_between), 6),

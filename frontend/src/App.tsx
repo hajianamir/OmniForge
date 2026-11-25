@@ -129,6 +129,8 @@ export const App: React.FC = () => {
   const [visitedStudios, setVisitedStudios] = useState<StudioId[]>(['00']);
   const [gridVersion, setGridVersion] = useState(0);
   const [modal, setModal] = useState<'none' | 'targets' | 'exclusions' | 'split' | 'project' | 'auth'>('none');
+  const [savingExclusions, setSavingExclusions] = useState(false);
+  const [exclusionError, setExclusionError] = useState<string | null>(null);
   const [helpOpen, setHelpOpen] = useState(false);
   const [helpSection, setHelpSection] = useState<HandbookSectionId>('workflow');
   const [toast, setToast] = useState<string | null>(null);
@@ -269,13 +271,26 @@ export const App: React.FC = () => {
     syncState(r.state); bumpGrid();
   }, [ws.targets, syncState, bumpGrid]);
 
-  const toggleExclude = useCallback(async (col: string) => {
+  const saveExclusions = useCallback(async (next: string[]) => {
+    setSavingExclusions(true);
+    setExclusionError(null);
+    try {
+      const r = await apiPost<{ state: WorkspaceState }>('/api/workbench/exclusions', { excluded_columns: next });
+      syncState(r.state);
+      bumpGrid();
+    } catch (err: unknown) {
+      setExclusionError(toErrorMessage(err));
+    } finally {
+      setSavingExclusions(false);
+    }
+  }, [syncState, bumpGrid]);
+
+  const toggleExclude = (col: string) => {
     const next = ws.excluded_columns.includes(col)
       ? ws.excluded_columns.filter((c) => c !== col)
       : [...ws.excluded_columns, col];
-    const r = await apiPost<{ state: WorkspaceState }>('/api/workbench/exclusions', { excluded_columns: next });
-    syncState(r.state); bumpGrid();
-  }, [ws.excluded_columns, syncState, bumpGrid]);
+    void saveExclusions(next);
+  };
 
   const handleSaveProject = useCallback(async () => {
     try {
@@ -540,11 +555,12 @@ export const App: React.FC = () => {
                 <p style={{ color: 'var(--text-muted)', marginTop: 0 }}>Excluded columns are masked reversibly across all 14 studios without mutating raw data.</p>
                 <div className="chip-grid" style={{ marginBottom: 14 }}>
                   {ws.columns.map((c) => (
-                    <button key={c} className={`chip ${ws.excluded_columns.includes(c) ? 'excluded' : ''}`} onClick={() => toggleExclude(c)}>{c}</button>
+                    <button key={c} disabled={savingExclusions} aria-pressed={ws.excluded_columns.includes(c)} className={`chip ${ws.excluded_columns.includes(c) ? 'excluded' : ''}`} onClick={() => toggleExclude(c)}>{c}</button>
                   ))}
                 </div>
+                {exclusionError && <div className="alert alert-error" role="alert">{exclusionError}</div>}
                 {ws.excluded_columns.length > 0 && (
-                  <button className="btn btn-sm" onClick={async () => { const r = await apiPost<{ state: WorkspaceState }>('/api/workbench/exclusions', { excluded_columns: [] }); syncState(r.state); bumpGrid(); }}>
+                  <button className="btn btn-sm" disabled={savingExclusions} onClick={() => void saveExclusions([])}>
                     Restore All Excluded Columns
                   </button>
                 )}

@@ -164,7 +164,9 @@ def test_phase2_3_vision_foundation_hub() -> None:
     img[30:66, 30:66, :] = [240, 90, 60]
 
     zs = hub.zero_shot_classify(img, ["sky", "forest", "dark night", "industrial"])
-    assert zs["top_label"] is not None and abs(sum(p["probability"] for p in zs["predictions"]) - 1.0) < 1e-3
+    assert zs["predictions"]
+    assert zs["calibrated"] is False
+    assert all("score" in item and "probability" not in item for item in zs["predictions"])
 
     emb = hub.extract_foundation_embedding(img, pretrained=False)
     assert emb["embedding_dim"] >= 64

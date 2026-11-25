@@ -107,7 +107,11 @@ def _bench_health_endpoint() -> None:
         from omniforge.api.main import create_app
 
         _HEALTH_CLIENT = TestClient(create_app())
-    _HEALTH_CLIENT.get("/health")
+    response = _HEALTH_CLIENT.get("/health")
+    response.raise_for_status()
+    body = response.json()
+    if body.get("status") != "healthy" or not body.get("spa_ready"):
+        raise RuntimeError("Health check did not confirm the application and SPA are ready.")
 
 
 # Budgets in milliseconds (p95) / megabytes (peak alloc). See module docstring for sizing.

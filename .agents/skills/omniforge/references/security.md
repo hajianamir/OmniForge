@@ -14,8 +14,9 @@ requires a valid API key or an existing admin token; tenant admins cannot mint
 platform-admin or other-tenant tokens. The workbench router globally requires
 a principal (`src/omniforge/api/workbench.py`), but **many workbench handlers have no
 additional per-action permission dependency**. Studio 11 promotion uses
-`require_permission("model:promote")`; the registration and rollback handlers
-shown next to it do not. Audit authorization route by route, including
+`require_permission("model:promote")`; registration now requires `mlops:write`
+and additionally `model:promote` for Production, and rollback requires
+`model:promote`. Audit authorization route by route, including
 `/api/v1` handlers (`src/omniforge/api/main.py`).
 
 `_sid` namespaces a supplied session ID by tenant and subject. Job status is
@@ -115,8 +116,10 @@ Blind rotation or deleting development keys can make data inaccessible.
   `OMNIFORGE_COPILOT_INGEST_ROOT` (default current directory), rejects
   traversal/dotfiles, and allows HTTP(S) through the ingestion path. Test
   symlinks, redirects and tenant boundaries when modifying this code.
-- `DataFramePIIGuard` and `PIIRedactor` use patterns/heuristics, not exhaustive
-  PII detection. The guard's `block` and `pseudonymize` policies apply to
+- `DataFramePIIGuard` and `PIIRedactor` screen for patterns and column indicators.
+  `PIIRedactor.scan_dataframe_report` gives row coverage and can inspect all
+  rows when requested. `ComplianceValidator` reports missing evidence,
+  unsupported profiles, and the outcome of limited checks. The guard's `block` and `pseudonymize` policies apply to
   recognized cells when invoked; `off` leaves data unchanged, but the guard
   still resolves a salt on construction. Pseudonyms include the tenant ID;
   `resolve_pseudonym_salt` can use per-tenant salts or a global fallback. Its

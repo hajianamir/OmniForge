@@ -813,6 +813,7 @@ class MultiBackendAutoMLResult:
     lift_over_best_baseline: float
     elapsed_seconds: float
     extra: dict[str, Any] = field(default_factory=dict)
+    evaluation_indices: np.ndarray | None = None
 
 
 class AutoMLBackendHub:
@@ -837,6 +838,10 @@ class AutoMLBackendHub:
         random_seed: int = 42,
         max_carbon_grams_co2e: float | None = None,
         max_inference_latency_ms: float | None = None,
+        groups: pd.Series | np.ndarray | None = None,
+        time_values: pd.Series | np.ndarray | None = None,
+        gap: int = 0,
+        holdout: tuple[pd.DataFrame, pd.Series] | None = None,
     ) -> MultiBackendAutoMLResult:
         """Run any selected AutoML engine with baseline comparison and optional native fallback."""
         if target_col not in df.columns:
@@ -845,10 +850,57 @@ class AutoMLBackendHub:
         clean_df = df.dropna(subset=[target_col]).copy()
         y_all = clean_df[target_col]
         X_all = clean_df.drop(columns=[target_col])
+        if holdout is not None:
+            X_test, y_test = holdout
+            if X_test.empty or not X_test.columns.equals(X_all.columns) or not X_test.index.equals(y_test.index) or y_test.isna().any():
+                raise AutoMLError("A supplied holdout requires observed targets and aligned rows and predictor columns.")
         resolved_task = _infer_task(y_all, task_type)
         is_clf = resolved_task != TaskType.REGRESSION
 
-        # Strict leakage-safe holdout split
+        def run_native(used_fallback: bool = False, fallback_reason: str | None = None) -> MultiBackendAutoMLResult:
+            observed = df[target_col].notna().to_numpy()
+            if any(values is not None and len(values) != len(df) for values in (groups, time_values)):
+                raise AutoMLError("Group and time vectors must align with the input data.")
+            aligned_groups = np.asarray(groups)[observed] if groups is not None else None
+            aligned_times = np.asarray(time_values)[observed] if time_values is not None else None
+            native_res: AutoMLResult = AutoMLPipelineSearch(
+                task_type=resolved_task,
+                time_budget_seconds=time_budget_seconds,
+                cv_folds=cv_folds,
+                split_strategy=split_strategy,
+                gap=gap,
+                random_seed=random_seed,
+                max_carbon_grams_co2e=max_carbon_grams_co2e,
+                max_inference_latency_ms=max_inference_latency_ms,
+            ).fit(X_all, y_all, groups=aligned_groups, time_values=aligned_times, holdout=holdout)
+            return MultiBackendAutoMLResult(
+                requested_backend=req_backend,
+                executed_backend="omniforge_native",
+                used_fallback=used_fallback,
+                fallback_reason=fallback_reason,
+                task_type=native_res.task_type,
+                best_model_name=native_res.best_model_name,
+                best_model=native_res.best_model,
+                best_score=native_res.best_score,
+                primary_metric=native_res.primary_metric,
+                leaderboard=native_res.leaderboard,
+                baseline_benchmarks=native_res.baseline_benchmarks,
+                lift_over_best_baseline=native_res.lift_over_best_baseline,
+                elapsed_seconds=native_res.elapsed_seconds,
+                extra={"cv_summary": native_res.cv_summary, "evaluation": native_res.metadata["evaluation"]},
+                evaluation_indices=native_res.test_indices,
+            )
+
+        if req_backend == "omniforge_native":
+            return run_native()
+
+        if groups is not None or time_values is not None or gap:
+            raise AutoMLError(
+                "This AutoML backend does not support explicit group or time split metadata.",
+                suggestions=["Choose the OmniForge native backend for grouped or chronological evaluation."],
+            )
+
+        # Benchmark comparison for specialized and external backends.
         splitter = LeakageSafeSplitter(SplitConfig(strategy=split_strategy, test_size=0.2, cv_folds=cv_folds, random_seed=random_seed))
         split_res = splitter.split(clean_df, target_col=target_col)
         tr_df = clean_df.iloc[split_res.train_indices]
@@ -856,16 +908,70 @@ class AutoMLBackendHub:
         X_tr, y_tr = tr_df.drop(columns=[target_col]), tr_df[target_col]
         X_va, y_va = va_df.drop(columns=[target_col]), va_df[target_col]
 
-        # Always compute quantitative baselines for honest lift comparison
-        pre_bl = _build_preprocessor(X_tr)
-        X_tr_bl = pre_bl.fit_transform(X_tr)
-        X_va_bl = pre_bl.transform(X_va)
-        if is_clf:
-            baselines = BaselineBenchmarkSuite.run_classification(X_tr_bl, y_tr, X_va_bl, y_va)
-            best_bl_score = max((float(m.get("f1", 0.0)) for m in baselines.values()), default=0.0)
-        else:
-            baselines = BaselineBenchmarkSuite.run_regression(X_tr_bl, y_tr, X_va_bl, y_va)
-            best_bl_score = min((float(m.get("rmse", 1e9)) for m in baselines.values()), default=0.0)
+        def finish(
+            result: dict[str, Any], *, extra: dict[str, Any] | None = None, leaderboard_partition: str = "validation",
+        ) -> MultiBackendAutoMLResult:
+            # Fit baseline preprocessing on the same development rows as the selected adapter.
+            preprocessor = _build_preprocessor(X_tr)
+            X_train_matrix = preprocessor.fit_transform(X_tr)
+            X_validation_matrix = preprocessor.transform(X_va)
+            validation_score = float(result["best_score"])
+            metric = "f1_macro" if is_clf else "rmse"
+
+            def score(y_true: pd.Series, predicted: np.ndarray) -> float:
+                if is_clf:
+                    return float(f1_score(y_true, predicted, average="macro", zero_division=0))
+                return float(root_mean_squared_error(y_true, predicted))
+
+            benchmark = (
+                BaselineBenchmarkSuite.run_classification_detailed if is_clf
+                else BaselineBenchmarkSuite.run_regression_detailed
+            )
+            validation_baselines, baseline_models = benchmark(
+                X_train_matrix, y_tr, X_validation_matrix, y_va, random_seed=random_seed,
+            )
+            if is_clf:
+                for name, model in baseline_models.items():
+                    validation_baselines[name][metric] = score(y_va, model.predict(X_validation_matrix))
+
+            choose_best = max if is_clf else min
+            if not validation_baselines:
+                raise AutoMLError("No baseline completed specialized AutoML validation.")
+            validation_baseline = choose_best(metrics[metric] for metrics in validation_baselines.values())
+            best_score = validation_score
+            baseline_score = validation_baseline
+            baselines = validation_baselines
+            evaluation: dict[str, Any] = {
+                "leaderboard_partition": leaderboard_partition,
+                "best_score_partition": "validation",
+                "validation_score": validation_score,
+                "validation_baseline_score": validation_baseline,
+                "n_train": len(X_tr),
+                "n_validation": len(X_va),
+            }
+            test_positions = None
+            if holdout is not None:
+                X_test, y_test = holdout
+                X_test_matrix = preprocessor.transform(X_test)
+                best_score = score(y_test, result["best_model"].predict(X_test))
+                baselines = {name: {metric: score(y_test, model.predict(X_test_matrix))}
+                             for name, model in baseline_models.items()}
+                baseline_score = choose_best(metrics[metric] for metrics in baselines.values())
+                test_positions = np.arange(len(clean_df), len(clean_df) + len(X_test))
+                evaluation.update(
+                    best_score_partition="test", test_partition_source="supplied_holdout",
+                    test_baseline_score=baseline_score, n_test=len(X_test),
+                )
+            lift = (best_score - baseline_score) if is_clf else (baseline_score - best_score)
+            return MultiBackendAutoMLResult(
+                requested_backend=req_backend, executed_backend=exec_backend,
+                used_fallback=used_fallback, fallback_reason=fallback_reason, task_type=resolved_task,
+                best_model_name=str(result["best_model_name"]), best_model=result["best_model"],
+                best_score=round(best_score, 6), primary_metric=metric,
+                leaderboard=list(result["leaderboard"]), baseline_benchmarks=baselines,
+                lift_over_best_baseline=round(lift, 6), elapsed_seconds=float(result["elapsed_seconds"]),
+                extra={**(extra or {}), "evaluation": evaluation}, evaluation_indices=test_positions,
+            )
 
         used_fallback = False
         fallback_reason: str | None = None
@@ -877,23 +983,9 @@ class AutoMLBackendHub:
                 req_backend, tr_df, va_df, target_col, resolved_task, time_budget_seconds, random_seed
             )
             if ext_out is not None:
-                best_sc = float(ext_out["best_score"])
-                lift = (best_sc - best_bl_score) if is_clf else (best_bl_score - best_sc)
-                return MultiBackendAutoMLResult(
-                    requested_backend=req_backend,
-                    executed_backend=req_backend,
-                    used_fallback=False,
-                    fallback_reason=None,
-                    task_type=resolved_task,
-                    best_model_name=str(ext_out["best_model_name"]),
-                    best_model=ext_out["best_model"],
-                    best_score=best_sc,
-                    primary_metric=str(ext_out["primary_metric"]),
-                    leaderboard=list(ext_out["leaderboard"]),
-                    baseline_benchmarks=baselines,
-                    lift_over_best_baseline=round(float(lift), 6),
-                    elapsed_seconds=float(ext_out["elapsed_seconds"]),
-                    extra=dict(ext_out.get("extra") or {}),
+                return finish(
+                    ext_out, extra=ext_out.get("extra"),
+                    leaderboard_partition="adapter_internal" if req_backend == "h2o" else "validation",
                 )
             if not fallback_to_native:
                 raise AutoMLError(f"External AutoML backend '{req_backend}' is not installed or unavailable on this system.")
@@ -911,96 +1003,20 @@ class AutoMLBackendHub:
                 f"automatically executed native equivalent '{exec_backend}'."
             )
 
-        # Dispatch native engines
+        # Specialized engines select using development rows only.
         if exec_backend == "multi_layer_stacker":
             res = MultiLayerStackingAutoML(cv_folds=cv_folds, random_seed=random_seed).fit(X_tr, y_tr, X_va, y_va, resolved_task)
-            best_sc = float(res["best_score"])
-            lift = (best_sc - best_bl_score) if is_clf else (best_bl_score - best_sc)
-            return MultiBackendAutoMLResult(
-                requested_backend=req_backend,
-                executed_backend=exec_backend,
-                used_fallback=used_fallback,
-                fallback_reason=fallback_reason,
-                task_type=resolved_task,
-                best_model_name=str(res["best_model_name"]),
-                best_model=res["best_model"],
-                best_score=best_sc,
-                primary_metric=str(res["primary_metric"]),
-                leaderboard=list(res["leaderboard"]),
-                baseline_benchmarks=baselines,
-                lift_over_best_baseline=round(float(lift), 6),
-                elapsed_seconds=float(res["elapsed_seconds"]),
-                extra={"ensemble_weights": res.get("ensemble_weights", {})},
-            )
+            return finish(res, extra={"ensemble_weights": res.get("ensemble_weights", {})})
 
         if exec_backend == "genetic_pipeline":
             res = GeneticPipelineAutoML(cv_folds=cv_folds, random_seed=random_seed).fit(X_tr, y_tr, X_va, y_va, resolved_task)
-            best_sc = float(res["best_score"])
-            lift = (best_sc - best_bl_score) if is_clf else (best_bl_score - best_sc)
-            return MultiBackendAutoMLResult(
-                requested_backend=req_backend,
-                executed_backend=exec_backend,
-                used_fallback=used_fallback,
-                fallback_reason=fallback_reason,
-                task_type=resolved_task,
-                best_model_name=str(res["best_model_name"]),
-                best_model=res["best_model"],
-                best_score=best_sc,
-                primary_metric=str(res["primary_metric"]),
-                leaderboard=list(res["leaderboard"]),
-                baseline_benchmarks=baselines,
-                lift_over_best_baseline=round(float(lift), 6),
-                elapsed_seconds=float(res["elapsed_seconds"]),
-                extra={"evolution_history": res.get("evolution_history", [])},
-            )
+            return finish(res, extra={"evolution_history": res.get("evolution_history", [])}, leaderboard_partition="train_cv")
 
         if exec_backend == "meta_bayesian":
             res = MetaFeatureWarmStartAutoML(cv_folds=cv_folds, random_seed=random_seed).fit(X_tr, y_tr, X_va, y_va, resolved_task)
-            best_sc = float(res["best_score"])
-            lift = (best_sc - best_bl_score) if is_clf else (best_bl_score - best_sc)
-            return MultiBackendAutoMLResult(
-                requested_backend=req_backend,
-                executed_backend=exec_backend,
-                used_fallback=used_fallback,
-                fallback_reason=fallback_reason,
-                task_type=resolved_task,
-                best_model_name=str(res["best_model_name"]),
-                best_model=res["best_model"],
-                best_score=best_sc,
-                primary_metric=str(res["primary_metric"]),
-                leaderboard=list(res["leaderboard"]),
-                baseline_benchmarks=baselines,
-                lift_over_best_baseline=round(float(lift), 6),
-                elapsed_seconds=float(res["elapsed_seconds"]),
-                extra={"meta_features": res.get("meta_features", {})},
-            )
+            return finish(res, extra={"meta_features": res.get("meta_features", {})})
 
-        # Default: OmniForge Native Leakage-Safe AutoMLPipelineSearch
-        native_res: AutoMLResult = AutoMLPipelineSearch(
-            task_type=resolved_task,
-            time_budget_seconds=time_budget_seconds,
-            cv_folds=cv_folds,
-            split_strategy=split_strategy,
-            random_seed=random_seed,
-            max_carbon_grams_co2e=max_carbon_grams_co2e,
-            max_inference_latency_ms=max_inference_latency_ms,
-        ).fit(X_all, y_all)
-        return MultiBackendAutoMLResult(
-            requested_backend=req_backend,
-            executed_backend="omniforge_native",
-            used_fallback=used_fallback,
-            fallback_reason=fallback_reason,
-            task_type=native_res.task_type,
-            best_model_name=native_res.best_model_name,
-            best_model=native_res.best_model,
-            best_score=native_res.best_score,
-            primary_metric=native_res.primary_metric,
-            leaderboard=native_res.leaderboard,
-            baseline_benchmarks=native_res.baseline_benchmarks,
-            lift_over_best_baseline=native_res.lift_over_best_baseline,
-            elapsed_seconds=native_res.elapsed_seconds,
-            extra={"cv_summary": native_res.cv_summary},
-        )
+        return run_native(used_fallback, fallback_reason)
 
     @staticmethod
     def _try_external_adapter(
@@ -1098,7 +1114,10 @@ class AutoMLBackendHub:
             class _H2OWrapper:
                 def predict(self, X_in: pd.DataFrame) -> np.ndarray:
                     frame = aml.leader.predict(h2o.H2OFrame(X_in)).as_data_frame()["predict"]
-                    return np.asarray(frame.to_numpy(), dtype=float)
+                    if not is_clf:
+                        return np.asarray(frame.to_numpy(), dtype=float)
+                    class_values = {str(value): value for value in y_tr.unique()}
+                    return np.asarray([class_values[str(value)] for value in frame])
 
             return {
                 "best_model": _WrappedSklearnModel(f"H2O({aml.leader.model_id})", _H2OWrapper(), task_type, random_seed=random_seed),

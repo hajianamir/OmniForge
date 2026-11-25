@@ -289,7 +289,8 @@ def test_cleaning_clustering_provenance_and_stage_persistence() -> None:
     )
     assert r_np.status_code == 200, r_np.text
     np_data = r_np.json()
-    assert np_data["n_samples"] == expected_after_cl  # PROVENANCE PROOF!
+    assert np_data["n_samples"] == cl_commit["state"]["split_lock"]["n_train"]
+    assert np_data["n_samples"] < expected_after_cl
     assert len(np_data["equations"]) >= 4
     assert len(np_data["spline_components"]) >= 2
 

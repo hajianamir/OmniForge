@@ -37,7 +37,7 @@ from omniforge.api import workbench as wb_module  # noqa: E402
 from omniforge.api.studios import s05_features, s06_automl, s11_mlops  # noqa: E402
 from omniforge.causal.inference import CausalInferenceEngine  # noqa: E402
 from omniforge.core.exceptions import CausalInferenceError  # noqa: E402
-from omniforge.core.types import Principal  # noqa: E402
+from omniforge.core.types import Principal, TaskType  # noqa: E402
 from omniforge.data.cleaning import CleaningConfig  # noqa: E402
 from omniforge.data.feature_store import LocalFeatureStore  # noqa: E402
 from omniforge.data.quality import DataQualityProfiler  # noqa: E402
@@ -48,6 +48,7 @@ from omniforge.mlops.job_queue import BackgroundJobQueue  # noqa: E402
 from omniforge.mlops.registry import ModelRegistry  # noqa: E402
 from omniforge.mlops.tracking import ExperimentTracker  # noqa: E402
 from omniforge.models.base import BaseOmniForgeModel  # noqa: E402
+from omniforge.models.classical import ClassicalMLModel  # noqa: E402
 from omniforge.optimization.solvers import OptimizationEngine, OptimizationError  # noqa: E402
 from omniforge.simulation.engines import DiscreteEventSimulator  # noqa: E402
 from omniforge.ui.state import (  # noqa: E402
@@ -148,7 +149,8 @@ class TestClaim2_EncryptionRoundTrip:
         reg = ModelRegistry(db_path=Path(tmpdir) / "registry.db",
                             artifact_dir=Path(tmpdir) / "artifacts")
 
-        model = _DummyOmniForgeModel(name="enc-test", score_val=0.5)
+        features = pd.DataFrame({"x": np.arange(12, dtype=float)})
+        model = ClassicalMLModel("ridge", task_type=TaskType.REGRESSION).fit(features, features["x"])
 
         _model_id = reg.register_model(
             model=model,
@@ -176,6 +178,7 @@ class TestClaim2_EncryptionRoundTrip:
             "FIX NOT APPLIED: load_model() cannot decrypt encrypted artifacts."
         )
         assert loaded_ver.encrypted_at_rest is True
+        np.testing.assert_allclose(loaded_model.predict(features), model.predict(features))
 
 
 # ===========================================================================
@@ -462,7 +465,9 @@ class TestClaims15_16_FairnessEdgeCases:
         sensitive = np.array(["A", "A", "A", "A", "A", "A"])
 
         report = auditor.audit(y_true, y_pred, sensitive, attribute_name="group")
-        assert report.passed is True
+        assert report.passed is False
+        assert report.selection_interval_method is None
+        assert report.demographic_parity_ci_95 is None
         assert report.disparate_impact_ratio == 1.0
         assert report.demographic_parity_diff == 0.0
 

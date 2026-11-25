@@ -328,15 +328,14 @@ class AdvancedNLPSuite(NLPEngine):
 
     @staticmethod
     def screen_toxicity_and_pii(texts: list[str]) -> list[dict[str, Any]]:
-        """Screen documents for PII exposure and toxic/compliance risk, returning redacted text."""
+        """Return redacted text, PII categories and counts, and a toxicity assessment."""
         out: list[dict[str, Any]] = []
         for txt in texts:
             s = str(txt)
             pii_found: list[dict[str, str]] = []
             redacted = s
             for kind, pat in _PII_PATTERNS.items():
-                for m in pat.findall(s):
-                    pii_found.append({"type": kind, "value": str(m)})
+                pii_found.extend({"type": kind} for _ in pat.finditer(s))
                 redacted = pat.sub(f"[{kind}_REDACTED]", redacted)
             toks = re.findall(r"[a-zA-Z]+", s.lower())
             tox_hits = [t for t in toks if t in _TOXIC_TERMS]

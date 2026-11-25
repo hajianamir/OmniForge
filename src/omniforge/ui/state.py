@@ -434,18 +434,13 @@ def record_exclusion(
 
 
 def get_excluded_columns(state: dict[str, Any], df: pd.DataFrame | None = None) -> list[str]:
-    """Return user-excluded columns currently present in ``df``."""
+    """Resolve exclusions for this view without changing the workspace selection."""
     active_df = df if df is not None else state.get("uap_df")
     if active_df is None or active_df.empty:
         return []
     cols = set(active_df.columns)
     raw = state.get("uap_excluded_columns") or []
-    valid = [c for c in raw if c in cols]
-    # Never allow all columns to be excluded simultaneously
-    if len(valid) >= len(active_df.columns):
-        valid = valid[: max(0, len(active_df.columns) - 1)]
-    state["uap_excluded_columns"] = valid
-    return valid
+    return [c for c in raw if c in cols]
 
 
 def get_audit_anomaly_dataframe(state: dict[str, Any], df: pd.DataFrame | None = None) -> pd.DataFrame:
@@ -468,10 +463,7 @@ def get_analysis_dataframe(state: dict[str, Any], df: pd.DataFrame | None = None
     excluded = get_excluded_columns(state, active_df)
     if not excluded:
         return active_df
-    remaining = [c for c in active_df.columns if c not in set(excluded)]
-    if not remaining:
-        return active_df
-    return active_df[remaining].copy()
+    return active_df.drop(columns=excluded)
 
 
 def get_study_df(state: dict[str, Any]) -> pd.DataFrame | None:

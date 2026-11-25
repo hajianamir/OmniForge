@@ -367,8 +367,14 @@ class ReportGenerator:
         if fairness_report:
             kpis["Fairness Gate"] = "PASSED" if fairness_report.get("passed", True) else "FLAGGED"
         if carbon_report:
-            kpis["Carbon (gCO2eq)"] = round(float(carbon_report.get("emissions_g_co2eq", 0.0)), 6)
-            kpis["Green AI Score"] = f"{carbon_report.get('green_score', 100)}/100"
+            emissions = carbon_report.get("emissions_g_co2eq")
+            green = carbon_report.get("green_score")
+            if carbon_report.get("tracker_backend") == "disabled" or emissions is None:
+                kpis["Carbon footprint"] = "Unmeasured"
+            else:
+                kpis["Carbon (gCO2eq)"] = round(float(emissions), 6)
+                if green is not None:
+                    kpis["Green AI Score"] = f"{green}/100"
 
         return {
             **nar,

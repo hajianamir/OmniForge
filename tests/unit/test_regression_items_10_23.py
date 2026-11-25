@@ -124,20 +124,14 @@ def test_quality_cache_includes_rules_hash() -> None:
 
     profiler = DataQualityProfiler()
 
-    # First profile with no rules
-    rep1 = profiler.profile(df)
-    acc_no_rules = rep1.dimensions["accuracy"]
+    no_rules = profiler.profile(df)
+    restrictive = profiler.profile(df, reference_rules={"a": (0.0, 1.5)})
 
-    # Second profile with restrictive rules
-    rep2 = profiler.profile(df, reference_rules={"a": (0.0, 1.5)})
-    acc_with_rules = rep2.dimensions["accuracy"]
-
-    # They should differ because rules changed
-    assert acc_with_rules != acc_no_rules, (
-        "Quality profiler returned stale cached accuracy after rule change"
-    )
-    # Accuracy with rules should be lower (only 1 of 3 values in range)
-    assert acc_with_rules < acc_no_rules
+    assert no_rules.dimensions["accuracy"] is None
+    assert restrictive.dimensions["accuracy"] is None
+    assert no_rules.rule_conformance is None
+    assert restrictive.rule_checks == 3
+    assert restrictive.rule_conformance == 33.33
 
 
 def test_quality_cache_different_rules_different_results() -> None:
@@ -148,7 +142,8 @@ def test_quality_cache_different_rules_different_results() -> None:
     rep_loose = profiler.profile(df, reference_rules={"x": (0.0, 100.0)})
     rep_strict = profiler.profile(df, reference_rules={"x": (25.0, 35.0)})
 
-    assert rep_strict.dimensions["accuracy"] < rep_loose.dimensions["accuracy"]
+    assert rep_strict.rule_conformance == 33.33
+    assert rep_loose.rule_conformance == 100.0
 
 
 # ===========================================================================

@@ -10,9 +10,7 @@ import pandas as pd
 from scipy import stats
 
 from omniforge.core.constants import DEFAULT_RANDOM_SEED
-from omniforge.core.logging import get_logger
-
-logger = get_logger(__name__)
+from omniforge.core.exceptions import DataValidationError
 
 
 def _project_psd_correlation(corr: np.ndarray) -> np.ndarray:
@@ -44,7 +42,7 @@ def _dp_noisy_histogram_cdf(
     Theorem 3.6; NIST SP 800-226).
     """
     if high <= low:
-        edges = np.array([low - 0.5, high + 0.5], dtype=float)
+        edges = np.array([low, high], dtype=float)
         return edges, np.array([0.0, 1.0], dtype=float)
 
     edges = np.linspace(low, high, n_bins + 1, dtype=float)
@@ -60,7 +58,7 @@ def _dp_noisy_histogram_cdf(
 
 
 class SyntheticDataGenerator:
-    """Generates privacy-preserving synthetic tabular data and domain benchmark datasets."""
+    """Generate synthetic tabular data and domain benchmarks."""
 
     def __init__(self, random_seed: int = DEFAULT_RANDOM_SEED, random_state: int | None = None) -> None:
         self.random_seed = random_state if random_state is not None else random_seed
@@ -76,18 +74,17 @@ class SyntheticDataGenerator:
     ) -> pd.DataFrame:
         """Synthesize tabular data preserving marginal distributions and rank correlations via Gaussian Copula.
 
-        When ``dp_epsilon`` is specified, constructs a pure ``(dp_epsilon, 0)``-differentially private
-        copula synopsis under bounded-replacement adjacency using the Laplace Mechanism (Dwork et al.,
-        2006), Sequential Composition across all marginal and pairwise correlation queries (Dwork & Roth,
-        2014, Theorem 3.14), and Post-Processing Invariance (Proposition 2.1; NIST SP 800-226) so drawing
-        any number ``n_samples`` incurs zero additional privacy loss.
+        With ``dp_epsilon``, use a Laplace mechanism with a fixed public schema,
+        public column domains, and bounded-replacement adjacency at a fixed row
+        count. Noise uses fresh randomness for each release. Repeated releases
+        need a cumulative budget. Categorical columns use marginal draws.
 
         Args:
             reference_df: Real source DataFrame to model.
             n_samples: Number of synthetic rows to generate (defaults to ``len(reference_df)``).
             dp_epsilon: Optional strictly positive total privacy budget ``epsilon > 0``.
-            dp_bounds: Optional public ``(min, max)`` clipping bounds per numeric/datetime column for strict global sensitivity.
-            dp_categories: Optional public category list per categorical column for strict domain privacy.
+            dp_bounds: Required public ``(min, max)`` clipping bounds per numeric/datetime column for strict global sensitivity.
+            dp_categories: Required public category list per non-boolean categorical column for strict domain privacy.
 
         Returns:
             Synthetic DataFrame matching schema and statistical structure of ``reference_df``.
@@ -98,7 +95,7 @@ class SyntheticDataGenerator:
                     "dp_epsilon must be a finite positive float (> 0) to guarantee epsilon-differential privacy."
                 )
 
-        rng = np.random.default_rng(self.random_seed)
+        rng = np.random.default_rng(self.random_seed if dp_epsilon is None else None)
         if len(reference_df.columns) == 0:
             return pd.DataFrame()
         n = len(reference_df) if n_samples is None else int(n_samples)
@@ -171,6 +168,7 @@ class SyntheticDataGenerator:
                     sampled_idx = rng.choice(len(choices), size=n, p=probs)
                     out[col] = [choices[i] for i in sampled_idx]
 
+            out.attrs["is_synthetic"] = True
             return out[reference_df.columns]
 
         # Pure (dp_epsilon, 0)-DP Gaussian Copula path (Sequential Composition + Post-Processing)
@@ -188,9 +186,35 @@ class SyntheticDataGenerator:
             eps_pair = 0.0
         eps_per_col = eps_marginal_total / total_cols
         n_bins = min(32, max(4, int(math.isqrt(max(n_ref, 1)))))
+        if len({str(column) for column in reference_df.columns}) != len(reference_df.columns):
+            raise DataValidationError("DP synthesis requires unique public column names.")
         bounds_map = dp_bounds or {}
         cat_domain_map = dp_categories or {}
+        public_bounds: dict[str, tuple[float, float]] = {}
+        for col, series in reference_df.items():
+            key = str(col)
+            temporal = pd.api.types.is_datetime64_any_dtype(series)
+            if col in num_cols or temporal:
+                if key not in bounds_map:
+                    raise DataValidationError("DP synthesis requires public bounds for every numeric and datetime column.")
+                try:
+                    low, high = map(float, bounds_map[key])
+                except (ValueError, TypeError, OverflowError) as exc:
+                    raise DataValidationError("DP synthesis requires a numeric pair for each public bound.") from exc
+                if not math.isfinite(low) or not math.isfinite(high) or low > high or not math.isfinite(high - low):
+                    raise DataValidationError("DP synthesis requires finite, ordered public bounds.")
+                if pd.api.types.is_integer_dtype(series) and (
+                    not low.is_integer() or not high.is_integer() or low < -(2**63) or high >= 2**63
+                ):
+                    raise DataValidationError("DP synthesis requires public integer bounds within int64 range.")
+                if temporal and (low <= float(pd.NaT.value) or high >= float(pd.Timestamp.max.value)):
+                    raise DataValidationError("DP datetime bounds must fit in the supported nanosecond timestamp range.")
+                public_bounds[key] = (low, high)
+            elif not pd.api.types.is_bool_dtype(series) and not cat_domain_map.get(key):
+                raise DataValidationError("DP synthesis requires a public category domain for every non-boolean categorical column.")
 
+        if eps_per_col <= 0 or not math.isfinite(2.0 / eps_per_col) or (n_pairs and eps_pair <= 0):
+            raise DataValidationError("DP budget is too small for this schema.")
         if num_cols:
             dp_edges: dict[str, np.ndarray] = {}
             dp_cdfs: dict[str, np.ndarray] = {}
@@ -201,20 +225,8 @@ class SyntheticDataGenerator:
                 col_key = str(col)
                 series = reference_df[col]
                 dp_is_int[col_key] = bool(pd.api.types.is_integer_dtype(series))
-                if col_key in bounds_map:
-                    lo, hi = float(bounds_map[col_key][0]), float(bounds_map[col_key][1])
-                    if lo > hi:
-                        raise ValueError(f"dp_bounds for column '{col_key}' requires low <= high, got ({lo}, {hi}).")
-                else:
-                    non_na = pd.to_numeric(series, errors="coerce").dropna()
-                    lo = float(non_na.min()) if len(non_na) > 0 else 0.0
-                    hi = float(non_na.max()) if len(non_na) > 0 else 1.0
-                    logger.warning(
-                        "dp_copula_empirical_bounds_used",
-                        column=col_key,
-                        note="Pass public dp_bounds for strict global-sensitivity guarantees without empirical bound estimation.",
-                    )
-                mid = 0.5 * (lo + hi)
+                lo, hi = public_bounds[col_key]
+                mid = lo + 0.5 * (hi - lo)
                 vals = np.clip(pd.to_numeric(series, errors="coerce").fillna(mid).to_numpy(dtype=float), lo, hi)
                 edges, cdf_knots = _dp_noisy_histogram_cdf(vals, lo, hi, n_bins, eps_per_col, rng)
                 dp_edges[col_key] = edges
@@ -231,7 +243,9 @@ class SyntheticDataGenerator:
                 corr = np.eye(d_num, dtype=float)
                 # Since each z_{ia} in [-3, 3], z_{ia}*z_{ib} in [-9, 9]; under 1-record replacement,
                 # L1 sensitivity of (1/N) * sum_i z_{ia}*z_{ib} is exactly Delta_1 = 18 / N.
-                pair_scale = 18.0 / (max(n_ref, 1) * eps_pair)
+                pair_scale = (18.0 / n_ref) / eps_pair
+                if not math.isfinite(pair_scale):
+                    raise DataValidationError("DP budget is too small for the requested numeric relationships.")
                 for a_idx in range(d_num):
                     for b_idx in range(a_idx + 1, d_num):
                         raw_cov = float(np.mean(z_mat[:, a_idx] * z_mat[:, b_idx]))
@@ -255,45 +269,22 @@ class SyntheticDataGenerator:
             col_key = str(col)
             series = reference_df[col]
             if pd.api.types.is_datetime64_any_dtype(series):
-                non_null = series.dropna()
-                if len(non_null) == 0 and col_key not in bounds_map:
-                    out[col] = pd.NaT
-                    continue
-                if col_key in bounds_map:
-                    lo_ts, hi_ts = float(bounds_map[col_key][0]), float(bounds_map[col_key][1])
-                else:
-                    ts_obs = non_null.astype("datetime64[ns]").astype("int64").to_numpy(dtype=float)
-                    lo_ts, hi_ts = float(ts_obs.min()), float(ts_obs.max())
-                    logger.warning("dp_copula_empirical_datetime_bounds_used", column=col_key)
-                mid_ts = 0.5 * (lo_ts + hi_ts)
-                raw_ts = (
-                    series.astype("datetime64[ns]")
-                    .astype("int64")
-                    .where(series.notna(), int(mid_ts))
-                    .to_numpy(dtype=float)
-                )
+                lo_ts, hi_ts = public_bounds[col_key]
+                mid_ts = lo_ts + 0.5 * (hi_ts - lo_ts)
+                timestamp_ns = pd.to_datetime(series, utc=True).astype("datetime64[ns, UTC]")
+                raw_ts = timestamp_ns.astype("int64").where(timestamp_ns.notna(), int(mid_ts)).to_numpy(dtype=float)
                 edges_ts, cdf_ts = _dp_noisy_histogram_cdf(raw_ts, lo_ts, hi_ts, n_bins, eps_per_col, rng)
                 u_draw = rng.uniform(0.0, 1.0, size=n)
                 synth_ts = np.interp(u_draw, cdf_ts, edges_ts).astype("int64")
-                out[col] = pd.to_datetime(synth_ts, unit="ns")
+                timezone = series.dt.tz
+                samples = pd.to_datetime(synth_ts, unit="ns", utc=timezone is not None)
+                out[col] = samples.tz_convert(timezone) if timezone is not None else samples
             else:
-                if col_key in cat_domain_map and len(cat_domain_map[col_key]) > 0:
-                    domain_vals = list(cat_domain_map[col_key])
-                elif pd.api.types.is_bool_dtype(series):
-                    domain_vals = [False, True]
-                else:
-                    domain_vals = series.value_counts(dropna=False).index.tolist() or ["MISSING"]
-                    logger.warning("dp_copula_empirical_categories_used", column=col_key)
-                val_to_idx = {v: i for i, v in enumerate(domain_vals)}
-                cat_counts = np.zeros(len(domain_vals), dtype=float)
-                for item in series.tolist():
-                    if item in val_to_idx:
-                        cat_counts[val_to_idx[item]] += 1.0
-                    elif pd.isna(item):
-                        na_matches = [i for i, dv in enumerate(domain_vals) if pd.isna(dv)]
-                        cat_counts[na_matches[0] if na_matches else 0] += 1.0
-                    else:
-                        cat_counts[0] += 1.0
+                domain_vals = list(cat_domain_map.get(col_key, [False, True]))
+                if not domain_vals or len(set(domain_vals)) != len(domain_vals):
+                    raise DataValidationError("A public category domain must contain unique values.")
+                counts = series.value_counts(dropna=True, sort=False)
+                cat_counts = counts.reindex(domain_vals, fill_value=0).to_numpy(dtype=float)
                 # Disjoint category count histogram has L1 sensitivity Delta_1 = 2.0 under replacement
                 noisy_cat = np.maximum(
                     cat_counts + rng.laplace(0.0, 2.0 / eps_per_col, size=len(domain_vals)),
@@ -304,6 +295,8 @@ class SyntheticDataGenerator:
                 sampled_idx = rng.choice(len(domain_vals), size=n, p=probs)
                 out[col] = [domain_vals[i] for i in sampled_idx]
 
+        out.attrs["is_synthetic"] = True
+        out.attrs["privacy_accounting"] = {"epsilon": eps_total, "adjacency": "bounded_replacement"}
         return out[reference_df.columns]
 
     def generate_classification_dataset(

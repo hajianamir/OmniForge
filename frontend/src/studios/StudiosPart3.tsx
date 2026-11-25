@@ -194,7 +194,12 @@ export const Studio09Specialized: React.FC<StudioProps> = ({ ws, studioCache, se
             <div className="grid-2">
               <div>
                 <h4>Zero-Shot Classification ({visRes.zero_shot?.backend})</h4>
-                <BarChartSVG horizontal items={(visRes.zero_shot?.predictions || []).map((p) => ({ label: p.label, value: p.probability }))} />
+                {visRes.zero_shot?.top_label === null && <p>No supported top label.</p>}
+                {visRes.zero_shot?.note && <p>{visRes.zero_shot.note}</p>}
+                <SimpleTable
+                  title={visRes.zero_shot?.score_kind === 'cosine_similarity' ? 'Cosine similarity' : 'Uncalibrated visual scores'}
+                  rows={(visRes.zero_shot?.predictions || []).map((p) => ({ label: p.label, score: p.score ?? p.probability }))}
+                />
               </div>
               <div>
                 <h4>Detections ({visRes.detections?.n_detections}) &amp; Regions ({visRes.segmentation?.n_segments})</h4>
