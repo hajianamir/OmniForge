@@ -1889,6 +1889,7 @@ def s02_data_mining(req: MiningReq, x_session_id: str | None = Header(default="d
 # ---------------------------------------------------------------------------
 # Studio 03 — Universal Diagnostics, Baselines & Risk
 # ---------------------------------------------------------------------------
+from omniforge.api.studios.charts_hub import router as charts_hub_router  # noqa: E402
 from omniforge.api.studios.s00_ingestion import router as s00_router  # noqa: E402
 from omniforge.api.studios.s01_cleaning import router as s01_router  # noqa: E402
 from omniforge.api.studios.s02_mining import router as s02_router  # noqa: E402
@@ -1905,6 +1906,7 @@ from omniforge.api.studios.s12_reports import router as s12_router  # noqa: E402
 from omniforge.api.studios.s13_copilot import router as s13_router  # noqa: E402
 from omniforge.api.studios.s14_supervisory import router as s14_router  # noqa: E402
 
+router.include_router(charts_hub_router)
 router.include_router(s00_router)
 router.include_router(s01_router)
 router.include_router(s02_router)

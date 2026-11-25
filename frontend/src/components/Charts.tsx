@@ -809,3 +809,4 @@ export const DivergingDriverBarSVG: React.FC<{
   );
 };
 
+export * from './ProfessionalCharts';
