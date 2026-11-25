@@ -8,7 +8,6 @@ import webbrowser
 from pathlib import Path
 from typing import Any
 
-from omniforge.api.main import create_app
 from omniforge.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -33,6 +32,8 @@ STUDIOS: list[tuple[str, str, str]] = [
 
 def create_workbench_app() -> Any:
     """Create and return the unified FastAPI + React SPA Workbench ASGI application."""
+    from omniforge.api.main import create_app
+
     return create_app()
 
 

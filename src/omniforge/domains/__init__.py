@@ -51,6 +51,8 @@ _BUILTIN_PLUGINS: list[BaseDomainPlugin] = [
 for _p in _BUILTIN_PLUGINS:
     default_domain_registry.register(_p)
 
+default_domain_registry.discover_entry_points(skip_existing=True)
+
 __all__ = [
     "BaseDomainPlugin",
     "DomainMetadata",

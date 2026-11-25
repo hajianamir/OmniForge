@@ -81,7 +81,8 @@ jobs:
         run: npm run build
       - name: Fail if committed static_app is stale vs frontend source
         run: |
-          if ! git diff --quiet -- src/omniforge/ui/static_app; then
+          if [ -n "$(git status --porcelain -- src/omniforge/ui/static_app)" ]; then
+            git status --short -- src/omniforge/ui/static_app
             git --no-pager diff --stat -- src/omniforge/ui/static_app
             echo "::error title=static_app stale::Committed src/omniforge/ui/static_app does not match frontend/ source. Run 'cd frontend && npm ci && npm run build' and commit the rebuilt assets."
             exit 1

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from abc import ABC, abstractmethod
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -101,15 +102,35 @@ class DomainPluginRegistry:
         """Return sorted list of registered domain slugs."""
         return sorted(self._plugins.keys())
 
-    def discover_entry_points(self, group: str = "omniforge.domains") -> int:
+    def discover_entry_points(
+        self, group: str = "omniforge.domains", *, skip_existing: bool = False
+    ) -> int:
         """Dynamically load external plugins registered under setuptools entry points."""
         loaded = 0
         try:
             eps = importlib_metadata.entry_points(group=group)
             for ep in eps:
                 try:
+                    if skip_existing and ep.name.lower().strip() in self._plugins:
+                        continue
                     plugin_obj = ep.load()
+                    if (
+                        inspect.isclass(plugin_obj)
+                        and issubclass(plugin_obj, BaseDomainPlugin)
+                        and plugin_obj is not BaseDomainPlugin
+                        and not inspect.isabstract(plugin_obj)
+                    ):
+                        cls_meta = getattr(plugin_obj, "metadata", None)
+                        if (
+                            skip_existing
+                            and isinstance(cls_meta, DomainMetadata)
+                            and cls_meta.name.lower() in self._plugins
+                        ):
+                            continue
+                        plugin_obj = plugin_obj()
                     if isinstance(plugin_obj, BaseDomainPlugin):
+                        if skip_existing and plugin_obj.metadata.name.lower() in self._plugins:
+                            continue
                         self.register(plugin_obj)
                         loaded += 1
                 except Exception as exc:

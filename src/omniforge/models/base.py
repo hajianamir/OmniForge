@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import io
 import json
+import os
+import tempfile
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -19,7 +24,7 @@ from omniforge.core.exceptions import ModelNotFittedError, ModelSerializationErr
 from omniforge.core.logging import get_logger
 from omniforge.core.security import ArtifactSigner, EncryptionManager, safe_joblib_load_bytes
 from omniforge.core.types import ModelMetadata, TaskType
-from omniforge.core.utils import compute_file_checksum, set_global_seed
+from omniforge.core.utils import set_global_seed
 
 _MODEL_HMAC_CONTEXT = b"omniforge:model:v1"
 
@@ -156,6 +161,30 @@ class BaseOmniForgeModel(ABC):
         self.metadata_.hyperparameters = dict(self.hyperparameters)
         return self
 
+    @staticmethod
+    def _write_temp_fsync(parent: Path, prefix: str, payload: bytes) -> Path:
+        """Write ``payload`` to a mode-0600 sibling temporary file and ``fsync`` before return."""
+        fd, raw_name = tempfile.mkstemp(dir=str(parent), prefix=prefix, suffix=".tmp")
+        tmp_path = Path(raw_name)
+        closed = False
+        try:
+            view = memoryview(payload)
+            written = 0
+            while written < len(view):
+                written += os.write(fd, view[written:])
+            os.fsync(fd)
+            os.close(fd)
+            closed = True
+            return tmp_path
+        except Exception:
+            if not closed:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            tmp_path.unlink(missing_ok=True)
+            raise
+
     def save(
         self,
         path: str | Path,
@@ -163,28 +192,69 @@ class BaseOmniForgeModel(ABC):
         encrypt: bool = False,
         encryption_key: str | bytes | None = None,
     ) -> Path:
-        """Persist model artifact to disk with SHA-256 checksum, HMAC-SHA256 signature, and optional AES-256-GCM encryption."""
+        """Persist model artifact to disk with SHA-256 checksum, HMAC-SHA256 signature, and optional AES-256-GCM encryption.
+
+        Serializes into memory so plaintext never touches disk during encrypted saves,
+        stages ``fsync``-ed temporary sibling files, and swaps them atomically via
+        :func:`os.replace` so failed or interrupted saves never leave torn artifacts.
+        """
         self._check_is_fitted()
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
+        meta_path = target.with_suffix(target.suffix + ".meta.json")
+        prev_checksum = self.metadata_.artifact_checksum
+        prev_meta_bytes = meta_path.read_bytes() if meta_path.is_file() else None
+        tmp_artifact: Path | None = None
+        tmp_meta: Path | None = None
+        meta_replaced = False
         try:
-            joblib.dump(self, target)
-            if encrypt:
-                enc = EncryptionManager(encryption_key)
-                raw = target.read_bytes()
-                target.write_bytes(enc.encrypt_bytes(raw))
-            persisted_bytes = target.read_bytes()
-            self.metadata_.artifact_checksum = compute_file_checksum(target)
+            buf = io.BytesIO()
+            joblib.dump(self, buf)
+            raw_bytes = buf.getvalue()
+            persisted_bytes = (
+                EncryptionManager(encryption_key).encrypt_bytes(raw_bytes)
+                if encrypt
+                else raw_bytes
+            )
+            checksum = hashlib.sha256(persisted_bytes).hexdigest()
             hmac_sig = ArtifactSigner().sign_bytes(persisted_bytes, context=_MODEL_HMAC_CONTEXT)
+
+            self.metadata_.artifact_checksum = checksum
             meta_dict = self.metadata_.model_dump(mode="json")
             meta_dict["artifact_hmac_sha256"] = hmac_sig
-            meta_path = target.with_suffix(target.suffix + ".meta.json")
-            meta_path.write_text(json.dumps(meta_dict, indent=2), encoding="utf-8")
+            meta_bytes = json.dumps(meta_dict, indent=2).encode("utf-8")
+
+            tmp_artifact = self._write_temp_fsync(target.parent, f".{target.name}.", persisted_bytes)
+            tmp_meta = self._write_temp_fsync(target.parent, f".{meta_path.name}.", meta_bytes)
+
+            os.replace(tmp_meta, meta_path)
+            tmp_meta = None
+            meta_replaced = True
+
+            os.replace(tmp_artifact, target)
+            tmp_artifact = None
             return target
         except Exception as exc:
+            self.metadata_.artifact_checksum = prev_checksum
+            if meta_replaced:
+                try:
+                    if prev_meta_bytes is not None:
+                        rollback_tmp = self._write_temp_fsync(
+                            target.parent, f".{meta_path.name}.rollback.", prev_meta_bytes
+                        )
+                        os.replace(rollback_tmp, meta_path)
+                    else:
+                        meta_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             raise ModelSerializationError(
                 f"Failed to serialize model '{self.name}' to '{target}'.", cause=exc
             ) from exc
+        finally:
+            if tmp_artifact is not None:
+                tmp_artifact.unlink(missing_ok=True)
+            if tmp_meta is not None:
+                tmp_meta.unlink(missing_ok=True)
 
     @classmethod
     def load(
@@ -213,6 +283,13 @@ class BaseOmniForgeModel(ABC):
                 if not ArtifactSigner().verify_bytes(raw_bytes, expected_hmac, context=_MODEL_HMAC_CONTEXT):
                     raise SecurityError(
                         f"Model artifact '{src.name}' failed HMAC-SHA256 signature verification."
+                    )
+                expected_checksum = str(meta_payload.get("artifact_checksum") or "")
+                if expected_checksum and not hmac.compare_digest(
+                    hashlib.sha256(raw_bytes).hexdigest(), expected_checksum
+                ):
+                    raise SecurityError(
+                        f"Model artifact '{src.name}' failed SHA-256 checksum verification."
                     )
             if encrypted:
                 enc = EncryptionManager(encryption_key)

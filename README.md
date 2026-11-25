@@ -12,7 +12,7 @@ v4.0.0 is a major SemVer bump from 3.3.0. It delivers three contracted capabilit
 
 | Capability Cluster | Code | What It Delivers | Where It Lives |
 |---|------|------------------|----------------|
-| **C5 — Causal Drift Root-Cause Attribution** | `DriftRootCauseAnalyzer` + `CausalDiscovery` | Connects `DriftDetector` PSI/Wasserstein shifts → Delta-attribution per drifted feature → structural DAG upstream-ancestor traversal to isolate root-cause upstream sensor/source shifts from downstream correlated symptoms; emits remediation prescriptions | `src/omniforge/mlops/root_cause.py`; Studios 11 (`/s11/root-cause`) & 14 (`/s14/root-cause`) |
+| **C5 — Causal Drift Root-Cause Attribution** | `DriftRootCauseAnalyzer` + `CausalDiscovery` | Connects `DriftDetector` PSI/Wasserstein shifts → Delta-attribution per drifted feature → structural DAG upstream-ancestor traversal to isolate root-cause upstream sensor/source shifts from downstream correlated symptoms; emits remediation prescriptions | `src/omniforge/mlops/root_cause.py`; Studio 11 (`/s11/root-cause`) |
 | **C7 — Closed-Loop Digital Twin MPC** | `ClosedLoopMPCController` | Constrained receding-horizon quadratic control `argmin ||Hx̂−r||_Q² + ||u||_R²` subject to input/state safety bounds via SLSQP; constraint softening with slack variables, solve-time tracking, warm-start alignment, R-matrix dimension fix, bounded relaxation fallback; exposed via `POST /s09/twin-control` with interactive trajectory charts | `src/omniforge/simulation/closed_loop.py`; Studio 09 (`/s09/twin-control`) |
 | **C4 — Air-Gapped Deterministic Copilot** | `CopilotToolRegistry` + `_chat_local_planner` | 10 new deterministic offline tools spanning all 15 Studios: intake/PII auditing (`pii_audit`), Split Lock enforcement (`split_lock`), honest data cleaning, 18-domain validation (`domain_validate`), Green-AI Pareto AutoML (`pareto_automl`), causal root-cause diagnosis (`root_cause_diagnosis`), closed-loop twin control (`twin_control`), model register/promote (`register_model`/`promote_model`), studio listing/overview (`list_studios`/`studio_overview`) | `src/omniforge/copilot/tools.py`; Studio 13 (`/s13/chat`) |
 | **Version Alignment** | `pyproject.toml`, `src/omniforge/version.py` | Canonical SemVer 3.3.0 → 4.0.0 across SDK, pyproject.toml, native hubs, exporters, SPA manifests, and tests | All packages |
@@ -49,21 +49,21 @@ v4.0.0 is a major SemVer bump from 3.3.0. It delivers three contracted capabilit
 
 | Studio | ID | Name | Primary Purpose | Phase 6 Enhancement |
 |---|---|---|---|---|
-| Studio 00 | `s00` | Ingestion | Multi-source data loading + initial intake audit | — |
+| Studio 00 | `s00` | Data Relationships | Multi-source data loading, schema relationships & initial intake audit | — |
 | Studio 01 | `s01` | Cleaning | Leakage-safe cleaning, imputation, outlier handling | — |
 | Studio 02 | `s02` | Mining | Clustering, anomaly screening, data mining | — |
-| Studio 03 | `s03` | EDA | Automated exploratory data analysis | — |
-| Studio 04 | `s04` | Diagnostics | Universal diagnostics, baseline equations, risk | — |
-| Studio 05 | `s05` | Feature Engineering | Feature creation & 4-method consensus selection | — |
-| Studio 06 | `s06` | AutoML | Multi-backend AutoML, non-parametric analytical, deep learning | — |
-| Studio 07 | `s07` | Advanced AI | Responsible AI: SHAP, PDP, fairness, model cards | — |
-| Studio 08 | `s08` | Causal | Forecasting, causal ATE, optimization, simulation | — |
+| Studio 03 | `s03` | Industry Domains | 18 vertical industry domain solutions, KPIs & diagnostics | — |
+| Studio 04 | `s04` | EDA & Hypothesis | Automated exploratory data analysis & statistical hypothesis lab | — |
+| Studio 05 | `s05` | Feature Engineering | Feature creation & multi-method consensus selection | — |
+| Studio 06 | `s06` | AutoML | Multi-backend AutoML, non-parametric analytical, deep learning & Green-AI Pareto | — |
+| Studio 07 | `s07` | Responsible AI | Explainability (SHAP, PDP), conformal intervals, fairness & model cards | — |
+| Studio 08 | `s08` | Forecasting & Causal | Forecasting, causal ATE, optimization & simulation | — |
 | Studio 09 | `s09` | Specialized AI | NLP, Vision, Graph, RecSys, Survival + **C7 Twin MPC** | ✅ C7 `/s09/twin-control` |
-| Studio 10 | `s10` | RAI | DAG pipeline builder | — |
-| Studio 11 | `s11` | MLOps | Model registry, experiments, **C5 root-cause** | ✅ C5 `/s11/root-cause` |
-| Studio 12 | `s12` | Reports | Executive reporting & export | — |
+| Studio 10 | `s10` | Pipeline DAG | Visual DAG pipeline orchestration & code export | — |
+| Studio 11 | `s11` | MLOps | Model registry, experiments, drift & **C5 root-cause** | ✅ C5 `/s11/root-cause` |
+| Studio 12 | `s12` | Reports | Executive reporting & multi-format export | — |
 | Studio 13 | `s13` | Copilot | AI analytics copilot + **C4 deterministic tools** | ✅ C4 `/s13/chat` |
-| Studio 14 | `s14` | Supervisory | Live prediction & engineering supervisory control + **C5 root-cause** | ✅ C5 `/s14/root-cause` |
+| Studio 14 | `s14` | Supervisory | Algorithm catalog, quick-train, live prediction & supervisory control | — |
 
 ---
 
@@ -109,7 +109,7 @@ pip install -e ".[api,ui,reporting,data,forecasting,deep,boosting,automl,respons
 
 ### Reproducible & Hardened Installs
 
-For production/deployments, install the hash-pinned runtime lock instead of the floating `requirements.txt` ranges (target: Python 3.12, generated with `uv pip compile requirements.txt --generate-hashes --python-version 3.12 --universal`):
+For production/deployments, install the hash-pinned runtime lock instead of floating ranges (target: Python 3.12, generated with `uv pip compile requirements.in --generate-hashes --python-version 3.12 --universal -o requirements.lock`):
 
 ```bash
 pip install --require-hashes -r requirements.lock
@@ -202,7 +202,7 @@ reporter.export(payload, "credit_risk_deck.pptx")
 omniforge domains
 
 # Run AutoML from the terminal
-omniferge automl finance.csv --target default_flag --budget 20
+omniforge automl finance.csv --target default_flag --budget 20
 
 # Ask the AI Copilot in plain English (air-gapped deterministic planner)
 omniforge copilot "profile data quality" --data finance.csv

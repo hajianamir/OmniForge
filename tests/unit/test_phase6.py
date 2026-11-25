@@ -326,16 +326,22 @@ def test_deltashap_integration():
 
 def test_mpc_convergence_fallback():
     twin = build_default_twin(n_x=2, n_u=1, dt=1.0)
-    # Extremely tight control bound -> QP likely infeasible; controller must not crash.
+    # Extremely tight control bound makes hard state bounds infeasible; Stage-2 soft state constraints must converge.
     ctrl = ClosedLoopMPCController(
         twin, horizon=6, u_min=np.array([-1e-6]), u_max=np.array([1e-6]),
         x_min=np.array([-10.0, -10.0]), x_max=np.array([10.0, 10.0]),
     )
     res = ctrl.solve(x0=np.array([100.0, 100.0]), r_path=np.zeros((6, 2)))
-    assert isinstance(res.success, bool)
+    assert res.success is True
+    assert res.slack_used > 0.0
     assert isinstance(res.solver_message, str)
-    assert isinstance(res.constraint_violations, list)
+    assert isinstance(res.constraint_violations, list) and len(res.constraint_violations) > 0
     assert res.state_trajectory.shape == (7, 2)
+    np.testing.assert_allclose(
+        res.state_trajectory[1],
+        twin.A @ np.array([100.0, 100.0]) + twin.B @ res.optimal_control,
+        atol=1e-6,
+    )
 
 
 # --------------------------------------------------------------------------- C7: twin persistence (Item 4)

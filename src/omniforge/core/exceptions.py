@@ -61,11 +61,15 @@ class OmniForgeError(Exception):
         self.cause = cause
         self.timestamp = datetime.now(UTC).isoformat()
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, include_internal: bool = True) -> dict[str, Any]:
         """Serialize the exception into an API- and log-safe dictionary.
 
+        Args:
+            include_internal: When ``False`` (used for external HTTP responses), omits
+                ``context`` and ``cause`` so internal paths/driver messages never leak.
+
         Returns:
-            Dictionary with complete error telemetry.
+            Dictionary with structured error telemetry.
         """
         payload: dict[str, Any] = {
             "error_type": self.__class__.__name__,
@@ -75,10 +79,11 @@ class OmniForgeError(Exception):
             "suggestions": self.suggestions,
             "trace_id": self.trace_id,
             "timestamp": self.timestamp,
-            "context": self.context,
         }
-        if self.cause is not None:
-            payload["cause"] = f"{type(self.cause).__name__}: {self.cause}"
+        if include_internal:
+            payload["context"] = self.context
+            if self.cause is not None:
+                payload["cause"] = f"{type(self.cause).__name__}: {self.cause}"
         return payload
 
     def __str__(self) -> str:

@@ -95,23 +95,23 @@ Areas not covered in depth (read the module and its tests in full before editing
 
 ## 5. Architecture traps
 
-- **Layering is violated in practice.** `api/workbench.py` imports `omniforge.ui.state` at module level; `ui/__init__.py` imports `ui.app`, which imports `api.main`; `api/main.py` runs `app = create_app()` at import time. Importing `omniforge.ui.state` therefore constructs the whole FastAPI app. Do not add top-level imports of `omniforge.api` or `omniforge.ui` into `core` or `data`. Keep the studio `_wb()` lazy-import pattern. Full detail: reference section 5.
+- **Layering guardrails.** `api/workbench.py` imports `omniforge.ui.state` at module level, while `ui/__init__.py` uses lazy PEP 562 `__getattr__` and `ui/app.py` defers `omniforge.api.main` imports inside `create_workbench_app()` so importing `omniforge.ui.state` or `omniforge.ui` does not construct the FastAPI app at import time. Do not add top-level imports of `omniforge.api` or `omniforge.ui` into `core` or `data`. Keep the studio `_wb()` lazy-import pattern. Full detail: reference section 5.
 - **Two registry surfaces do not share models for non-default tenants.** `api.main` uses `tenants/<sha256[:16]>/api_v1/...`; `api.workbench` uses `tenants/<slug>/...`. In workbench code, always obtain stores via `get_tenant_registry()` / `get_tenant_tracker()`.
 - **State is per-process and lost on restart.** `ServerSessionRegistry` (in-process, `RLock`-guarded) and `BackgroundJobManager` do not share across workers.
 - **Canonical workspace extension is `.omniforge`.** `.uap` is read-only legacy. Signing keys are host-local - workspaces do not verify across hosts unless keys are shared.
-- **Known defects (do not rely on the buggy behaviour; fix with a test first):** MPC gradient mismatch (D2), audit-chain fork with multiple writers (D1), SSRF DNS-rebinding gap (D6), inert domain entry-points (D7), non-atomic `save()` (D8), RBAC inconsistency (D4), Copilot `list_studios` advertising non-existent routes (D5). Full register: reference section 20.
+- **Remediated defects & remaining architectural boundaries:** D1 (multi-writer audit locking & tail sync), D2 (exact MPC gradient, initial-step dynamics & soft state slack), D3 (`.env.example` `AUTO_BOOTSTRAP_LOCAL_UI=false` & loopback `Makefile` defaults), D4 (`model:promote` enforced on `/api/v1/registry/.../stage` Production transitions and request-scoped Copilot tools), D5 (`list_studios` OpenAPI-verified routes), D6 (per-hop SSRF DNS-rebinding IP pinning + TLS SNI), D7 (class/instance domain entry-point discovery), D8 (atomic in-memory encrypted `save()`), D12, D14 (`/api/system/capabilities`), D15 (JWT `exp`/`sub` parity & sanitized `OmniForgeError` HTTP responses), D16, and D17 (CI untracked `static_app` check) are remediated and covered by `tests/unit/test_remediation_audit_loop.py`. Full register: reference section 20.
 
 ## 6. Security invariants (verify on every change)
 
-1. Every `/api/workbench` route keeps `require_workbench_auth`. RBAC is not applied inside the workbench (D4).
+1. Every `/api/workbench` route keeps `require_workbench_auth`, and Production model promotions enforce `model:promote` across `/s11/promote`, `/api/v1/registry/.../stage`, and request-scoped Copilot tools.
 2. Workbench state is reached only through `_sid()`. Cookie and API-key callers share one namespace.
 3. State-changing, cookie-authenticated requests need a matching `X-CSRF-Token`.
 4. Uploads use `read_upload_bounded`. Pickle-like extensions (`.pkl .pickle .joblib .dill`) are rejected.
-5. Outbound HTTP goes only through `validate_outbound_http_url` and `_fetch_http_safe`, with no `follow_redirects=True`. No DNS pinning (D6).
+5. Outbound HTTP goes only through `resolve_and_validate_outbound_http_url` / `validate_outbound_http_url` and `_fetch_http_safe`, with no `follow_redirects=True` and per-hop IP pinning + TLS SNI verification.
 6. SQL goes only through `validate_readonly_sql`, with allow-listed and quoted identifiers. SQLite is read-only with an authorizer. DuckDB is read-only without external access.
-7. Model and workspace artifacts are HMAC-signed and loaded through the restricted unpickler. Enums that can be pickled use `SerializableStrEnum`. See D8 and reference 6.6.
-8. Secrets resolve through `_resolve_or_persist_secret`. Production requires explicit, strong, non-placeholder values.
-9. The audit log is append-only, hash-chained and MACed. Never add an unsigned verification path. Multi-writer behaviour forks the chain (D1).
+7. Model and workspace artifacts are HMAC-signed, saved atomically via sibling temp files + `os.replace` (plaintext never touches disk when `encrypt=True`), and loaded through the restricted unpickler. Enums that can be pickled use `SerializableStrEnum`. See reference 6.6.
+8. Secrets resolve through `_resolve_or_persist_secret` (race-free across threads/processes). Production requires explicit, strong, non-placeholder values.
+9. The audit log is append-only, hash-chained and MACed, synchronized across threads and processes via `_locked_file_path` + prefix digest verification. Never add an unsigned verification path.
 10. Copilot file ingestion stays confined to `OMNIFORGE_COPILOT_INGEST_ROOT`, with no hidden files and no system directories.
 11. Rate limiting is keyed by the ASGI client host. Only `/health` and `/api/v1/health` are exempt.
 12. CORS never combines a wildcard with credentials.

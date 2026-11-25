@@ -16,7 +16,17 @@ from omniforge.core.exceptions import AuthorizationError
 from omniforge.core.security import AccessController, JWTManager, _is_production_env, _resolve_or_persist_secret
 from omniforge.core.types import Principal
 
-jwt_manager = JWTManager()
+
+def _build_jwt_manager() -> JWTManager:
+    sec = get_settings().security
+    return JWTManager(
+        secret_key=sec.jwt_secret_key or None,
+        algorithm=sec.jwt_algorithm,
+        expiration_minutes=sec.jwt_expiration_minutes,
+    )
+
+
+jwt_manager = _build_jwt_manager()
 
 
 def _build_access_controller() -> AccessController:
