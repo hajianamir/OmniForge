@@ -3,6 +3,7 @@ import { apiGet, apiPost, apiUpload, toErrorMessage } from '../api';
 import { BarChartSVG, DivergingDriverBarSVG, ForecastFanSVG, LineSeriesSVG } from '../components/Charts';
 import { SimpleTable } from '../components/DataGrid';
 import { StudioHelpButton } from '../components/HelpGuideModal';
+import { LiveChartGenerator } from '../components/LiveChartGenerator';
 import { MathEquationCard } from '../components/MathEquation';
 import { ModeBar, type ExecutionMode } from '../components/ModeBar';
 import type {
@@ -144,6 +145,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
         <ProvenancePill ws={ws} />
       </div>
       {err && <div className="alert alert-error">{err}</div>}
+      <LiveChartGenerator studioId="06" ws={ws} studioCache={studioCache} />
       <div className="tabs">
         <button className={`tab-btn ${tab === 'automl' ? 'active' : ''}`} onClick={() => setTab('automl')}>Multi-Backend AutoML Hub</button>
         <button className={`tab-btn ${tab === 'nonparametric' ? 'active' : ''}`} onClick={() => setTab('nonparametric')}>Non-Parametric Analytical Models</button>
@@ -544,6 +546,7 @@ export const Studio07Responsible: React.FC<StudioProps> = ({ ws, studioCache, se
         <ProvenancePill ws={ws} />
       </div>
       {err && <div className="alert alert-error">{err}</div>}
+      <LiveChartGenerator studioId="07" ws={ws} studioCache={studioCache} />
       <div className="grid-2">
         <div className="card">
           <div className="card-title">Global Permutation Importance &amp; Local Explanation</div>
@@ -676,6 +679,7 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
         <ProvenancePill ws={ws} />
       </div>
       {err && <div className="alert alert-error">{err}</div>}
+      <LiveChartGenerator studioId="08" ws={ws} studioCache={studioCache} />
       <div className="tabs">
         <button className={`tab-btn ${tab === 'forecast' ? 'active' : ''}`} onClick={() => setTab('forecast')}>Deep &amp; Classical Forecasting</button>
         <button className={`tab-btn ${tab === 'causal' ? 'active' : ''}`} onClick={() => setTab('causal')}>Causal Inference (ATE/AIPW)</button>

@@ -3,6 +3,7 @@ import { apiDelete, apiDownload, apiGet, apiPost, apiUpload, toErrorMessage } fr
 import { BarChartSVG, CanvasScatter, HeatmapGrid } from '../components/Charts';
 import { PaginatedDataGrid, SimpleTable } from '../components/DataGrid';
 import { StudioHelpButton, type HandbookSectionId } from '../components/HelpGuideModal';
+import { LiveChartGenerator } from '../components/LiveChartGenerator';
 import { MathEquationCard, type EquationEntry } from '../components/MathEquation';
 import { ModeBar, type ExecutionMode } from '../components/ModeBar';
 import type {
@@ -480,6 +481,8 @@ export const Studio01Data: React.FC<StudioProps & { sectionMode?: 'ingestion' | 
 
       {msg && <div className="alert alert-success">{msg}</div>}
       {err && <div className="alert alert-error">{err}</div>}
+
+      <LiveChartGenerator studioId={sectionMode === 'ingestion' ? '00' : '01'} ws={ws} studioCache={studioCache} />
 
       {/* Multi-Source Ingestion Hub */}
       {sectionMode === 'ingestion' && (
@@ -1083,6 +1086,8 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
       {msg && <div className="alert alert-success">{msg}</div>}
       {err && <div className="alert alert-error">{err}</div>}
 
+      <LiveChartGenerator studioId="02" ws={ws} studioCache={studioCache} />
+
       <div className="tabs">
         <button className={`tab-btn ${tab === 'cluster' ? 'active' : ''}`} onClick={() => setTab('cluster')}>1. Clustering &amp; Cluster Row Removal</button>
         <button className={`tab-btn ${tab === 'anomaly' ? 'active' : ''}`} onClick={() => setTab('anomaly')}>2. Anomaly Detection Screening</button>
@@ -1411,6 +1416,7 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
         <ProvenancePill ws={ws} />
       </div>
       {err && <div className="alert alert-error">{err}</div>}
+      <LiveChartGenerator studioId="03" ws={ws} studioCache={studioCache} />
       <div className="card">
         <div className="card-title">
           <span className="row" style={{ gap: 6, alignItems: 'center' }}>
@@ -1655,6 +1661,8 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
       </div>
       {err && <div className="alert alert-error">{err}</div>}
 
+      <LiveChartGenerator studioId="04" ws={ws} studioCache={studioCache} />
+
       {!eda && ws.has_dataset && (
         <div className="card" style={{ borderStyle: 'dashed' }}>
           <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>
@@ -1862,6 +1870,7 @@ export const Studio05Features: React.FC<StudioProps> = ({ ws, onSync, bumpGrid, 
         <ProvenancePill ws={ws} />
       </div>
       {err && <div className="alert alert-error">{err}</div>}
+      <LiveChartGenerator studioId="05" ws={ws} studioCache={studioCache} />
       <div className="grid-2">
         <div className="card">
           <div className="card-title">

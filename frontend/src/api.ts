@@ -448,3 +448,36 @@ export async function apiDownload(
   a.remove();
   URL.revokeObjectURL(url);
 }
+
+export async function apiDownloadJson(
+  path: string,
+  filename: string,
+  body: unknown,
+  options: ApiRequestOptions = {},
+): Promise<void> {
+  const res = await fetchWithRetry(
+    path,
+    {
+      method: 'POST',
+      credentials: 'same-origin',
+      body: JSON.stringify(body ?? {}),
+    },
+    { 'Content-Type': 'application/json' },
+    options,
+    DEFAULT_TIMEOUTS.download,
+    0,
+  );
+  if (!res.ok) {
+    const rawText = await res.text();
+    throw new ApiError(extractErrorMessage(rawText, res.status, res.statusText), res.status, 'HTTP');
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}

@@ -5,6 +5,7 @@ import { SimpleTable } from '../components/DataGrid';
 import { FeatureFreshnessPanel } from '../components/FeatureFreshnessPanel';
 import { StudioHelpButton } from '../components/HelpGuideModal';
 import { InspectableBox } from '../components/InspectModal';
+import { LiveChartGenerator } from '../components/LiveChartGenerator';
 import type {
   BackendsProbeResponse,
   ChatResponse,
@@ -114,6 +115,7 @@ export const Studio09Specialized: React.FC<StudioProps> = ({ ws, studioCache, se
         <ProvenancePill ws={ws} />
       </div>
       {err && <div className="alert alert-error">{err}</div>}
+      <LiveChartGenerator studioId="09" ws={ws} studioCache={studioCache} />
       <div className="tabs">
         <button className={`tab-btn ${tab === 'nlp' ? 'active' : ''}`} onClick={() => setTab('nlp')}>Extended NLP Suite</button>
         <button className={`tab-btn ${tab === 'vision' ? 'active' : ''}`} onClick={() => setTab('vision')}>Vision Foundation Hub</button>
@@ -385,6 +387,7 @@ export const Studio10DAG: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
         </div>
       </div>
       {err && <div className="alert alert-error">{err}</div>}
+      <LiveChartGenerator studioId="10" ws={ws} studioCache={studioCache} />
       <div className="card">
         <div className="chip-grid" style={{ marginBottom: 14 }}>
           {['quality', 'clean', 'eda', 'features', 'automl'].map((s) => (
@@ -454,6 +457,7 @@ export const Studio11MLOps: React.FC<StudioProps> = ({ ws, studioCache, setStudi
         <ProvenancePill ws={ws} />
       </div>
       {err && <div className="alert alert-error">{err}</div>}
+      <LiveChartGenerator studioId="11" ws={ws} studioCache={studioCache} />
       <div className="grid-2">
         <div className="card">
           <div className="card-title">Model Registry</div>
@@ -597,6 +601,8 @@ export const Studio12Reporting: React.FC<StudioProps> = ({ ws, onSync, studioCac
       </div>
 
       {err && <div className="alert alert-error">{err}</div>}
+
+      <LiveChartGenerator studioId="12" ws={ws} studioCache={studioCache} />
 
       <div className="card">
         <div className="card-title">
@@ -796,6 +802,7 @@ export const Studio13Copilot: React.FC<StudioProps> = ({ ws, studioCache, setStu
         </div>
         <ProvenancePill ws={ws} />
       </div>
+      <LiveChartGenerator studioId="13" ws={ws} studioCache={studioCache} />
       <div className="card">
         <div className="chat-box">
           {messages.map((m, i) => <div key={i} className={`chat-msg ${m.role}`}>{m.text}</div>)}

@@ -5,6 +5,7 @@ import { BarChartSVG, DivergingDriverBarSVG, SPCControlSVG, SupervisoryTrendSVG 
 import { SimpleTable } from '../components/DataGrid';
 import { FeatureFreshnessPanel } from '../components/FeatureFreshnessPanel';
 import { StudioHelpButton } from '../components/HelpGuideModal';
+import { LiveChartGenerator } from '../components/LiveChartGenerator';
 import { MathEquationCard } from '../components/MathEquation';
 import type {
   ExcelSheetsResponse,
@@ -353,6 +354,8 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
 
       {msg && <div className="alert alert-success">{msg}</div>}
       {err && <div className="alert alert-error">{err}</div>}
+
+      <LiveChartGenerator studioId="14" ws={ws} studioCache={studioCache} />
       <FeatureFreshnessPanel />
 
       {/* 1. MODEL & BASELINE SELECTOR + INLINE QUICK-TRAIN */}
