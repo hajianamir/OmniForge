@@ -185,7 +185,7 @@ class ModelRegistry:
         """Enforce Responsible AI fairness promotion gate when transitioning to PRODUCTION (NIST AI RMF MANAGE 2.2)."""
         eff_require = self.require_fairness_gate if require_fairness_gate is None else bool(require_fairness_gate)
         failed_audit = fairness_passed is False
-        missing_required_audit = eff_require and not evidence_bound
+        missing_required_audit = eff_require and (not evidence_bound or fairness_passed is not True)
         if not failed_audit and not missing_required_audit:
             return tags
 
@@ -194,7 +194,7 @@ class ModelRegistry:
             reason_msg = (
                 f"Model '{model_name}' v{version} failed its Responsible AI fairness audit (fairness_passed=False)"
                 if failed_audit
-                else f"Model '{model_name}' v{version} has no fairness evidence bound to its artifact and holdout (require_fairness_gate=True)"
+                else f"Model '{model_name}' v{version} requires a current fairness assessment bound to its artifact and holdout"
             )
             _audit_registry_event(
                 "registry:fairness_gate_blocked",
@@ -287,7 +287,7 @@ class ModelRegistry:
                     model_name=model_name,
                     version=next_ver,
                     fairness_passed=eff_fairness,
-                    evidence_bound=fairness_evidence is not None,
+                    evidence_bound=fairness_evidence is not None and fairness_evidence.report.assessment_status is not None,
                     require_fairness_gate=require_fairness_gate,
                     override_reason=override_reason,
                     tags=eff_tags,
@@ -326,6 +326,7 @@ class ModelRegistry:
                     n_holdout_rows=fairness_evidence.n_holdout_rows,
                     protected_attribute=fairness_evidence.report.protected_attribute,
                     passed=fairness_evidence.report.passed,
+                    assessment_status=fairness_evidence.report.assessment_status,
                 ) if fairness_evidence is not None else None,
                 encrypted_at_rest=encrypt,
                 registered_at=now,
@@ -432,6 +433,7 @@ class ModelRegistry:
             evidence.model_name != record.model_name or evidence.version != record.version
             or evidence.artifact_checksum != record.checksum_sha256
             or evidence.passed != record.fairness_passed
+            or (evidence.assessment_status is not None and evidence.passed != (evidence.assessment_status == "thresholds_met"))
         ):
             raise MLOpsError("The registry fairness evidence does not match this model version.")
         try:
@@ -441,7 +443,7 @@ class ModelRegistry:
             raise MLOpsError("The model artifact required by its fairness evidence is unavailable.") from exc
         if checksum != evidence.artifact_checksum:
             raise MLOpsError("The model artifact does not match its fairness evidence.")
-        return True
+        return evidence.assessment_status is not None
 
     def rollback_production(
         self,

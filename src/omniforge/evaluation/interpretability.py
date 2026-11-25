@@ -20,10 +20,21 @@ class InterpretabilityEngine:
         self.random_seed = random_seed
 
     def _predict_scalar(self, model: BaseOmniForgeModel, X: pd.DataFrame | np.ndarray) -> np.ndarray:
-        if model.task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
-            proba = model.predict_proba(X)
-            return proba[:, 1] if proba.shape[1] == 2 else np.max(proba, axis=1)
-        return model.predict(X).astype(float)
+        response, _ = self.prediction_response(model, X)
+        return response
+
+    @staticmethod
+    def prediction_response(model: Any, X: pd.DataFrame | np.ndarray) -> tuple[np.ndarray, str]:
+        """Return the scalar model response used by explanations and its meaning."""
+        task = getattr(model, "task_type", None)
+        if task in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION) or (
+            task is None and hasattr(model, "predict_proba")
+        ):
+            proba = np.asarray(model.predict_proba(X), dtype=float)
+            if proba.shape[1] == 2:
+                return proba[:, 1], "second_class_probability"
+            return np.max(proba, axis=1), "maximum_class_probability"
+        return np.asarray(model.predict(X), dtype=float), "numeric_prediction"
 
     def permutation_importance(
         self,

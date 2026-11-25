@@ -17,7 +17,7 @@ logger = get_logger(__name__)
 
 
 class StatisticalForecaster:
-    """Unified probabilistic statistical forecaster covering ETS, ARIMA, Theta, Croston, and Fourier-Trend."""
+    """Statistical forecasting with method-specific nominal prediction intervals."""
 
     def __init__(
         self,
@@ -25,12 +25,14 @@ class StatisticalForecaster:
         *,
         seasonal_period: int = 7,
         arima_order: tuple[int, int, int] = (1, 1, 1),
+        seasonal_arima_order: tuple[int, int, int] = (1, 0, 0),
         fourier_order: int = 3,
         confidence_level: float = 0.95,
     ) -> None:
         self.method = method.lower()
         self.seasonal_period = max(1, int(seasonal_period))
         self.arima_order = arima_order
+        self.seasonal_arima_order = seasonal_arima_order
         self.fourier_order = int(fourier_order)
         self.confidence_level = float(confidence_level)
         self._history: np.ndarray = np.array([], dtype=float)
@@ -38,16 +40,27 @@ class StatisticalForecaster:
         self._residual_std: float = 1.0
         self._theta_params: dict[str, float] = {}
         self._croston_rate: float = 0.0
+        self._exog_columns: pd.Index | None = None
 
-    def fit(self, y: pd.Series | np.ndarray) -> StatisticalForecaster:
-        """Fit statistical forecasting model to a 1D target series (strictly causal imputation)."""
-        s_y = pd.to_numeric(pd.Series(y), errors="coerce")
-        if not s_y.notna().any():
+    def fit(
+        self, y: pd.Series | np.ndarray, *, exog: pd.DataFrame | np.ndarray | None = None
+    ) -> StatisticalForecaster:
+        """Fit ordered observations, with optional row-aligned SARIMAX regressors."""
+        s_y = pd.to_numeric(pd.Series(y), errors="coerce").replace([np.inf, -np.inf], np.nan)
+        observed = np.flatnonzero(s_y.notna())
+        if observed.size == 0:
             raise ForecastingError("StatisticalForecaster target series contains no valid numeric values.")
-        arr = s_y.ffill().fillna(float(s_y.dropna().iloc[0])).to_numpy(dtype=float).ravel()
+        start = int(observed[0])
+        arr = s_y.iloc[start:].ffill().to_numpy(dtype=float)
         if len(arr) < 4:
             raise ForecastingError("StatisticalForecaster requires at least 4 historical observations.")
-        self._history = arr
+        if exog is not None and self.method != "sarimax":
+            raise ForecastingError("Exogenous regressors require method='sarimax'.")
+        if isinstance(y, pd.Series) and isinstance(exog, pd.DataFrame) and not exog.index.equals(y.index):
+            raise ForecastingError("Exogenous training rows must match the target index.")
+        regressors = self._validate_exog(exog, len(s_y))[start:] if exog is not None else None
+        if self.method != "sarimax":
+            self._history = arr
 
         if self.method == "prophet" and is_package_available("prophet"):
             from prophet import Prophet
@@ -61,7 +74,7 @@ class StatisticalForecaster:
         if self.method == "ets":
             self._fit_ets(arr)
         elif self.method in ("arima", "sarimax"):
-            self._fit_arima(arr)
+            self._fit_arima(arr, regressors)
         elif self.method == "theta":
             self._fit_theta(arr)
         elif self.method == "croston":
@@ -70,13 +83,23 @@ class StatisticalForecaster:
             # Fourier-Prophet style additive trend + multi-harmonic seasonality
             self._fit_fourier_trend(arr)
 
+        self._history = arr
+        self._exog_columns = exog.columns.copy() if isinstance(exog, pd.DataFrame) else None
         return self
 
-    def predict(self, horizon: int) -> pd.DataFrame:
-        """Forecast ``horizon`` steps ahead with point estimate and calibrated prediction intervals."""
+    def predict(self, horizon: int, *, exog: pd.DataFrame | np.ndarray | None = None) -> pd.DataFrame:
+        """Forecast the horizon using future regressors when the model was fitted with them."""
         if len(self._history) == 0:
             raise ForecastingError("Call fit() before predict().")
         h = max(1, int(horizon))
+        fitted_exog = self._fitted_model.model.k_exog if self.method == "sarimax" else 0
+        if bool(fitted_exog) != (exog is not None):
+            raise ForecastingError("Supply future regressors exactly when the fitted model uses them.")
+        if isinstance(exog, pd.DataFrame) and self._exog_columns is not None and not exog.columns.equals(self._exog_columns):
+            raise ForecastingError("Future regressor columns must match the fitted columns in order.")
+        future_exog = self._validate_exog(exog, h) if exog is not None else None
+        if future_exog is not None and future_exog.shape[1] != fitted_exog:
+            raise ForecastingError(f"Fitted SARIMAX expects {fitted_exog} exogenous columns.")
         z = self._z_score(self.confidence_level)
         steps = np.sqrt(np.arange(1, h + 1, dtype=float))
 
@@ -95,7 +118,7 @@ class StatisticalForecaster:
         if self.method == "ets" and self._fitted_model is not None:
             yhat = np.asarray(self._fitted_model.forecast(h), dtype=float)
         elif self.method in ("arima", "sarimax") and self._fitted_model is not None:
-            fc_res = self._fitted_model.get_forecast(steps=h)
+            fc_res = self._fitted_model.get_forecast(steps=h, exog=future_exog)
             yhat = np.asarray(fc_res.predicted_mean, dtype=float)
             ci = np.asarray(fc_res.conf_int(alpha=1.0 - self.confidence_level), dtype=float)
             return pd.DataFrame(
@@ -162,13 +185,29 @@ class StatisticalForecaster:
             self.method = "fourier_prophet"
             self._fit_fourier_trend(arr)
 
-    def _fit_arima(self, arr: np.ndarray) -> None:
+    @staticmethod
+    def _validate_exog(exog: pd.DataFrame | np.ndarray, n_rows: int) -> np.ndarray:
+        try:
+            values = np.asarray(exog, dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise ForecastingError("Exogenous regressors must be finite numeric values.") from exc
+        if values.ndim != 2 or values.shape[0] != n_rows or not values.shape[1] or not np.isfinite(values).all():
+            raise ForecastingError(f"Exogenous regressors must have {n_rows} rows and at least one finite numeric column.")
+        return values
+
+    def _fit_arima(self, arr: np.ndarray, exog: np.ndarray | None) -> None:
         try:
             from statsmodels.tsa.statespace.sarimax import SARIMAX
 
             model = SARIMAX(
                 arr,
+                exog=exog,
                 order=self.arima_order,
+                seasonal_order=(
+                    (*self.seasonal_arima_order, self.seasonal_period)
+                    if self.method == "sarimax" and self.seasonal_period > 1
+                    else (0, 0, 0, 0)
+                ),
                 enforce_stationarity=False,
                 enforce_invertibility=False,
             )
@@ -182,6 +221,8 @@ class StatisticalForecaster:
             ddof = 1 if len(eff_resid) > 1 else 0
             self._residual_std = float(np.std(eff_resid, ddof=ddof)) or 1.0
         except Exception as exc:
+            if self.method == "sarimax":
+                raise ForecastingError(f"SARIMAX fit failed ({type(exc).__name__}).") from exc
             logger.warning("arima_fallback_to_fourier", reason=str(exc))
             self.method = "fourier_prophet"
             self._fit_fourier_trend(arr)

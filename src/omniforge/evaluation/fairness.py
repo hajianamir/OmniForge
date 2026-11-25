@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from scipy import stats
 
 from omniforge.core.exceptions import EvaluationError
+
+FairnessAssessmentStatus = Literal["insufficient_evidence", "threshold_failed", "thresholds_met"]
 
 
 class FairnessReport(BaseModel):
@@ -22,6 +24,9 @@ class FairnessReport(BaseModel):
     disparate_impact_ratio: float
     equalized_odds_diff: float | None
     equal_opportunity_diff: float | None
+    assessment_status: FairnessAssessmentStatus | None = None
+    missing_sensitive_count: int = 0
+    missing_outcome_count: int = 0
     disparate_impact_ci_95: tuple[float, float] | None = None
     demographic_parity_ci_95: tuple[float, float] | None = None
     selection_interval_method: str | None = None
@@ -35,6 +40,12 @@ class FairnessReport(BaseModel):
     group_metrics: dict[str, dict[str, float | None]] = Field(default_factory=dict)
     violations: list[str] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_assessment_status(self) -> FairnessReport:
+        if self.assessment_status is not None and self.passed != (self.assessment_status == "thresholds_met"):
+            raise ValueError("Fairness assessment status must agree with its pass flag.")
+        return self
 
     @field_validator(
         "equalized_odds_diff",
@@ -73,12 +84,25 @@ class FairnessAuditor:
         positive_label: Any = 1,
     ) -> FairnessReport:
         """Compute group-level TPR, FPR, selection rate, disparate impact, and equalized odds."""
-        yt = (np.asarray(y_true) == positive_label).astype(int)
-        yp = (np.asarray(y_pred) == positive_label).astype(int)
-        sf = np.asarray(sensitive_features).astype(str)
+        labels, predictions, sensitive = map(np.asarray, (y_true, y_pred, sensitive_features))
 
-        if any(values.ndim != 1 for values in (yt, yp, sf)) or len(yt) != len(yp) or len(yt) != len(sf):
+        if any(a.ndim != 1 for a in (labels, predictions, sensitive)) or not (
+            len(labels) == len(predictions) == len(sensitive)
+        ):
             raise EvaluationError("Fairness auditing requires aligned, one-dimensional labels, predictions and groups.")
+        missing_sensitive = pd.isna(sensitive)
+        missing_outcome = pd.isna(labels) | pd.isna(predictions)
+        observed = ~(missing_sensitive | missing_outcome)
+        n_missing_sensitive = int(missing_sensitive.sum())
+        n_missing_outcomes = int(missing_outcome.sum())
+        insufficient: list[str] = []
+        if n_missing_sensitive:
+            insufficient.append(f"{n_missing_sensitive} row(s) lack protected group values.")
+        if n_missing_outcomes:
+            insufficient.append(f"{n_missing_outcomes} row(s) lack a label or prediction.")
+        yt = (labels[observed] == positive_label).astype(int)
+        yp = (predictions[observed] == positive_label).astype(int)
+        sf = sensitive[observed].astype(str)
         groups = sorted(np.unique(sf).tolist())
         group_metrics: dict[str, dict[str, float | None]] = {}
         sel_rates: list[float] = []
@@ -90,11 +114,14 @@ class FairnessAuditor:
             return FairnessReport(
                 protected_attribute=attribute_name,
                 passed=False,
+                assessment_status="insufficient_evidence",
+                missing_sensitive_count=n_missing_sensitive,
+                missing_outcome_count=n_missing_outcomes,
                 demographic_parity_diff=0.0,
                 disparate_impact_ratio=1.0,
                 equalized_odds_diff=None,
                 equal_opportunity_diff=None,
-                violations=["Insufficient data: empty input or no groups to compare"],
+                violations=[*insufficient, "Insufficient data: no complete rows with groups to compare"],
                 recommendations=[
                     "Provide non-empty predictions with at least two sensitive groups."
                 ],
@@ -205,8 +232,10 @@ class FairnessAuditor:
         violations: list[str] = []
         recommendations: list[str] = []
         if len(groups) < 2:
-            violations.append("Group fairness requires at least two observed groups.")
+            insufficient.append("Group fairness requires at least two observed groups.")
             eopp_diff = eodds_diff = float("nan")
+        if np.all(yp == yp[0]):
+            insufficient.append("Selection comparisons require both selected and unselected rows.")
 
         # Equalized odds requires comparable TPR and FPR across >= 2 groups.
         # If some groups lack positives or negatives (null TPR/FPR), the metric
@@ -214,13 +243,13 @@ class FairnessAuditor:
         # than silently reported as 0.0 (which would falsely appear "fair").
         if len(groups) >= 2:
             if len(tprs) < len(groups):
-                violations.append(
+                insufficient.append(
                     f"Equalized odds undefined: {len(groups) - len(tprs)} group(s) have no positive labels (TPR unavailable)."
                 )
                 eopp_diff = float("nan")
                 eodds_diff = float("nan")
             if len(fprs) < len(groups):
-                violations.append(
+                insufficient.append(
                     f"Equalized odds undefined: {len(groups) - len(fprs)} group(s) have no negative labels (FPR unavailable)."
                 )
                 fpr_diff = float("nan")
@@ -241,7 +270,9 @@ class FairnessAuditor:
             )
             recommendations.append("Inspect group-specific ROC operating points and calibrate thresholds.")
         if not recommendations:
-            if violations:
+            if insufficient:
+                recommendations.append("Resolve missing evidence before making a deployment decision.")
+            elif violations:
                 recommendations.append(
                     "Review and remediate the listed fairness violations before deployment."
                 )
@@ -252,7 +283,12 @@ class FairnessAuditor:
 
         return FairnessReport(
             protected_attribute=attribute_name,
-            passed=len(violations) == 0,
+            passed=not (insufficient or violations),
+            assessment_status=(
+                "insufficient_evidence" if insufficient else "threshold_failed" if violations else "thresholds_met"
+            ),
+            missing_sensitive_count=n_missing_sensitive,
+            missing_outcome_count=n_missing_outcomes,
             demographic_parity_diff=round(dp_diff, 6),
             disparate_impact_ratio=round(di_ratio, 6),
             equalized_odds_diff=round(eodds_diff, 6),
@@ -268,7 +304,7 @@ class FairnessAuditor:
             between_group_gei=round(max(0.0, gei_between), 6),
             theil_index=round(max(0.0, theil_val), 6),
             group_metrics=group_metrics,
-            violations=violations,
+            violations=[*insufficient, *violations],
             recommendations=recommendations,
         )
 

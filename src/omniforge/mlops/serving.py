@@ -143,16 +143,30 @@ class ModelServingEngine:
         model: BaseOmniForgeModel = ep["canary_model"] if use_canary else ep["primary_model"]
         routed_variant = "canary" if use_canary else "primary"
 
-        X_df = pd.DataFrame(records) if isinstance(records, list) else records
-        self._validate_input_schema(model, X_df)
+        inputs: pd.DataFrame | np.ndarray
+        if isinstance(records, np.ndarray):
+            if records.ndim != 2:
+                raise MLOpsError("Array inputs must have shape (n_records, n_features).")
+            # Positional requests follow the public endpoint's primary schema even
+            # when a canary fitted its features in a different order.
+            features = getattr(ep["primary_model"], "feature_names_", None)
+            if not features:
+                features = getattr(model, "feature_names_", None)
+            if features and records.shape[1] != len(features):
+                raise MLOpsError(f"Expected {len(features)} array features, got {records.shape[1]}.")
+            inputs = pd.DataFrame(records, columns=features) if features else records
+        else:
+            inputs = pd.DataFrame(records) if isinstance(records, list) else records
+        if isinstance(inputs, pd.DataFrame):
+            self._validate_input_schema(model, inputs)
         t0 = time.perf_counter()
-        preds = model.predict(X_df)
+        preds = model.predict(inputs)
         probas = None
         if return_probabilities and model.task_type in (
             TaskType.BINARY_CLASSIFICATION,
             TaskType.MULTICLASS_CLASSIFICATION,
         ):
-            probas = model.predict_proba(X_df).tolist()
+            probas = model.predict_proba(inputs).tolist()
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
         ep["requests"] += 1

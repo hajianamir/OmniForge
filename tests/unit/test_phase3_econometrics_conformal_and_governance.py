@@ -40,7 +40,7 @@ from omniforge.core.types import ModelStage, TaskType
 from omniforge.data.connectors import sql_inspect_database, sql_load_dataframe
 from omniforge.data.ingestion import DataIngestionEngine, fast_read_tabular
 from omniforge.eda.statistics import StatisticalAnalyzer, distance_correlation, friedman_nemenyi_test
-from omniforge.evaluation.fairness import FairnessReport
+from omniforge.evaluation.fairness import FairnessAuditor
 from omniforge.evaluation.interpretability import InterpretabilityEngine
 from omniforge.evaluation.robustness import ConformalPredictor, adaptive_conformal_intervals
 from omniforge.forecasting.engine import ForecastingEngine, diebold_mariano_test
@@ -456,31 +456,14 @@ def test_registry_governance_fairness_gate_and_automated_rollback(tmp_path: Path
     m_v1 = ClassicalMLModel("logistic_regression", task_type=TaskType.BINARY_CLASSIFICATION).fit(X_m, y_m)
     m_v2 = ClassicalMLModel("logistic_regression", task_type=TaskType.BINARY_CLASSIFICATION).fit(X_m, y_m)
 
-    fair_pass = FairnessReport(
-        protected_attribute="gender",
-        demographic_parity_diff=0.03,
-        disparate_impact_ratio=0.92,
-        equal_opportunity_diff=0.02,
-        equalized_odds_diff=0.04,
-        group_metrics={},
-        passed=True,
-    )
-    fair_fail = FairnessReport(
-        protected_attribute="gender",
-        demographic_parity_diff=0.35,
-        disparate_impact_ratio=0.48,
-        equal_opportunity_diff=0.29,
-        equalized_odds_diff=0.31,
-        group_metrics={},
-        passed=False,
-    )
-
     from omniforge.mlops.fairness_evidence import FairnessEvidence
 
-    X_holdout = X_m.iloc[48:]
-    y_holdout = y_m.iloc[48:]
-    protected = pd.Series(["A", "B"] * 6, index=X_holdout.index, name="gender")
-    m_v1.fit(X_m.iloc[:48], y_m.iloc[:48])
+    X_holdout = pd.DataFrame({"f1": [-3, 3, -4, 4], "f2": [-4, 4, -3, 3]}, index=range(60, 64))
+    y_holdout = pd.Series([0, 1, 0, 1], index=X_holdout.index)
+    protected = pd.Series(["A", "A", "B", "B"], index=X_holdout.index, name="gender")
+    auditor = FairnessAuditor()
+    fair_pass = auditor.audit(y_holdout, m_v1.predict(X_holdout), protected, attribute_name="gender")
+    fair_fail = auditor.audit(y_holdout, (protected == "A").astype(int), protected, attribute_name="gender")
     evidence = FairnessEvidence.capture(m_v1, X_holdout, y_holdout, protected, fair_pass)
 
     v1 = reg.register_model(

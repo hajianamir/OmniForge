@@ -7,10 +7,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from fastapi import APIRouter, Header, HTTPException
+from sklearn.base import is_regressor
 
 from omniforge.api.studios.schemas import ExplainReq, FairnessReq
 from omniforge.core.exceptions import MLOpsError
-from omniforge.core.types import ModelMetadata
+from omniforge.core.types import ModelMetadata, TaskType
 from omniforge.core.utils import to_json_object
 from omniforge.evaluation.fairness import FairnessAuditor
 from omniforge.evaluation.interpretability import InterpretabilityEngine
@@ -62,32 +63,55 @@ def s07_fairness(req: FairnessReq, x_session_id: str | None = Header(default="de
     if not isinstance(X_te, pd.DataFrame) or X_te.empty:
         raise HTTPException(status_code=400, detail="Fairness auditing requires held-out data. Enable Split Lock and retrain.")
     if (
-        not isinstance(y_te, pd.Series) or not X_te.index.equals(y_te.index) or not X_te.index.is_unique
+        not isinstance(y_te, pd.Series) or y_te.isna().any()
+        or not X_te.index.equals(y_te.index) or not X_te.index.is_unique
         or not sens_source.index.is_unique or not X_te.index.isin(sens_source.index).all()
     ):
-        raise HTTPException(status_code=400, detail="Fairness auditing requires aligned held-out data.")
+        raise HTTPException(status_code=400, detail="Fairness auditing requires aligned held-out data with observed labels.")
     raw_sensitive = sens_source[req.sensitive_col].reindex(X_te.index)
-    sens = raw_sensitive.astype("string").fillna("Missing").to_numpy(dtype=str)
     preds = np.asarray(model.predict(X_te))
+    if preds.shape != (len(X_te),):
+        raise HTTPException(status_code=400, detail="Fairness auditing requires one prediction per held-out row.")
     y_arr = np.asarray(y_te)
-    if np.issubdtype(y_arr.dtype, np.number) and len(np.unique(y_arr)) > 2:
+    unique_labels = np.unique(y_arr)
+    task = getattr(model, "task_type", None)
+    classes = getattr(model, "classes_", None)
+    regression = task == TaskType.REGRESSION or (task is None and is_regressor(model))
+    fixed_binary_outcome = (
+        len(unique_labels) == 2 and not regression and task in (None, TaskType.BINARY_CLASSIFICATION)
+        and (classes is None or len(classes) == 2)
+    )
+    observed = ~pd.isna(preds)
+    p_bin = np.full(len(preds), np.nan)
+    if regression:
         med = float(np.median(y_arr))
         y_bin = (y_arr >= med).astype(int)
-        p_bin = (preds.astype(float) >= med).astype(int)
+        p_bin[observed] = preds[observed].astype(float) >= med
+        outcome_definition = {"method": "at_or_above_holdout_median", "threshold": med}
     else:
-        pos_val = np.unique(y_arr)[-1]
+        pos_val = unique_labels[-1]
         y_bin = (y_arr == pos_val).astype(int)
-        p_bin = (preds == pos_val).astype(int)
-    report = FairnessAuditor().audit(y_bin, p_bin, sens, attribute_name=req.sensitive_col)
+        p_bin[observed] = preds[observed] == pos_val
+        outcome_definition = {"method": "label_equals", "positive_label": pos_val}
+    report = FairnessAuditor().audit(y_bin, p_bin, raw_sensitive, attribute_name=req.sensitive_col)
+    if not fixed_binary_outcome:
+        report = report.model_copy(update={
+            "passed": False,
+            "assessment_status": "insufficient_evidence",
+            "violations": [*report.violations, "Promotion requires a binary classification outcome with both labels observed."],
+            "recommendations": ["Use a fairness policy designed for this model's outcome before requesting promotion."],
+        })
     recommended_thresholds: dict[str, dict[str, float]] = {}
-    if hasattr(model, "predict_proba"):
+    if classes is not None and hasattr(model, "predict_proba") and report.assessment_status != "insufficient_evidence":
         try:
             proba = np.asarray(model.predict_proba(X_te), dtype=float)
+            positive_index = int(np.flatnonzero(np.asarray(classes) == unique_labels[-1])[0])
+            positive_proba = proba[:, positive_index]
             recommended_thresholds["demographic_parity"] = FairnessAuditor.optimize_group_thresholds(
-                proba, sens, criterion="demographic_parity"
+                positive_proba, raw_sensitive, criterion="demographic_parity"
             )
             recommended_thresholds["equalized_odds"] = FairnessAuditor.optimize_group_thresholds(
-                proba, sens, y_true=y_bin, criterion="equalized_odds"
+                positive_proba, raw_sensitive, y_true=y_bin, criterion="equalized_odds"
             )
         except Exception:
             recommended_thresholds = {}
@@ -116,6 +140,7 @@ def s07_fairness(req: FairnessReq, x_session_id: str | None = Header(default="de
     payload = to_json_object(
         {
             "fairness": report.model_dump(),
+            "outcome_definition": outcome_definition,
             "promotion_evidence": {"holdout_fingerprint": evidence.holdout_fingerprint,
                                    "n_holdout_rows": evidence.n_holdout_rows} if evidence is not None else None,
             "recommended_thresholds": recommended_thresholds,

@@ -91,6 +91,12 @@ def test_strict_gate_rejects_unbound_and_reassigned_evidence(tmp_path: Path) -> 
     assert version.fairness_evidence is not None
     assert version.fairness_evidence.holdout_fingerprint == evidence.holdout_fingerprint
     assert version.fairness_evidence.artifact_checksum == version.checksum_sha256
+    assert version.fairness_evidence.assessment_status == "thresholds_met"
+    legacy_report = report.model_copy(update={"assessment_status": None})
+    legacy_evidence = FairnessEvidence.capture(model, X_test, y_test, groups, legacy_report)
+    legacy = registry.register_model(model, "legacy", stage="Staging", fairness_evidence=legacy_evidence)
+    with pytest.raises(MLOpsError, match="requires a current fairness assessment"):
+        registry.transition_stage("legacy", legacy.version, "Production")
     unbound = registry.register_model(model, "credit", stage="Staging", fairness_passed=True)
     with pytest.raises(MLOpsError, match="saved with the target version"):
         registry.transition_stage("credit", unbound.version, "Production", fairness_report=report)
@@ -109,7 +115,7 @@ def test_strict_gate_rejects_unbound_and_reassigned_evidence(tmp_path: Path) -> 
 def test_workbench_fairness_is_bound_to_trained_holdout_and_registration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import pandas as pd
     from fastapi.testclient import TestClient
-    from sklearn.linear_model import LogisticRegression
+    from sklearn.linear_model import LinearRegression, LogisticRegression
 
     from omniforge.api import workbench as wb
     from omniforge.api.auth import get_api_key
@@ -150,6 +156,13 @@ def test_workbench_fairness_is_bound_to_trained_holdout_and_registration(tmp_pat
     promoted = client.post("/api/workbench/s11/promote", json={"model_name": "credit", "version": 1, "stage": "Production"})
     assert promoted.status_code == 200, promoted.text
     assert promoted.json()["updated"]["fairness_passed"] is True
+
+    state["uap_active_model"] = LinearRegression().fit(train[["x"]], train["target"])
+    diagnostic = client.post("/api/workbench/s07/fairness", json={"sensitive_col": "group"})
+    assert diagnostic.status_code == 200, diagnostic.text
+    assert diagnostic.json()["outcome_definition"]["method"] == "at_or_above_holdout_median"
+    assert diagnostic.json()["fairness"]["assessment_status"] == "insufficient_evidence"
+    assert not diagnostic.json()["fairness"]["passed"]
 
 
 def test_workspace_root_rebases_default_paths_but_keeps_overrides(tmp_path: Path) -> None:

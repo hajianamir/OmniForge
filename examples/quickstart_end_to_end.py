@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from sklearn.model_selection import train_test_split
+
 import omniforge
+from omniforge.mlops.fairness_evidence import FairnessEvidence
 
 
 def main() -> None:
@@ -20,7 +23,8 @@ def main() -> None:
     # 2. Data Quality & Cleaning
     quality = omniforge.DataQualityProfiler().profile(df)
     print(f"[Data Quality] Score: {quality.overall_score}/100 (Grade {quality.grade})")
-    df_clean, clean_report = omniforge.DataCleaner().fit_transform(df)
+    development, holdout = train_test_split(df, test_size=0.20, stratify=df["target"], random_state=42)
+    df_clean, holdout_clean, clean_report, _ = omniforge.DataCleaner().fit_transform_split(development, holdout)
     print(f"[Cleaning] Missing values: {clean_report.missing_values_before} -> {clean_report.missing_values_after}")
 
     # 3. Automated EDA
@@ -28,9 +32,12 @@ def main() -> None:
     eda.export_html(out_dir / "eda_report.html")
 
     # 4. AutoML with mandatory strong baseline comparison & carbon tracking
-    X = df_clean.drop(columns=["target"])
+    X = df_clean.drop(columns=["target", "group_attr"])
     y = df_clean["target"]
-    automl = omniforge.AutoMLPipelineSearch(time_budget_seconds=25.0, tune_trials=4).fit(X, y)
+    X_test = holdout_clean.drop(columns=["target", "group_attr"])
+    y_test = holdout.loc[X_test.index, "target"]
+    groups_test = holdout.loc[X_test.index, "group_attr"]
+    automl = omniforge.AutoMLPipelineSearch(time_budget_seconds=25.0, tune_trials=4).fit(X, y, holdout=(X_test, y_test))
     print(
         f"[AutoML] Champion: {automl.best_model_name} | "
         f"{automl.primary_metric}={automl.best_score:.4f} | "
@@ -40,16 +47,25 @@ def main() -> None:
     # 5. Responsible AI: SHAP + Fairness + Model Card
     shap_local = omniforge.InterpretabilityEngine().explain_shap_local(automl.best_model, X, X.iloc[0], n_samples=25)
     print(f"[SHAP] Top local drivers: {list(shap_local['attributions'].items())[:3]}")
-    fairness = omniforge.FairnessAuditor().audit(y, automl.best_model.predict(X), df_clean["group_attr"], attribute_name="group_attr")
+    fairness = omniforge.FairnessAuditor().audit(
+        y_test, automl.best_model.predict(X_test), groups_test, attribute_name="group_attr"
+    )
     print(f"[Fairness] Passed={fairness.passed} | Disparate Impact={fairness.disparate_impact_ratio}")
 
     # 6. MLOps Registration & Serving
     registry = omniforge.ModelRegistry(db_path=out_dir / "registry.db", artifact_dir=out_dir / "reg_artifacts")
-    registry.register_model(automl.best_model, "quickstart_classifier", stage=omniforge.core.ModelStage.PRODUCTION)
+    evidence = FairnessEvidence.capture(automl.best_model, X_test, y_test, groups_test, fairness)
+    version = registry.register_model(
+        automl.best_model, "quickstart_classifier", fairness_evidence=evidence, stage=omniforge.core.ModelStage.STAGING
+    )
+    if fairness.passed:
+        version = registry.transition_stage(
+            version.model_name, version.version, omniforge.core.ModelStage.PRODUCTION, require_fairness_gate=True
+        )
     serving = omniforge.ModelServingEngine(registry=registry)
-    serving.deploy_from_registry("scoring_v1", "quickstart_classifier")
-    pred_out = serving.predict("scoring_v1", X.head(3), return_probabilities=True)
-    print(f"[Serving] Endpoint predictions: {pred_out['predictions']} (latency={pred_out['latency_ms']} ms)")
+    serving.deploy_from_registry("scoring_v1", version.model_name, stage=version.stage)
+    pred_out = serving.predict("scoring_v1", X_test.head(3), return_probabilities=True)
+    print(f"[Serving {version.stage.value}] Predictions: {pred_out['predictions']} (latency={pred_out['latency_ms']} ms)")
 
     # 7. Multi-format Executive Reporting
     reporter = omniforge.ReportGenerator()

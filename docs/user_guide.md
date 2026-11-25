@@ -109,6 +109,10 @@ docker compose -f docker/docker-compose.yml up -d --build
 | FastAPI Swagger Docs | `http://localhost:8501/docs` |
 | Healthcheck | `/api/v1/health` |
 
+The API and Workbench services share the named workspace volume at `/var/lib/omniforge`. Keep that volume and the existing signing and encryption keys when rebuilding the containers. For SDK or single-process deployments with explicitly configured registry, artifact, or tracking paths, carry those settings forward to keep using the same data. The registry records artifact locations as absolute paths. Preserve those mount points when moving an existing deployment, and verify that a saved model loads before retiring the old storage.
+
+To verify the installed Python packages in a locally built image against its platform lock and export a CycloneDX inventory, run `python scripts/generate_sbom.py --image omniforge-enterprise:4.0.0 --out docker-sbom.cdx.json`.
+
 ### 2.4 Reproducible / Hash-Pinned Installs (Production)
 
 ```bash
@@ -145,7 +149,7 @@ print(omniforge.get_version_info())             # full metadata dict
 
 ## 4. Exact Step-by-Step End-to-End Workflow
 
-Follow this CRISP-DM sequence to guarantee zero data leakage, reproducible data lineage, scientifically validated baselines, and production-ready deliverables.
+Follow this CRISP-DM sequence to track data lineage, compare models against baselines, and reserve data for final evaluation. Choose a split that matches real deployment, review feature availability at prediction time, and validate the model on representative held-out data before promotion.
 
 | Step | Studio / Control | Requirement | Exact Action | Why & What Happens |
 |---:|---|---|---|---|

@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 from omniforge.core.exceptions import MLOpsError
 from omniforge.core.performance import compute_df_fingerprint
-from omniforge.evaluation.fairness import FairnessReport
+from omniforge.evaluation.fairness import FairnessAssessmentStatus, FairnessReport
 from omniforge.models.base import BaseOmniForgeModel
 
 
@@ -73,3 +73,4 @@ class RegisteredFairnessEvidence(BaseModel):
     protected_attribute: str
     passed: bool
     artifact_checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
+    assessment_status: FairnessAssessmentStatus | None = None

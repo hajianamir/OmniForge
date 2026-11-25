@@ -333,7 +333,9 @@ def test_mpc_convergence_fallback():
     )
     res = ctrl.solve(x0=np.array([100.0, 100.0]), r_path=np.zeros((6, 2)))
     assert res.success is True
-    assert res.slack_used > 0.0
+    assert res.feasibility == "soft_state_feasible"
+    np.testing.assert_array_less(np.abs(res.full_control_sequence), 1.00001e-6)
+    assert res.slack_used == pytest.approx(np.abs(res.state_trajectory[1:]).max() - 10.0)
     assert isinstance(res.solver_message, str)
     assert isinstance(res.constraint_violations, list) and len(res.constraint_violations) > 0
     assert res.state_trajectory.shape == (7, 2)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -351,8 +351,8 @@ class CopilotReq(BaseModel):
 class TwinControlReq(BaseModel):
     """Closed-loop digital twin MPC control request (C7)."""
 
-    n_x: int = Field(default=2, ge=1, le=16, description="State dimension.")
-    n_u: int = Field(default=1, ge=1, le=8, description="Control dimension.")
+    n_x: Literal[2] = Field(default=2, description="State dimension of the default double-integrator twin.")
+    n_u: Literal[1] = Field(default=1, description="Control dimension of the default double-integrator twin.")
     horizon: int = Field(default=10, ge=1, le=100, description="MPC receding horizon H.")
     n_steps: int = Field(default=8, ge=1, le=500, description="Closed-loop steps to apply.")
     dt: float = Field(default=1.0, gt=0.0, le=3600.0, description="Sampling period.")

@@ -1,13 +1,4 @@
-"""Causal Drift Root-Cause Attribution Engine (C5 — Future Developments II).
-
-Connects :class:`~omniforge.mlops.drift.DriftDetector` feature shifts (PSI / Wasserstein)
-with model prediction-shift attribution (Delta-SHAP per drifted feature) and structural
-DAG upstream-ancestor traversal to distinguish *root-cause upstream sensor/source shifts*
-from *downstream correlated symptoms*. Emits concrete remediation prescriptions for
-Studios 11 (MLOps) and 14 (Supervisory).
-
-All components run offline with zero third-party LLM dependency.
-"""
+"""Observational drift diagnostics with model response shifts and upstream hypotheses."""
 
 from __future__ import annotations
 
@@ -43,14 +34,14 @@ class DriftedFeature(BaseModel):
     abs_delta_prediction: float = 0.0
     is_root_cause: bool = False
     is_symptom: bool = False
-    root_cause_confidence: float = 0.0  # 0.0-1.0 confidence in root-cause classification
+    root_cause_confidence: float = 0.0  # Legacy field for a heuristic ranking score.
     upstream_ancestors: list[str] = Field(default_factory=list)
     downstream_descendants: list[str] = Field(default_factory=list)
     remediation: str = ""
 
 
 class RootCauseReport(BaseModel):
-    """Dataset-level causal drift root-cause attribution."""
+    """Dataset-level drift diagnostics. Graph directions and rankings are heuristic."""
 
     overall_status: DriftStatus
     n_reference: int = 0
@@ -59,7 +50,11 @@ class RootCauseReport(BaseModel):
     root_causes: list[str] = Field(default_factory=list)
     symptoms: list[str] = Field(default_factory=list)
     dag_edges: list[list[str]] = Field(default_factory=list)  # [parent, child] pairs
-    prediction_shift: float = 0.0
+    graph_method: str = "partial_correlation_with_heuristic_orientation"
+    root_cause_score_method: str = "heuristic_drift_attribution_and_graph_position"
+    prediction_shift: float | None = None
+    prediction_response: str | None = None
+    attributed_prediction_shift: float | None = None
     total_attribution: float = 0.0
     remediation_prescriptions: list[str] = Field(default_factory=list)
     evaluated_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
@@ -74,8 +69,7 @@ class CausalDiscovery:
     Learns a parent-set DAG from observational tabular data using first-order partial
     correlation conditional-independence tests (PC skeleton), then orients edges using
     a temporal column when available or deterministic stability/naming heuristics.
-    The resulting parent map supports upstream-ancestor traversal for root-cause
-    isolation (root cause = drifted node with no drifted ancestors).
+    The parent map represents upstream hypotheses from an observational sample.
     """
 
     def __init__(
@@ -122,7 +116,9 @@ class CausalDiscovery:
         df_resid = n - effective_controls - 2
         if df_resid < 1:
             return r, 1.0
-        t_stat = r * np.sqrt(df_resid / max(1.0 - r * r, np.finfo(float).tiny))
+        if abs(r) == 1.0:
+            return r, 0.0
+        t_stat = r * np.sqrt(df_resid / (1.0 - r * r))
         p_val = 2.0 * stats.t.sf(abs(t_stat), df_resid)
         return r, float(p_val)
 
@@ -158,7 +154,7 @@ class CausalDiscovery:
     def discover(
         self, df: pd.DataFrame, time_col: str | None = None
     ) -> dict[str, set[str]]:
-        """Return ``{child: set of direct parents}`` adjacency (parents = upstream causes).
+        """Return ``{child: set of proposed parents}`` adjacency.
 
         Skeleton: start complete, drop edges where X ⟂ Y | S for some small S.
         Orientation: temporal column (rolling drift onset) if provided, otherwise
@@ -167,7 +163,7 @@ class CausalDiscovery:
         numeric_cols = [
             c
             for c in df.select_dtypes(include=[np.number]).columns
-            if df[c].dropna().nunique() > 1
+            if c != time_col and df[c].dropna().nunique() > 1
         ]
         if len(numeric_cols) < 2:
             return {c: set() for c in numeric_cols}
@@ -248,11 +244,11 @@ class CausalDiscovery:
                 drift = {c: float(df[c].std()) for c in cols}
 
         parents: dict[str, set[str]] = {c: set() for c in cols}
-        for a, b in edges:
+        for a, b in sorted(edges):
             sa, sb = upstream_score(a), upstream_score(b)
             oa, ob = onset.get(a), onset.get(b)
             da, db = drift.get(a, 0.0), drift.get(b, 0.0)
-            # 1) Temporal causality: earlier drift onset = upstream (strongest signal).
+            # 1) Use relative temporal drift onset when available.
             if oa is not None and ob is not None and oa != ob:
                 parent, child = (a, b) if oa < ob else (b, a)
             elif oa is not None and ob is None:
@@ -268,8 +264,8 @@ class CausalDiscovery:
             elif sb > sa:
                 parent, child = b, a
             else:
-                # Exact tie: deterministic by column order (lower index = upstream).
-                parent, child = (a, b) if cols.index(a) < cols.index(b) else (b, a)
+                # Exact tie: deterministic by name.
+                parent, child = a, b
             parents[child].add(parent)
             logger.debug(
                 "root_cause_edge_oriented", parent=parent, child=child,
@@ -304,16 +300,16 @@ class CausalDiscovery:
 
             def dfs(node: str) -> list[tuple[str, str]] | None:
                 color[node] = GRAY
-                for child in parents.get(node, set()):
+                for child in sorted(parents[node]):
                     if color.get(child, WHITE) == GRAY:
                         # Cycle detected: reconstruct edges from child back to node.
-                        cycle_edges: list[tuple[str, str]] = [(node, child)]
+                        cycle_edges: list[tuple[str, str]] = [(child, node)]
                         cur = node
                         while cur != child:
                             prev = parent_edge.get(cur)
                             if prev is None or prev not in parents:
                                 break
-                            cycle_edges.append((prev, cur))
+                            cycle_edges.append((cur, prev))
                             cur = prev
                         return cycle_edges
                     if color.get(child, WHITE) == WHITE:
@@ -324,22 +320,21 @@ class CausalDiscovery:
                 color[node] = BLACK
                 return None
 
-            for start in parents:
+            for start in sorted(parents):
                 if color[start] == WHITE:
                     result = dfs(start)
                     if result is not None:
                         return result
             return None
 
-        max_iterations = len(parents) * 2
-        for _ in range(max_iterations):
+        while True:
             cycle = _find_cycle()
             if cycle is None:
                 break
             # Remove the edge with the weakest orientation signal.
             weakest_edge = min(
                 cycle,
-                key=lambda e: abs(drift.get(e[0], 0.0) - drift.get(e[1], 0.0)),
+                key=lambda e: (abs(drift.get(e[0], 0.0) - drift.get(e[1], 0.0)), e),
             )
             p, c = weakest_edge
             parents[c].discard(p)
@@ -392,7 +387,7 @@ class CausalDiscovery:
 
 
 class DriftRootCauseAnalyzer:
-    """End-to-end causal drift root-cause attribution.
+    """End-to-end drift diagnostics and root-cause hypothesis ranking.
 
     Pipeline:
       1. DriftDetector on reference vs current -> per-feature drift (PSI/Wasserstein)
@@ -431,8 +426,6 @@ class DriftRootCauseAnalyzer:
         Returns a :class:`RootCauseReport` with root-cause / symptom classification
         and remediation prescriptions.
         """
-        np.random.default_rng(self.random_seed)
-
         # ---- feature selection -----------------------------------------------
         all_cols = [c for c in reference_df.columns if c in current_df.columns]
         if feature_cols is not None:
@@ -450,13 +443,31 @@ class DriftRootCauseAnalyzer:
         drift_report: DriftReport = det.detect(ref, cur)
         drift_map: dict[str, FeatureDriftResult] = {f.column: f for f in drift_report.features}
 
-        # ---- Step 2: Prediction-shift attribution (exact Delta-SHAP) ---------
+        # Score both complete populations separately from sampled SHAP estimates.
+        prediction_shift = None
+        response_kind = None
+        if model is not None and not ref.empty and not cur.empty:
+            try:
+                before, kind = InterpretabilityEngine.prediction_response(model, ref)
+                after, after_kind = InterpretabilityEngine.prediction_response(model, cur)
+                if (
+                    kind == after_kind and before.shape == (len(ref),) and after.shape == (len(cur),)
+                    and np.isfinite(before).all() and np.isfinite(after).all()
+                ):
+                    prediction_shift = round(float(after.mean() - before.mean()), 6)
+                    response_kind = kind
+            except Exception as exc:
+                logger.warning("root_cause_prediction_shift_unavailable", error_type=type(exc).__name__)
+
         attributions: dict[str, float] = {}
-        if model is not None and hasattr(model, "predict"):
+        n_attr = min(len(ref), len(cur), 8)
+        drifted_cols = [
+            f.column for f in drift_report.features if f.status in (DriftStatus.WARNING, DriftStatus.CRITICAL)
+        ]
+        if model is not None and n_attr and drifted_cols:
             try:
                 interp = InterpretabilityEngine(random_seed=self.random_seed)
                 # Mean SHAP attribution per feature on reference vs current samples.
-                n_attr = max(3, min(len(ref), 8))
                 ref_sample = ref.sample(n=n_attr, random_state=self.random_seed)
                 cur_sample = cur.sample(n=n_attr, random_state=self.random_seed + 1)
 
@@ -474,28 +485,30 @@ class DriftRootCauseAnalyzer:
 
                 attrs_ref = _mean_attrs(ref_sample)
                 attrs_cur = _mean_attrs(cur_sample)
-                for col in feat_cols:
-                    if col not in drift_map or drift_map[col].status == DriftStatus.HEALTHY:
-                        continue
+                for col in drifted_cols:
                     attributions[col] = round(
                         float(attrs_cur.get(col, 0.0) - attrs_ref.get(col, 0.0)), 6
                     )
             except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("root_cause_attribution_skipped", reason=str(exc))
+                logger.warning("root_cause_attribution_skipped", error_type=type(exc).__name__)
 
         # ---- Step 3: CausalDiscovery DAG -------------------------------------
         cd = CausalDiscovery(
             alpha=0.05, max_cond_set_size=self.max_cond_set_size, random_seed=self.random_seed
         )
-        parents = cd.discover(pd.concat([ref, cur], ignore_index=True), time_col=time_col)
+        graph_cols = feat_cols
+        if time_col is not None and time_col in all_cols and time_col not in feat_cols:
+            graph_cols = [*feat_cols, time_col]
+        parents = cd.discover(
+            pd.concat([reference_df[graph_cols], current_df[graph_cols]], ignore_index=True), time_col=time_col
+        )
 
         dag_edges: list[list[str]] = []
         for child, par_set in parents.items():
-            for p in par_set:
+            for p in sorted(par_set):
                 dag_edges.append([p, child])
 
         # ---- Step 4: Root-cause / symptom classification ---------------------
-        drifted_cols = [f.column for f in drift_report.features if f.status != DriftStatus.HEALTHY]
         drifted_set = set(drifted_cols)
 
         feature_details: list[DriftedFeature] = []
@@ -513,16 +526,16 @@ class DriftRootCauseAnalyzer:
             attribution_strength = min(abs(attributions.get(col, 0.0)), 1.0)
 
             is_root = (
-                fres.status != DriftStatus.HEALTHY
+                col in drifted_set
                 and len(drifted_ancestors) == 0
                 and len(drifted_descendants) > 0
             )
             is_symptom = (
-                fres.status != DriftStatus.HEALTHY
+                col in drifted_set
                 and len(drifted_ancestors) > 0
             )
             # A drifted source with no descendants is still a root cause (isolated source).
-            if fres.status != DriftStatus.HEALTHY and len(drifted_ancestors) == 0 and len(drifted_descendants) == 0:
+            if col in drifted_set and not drifted_ancestors and not drifted_descendants:
                 is_root = True
 
             # Confidence: combine drift magnitude, attribution strength, and DAG position.
@@ -562,7 +575,9 @@ class DriftRootCauseAnalyzer:
 
         # ---- Step 5: Remediation prescriptions -------------------------------
         prescriptions: list[str] = []
-        if not drifted_cols:
+        if drift_report.overall_status == DriftStatus.UNKNOWN:
+            prescriptions.append("Feature drift could not be assessed. Provide enough reference and current observations.")
+        elif not drifted_cols:
             prescriptions.append("No material drift detected; no remediation required.")
         else:
             # Build a lookup for confidence by column.
@@ -576,9 +591,9 @@ class DriftRootCauseAnalyzer:
                 )
                 attr = attributions.get(rc, 0.0)
                 conf = conf_lookup.get(rc, 0.0)
-                conf_str = f"confidence={conf:.2f}"
+                conf_str = f"heuristic score={conf:.2f}"
                 prescriptions.append(
-                    f"ROOT CAUSE '{rc}' ({psi_str}, {conf_str}): investigate upstream "
+                    f"ROOT CAUSE HYPOTHESIS '{rc}' ({psi_str}, {conf_str}): investigate upstream "
                     f"sensor/source feed for '{rc}' (attributed prediction shift "
                     f"{attr:+.4f}); check calibration, sensor drift, or upstream ETL change."
                 )
@@ -587,11 +602,10 @@ class DriftRootCauseAnalyzer:
                     sorted(CausalDiscovery.upstream_ancestors(parents, sym) & drifted_set)
                 )
                 conf = conf_lookup.get(sym, 0.0)
-                conf_str = f"confidence={conf:.2f}"
+                conf_str = f"heuristic score={conf:.2f}"
                 prescriptions.append(
-                    f"SYMPTOM '{sym}' ({conf_str}): downstream effect of drifted upstream "
-                    f"cause(s) [{anc}]; do not remediate '{sym}' directly — fix the "
-                    f"upstream root cause(s)."
+                    f"POTENTIAL SYMPTOM '{sym}' ({conf_str}): examine its association with "
+                    f"proposed upstream features [{anc}] before choosing a repair."
                 )
             if not root_causes and drifted_cols:
                 prescriptions.append(
@@ -600,11 +614,6 @@ class DriftRootCauseAnalyzer:
                 )
 
         total_attribution = float(sum(abs(v) for v in attributions.values()))
-        # Net signed prediction shift attributed to drift (Delta-SHAP).
-        prediction_shift = (
-            round(float(sum(attributions.values())), 6) if attributions else 0.0
-        )
-
         return RootCauseReport(
             overall_status=drift_report.overall_status,
             n_reference=int(len(ref)),
@@ -614,6 +623,8 @@ class DriftRootCauseAnalyzer:
             symptoms=symptoms,
             dag_edges=dag_edges,
             prediction_shift=prediction_shift,
+            prediction_response=response_kind,
+            attributed_prediction_shift=round(sum(attributions.values()), 6) if attributions else None,
             total_attribution=round(total_attribution, 6),
             remediation_prescriptions=prescriptions,
         )
