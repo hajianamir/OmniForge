@@ -19,7 +19,7 @@ const ScatterPlot: React.FC<ScatterPlotProps> = ({ data, xLabel, yLabel, height 
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const width = canvas.clientWidth;
+    const width = canvas.clientWidth || containerRef.current?.clientWidth || 0;
     // A keep-alive studio can be hidden. Wait for ResizeObserver to report a
     // real width when it becomes visible instead of painting at a fake size.
     if (!width) return;
@@ -86,8 +86,10 @@ const ScatterPlot: React.FC<ScatterPlotProps> = ({ data, xLabel, yLabel, height 
       cancelAnimationFrame(rafRef.current);
       rafRef.current = requestAnimationFrame(draw);
     };
+    scheduleDraw();
     const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(scheduleDraw);
     if (containerRef.current) observer?.observe(containerRef.current);
+    if (canvasRef.current) observer?.observe(canvasRef.current);
     window.addEventListener('resize', scheduleDraw);
     return () => {
       observer?.disconnect();
@@ -172,7 +174,7 @@ export const BarChartSVG: React.FC<{
 
   const w = 520;
   const h = height;
-  const pad = { l: 38, r: 10, t: 14, b: 32 };
+  const pad = { l: 44, r: 12, t: 16, b: 32 };
   const bw = (w - pad.l - pad.r) / validItems.length;
   const minVal = validItems.reduce((min, item) => Math.min(min, item.value), 0);
   const maxVal = validItems.reduce((max, item) => Math.max(max, item.value), 0);
@@ -182,13 +184,26 @@ export const BarChartSVG: React.FC<{
 
   return (
     <InspectableBox title={title} compact>
-      <svg viewBox={`0 0 ${w} ${h}`} style={{ width: '100%', height }}>
-        {hasNegative && <line x1={pad.l} y1={zero} x2={w - pad.r} y2={zero} stroke="#94a3b8" />}
+      <svg viewBox={`0 0 ${w} ${h}`} style={{ width: '100%', height, background: 'var(--bg)', borderRadius: 10, display: 'block' }}>
+        {[0, 0.5, 1].map((frac) => {
+          const gy = pad.t + (h - pad.t - pad.b) * frac;
+          const gv = maxVal - span * frac;
+          return (
+            <g key={frac}>
+              <line x1={pad.l} y1={gy} x2={w - pad.r} y2={gy} stroke="rgba(148, 163, 184, 0.16)" strokeWidth={1} />
+              <text x={pad.l - 5} y={gy + 3} textAnchor="end" fill="#94a3b8" fontSize={9}>
+                {Math.abs(gv) >= 1000 ? gv.toExponential(1) : Number(gv.toFixed(2))}
+              </text>
+            </g>
+          );
+        })}
+        <line x1={pad.l} y1={zero} x2={w - pad.r} y2={zero} stroke="rgba(148, 163, 184, 0.45)" strokeWidth={1} />
         {validItems.map((it, i) => {
           const yValue = sy(it.value);
-          const bh = Math.abs(yValue - zero);
+          const rawBh = Math.abs(yValue - zero);
+          const bh = it.value === 0 ? 1.5 : Math.max(2, rawBh);
           const x = pad.l + i * bw + 2;
-          const y = Math.min(yValue, zero);
+          const y = it.value >= 0 ? Math.min(yValue, zero - bh) : zero;
           return (
             <g key={`${it.label}-${i}`}>
               <rect x={x} y={y} width={Math.max(3, bw - 4)} height={bh} rx={3} fill={it.color || '#38bdf8'} opacity={0.88}>
@@ -202,6 +217,149 @@ export const BarChartSVG: React.FC<{
             </g>
           );
         })}
+      </svg>
+    </InspectableBox>
+  );
+};
+
+export interface LineSeriesItem {
+  name: string;
+  color?: string;
+  stepAfter?: boolean;
+  points: { x: number; y: number; lower?: number | null; upper?: number | null }[];
+}
+
+export const LineSeriesSVG: React.FC<{
+  series: LineSeriesItem[];
+  title?: string;
+  subtitle?: string;
+  xLabel?: string;
+  yLabel?: string;
+  height?: number;
+}> = ({ series, title = 'Trend & Curve View', subtitle, xLabel, yLabel, height = 240 }) => {
+  const cleanSeries = (series || [])
+    .map((s, idx) => ({
+      ...s,
+      color: s.color || PALETTE[idx % PALETTE.length],
+      points: (s.points || []).filter((p) => isFiniteNumber(p.x) && isFiniteNumber(p.y)),
+    }))
+    .filter((s) => s.points.length > 0);
+
+  if (!cleanSeries.length) {
+    return <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>No curve data available.</div>;
+  }
+
+  const allX: number[] = [];
+  const allY: number[] = [];
+  cleanSeries.forEach((s) => {
+    s.points.forEach((p) => {
+      allX.push(p.x);
+      allY.push(p.y);
+      if (isFiniteNumber(p.lower)) allY.push(p.lower);
+      if (isFiniteNumber(p.upper)) allY.push(p.upper);
+    });
+  });
+
+  const minX = Math.min(...allX);
+  const maxX = Math.max(...allX);
+  const spanX = maxX - minX || 1;
+  const minY = Math.min(...allY);
+  const maxY = Math.max(...allY);
+  const padY = (maxY - minY) * 0.08 || 0.5;
+  const loY = minY - padY;
+  const hiY = maxY + padY;
+  const spanY = hiY - loY || 1;
+
+  const W = 720;
+  const H = height;
+  const pad = { l: 54, r: 20, t: 28, b: 34 };
+  const pw = W - pad.l - pad.r;
+  const ph = H - pad.t - pad.b;
+  const sx = (x: number) => pad.l + ((x - minX) / spanX) * pw;
+  const sy = (y: number) => pad.t + ph - ((y - loY) / spanY) * ph;
+
+  return (
+    <InspectableBox title={title} subtitle={subtitle} compact>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height, background: 'var(--bg)', borderRadius: 10, display: 'block' }}>
+        {[0, 0.25, 0.5, 0.75, 1].map((frac) => {
+          const gy = pad.t + ph * frac;
+          const gv = hiY - spanY * frac;
+          return (
+            <g key={frac}>
+              <line x1={pad.l} y1={gy} x2={W - pad.r} y2={gy} stroke="rgba(148,163,184,0.16)" strokeWidth={1} />
+              <text x={pad.l - 6} y={gy + 3} textAnchor="end" fill="#94a3b8" fontSize={9.5}>
+                {Math.abs(gv) >= 1000 ? gv.toExponential(1) : gv.toFixed(3)}
+              </text>
+            </g>
+          );
+        })}
+        {[0, 0.5, 1].map((frac) => {
+          const gx = pad.l + pw * frac;
+          const xv = minX + spanX * frac;
+          return (
+            <text key={frac} x={gx} y={H - 10} textAnchor="middle" fill="#94a3b8" fontSize={9.5}>
+              {Math.abs(xv) >= 1000 ? xv.toFixed(0) : Number(xv.toFixed(2))}
+            </text>
+          );
+        })}
+
+        {cleanSeries.map((s) => {
+          const hasBand =
+            s.points.length >= 2 && s.points.every((p) => isFiniteNumber(p.lower) && isFiniteNumber(p.upper));
+          const bandPts = hasBand
+            ? [
+                ...s.points.map((p) => `${sx(p.x).toFixed(1)},${sy(p.upper!).toFixed(1)}`),
+                ...[...s.points].reverse().map((p) => `${sx(p.x).toFixed(1)},${sy(p.lower!).toFixed(1)}`),
+              ].join(' ')
+            : '';
+
+          const d = s.points
+            .map((p, idx) => {
+              const cx = sx(p.x).toFixed(1);
+              const cy = sy(p.y).toFixed(1);
+              if (idx === 0) return `M ${cx} ${cy}`;
+              if (s.stepAfter) {
+                const prevY = sy(s.points[idx - 1].y).toFixed(1);
+                return `L ${cx} ${prevY} L ${cx} ${cy}`;
+              }
+              return `L ${cx} ${cy}`;
+            })
+            .join(' ');
+
+          return (
+            <g key={s.name}>
+              {bandPts && <polygon points={bandPts} fill={s.color} opacity={0.16} />}
+              <path d={d} fill="none" stroke={s.color} strokeWidth={2.2} />
+              {s.points.length <= 40 &&
+                s.points.map((p, i) => (
+                  <circle key={i} cx={sx(p.x)} cy={sy(p.y)} r={2.8} fill={s.color}>
+                    <title>{`${s.name}: (${Number(p.x.toFixed(4))}, ${Number(p.y.toFixed(4))})`}</title>
+                  </circle>
+                ))}
+            </g>
+          );
+        })}
+
+        <g transform={`translate(${pad.l}, 15)`} fontSize={10}>
+          {cleanSeries.slice(0, 5).map((s, idx) => (
+            <g key={s.name} transform={`translate(${idx * 128}, 0)`}>
+              <line x1={0} y1={-4} x2={14} y2={-4} stroke={s.color} strokeWidth={2.4} />
+              <text x={18} y={0} fill="#94a3b8">
+                {s.name.slice(0, 16)}
+              </text>
+            </g>
+          ))}
+        </g>
+        {xLabel && (
+          <text x={pad.l + pw / 2} y={H - 2} textAnchor="middle" fill="#64748b" fontSize={9.5}>
+            {xLabel}
+          </text>
+        )}
+        {yLabel && (
+          <text x={12} y={pad.t + ph / 2} textAnchor="middle" fill="#64748b" fontSize={9.5} transform={`rotate(-90 12 ${pad.t + ph / 2})`}>
+            {yLabel}
+          </text>
+        )}
       </svg>
     </InspectableBox>
   );
@@ -454,7 +612,7 @@ export const SupervisoryTrendSVG: React.FC<{
         {corridor && <polygon points={corridor} fill="rgba(52, 211, 153, 0.14)" />}
         {basePath && <path d={basePath} fill="none" stroke="#a78bfa" strokeWidth={1.7} strokeDasharray="5 4" />}
         {modelPath && <path d={modelPath} fill="none" stroke="#38bdf8" strokeWidth={2.2} />}
-        {actualPath && <path d={actualPath} fill="none" stroke="#f8fafc" strokeWidth={1.8} opacity={0.92} />}
+        {actualPath && <path d={actualPath} fill="none" stroke="var(--text)" strokeWidth={1.8} opacity={0.92} />}
 
         {points.map((p, i) => {
           const modelVal = p.model_pred ?? p.predicted;
@@ -483,7 +641,7 @@ export const SupervisoryTrendSVG: React.FC<{
         <g transform={`translate(${pad.l}, 15)`} fontSize={10}>
           <rect x={0} y={-8} width={10} height={8} fill="rgba(52,211,153,0.35)" />
           <text x={14} y={0} fill="#94a3b8">Tolerance Band</text>
-          <line x1={102} y1={-4} x2={118} y2={-4} stroke="#f8fafc" strokeWidth={2} />
+          <line x1={102} y1={-4} x2={118} y2={-4} stroke="var(--text)" strokeWidth={2} />
           <text x={122} y={0} fill="#94a3b8">Actual</text>
           <line x1={164} y1={-4} x2={180} y2={-4} stroke="#38bdf8" strokeWidth={2.2} />
           <text x={184} y={0} fill="#94a3b8">Model Pred</text>
@@ -627,7 +785,7 @@ export const DivergingDriverBarSVG: React.FC<{
           const zTxt = typeof it.z_shift === 'number' && Number.isFinite(it.z_shift) ? ` (${it.z_shift >= 0 ? '+' : ''}${it.z_shift.toFixed(1)}σ)` : '';
           return (
             <g key={`${it.feature}-${idx}`}>
-              <text x={pad.l - 8} y={y + 16} textAnchor="end" fill="#cbd5e1" fontSize={11} fontWeight={600}>
+              <text x={pad.l - 8} y={y + 16} textAnchor="end" fill="var(--text)" fontSize={11} fontWeight={600}>
                 {shortFeat}
               </text>
               <rect x={x} y={y + 5} width={barW} height={15} rx={4} fill={color} opacity={0.88}>

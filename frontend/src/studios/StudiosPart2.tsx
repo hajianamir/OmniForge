@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { apiGet, apiPost, apiUpload, toErrorMessage } from '../api';
-import { BarChartSVG, ForecastFanSVG } from '../components/Charts';
+import { BarChartSVG, DivergingDriverBarSVG, ForecastFanSVG, LineSeriesSVG } from '../components/Charts';
 import { SimpleTable } from '../components/DataGrid';
 import { StudioHelpButton } from '../components/HelpGuideModal';
 import { MathEquationCard } from '../components/MathEquation';
@@ -209,6 +209,22 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
                 <div className="kpi-card"><div className="kpi-label">Strong Baseline</div><div className="kpi-value">{Number(automlRes.baseline_score).toFixed(4)}</div></div>
                 <div className="kpi-card"><div className="kpi-label">Runtime</div><div className="kpi-value">{automlRes.elapsed_seconds}s</div></div>
               </div>
+              {(automlRes.leaderboard?.length ?? 0) > 0 && (
+                <div style={{ marginBottom: 14 }}>
+                  <BarChartSVG
+                    title={`AutoML Candidate Leaderboard (${automlRes.primary_metric || 'Score'})`}
+                    horizontal
+                    items={(automlRes.leaderboard || []).slice(0, 14).flatMap((row, idx) => {
+                      const metricKey = automlRes.primary_metric || '';
+                      const rawVal = Number(row[metricKey] ?? row.score ?? row.cv_score ?? row.primary_score ?? NaN);
+                      const label = String(row.model ?? row.model_name ?? `Model ${idx + 1}`);
+                      return Number.isFinite(rawVal)
+                        ? [{ label, value: rawVal, color: idx === 0 ? '#34d399' : String(row.family || '').toLowerCase().includes('baseline') ? '#a78bfa' : '#38bdf8' }]
+                        : [];
+                    })}
+                  />
+                </div>
+              )}
               <SimpleTable title="Ranked Model Leaderboard & Acceptance Rationale" rows={automlRes.leaderboard || []} />
               {automlRes.equation && (automlRes.equation.formula_plain || automlRes.equation.equation_text) && (
                 <div style={{ marginTop: 14 }}>
@@ -316,6 +332,21 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
                   <span>Non-Parametric vs. Parametric Analytical Leaderboard</span>
                   <span className="badge badge-accent">Runtime: {npRes.elapsed_seconds}s · Ready for Studio 14 Live Monitor</span>
                 </div>
+                {(npRes.leaderboard?.length ?? 0) > 0 && (
+                  <div style={{ marginBottom: 14 }}>
+                    <BarChartSVG
+                      title={`Non-Parametric vs. Parametric Benchmark (${npRes.primary_metric || 'Score'})`}
+                      horizontal
+                      items={(npRes.leaderboard || []).slice(0, 12).flatMap((row, idx) => {
+                        const sc = Number(row.primary_score ?? row.score ?? NaN);
+                        const lbl = String(row.model_name ?? row.model ?? `Estimator ${idx + 1}`);
+                        return Number.isFinite(sc)
+                          ? [{ label: lbl, value: sc, color: row.is_nonparametric === false ? '#a78bfa' : idx === 0 ? '#34d399' : '#38bdf8' }]
+                          : [];
+                      })}
+                    />
+                  </div>
+                )}
                 <SimpleTable title="Non-Parametric Analytical Leaderboard" rows={npRes.leaderboard || []} />
               </div>
 
@@ -324,6 +355,17 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
                   <div className="card-title">
                     <span>Additive Penalized B-Spline GAM Component Decomposition</span>
                     <span className="badge badge-green">Per-Feature Smooth fⱼ(xⱼ) Effects</span>
+                  </div>
+                  <div style={{ marginBottom: 14 }}>
+                    <BarChartSVG
+                      title="GAM Smooth Feature Variance Share (%)"
+                      horizontal
+                      items={(npRes.spline_components || []).slice(0, 14).flatMap((sc) => {
+                        const feat = String(sc.feature ?? '');
+                        const share = Number(sc.variance_share_pct ?? sc.effect_std ?? NaN);
+                        return feat && Number.isFinite(share) ? [{ label: feat, value: share, color: '#34d399' }] : [];
+                      })}
+                    />
                   </div>
                   <SimpleTable title="GAM Smooth Component Contributions" rows={npRes.spline_components || []} />
                 </div>
@@ -372,6 +414,39 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
           </div>
           {dlRes && (
             <>
+              {(dlRes.results?.length ?? 0) > 0 && (
+                <div className="grid-2" style={{ marginBottom: 14 }}>
+                  <BarChartSVG
+                    title="Deep Learning vs. Baseline Benchmark Scores"
+                    horizontal
+                    items={(dlRes.results || []).slice(0, 14).flatMap((r, idx) => {
+                      const sc = Number(r.score ?? NaN);
+                      const lbl = String(r.model ?? `Arch ${idx + 1}`);
+                      return Number.isFinite(sc)
+                        ? [{ label: lbl, value: sc, color: String(r.family || '').toLowerCase() === 'baseline' ? '#a78bfa' : '#38bdf8' }]
+                        : [];
+                    })}
+                  />
+                  {(() => {
+                    const curveSeries = (dlRes.results || []).flatMap((r) => {
+                      const curve = Array.isArray(r.loss_curve) ? (r.loss_curve as number[]) : [];
+                      const pts = curve
+                        .map((val, epochIdx) => ({ x: epochIdx + 1, y: Number(val) }))
+                        .filter((p) => Number.isFinite(p.y));
+                      return pts.length >= 2 ? [{ name: String(r.model || 'Neural Net'), points: pts }] : [];
+                    });
+                    return curveSeries.length > 0 ? (
+                      <LineSeriesSVG
+                        title="Neural Training Loss Convergence Curves"
+                        subtitle="Epoch-by-epoch training loss across deep architectures"
+                        xLabel="Epoch"
+                        yLabel="Loss"
+                        series={curveSeries}
+                      />
+                    ) : null;
+                  })()}
+                </div>
+              )}
               <SimpleTable rows={(dlRes.results || []).map(({ loss_curve: _lossCurve, ...rest }) => rest)} />
               {dlRes.feature_importances && Object.keys(dlRes.feature_importances).length > 0 && (
                 <div className="grid-2" style={{ marginTop: 16 }}>
@@ -488,6 +563,43 @@ export const Studio07Responsible: React.FC<StudioProps> = ({ ws, studioCache, se
               })}
             />
           )}
+          {expRes?.local_explanation && !Array.isArray(expRes.local_explanation) && typeof expRes.local_explanation.attributions === 'object' && expRes.local_explanation.attributions !== null && (
+            <div style={{ marginTop: 14 }}>
+              <DivergingDriverBarSVG
+                title={`Local Instance #${rowIdx} Attribution Waterfall`}
+                subtitle={`Prediction=${Number(expRes.local_explanation.prediction ?? 0).toFixed(4)} vs Expected=${Number(expRes.local_explanation.expected_value ?? 0).toFixed(4)}`}
+                items={Object.entries(expRes.local_explanation.attributions as Record<string, unknown>).flatMap(([feature, val]) =>
+                  typeof val === 'number' && Number.isFinite(val) ? [{ feature, signed_impact: val }] : [],
+                )}
+              />
+            </div>
+          )}
+          {expRes?.pdp && !Array.isArray(expRes.pdp) && Array.isArray(expRes.pdp.grid) && Array.isArray(expRes.pdp.pdp_mean) && expRes.pdp.grid.length >= 2 && (
+            <div style={{ marginTop: 14 }}>
+              <LineSeriesSVG
+                title={`Partial Dependence Curve (PDP) — ${String(expRes.pdp.feature || expRes.pdp_feature || 'Top Feature')}`}
+                subtitle="Marginal model response ± 1σ ICE band"
+                xLabel={String(expRes.pdp.feature || expRes.pdp_feature || 'Feature Value')}
+                yLabel="Predicted Response"
+                series={[
+                  {
+                    name: String(expRes.pdp.feature || expRes.pdp_feature || 'PDP'),
+                    color: '#38bdf8',
+                    points: expRes.pdp.grid.map((gx, i) => {
+                      const meanVal = Number(expRes.pdp && !Array.isArray(expRes.pdp) ? expRes.pdp.pdp_mean?.[i] : NaN);
+                      const stdVal = Number(expRes.pdp && !Array.isArray(expRes.pdp) ? expRes.pdp.pdp_std?.[i] : NaN);
+                      return {
+                        x: Number(gx),
+                        y: meanVal,
+                        lower: Number.isFinite(stdVal) ? meanVal - stdVal : null,
+                        upper: Number.isFinite(stdVal) ? meanVal + stdVal : null,
+                      };
+                    }),
+                  },
+                ]}
+              />
+            </div>
+          )}
         </div>
         <div className="card">
           <div className="card-title">Fairness Audit &amp; Compliance Model Card</div>
@@ -500,9 +612,21 @@ export const Studio07Responsible: React.FC<StudioProps> = ({ ws, studioCache, se
           {fairRes && (
             <>
               <div className="kpi-grid">
-                <div className="kpi-card"><div className="kpi-label">Demographic Parity Diff</div><div className="kpi-value">{Number(fairRes.fairness?.demographic_parity_difference ?? 0).toFixed(4)}</div></div>
+                <div className="kpi-card"><div className="kpi-label">Demographic Parity Diff</div><div className="kpi-value">{Number(fairRes.fairness?.demographic_parity_diff ?? fairRes.fairness?.demographic_parity_difference ?? 0).toFixed(4)}</div></div>
                 <div className="kpi-card"><div className="kpi-label">Disparate Impact</div><div className="kpi-value">{Number(fairRes.fairness?.disparate_impact_ratio ?? 1).toFixed(3)}</div></div>
               </div>
+              {fairRes.fairness?.group_metrics && Object.keys(fairRes.fairness.group_metrics).length > 0 && (
+                <div style={{ marginBottom: 12 }}>
+                  <BarChartSVG
+                    title="Protected Group Selection Rate"
+                    horizontal
+                    items={Object.entries(fairRes.fairness.group_metrics).slice(0, 12).flatMap(([grp, m]) => {
+                      const rate = Number(m?.selection_rate ?? m?.positive_rate ?? NaN);
+                      return Number.isFinite(rate) ? [{ label: `Group ${grp}`, value: rate, color: '#34d399' }] : [];
+                    })}
+                  />
+                </div>
+              )}
               <pre className="code-block" style={{ maxHeight: 260 }}>{fairRes.model_card_markdown}</pre>
             </>
           )}
@@ -533,7 +657,7 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
   const runForecast = async () => {
     setBusy(true); setErr(null);
     try {
-      const res = await apiPost<ForecastResponse>('/api/workbench/s08/forecast', { target_col: targetCol || ws.numeric_columns[0], horizon, deep_arch: deepArch, epochs: 25 });
+      const res = await apiPost<ForecastResponse>('/api/workbench/s08/forecast', { target_col: targetCol || ws.numeric_columns[0] || ws.columns[0], horizon, deep_arch: deepArch, epochs: 25 });
       onSync(res.state);
       setStudioResult('s08_forecast', res);
     } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
@@ -564,7 +688,7 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
           <div className="row" style={{ marginBottom: 14 }}>
             <label className="field">Target Series
               <select value={targetCol} onChange={(e) => setTargetCol(e.target.value)}>
-                {ws.numeric_columns.map((c) => <option key={c} value={c}>{c}</option>)}
+                {(ws.numeric_columns.length ? ws.numeric_columns : ws.columns).map((c) => <option key={c} value={c}>{c}</option>)}
               </select>
             </label>
             <label className="field">Deep Forecaster Architecture
@@ -613,7 +737,38 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
               } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
             }}>Estimate Causal ATE</button>
           </div>
-          {causalRes && <pre className="code-block">{JSON.stringify(causalRes, null, 2)}</pre>}
+          {causalRes && (
+            <>
+              <div className="grid-2" style={{ marginBottom: 12 }}>
+                <BarChartSVG
+                  title="Causal Average Treatment Effect (ATE) & Refutation Checks"
+                  horizontal
+                  items={[
+                    ...(typeof causalRes.ate === 'number' && Number.isFinite(causalRes.ate)
+                      ? [{ label: `Primary ATE (${String(causalRes.method || 'AIPW').toUpperCase()})`, value: causalRes.ate, color: '#38bdf8' }]
+                      : []),
+                    ...Object.entries((causalRes.refutations as Record<string, Record<string, unknown>>) || {}).flatMap(([name, refObj]) => {
+                      const est = Number(refObj?.estimated_ate ?? NaN);
+                      return Number.isFinite(est)
+                        ? [{ label: `Refutation: ${name}`, value: est, color: refObj?.passed ? '#34d399' : '#fbbf24' }]
+                        : [];
+                    }),
+                  ]}
+                />
+                {typeof causalRes.cate_summary === 'object' && causalRes.cate_summary !== null && (
+                  <BarChartSVG
+                    title="Heterogeneous Treatment Effect (CATE) Quantiles"
+                    items={(['min', 'p25', 'median', 'mean', 'p75', 'max'] as const).flatMap((k) => {
+                      const v = Number((causalRes.cate_summary as Record<string, unknown>)[k] ?? NaN);
+                      return Number.isFinite(v) ? [{ label: k.toUpperCase(), value: v, color: v >= 0 ? '#34d399' : '#f87171' }] : [];
+                    })}
+                    height={195}
+                  />
+                )}
+              </div>
+              <pre className="code-block">{JSON.stringify(causalRes, null, 2)}</pre>
+            </>
+          )}
         </div>
       )}
 
@@ -623,10 +778,28 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
             setBusy(true); setErr(null);
             try {
               const r = await apiPost<OptimizeResponse>('/api/workbench/s08/optimize', {});
+              if (r.state) onSync(r.state);
               setStudioResult('s08_optimize', r);
             } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
           }}>Run Markowitz Mean-Variance Portfolio Optimizer</button>
-          {optRes && <pre className="code-block" style={{ marginTop: 12 }}>{JSON.stringify(optRes, null, 2)}</pre>}
+          {optRes && (
+            <div style={{ marginTop: 12 }}>
+              {typeof optRes.solution === 'object' && optRes.solution !== null && (
+                <div style={{ marginBottom: 12 }}>
+                  <BarChartSVG
+                    title="Optimal Markowitz Portfolio Allocation Weights"
+                    horizontal
+                    items={Object.entries(optRes.solution as Record<string, unknown>).flatMap(([asset, weight]) =>
+                      typeof weight === 'number' && Number.isFinite(weight)
+                        ? [{ label: asset, value: weight, color: '#34d399' }]
+                        : [],
+                    )}
+                  />
+                </div>
+              )}
+              <pre className="code-block">{JSON.stringify(optRes, null, 2)}</pre>
+            </div>
+          )}
         </div>
       )}
 
@@ -634,17 +807,46 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
         <div className="card">
           <div className="row" style={{ marginBottom: 12 }}>
             <select value={targetCol} onChange={(e) => setTargetCol(e.target.value)}>
-              {ws.numeric_columns.map((c) => <option key={c} value={c}>{c}</option>)}
+              {(ws.numeric_columns.length ? ws.numeric_columns : ws.columns).map((c) => <option key={c} value={c}>{c}</option>)}
             </select>
             <button className="btn btn-primary" disabled={busy || !ws.has_dataset} onClick={async () => {
               setBusy(true); setErr(null);
               try {
-                const r = await apiPost<SimulateResponse>('/api/workbench/s08/simulate', { target_col: targetCol || ws.numeric_columns[0], n_simulations: 3000 });
+                const r = await apiPost<SimulateResponse>('/api/workbench/s08/simulate', { target_col: targetCol || ws.numeric_columns[0] || ws.columns[0], n_simulations: 3000 });
+                if (r.state) onSync(r.state);
                 setStudioResult('s08_simulate', r);
               } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
             }}>Run 3,000-Trial Monte Carlo</button>
           </div>
-          {simRes && <pre className="code-block">{JSON.stringify(simRes, null, 2).slice(0, 2600)}</pre>}
+          {simRes && (
+            <>
+              <div className="grid-2" style={{ marginBottom: 12 }}>
+                {Array.isArray(simRes.histogram) && simRes.histogram.length > 0 ? (
+                  <BarChartSVG
+                    title="Monte Carlo Simulated Outcome Distribution"
+                    items={(simRes.histogram as Array<{ label?: string; count?: number }>).map((b) => ({
+                      label: String(b.label ?? ''),
+                      value: Number(b.count) || 0,
+                      color: '#38bdf8',
+                    }))}
+                    height={195}
+                  />
+                ) : null}
+                {typeof simRes.percentiles === 'object' && simRes.percentiles !== null && (
+                  <BarChartSVG
+                    title="Simulated Outcome Percentiles & Tail Risk"
+                    items={Object.entries(simRes.percentiles as Record<string, unknown>).flatMap(([pk, pv]) =>
+                      typeof pv === 'number' && Number.isFinite(pv)
+                        ? [{ label: pk.toUpperCase(), value: pv, color: pk === 'p01' || pk === 'p05' ? '#f87171' : '#34d399' }]
+                        : [],
+                    )}
+                    height={195}
+                  />
+                )}
+              </div>
+              <pre className="code-block">{JSON.stringify(simRes, null, 2).slice(0, 2600)}</pre>
+            </>
+          )}
         </div>
       )}
     </div>

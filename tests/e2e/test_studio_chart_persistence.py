@@ -359,3 +359,134 @@ def test_committed_screening_previews_match_server_cache_and_are_marked_historic
     assert set(test["alpha"]) == original_test & survivors
     assert state["uap_clustering_result"] is None
     assert state["uap_s02_cluster_committed"] is True  # provenance is still retained
+
+
+def test_messy_excel_workbook_produces_charts_across_studios() -> None:
+    """Real-world Excel sheets with title banners, formatted numbers, and sentinels produce valid studio chart payloads."""
+    client, headers = _client()
+    rows = [
+        ["Q4 Enterprise Telemetry Report", None, None, None, None],
+        [None, None, None, None, None],
+        ["Region", "Revenue_USD", "Operating_Cost", "Defect_Rate", "Risk_Band"],
+    ]
+    for i in range(45):
+        rev = "-" if i == 3 else f"${1200 + i * 35:,.2f}"
+        cost = "#N/A" if i == 7 else f"{640 + (i % 11) * 28:,.1f}"
+        defect = f"{1.5 + (i % 6) * 0.8:.2f}%"
+        band = ["Low", "Medium", "High"][i % 3]
+        region = ["North", "South", "East", "West"][i % 4]
+        rows.append([region, rev, cost, defect, band])
+
+    excel_buf = io.BytesIO()
+    with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+        pd.DataFrame({"note": ["cover"]}).to_excel(writer, sheet_name="Cover", index=False)
+        pd.DataFrame(rows).to_excel(writer, sheet_name="Telemetry_Data", index=False, header=False)
+    excel_bytes = excel_buf.getvalue()
+
+    up = client.post(
+        "/api/workbench/s01/upload",
+        headers=headers,
+        data={"sheet_name": "Telemetry_Data"},
+        files={"file": ("messy_report.xlsx", io.BytesIO(excel_bytes), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+    assert up.status_code == 200, up.text
+    ws_state = up.json()["state"]
+    assert ws_state["n_rows"] == 45
+    assert set(["Revenue_USD", "Operating_Cost", "Defect_Rate"]).issubset(set(ws_state["numeric_columns"]))
+
+    # Studio 00: relationships + correlation matrix
+    r00 = client.get("/api/workbench/s00/data_relationships", headers=headers)
+    assert r00.status_code == 200, r00.text
+    d00 = r00.json()
+    assert len(d00["pairs"]) > 0
+    assert len(d00["target_relationships"]) > 0
+    assert len(d00["correlation_matrix"]["columns"]) >= 3
+
+    # Studio 02: clustering, anomaly, manifold scatter
+    r02_cl = client.post("/api/workbench/s02/clustering", headers=headers, json={"mode": "auto", "n_clusters": 3})
+    assert r02_cl.status_code == 200, r02_cl.text
+    assert r02_cl.json()["scatter"]["rendered_points"] == 45
+
+    r02_an = client.post("/api/workbench/s02/anomaly", headers=headers, json={"mode": "auto", "contamination": 0.1})
+    assert r02_an.status_code == 200, r02_an.text
+    assert r02_an.json()["scatter"]["rendered_points"] == 45
+
+    # Studio 04: numeric distributions + categorical distributions + missingness + correlation matrix
+    r04 = client.post("/api/workbench/s04/eda", headers=headers)
+    assert r04.status_code == 200, r04.text
+    d04 = r04.json()
+    assert len(d04["distributions"]) >= 3
+    assert len(d04["categorical_distributions"]) >= 1
+    assert len(d04["missing_bars"]) >= 1
+    assert len(d04["correlation_matrix"]["columns"]) >= 3
+
+    # Studio 08: optimize & simulate cache keys + histogram
+    r08_opt = client.post("/api/workbench/s08/optimize", headers=headers, json={})
+    assert r08_opt.status_code == 200, r08_opt.text
+    assert "s08_optimize" in r08_opt.json()["state"]["cached_result_keys"]
+    assert r08_opt.json()["optimization"]["solution"]
+
+    r08_sim = client.post("/api/workbench/s08/simulate", headers=headers, json={"target_col": "Revenue_USD", "n_simulations": 300})
+    assert r08_sim.status_code == 200, r08_sim.text
+    assert "s08_simulate" in r08_sim.json()["state"]["cached_result_keys"]
+    assert len(r08_sim.json()["simulation"]["histogram"]) >= 10
+
+
+def test_purely_categorical_dataset_still_renders_eda_and_scatter_charts() -> None:
+    """Datasets with zero native numeric columns still produce Studio 00, 02, and 04 chart payloads."""
+    client, headers = _client()
+    df = pd.DataFrame(
+        {
+            "department": [["Ops", "Sales", "Eng", "Finance"][i % 4] for i in range(40)],
+            "shift": [["Day", "Swing", "Night"][i % 3] for i in range(40)],
+            "tier": [["Gold", "Silver", "Bronze"][(i * 2) % 3] for i in range(40)],
+            "outcome": ["Pass" if i % 3 else "Fail" for i in range(40)],
+        }
+    )
+    up = client.post(
+        "/api/workbench/s01/upload",
+        headers=headers,
+        files={"file": ("categorical.csv", io.BytesIO(df.to_csv(index=False).encode()), "text/csv")},
+    )
+    assert up.status_code == 200, up.text
+
+    r00 = client.get("/api/workbench/s00/data_relationships", headers=headers)
+    assert r00.status_code == 200 and len(r00.json()["pairs"]) > 0
+
+    r02_cl = client.post("/api/workbench/s02/clustering", headers=headers, json={"mode": "custom", "algorithm": "kmeans", "n_clusters": 3})
+    assert r02_cl.status_code == 200 and r02_cl.json()["scatter"]["rendered_points"] == 40
+
+    r02_an = client.post("/api/workbench/s02/anomaly", headers=headers, json={"mode": "custom", "method": "isolation_forest"})
+    assert r02_an.status_code == 200 and r02_an.json()["scatter"]["rendered_points"] == 40
+
+    r02_mn = client.post("/api/workbench/s02/mining", headers=headers, json={"mode": "custom", "tasks": ["manifold"], "manifold_method": "pca"})
+    assert r02_mn.status_code == 200 and r02_mn.json()["manifold"]["scatter"]["rendered_points"] == 40
+
+    r04 = client.post("/api/workbench/s04/eda", headers=headers)
+    assert r04.status_code == 200 and len(r04.json()["categorical_distributions"]) == 4
+
+
+def test_compiled_static_spa_ships_studio_charts_across_lifecycle() -> None:
+    """Compiled static_app chunks include interactive chart titles across Studios 00-11."""
+    from omniforge.ui.app import get_static_app_dir
+
+    assets_dir = get_static_app_dir() / "assets"
+    combined_js = "\n".join(p.read_text(encoding="utf-8") for p in sorted(assets_dir.glob("*.js")))
+    expected_markers = [
+        "Target Correlation Profile",
+        "6D Intake Quality & Readiness Profile",
+        "Cleaning Remediation Impact",
+        "Ranked Baseline Model Performance",
+        "Category Breakdown:",
+        "AutoML Candidate Leaderboard",
+        "Neural Training Loss Convergence Curves",
+        "Partial Dependence Curve (PDP)",
+        "Optimal Markowitz Portfolio Allocation Weights",
+        "Monte Carlo Simulated Outcome Distribution",
+        "Kaplan-Meier Survival Probability Curve S(t)",
+        "DAG Stage Execution Telemetry",
+        "Feature Population Stability Index (PSI) Drift Profile",
+    ]
+    for marker in expected_markers:
+        assert marker in combined_js, f"Missing compiled chart marker in static_app bundle: {marker}"
+
