@@ -171,3 +171,19 @@ def test_trailing_interval_expands_after_shock_then_releases_it() -> None:
     assert windows[11]["rolling_half_width_by_lead"] == [1, 1]
     assert result["paired_outcomes"] == 23
     assert result["rolling"]["mean_width"] > result["fixed"]["mean_width"]
+
+
+def test_normalized_intervals_use_only_previous_windows_and_contract_after_spike() -> None:
+    calibration = np.ones((30, 1))
+    quiet = np.ones((18, 1))
+    spike = quiet.copy()
+    spike[0, 0] = 10
+    ordinary = _compare_rolling_interval_scores(calibration, quiet, np.ones(1), 0.05)
+    shifted = _compare_rolling_interval_scores(calibration, spike, np.ones(1), 0.05)
+    assert shifted["normalized_status"] == "evaluated"
+    before = ordinary["by_origin"][0]["normalized"]
+    at_shock = shifted["by_origin"][0]["normalized"]
+    assert before["mean_width"] == at_shock["mean_width"] == 2
+    assert before["coverage"] == 1 and at_shock["coverage"] == 0
+    assert shifted["by_origin"][1]["normalized"]["mean_width"] > shifted["by_origin"][1]["rolling"]["mean_width"]
+    assert shifted["by_origin"][-1]["normalized"]["mean_width"] < shifted["by_origin"][1]["normalized"]["mean_width"]

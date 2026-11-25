@@ -69,6 +69,9 @@ export interface QualityDimensionScores {
   overall_score?: number;
   dimensions?: Record<string, number | null>;
   column_scores?: JsonRow[];
+  reference_matched_rows?: number | null;
+  reference_comparisons?: number;
+  reference_key_columns?: string[];
 }
 
 export interface QualityResponse extends StateEnvelope {

@@ -209,6 +209,8 @@ class CausalReq(BaseModel):
     confounders: list[str] = Field(default_factory=list)
     method: str = "aipw"
     instrument_col: str | None = None
+    post_col: str | None = None
+    cluster_col: str | None = None
 
 
 class OptimizeReq(BaseModel):

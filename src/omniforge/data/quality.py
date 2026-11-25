@@ -49,6 +49,8 @@ class DataQualityReport(BaseModel):
     recommendations: list[str] = Field(default_factory=list)
     effective_weights: dict[str, float] = Field(default_factory=dict)
     reference_comparisons: int = 0
+    reference_matched_rows: int | None = None
+    reference_key_columns: list[str] = Field(default_factory=list)
     rule_conformance: float | None = None
     rule_checks: int = 0
     profiled_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
@@ -80,6 +82,7 @@ class DataQualityProfiler:
         reference_rules: dict[str, tuple[float, float]] | None = None,
         reference_data: pd.DataFrame | None = None,
         key_columns: list[str] | None = None,
+        reference_key_columns: list[str] | None = None,
     ) -> DataQualityReport:
         """Profile a DataFrame across all six enterprise data quality dimensions.
 
@@ -91,11 +94,24 @@ class DataQualityProfiler:
             reference_data: Trusted values keyed by matching index and column labels.
                 Only pairs with two observed values enter exact-match reference accuracy.
             key_columns: Optional primary key columns whose uniqueness is scored strictly.
+            reference_key_columns: Match reference rows by these columns instead of index labels.
 
         Returns:
             :class:`DataQualityReport` with scores on a 0–100 scale and recommendations.
         """
         import json
+
+        if reference_key_columns:
+            keys = list(dict.fromkeys(reference_key_columns))
+            if reference_data is None or not df.columns.is_unique or not reference_data.columns.is_unique:
+                raise DataValidationError("Keyed reference accuracy requires a reference and unique column labels.")
+            if any(key not in df or key not in reference_data for key in keys):
+                raise DataValidationError("Reference key columns must be present in both datasets.")
+            if df[keys].isna().any().any() or reference_data[keys].isna().any().any():
+                raise DataValidationError("Reference keys must have observed values in both datasets.")
+            df = df.set_index(keys, drop=False)
+            reference_data = reference_data.set_index(keys)
+            reference_key_columns = keys
 
         if reference_data is not None and (
             not df.index.is_unique or not reference_data.index.is_unique
@@ -111,6 +127,7 @@ class DataQualityProfiler:
             "rules": reference_rules,
             "reference": compute_df_fingerprint(reference_data) if reference_data is not None else None,
             "key_columns": key_columns,
+            "reference_keys": reference_key_columns,
             "weights": self.weights,
         }, sort_keys=True)
         hit, cached = GLOBAL_DF_CACHE.get("data_quality", df, cache_params)
@@ -314,6 +331,8 @@ class DataQualityProfiler:
             column_scores=col_scores,
             effective_weights=effective_weights,
             reference_comparisons=reference_comparisons,
+            reference_matched_rows=int(df.index.isin(reference_data.index).sum()) if reference_data is not None else None,
+            reference_key_columns=reference_key_columns or [],
             rule_conformance=round(rule_passed / rule_checks * 100.0, 2) if rule_checks else None,
             rule_checks=rule_checks,
             recommendations=recommendations,

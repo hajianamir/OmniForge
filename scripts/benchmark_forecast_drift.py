@@ -34,7 +34,7 @@ def _pool(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 metric: sum(row[method][metric] * row["paired_outcomes"] for row in used) / n if n else None
                 for metric in METRICS
             }
-            for method in ("fixed", "rolling")
+            for method in ("fixed", "rolling", "normalized")
         },
     }
 

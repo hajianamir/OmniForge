@@ -102,7 +102,7 @@ export const LiveChartGenerator: React.FC<LiveChartGeneratorProps> = ({
     apiGet<LiveChartCatalogResponse>(`/api/workbench/charts/catalog?studio_id=${encodeURIComponent(studioId)}`)
       .then((res) => {
         if (!alive) return;
-        setCatalog(res);
+        setCatalog(Array.isArray(res?.charts) && Array.isArray(res?.columns?.all) && Array.isArray(res?.columns?.numeric) ? res : null);
       })
       .catch(() => {
         if (!alive) return;

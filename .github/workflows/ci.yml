@@ -153,10 +153,10 @@ jobs:
         run: docker build -f docker/Dockerfile -t omniforge:ci-registry .
       - name: Replace the container and verify registry data and fairness evidence
         run: python3 scripts/smoke_docker_registry.py omniforge:ci-registry
-      - name: Verify installed Python inventory against the platform lock
-        run: python3 scripts/generate_sbom.py --image omniforge:ci-registry --out docker-sbom.cdx.json
+      - name: Verify the Python lock and inventory Debian packages
+        run: python3 scripts/generate_sbom.py --image omniforge:ci-registry --include-os --out docker-sbom.cdx.json
       - uses: actions/upload-artifact@v4
         with:
-          name: docker-python-sbom-${{ matrix.architecture }}
+          name: docker-sbom-${{ matrix.architecture }}
           path: docker-sbom.cdx.json
           if-no-files-found: error

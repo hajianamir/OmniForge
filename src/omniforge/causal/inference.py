@@ -187,8 +187,11 @@ class CausalInferenceEngine:
         group_col: str,
         post_col: str,
         outcome_col: str,
-    ) -> dict[str, float]:
-        """Compute canonical 2x2 Difference-in-Differences (DiD) with Neyman heteroskedastic SE and p-value."""
+        cluster_col: str | None = None,
+    ) -> dict[str, Any]:
+        """Estimate a 2×2 DiD contrast with independent rows or clusters nested in treatment arms."""
+        if cluster_col is not None:
+            return self._clustered_did(df, group_col, post_col, outcome_col, cluster_col)
         for c in (group_col, post_col, outcome_col):
             if c not in df.columns:
                 raise CausalInferenceError(f"Column '{c}' missing for DiD estimation.")
@@ -239,6 +242,56 @@ class CausalInferenceEngine:
             "control_pre": round(g0_pre, 6),
             "control_post": round(g0_post, 6),
         }
+
+    @staticmethod
+    def _clustered_did(
+        df: pd.DataFrame, group_col: str, post_col: str, outcome_col: str, cluster_col: str,
+    ) -> dict[str, Any]:
+        columns = [group_col, post_col, outcome_col, cluster_col]
+        if len(set(columns)) != len(columns) or any(col not in df for col in columns):
+            raise CausalInferenceError("Clustered DiD requires four distinct columns.")
+        work = df[columns].dropna(subset=[outcome_col])
+        if (
+            work[cluster_col].isna().any() or not work[group_col].isin([0, 1]).all()
+            or not work[post_col].isin([0, 1]).all()
+        ):
+            raise CausalInferenceError("Clustered DiD requires complete cluster IDs and binary treatment and period values.")
+        outcomes = pd.to_numeric(work[outcome_col], errors="coerce").to_numpy(dtype=float)
+        if not np.isfinite(outcomes).all():
+            raise CausalInferenceError("Clustered DiD outcomes must be finite numeric values.")
+        cluster_codes, clusters = pd.factorize(work[cluster_col], sort=False)
+        group = work[group_col].to_numpy(dtype=int)
+        post = work[post_col].to_numpy(dtype=int)
+        if len(np.unique(np.column_stack((cluster_codes, group)), axis=0)) != len(clusters):
+            raise CausalInferenceError("Each independent cluster must belong to one treatment arm.")
+        cells = 2 * group + post
+        counts = np.bincount(cells, minlength=4)
+        if np.any(counts == 0):
+            raise CausalInferenceError("All four 2×2 cells require observed outcomes.")
+        means = np.bincount(cells, weights=outcomes) / counts
+        contrast = np.array([1, -1, -1, 1])
+        scores = contrast[cells] * (outcomes - means[cells]) / counts[cells]
+        effects = np.bincount(cluster_codes, weights=scores, minlength=len(clusters))
+        arm_clusters = [int(np.unique(cluster_codes[group == arm]).size) for arm in (0, 1)]
+        degrees = min(arm_clusters) - 1
+        estimate = float(contrast @ means)
+        report: dict[str, Any] = {
+            "did_estimate": estimate, "std_error": None, "ci_lower": None, "ci_upper": None, "p_value": None,
+            "control_pre": float(means[0]), "control_post": float(means[1]),
+            "treated_pre": float(means[2]), "treated_post": float(means[3]),
+            "control_change": float(means[1] - means[0]), "treated_change": float(means[3] - means[2]),
+            "inference_method": "cluster_sandwich_conservative_t",
+            "control_clusters": arm_clusters[0], "treated_clusters": arm_clusters[1], "degrees_of_freedom": degrees,
+            "inference_status": "insufficient_clusters" if degrees < 1 else "degenerate_cluster_variance",
+        }
+        if degrees >= 1 and float(effects @ effects) > 0:
+            se = float(np.sqrt(len(clusters) / (len(clusters) - 1) * (effects @ effects)))
+            half_width = float(student_t.ppf(0.975, degrees)) * se
+            report.update(
+                std_error=se, ci_lower=estimate - half_width, ci_upper=estimate + half_width,
+                p_value=float(2 * student_t.sf(abs(estimate) / se, degrees)), inference_status="estimated",
+            )
+        return report
 
     def _dispatch_estimator(
         self,
