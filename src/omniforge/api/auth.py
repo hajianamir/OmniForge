@@ -5,6 +5,8 @@ from __future__ import annotations
 import contextvars
 import hashlib
 import hmac
+import ipaddress
+import os
 import secrets
 import time
 from collections.abc import Callable
@@ -170,11 +172,79 @@ def issue_local_workbench_cookies(response: Response, *, secure: bool = False) -
     )
 
 
-def should_auto_bootstrap_local_ui() -> bool:
-    """Return True only when non-production local UI cookie bootstrap is explicitly enabled."""
+def clear_local_workbench_cookies(response: Response, *, secure: bool = False) -> None:
+    """Expire stale or invalid local workbench auth + CSRF cookies so browsers do not stay wedged."""
+    response.delete_cookie(
+        key=WORKBENCH_AUTH_COOKIE,
+        path="/",
+        secure=secure,
+        httponly=True,
+        samesite="strict",
+    )
+    response.delete_cookie(
+        key=WORKBENCH_CSRF_COOKIE,
+        path="/",
+        secure=secure,
+        httponly=False,
+        samesite="strict",
+    )
+
+
+def has_valid_workbench_cookie(request: Request) -> bool:
+    """Return True when ``request`` carries a currently valid ``omniforge_wb_auth`` cookie."""
+    cookie_token = request.cookies.get(WORKBENCH_AUTH_COOKIE)
+    if not cookie_token:
+        return False
+    return _verify_workbench_cookie_token(cookie_token)
+
+
+_loopback_workbench_bootstrap_enabled: bool = False
+
+
+def is_loopback_host(host: str | None) -> bool:
+    """Return True strictly for loopback hostnames/IPs (never 0.0.0.0, ::, or LAN addresses)."""
+    if not host:
+        return False
+    cleaned = host.strip().strip("[]").lower()
+    if not cleaned:
+        return False
+    if cleaned == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(cleaned).is_loopback
+    except ValueError:
+        return False
+
+
+def set_loopback_workbench_bootstrap(enabled: bool) -> bool:
+    """Enable or disable loopback-only cookie bootstrap for interactive Workbench UI servers."""
+    global _loopback_workbench_bootstrap_enabled
+    prev = _loopback_workbench_bootstrap_enabled
+    _loopback_workbench_bootstrap_enabled = bool(enabled)
+    return prev
+
+
+def _is_loopback_bootstrap_disabled_by_env() -> bool:
+    raw = (os.getenv("OMNIFORGE_DISABLE_LOOPBACK_UI_BOOTSTRAP") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def should_auto_bootstrap_local_ui(request: Request | None = None) -> bool:
+    """Return True when non-production local UI cookie bootstrap is permitted for ``request``."""
     if _is_production_env():
         return False
-    return bool(get_settings().security.auto_bootstrap_local_ui)
+    if bool(get_settings().security.auto_bootstrap_local_ui):
+        return True
+    if _loopback_workbench_bootstrap_enabled and not _is_loopback_bootstrap_disabled_by_env():
+        if request is None:
+            return False
+        if not is_loopback_host(request.url.hostname):
+            return False
+        client_host = request.client.host if request.client is not None else None
+        if client_host is not None and not is_loopback_host(client_host):
+            return False
+        return True
+    return False
 
 
 def _authenticate_from_cookie(request: Request) -> Principal | None:

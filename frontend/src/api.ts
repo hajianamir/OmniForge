@@ -1,5 +1,7 @@
 const SESSION_KEY = 'omniforge_session_id';
 const CSRF_COOKIE_NAME = 'omniforge_csrf';
+const API_KEY_STORAGE = 'omniforge_api_key';
+const BEARER_STORAGE = 'omniforge_bearer_token';
 
 /** Default per-verb timeouts (ms). Long-running modeling jobs pass an explicit override. */
 export const DEFAULT_TIMEOUTS = {
@@ -117,15 +119,63 @@ function buildAuthHeaders(extra?: Record<string, string>): Record<string, string
   if (csrfToken) {
     headers['X-CSRF-Token'] = csrfToken;
   }
-  const apiKey = localStorage.getItem('omniforge_api_key');
+  const apiKey = localStorage.getItem(API_KEY_STORAGE);
   if (apiKey) {
     headers['X-API-Key'] = apiKey;
   }
-  const bearer = localStorage.getItem('omniforge_bearer_token');
+  const bearer = localStorage.getItem(BEARER_STORAGE);
   if (bearer) {
     headers['Authorization'] = `Bearer ${bearer}`;
   }
   return headers;
+}
+
+export function hasStoredCredentials(): boolean {
+  if (typeof localStorage === 'undefined') return false;
+  return Boolean(localStorage.getItem(API_KEY_STORAGE) || localStorage.getItem(BEARER_STORAGE));
+}
+
+export function setStoredCredentials(creds: { apiKey?: string; bearerToken?: string }): void {
+  const apiKey = (creds.apiKey ?? '').trim();
+  const bearer = (creds.bearerToken ?? '').trim();
+  if (apiKey) localStorage.setItem(API_KEY_STORAGE, apiKey);
+  else localStorage.removeItem(API_KEY_STORAGE);
+  if (bearer) localStorage.setItem(BEARER_STORAGE, bearer);
+  else localStorage.removeItem(BEARER_STORAGE);
+}
+
+export function clearStoredCredentials(): void {
+  localStorage.removeItem(API_KEY_STORAGE);
+  localStorage.removeItem(BEARER_STORAGE);
+}
+
+let inFlightCookieRefresh: Promise<boolean> | null = null;
+
+async function refreshWorkbenchSessionCookie(): Promise<boolean> {
+  if (typeof window === 'undefined' || hasStoredCredentials()) {
+    return false;
+  }
+  if (inFlightCookieRefresh) {
+    return inFlightCookieRefresh;
+  }
+  inFlightCookieRefresh = (async () => {
+    const prevCsrf = getCookieValue(CSRF_COOKIE_NAME);
+    try {
+      const res = await fetch('/', {
+        method: 'GET',
+        credentials: 'same-origin',
+        cache: 'no-store',
+      });
+      if (!res.ok) return false;
+      const nextCsrf = getCookieValue(CSRF_COOKIE_NAME);
+      return Boolean(nextCsrf && nextCsrf !== prevCsrf);
+    } catch {
+      return false;
+    } finally {
+      inFlightCookieRefresh = null;
+    }
+  })();
+  return inFlightCookieRefresh;
 }
 
 interface ValidationDetailItem {
@@ -242,7 +292,8 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 
 async function fetchWithRetry(
   path: string,
-  init: RequestInit,
+  init: Omit<RequestInit, 'headers'>,
+  extraHeaders: Record<string, string> | undefined,
   options: ApiRequestOptions,
   defaultTimeoutMs: number,
   defaultRetries: number,
@@ -250,10 +301,21 @@ async function fetchWithRetry(
   const timeoutMs = options.timeoutMs ?? defaultTimeoutMs;
   const maxRetries = options.retries ?? defaultRetries;
   let attempt = 0;
+  let refreshedSession = false;
   for (;;) {
     const signal = combineSignals(options.signal, timeoutMs);
     try {
-      const res = await fetch(path, { ...init, signal });
+      const res = await fetch(path, {
+        ...init,
+        headers: buildAuthHeaders(extraHeaders),
+        signal,
+      });
+      if (res.status === 401 && !refreshedSession && path.startsWith('/api/')) {
+        refreshedSession = true;
+        if (await refreshWorkbenchSessionCookie()) {
+          continue;
+        }
+      }
       // Retry transient HTTP statuses only when retries remain.
       if ((res.status === 429 || (res.status >= 500 && res.status < 600)) && attempt < maxRetries) {
         const rawText = await res.text();
@@ -300,7 +362,8 @@ async function handleResponse<T>(res: Response): Promise<T> {
 export async function apiGet<T = unknown>(path: string, options: ApiRequestOptions = {}): Promise<T> {
   const res = await fetchWithRetry(
     path,
-    { credentials: 'same-origin', headers: buildAuthHeaders() },
+    { credentials: 'same-origin' },
+    undefined,
     options,
     DEFAULT_TIMEOUTS.get,
     2,
@@ -318,9 +381,9 @@ export async function apiPost<T = unknown>(
     {
       method: 'POST',
       credentials: 'same-origin',
-      headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
       body: body === undefined ? '{}' : JSON.stringify(body),
     },
+    { 'Content-Type': 'application/json' },
     options,
     DEFAULT_TIMEOUTS.post,
     0,
@@ -331,7 +394,8 @@ export async function apiPost<T = unknown>(
 export async function apiDelete<T = unknown>(path: string, options: ApiRequestOptions = {}): Promise<T> {
   const res = await fetchWithRetry(
     path,
-    { method: 'DELETE', credentials: 'same-origin', headers: buildAuthHeaders() },
+    { method: 'DELETE', credentials: 'same-origin' },
+    undefined,
     options,
     DEFAULT_TIMEOUTS.delete,
     0,
@@ -346,7 +410,8 @@ export async function apiUpload<T = unknown>(
 ): Promise<T> {
   const res = await fetchWithRetry(
     path,
-    { method: 'POST', credentials: 'same-origin', headers: buildAuthHeaders(), body: formData },
+    { method: 'POST', credentials: 'same-origin', body: formData },
+    undefined,
     options,
     DEFAULT_TIMEOUTS.upload,
     0,
@@ -363,7 +428,8 @@ export async function apiDownload(
 ): Promise<void> {
   const res = await fetchWithRetry(
     path,
-    { method, credentials: 'same-origin', headers: buildAuthHeaders(), body: formData },
+    { method, credentials: 'same-origin', body: formData },
+    undefined,
     options,
     DEFAULT_TIMEOUTS.download,
     method === 'GET' ? 1 : 0,
