@@ -188,6 +188,64 @@ def _summarize_interval_scores(
     }
 
 
+def _compare_rolling_interval_scores(
+    calibration_errors: np.ndarray, evaluation_errors: np.ndarray, fixed_widths: np.ndarray, alpha: float,
+) -> dict[str, Any]:
+    """Replay rolling residual quantiles without using the current window's outcomes."""
+    window = len(calibration_errors)
+    errors = np.concatenate((calibration_errors, evaluation_errors), axis=0)
+    rolling_widths = np.empty_like(evaluation_errors)
+    last_widths = fixed_widths.copy()
+    retained_leads = []
+    for i in range(len(evaluation_errors)):
+        previous = errors[i : i + window]
+        retained = []
+        for lead, recent_errors in enumerate(previous.T):
+            count = int(np.isfinite(recent_errors).sum())
+            if count and (count + 1) * (1 - alpha) <= count:
+                width, estimable = split_conformal_quantile(recent_errors, alpha)
+                if estimable:
+                    last_widths[lead] = width
+                    continue
+            retained.append(lead + 1)
+        retained_leads.append(retained)
+        rolling_widths[i] = last_widths
+
+    fixed = np.broadcast_to(fixed_widths, evaluation_errors.shape)
+    fixed_hits, fixed_scores = _interval_scores(evaluation_errors, -fixed, fixed, alpha)
+    rolling_hits, rolling_scores = _interval_scores(evaluation_errors, -rolling_widths, rolling_widths, alpha)
+    paired = np.isfinite(fixed_hits) & np.isfinite(rolling_hits)
+
+    def summarize(index: int | slice = slice(None)) -> dict[str, Any]:
+        mask = paired[index]
+        count = int(mask.sum())
+        report: dict[str, Any] = {"paired_outcomes": count}
+        for name, hits, scores, widths in (
+            ("fixed", fixed_hits, fixed_scores, fixed),
+            ("rolling", rolling_hits, rolling_scores, rolling_widths),
+        ):
+            report[name] = {
+                "coverage": float(hits[index][mask].mean()) if count else None,
+                "mean_interval_score": float(scores[index][mask].mean()) if count else None,
+                "mean_width": float(2 * widths[index][mask].mean()) if count else None,
+            }
+        return report
+
+    by_origin = []
+    for i, widths in enumerate(rolling_widths):
+        by_origin.append({
+            "rolling_half_width_by_lead": widths.tolist(),
+            "retained_width_leads": retained_leads[i],
+            **summarize(i),
+        })
+    return {
+        "method": "trailing_origin_absolute_error_order_statistic",
+        "window_origins": window,
+        **summarize(),
+        "by_origin": by_origin,
+    }
+
+
 @dataclass
 class ForecastingReport:
     """Complete result from running :class:`ForecastingEngine`."""
@@ -234,8 +292,9 @@ class ForecastingEngine:
         validation_horizon: int | None = None,
         interval_calibration_origins: int = 0,
         interval_evaluation_origins: int = 1,
+        compare_rolling_intervals: bool = False,
     ) -> ForecastingReport:
-        """Run causal split, baseline benchmarks, TimeSeriesSplit rolling CV, model tournament, and future forecasts."""
+        """Run a chronological tournament and optionally compare rolling widths in retrospective evaluation."""
         if target_col not in df.columns:
             raise ForecastingError(f"Target column '{target_col}' not found in DataFrame.")
         work = (
@@ -263,6 +322,8 @@ class ForecastingEngine:
             "requested_evaluation_origins": interval_evaluation_origins,
             "nominal_level": self.confidence_level,
         }
+        if compare_rolling_intervals:
+            calibration["rolling_comparison"] = None
         calibration_start = None
         raw_series = all_history
         if interval_calibration_origins:
@@ -422,6 +483,7 @@ class ForecastingEngine:
                 widths, evidence = self._calibrate_intervals(
                     all_history, champion_name, fitted_builders, calibration_start,
                     interval_calibration_origins, interval_evaluation_origins, horizon,
+                    compare_rolling_intervals=compare_rolling_intervals,
                 )
                 calibration.update(evidence)
 
@@ -519,6 +581,7 @@ class ForecastingEngine:
     def _calibrate_intervals(
         self, history: pd.Series, champion: str, builders: dict[str, Any], start: int,
         origins: int, evaluation_origins: int, horizon: int,
+        *, compare_rolling_intervals: bool = False,
     ) -> tuple[np.ndarray | None, dict[str, Any]]:
         """Freeze lead-specific widths before evaluating later non-overlapping windows."""
         evaluation_start = len(history) - evaluation_origins * horizon
@@ -558,6 +621,7 @@ class ForecastingEngine:
         calibrated_scores = np.full_like(calibrated_hits, np.nan)
         native_hits = np.full_like(calibrated_hits, np.nan)
         native_scores = np.full_like(calibrated_hits, np.nan)
+        evaluation_errors = np.full_like(calibrated_hits, np.nan) if compare_rolling_intervals else None
         alpha = 1 - self.confidence_level
         by_origin: list[dict[str, Any]] = []
         for i in range(evaluation_origins):
@@ -573,6 +637,8 @@ class ForecastingEngine:
                         observed, lower, upper, alpha,
                     )
                 status = "scored" if np.isfinite(calibrated_hits[i]).any() else "no_evaluable_outcomes"
+                if evaluation_errors is not None:
+                    evaluation_errors[i] = np.where(np.isfinite(calibrated_hits[i]), np.abs(observed - point), np.nan)
             except Exception as exc:
                 status = "forecast_unavailable"
                 calibrated_hits[i] = calibrated_scores[i] = native_hits[i] = native_scores[i] = np.nan
@@ -595,6 +661,11 @@ class ForecastingEngine:
                 for i in range(horizon)
             ],
         }
+        if evaluation_errors is not None:
+            comparison = _compare_rolling_interval_scores(scores, evaluation_errors, widths, alpha)
+            for row, origin in zip(comparison["by_origin"], by_origin, strict=True):
+                row["start_position"] = origin["start_position"]
+            evidence["rolling_comparison"] = comparison
         return widths, evidence
 
     def _patch_forecaster(self) -> FoundationForecaster:
