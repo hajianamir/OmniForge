@@ -18,7 +18,10 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from omniforge.api.auth import (
+    WORKBENCH_AUTH_COOKIE,
     access_controller,
+    clear_local_workbench_cookies,
+    has_valid_workbench_cookie,
     issue_local_workbench_cookies,
     jwt_manager,
     require_permission,
@@ -109,6 +112,13 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def security_headers_middleware(request: Request, call_next: Any) -> Any:
         response = await call_next(request)
+        if (
+            response.status_code == 401
+            and request.cookies.get(WORKBENCH_AUTH_COOKIE)
+            and not has_valid_workbench_cookie(request)
+            and "set-cookie" not in response.headers
+        ):
+            clear_local_workbench_cookies(response, secure=(request.url.scheme == "https"))
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
         response.headers.setdefault("Referrer-Policy", "same-origin")
@@ -578,8 +588,11 @@ def create_app() -> FastAPI:
                 str(static_root / "index.html"),
                 headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"},
             )
-            if should_auto_bootstrap_local_ui():
-                issue_local_workbench_cookies(resp, secure=(request.url.scheme == "https"))
+            secure_cookie = request.url.scheme == "https"
+            if should_auto_bootstrap_local_ui(request):
+                issue_local_workbench_cookies(resp, secure=secure_cookie)
+            elif request.cookies.get(WORKBENCH_AUTH_COOKIE) and not has_valid_workbench_cookie(request):
+                clear_local_workbench_cookies(resp, secure=secure_cookie)
             return resp
     else:
 

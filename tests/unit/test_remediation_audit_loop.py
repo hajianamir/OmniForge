@@ -1049,3 +1049,95 @@ def test_ipv6_dns_pinning_concurrent_audit_reader_and_e2e_copilot_http_403(
     assert r_ds_promote.status_code == 403, r_ds_promote.text
 
 
+def test_loopback_workbench_session_bootstrap_stale_cookie_recovery_and_dns_rebinding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+
+    from fastapi.testclient import TestClient
+
+    from omniforge.api.auth import (
+        WORKBENCH_AUTH_COOKIE,
+        WORKBENCH_CSRF_COOKIE,
+        is_loopback_host,
+        set_loopback_workbench_bootstrap,
+    )
+    from omniforge.api.main import create_app
+    from omniforge.config.settings import get_settings
+
+    assert is_loopback_host("127.0.0.1") is True
+    assert is_loopback_host("localhost") is True
+    assert is_loopback_host("::1") is True
+    assert is_loopback_host("[::1]") is True
+    assert is_loopback_host("0.0.0.0") is False
+    assert is_loopback_host("::") is False
+    assert is_loopback_host("evil.example.com") is False
+
+    sec = get_settings().security
+    prev_opt = sec.auto_bootstrap_local_ui
+    sec.auto_bootstrap_local_ui = False
+    test_app = create_app()
+
+    try:
+        # 1. Headless mode (loopback bootstrap OFF): stale HttpOnly cookie is purged on 401 and GET /
+        headless = TestClient(test_app, base_url="http://127.0.0.1:8501", client=("127.0.0.1", 51234))
+        headless.cookies.set(WORKBENCH_AUTH_COOKIE, "stale_nonce.1700000000.deadbeef", domain="127.0.0.1", path="/")
+        r_401 = headless.get("/api/workbench/state")
+        assert r_401.status_code == 401
+        assert "omniforge_wb_auth=" in r_401.headers.get("set-cookie", "")
+        assert "Max-Age=0" in r_401.headers.get("set-cookie", "")
+
+        headless.cookies.set(WORKBENCH_AUTH_COOKIE, "stale_nonce.1700000000.deadbeef", domain="127.0.0.1", path="/")
+        r_root_headless = headless.get("/")
+        assert r_root_headless.status_code == 200
+        assert "Max-Age=0" in r_root_headless.headers.get("set-cookie", "")
+
+        # 2. Interactive loopback UI mode (`omniforge ui` / `start.bat` on 127.0.0.1:8501):
+        #    Even with an expired/rotated cookie pre-populated AND auto_bootstrap_local_ui == False,
+        #    GET / refreshes cookies and /api/workbench/state + /s01/catalog + /s01/upload succeed!
+        prev_loop = set_loopback_workbench_bootstrap(True)
+        try:
+            browser = TestClient(test_app, base_url="http://127.0.0.1:8501", client=("127.0.0.1", 51235))
+            browser.cookies.set(WORKBENCH_AUTH_COOKIE, "expired_nonce.1700000000.badmac", domain="127.0.0.1", path="/")
+
+            r_home = browser.get("/")
+            assert r_home.status_code == 200
+            assert WORKBENCH_AUTH_COOKIE in browser.cookies
+            assert WORKBENCH_CSRF_COOKIE in browser.cookies
+            assert browser.cookies.get(WORKBENCH_AUTH_COOKIE, domain="127.0.0.1") != "expired_nonce.1700000000.badmac"
+
+            r_state = browser.get("/api/workbench/state")
+            assert r_state.status_code == 200, r_state.text
+
+            r_cat = browser.get("/api/workbench/s01/catalog")
+            assert r_cat.status_code == 200, r_cat.text
+
+            csrf = browser.cookies[WORKBENCH_CSRF_COOKIE]
+            r_up = browser.post(
+                "/api/workbench/s01/upload",
+                files={"file": ("demo.csv", io.BytesIO(b"a,b\n1,2\n3,4\n"), "text/csv")},
+                headers={"X-CSRF-Token": csrf, "X-Session-ID": "of_loopback_test"},
+            )
+            assert r_up.status_code == 200, r_up.text
+
+            # 3. DNS-rebinding attack against 127.0.0.1:8501 MUST NOT mint session cookies!
+            rebind = TestClient(
+                test_app,
+                base_url="http://evil-rebind.attacker.example:8501",
+                client=("127.0.0.1", 51236),
+            )
+            r_rebind = rebind.get("/")
+            assert r_rebind.status_code == 200
+            assert WORKBENCH_AUTH_COOKIE not in rebind.cookies
+
+            # 4. Explicit opt-out env var disables loopback bootstrap.
+            monkeypatch.setenv("OMNIFORGE_DISABLE_LOOPBACK_UI_BOOTSTRAP", "true")
+            optout = TestClient(test_app, base_url="http://127.0.0.1:8501", client=("127.0.0.1", 51237))
+            assert optout.get("/").status_code == 200
+            assert WORKBENCH_AUTH_COOKIE not in optout.cookies
+        finally:
+            set_loopback_workbench_bootstrap(prev_loop)
+    finally:
+        sec.auto_bootstrap_local_ui = prev_opt
+
+

@@ -51,38 +51,44 @@ def run_workbench_server(
     """Launch the OmniForge FastAPI + React TypeScript Enterprise Workbench via Uvicorn."""
     import uvicorn
 
-    app = create_workbench_app()
-    display_host = "127.0.0.1" if host == "0.0.0.0" else host
-    url = f"http://{display_host}:{port}"
+    from omniforge.api.auth import is_loopback_host, set_loopback_workbench_bootstrap
 
-    if open_browser:
+    prev_bootstrap = set_loopback_workbench_bootstrap(is_loopback_host(host))
+    try:
+        app = create_workbench_app()
+        display_host = "127.0.0.1" if host == "0.0.0.0" else host
+        url = f"http://{display_host}:{port}"
 
-        def _opener() -> None:
-            time.sleep(1.0)
-            try:
-                if not webbrowser.open(url):
+        if open_browser:
+
+            def _opener() -> None:
+                time.sleep(1.0)
+                try:
+                    if not webbrowser.open(url):
+                        logger.warning(
+                            "workbench_browser_open_failed",
+                            reason="browser_open_returned_false",
+                            fallback="server_only",
+                        )
+                except Exception as exc:
+                    # Exception messages can contain URLs or local paths; avoid logging them.
                     logger.warning(
                         "workbench_browser_open_failed",
-                        reason="browser_open_returned_false",
+                        reason="browser_open_exception",
+                        error_type=type(exc).__name__,
                         fallback="server_only",
                     )
-            except Exception as exc:
-                # Exception messages can contain URLs or local paths; avoid logging them.
-                logger.warning(
-                    "workbench_browser_open_failed",
-                    reason="browser_open_exception",
-                    error_type=type(exc).__name__,
-                    fallback="server_only",
-                )
 
-        threading.Thread(target=_opener, daemon=True, name="omniforge-browser").start()
+            threading.Thread(target=_opener, daemon=True, name="omniforge-browser").start()
 
-    uvicorn.run(
-        app,
-        host=host,
-        port=int(port),
-        log_level="debug" if debug else "info",
-    )
+        uvicorn.run(
+            app,
+            host=host,
+            port=int(port),
+            log_level="debug" if debug else "info",
+        )
+    finally:
+        set_loopback_workbench_bootstrap(prev_bootstrap)
 
 
 # Backwards-compatible aliases preserved for external scripts and desktop launchers

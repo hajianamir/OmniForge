@@ -26,7 +26,18 @@ import {
   Unlock,
   X,
 } from 'lucide-react';
-import { apiDelete, apiDownload, apiGet, apiPost, apiUpload, toErrorMessage } from './api';
+import {
+  ApiError,
+  apiDelete,
+  apiDownload,
+  apiGet,
+  apiPost,
+  apiUpload,
+  clearStoredCredentials,
+  hasStoredCredentials,
+  setStoredCredentials,
+  toErrorMessage,
+} from './api';
 import type { HandbookSectionId } from './components/HelpGuideModal';
 import type { StudioCache, StudioPayload, StudioResultKey } from './studioTypes';
 import { STUDIOS, type StudioId, type WorkspaceState } from './types';
@@ -117,11 +128,14 @@ export const App: React.FC = () => {
   const [studio, setStudio] = useState<StudioId>('00');
   const [visitedStudios, setVisitedStudios] = useState<StudioId[]>(['00']);
   const [gridVersion, setGridVersion] = useState(0);
-  const [modal, setModal] = useState<'none' | 'targets' | 'exclusions' | 'split' | 'project'>('none');
+  const [modal, setModal] = useState<'none' | 'targets' | 'exclusions' | 'split' | 'project' | 'auth'>('none');
   const [helpOpen, setHelpOpen] = useState(false);
   const [helpSection, setHelpSection] = useState<HandbookSectionId>('workflow');
   const [toast, setToast] = useState<string | null>(null);
   const [cacheError, setCacheError] = useState<string | null>(null);
+  const [authRequired, setAuthRequired] = useState(false);
+  const [apiKeyInput, setApiKeyInput] = useState('');
+  const [bearerInput, setBearerInput] = useState('');
   const [studioCache, setStudioCache] = useState<StudioCache>({});
   // Keep the current cache synchronously available to event handlers. React
   // state updater functions may run later (or more than once in StrictMode).
@@ -215,6 +229,7 @@ export const App: React.FC = () => {
       } else {
         setCacheError(null);
       }
+      setAuthRequired(false);
       return;
     }
     const generation = cacheGeneration.current;
@@ -225,7 +240,10 @@ export const App: React.FC = () => {
         syncState(s);
       })
       .catch((err: unknown) => {
-        if (generation === cacheGeneration.current) setCacheError(`Could not load workspace: ${toErrorMessage(err)}`);
+        if (generation === cacheGeneration.current) {
+          setAuthRequired(err instanceof ApiError && err.status === 401);
+          setCacheError(`Could not load workspace: ${toErrorMessage(err)}`);
+        }
       });
   }, [fetchServerCache, updateCache]);
 
@@ -427,7 +445,14 @@ export const App: React.FC = () => {
         {toast && <div className="alert alert-success">{toast}</div>}
         {cacheError && (
           <div className="alert alert-error" role="alert">
-            {cacheError} <button className="btn btn-sm" onClick={() => syncState()}>Retry workspace results</button>
+            {cacheError}{' '}
+            <button className="btn btn-sm" onClick={() => syncState()}>Retry workspace results</button>
+            {authRequired && (
+              <>
+                {' '}
+                <button className="btn btn-sm btn-primary" onClick={() => setModal('auth')}>Authenticate Session</button>
+              </>
+            )}
           </div>
         )}
         <React.Suspense fallback={<StudioLoadingFallback />}>
@@ -478,6 +503,7 @@ export const App: React.FC = () => {
                 {modal === 'exclusions' && 'Reversible Column Exclusions (All 14 Studios)'}
                 {modal === 'split' && 'Anti-Leakage Train/Test Split Lock'}
                 {modal === 'project' && 'Portable .omniforge Workspace Save & Restore'}
+                {modal === 'auth' && 'Workbench Session Authentication'}
               </span>
               <div className="row" style={{ gap: 6 }}>
                 <React.Suspense fallback={null}>
@@ -578,6 +604,62 @@ export const App: React.FC = () => {
                     <FolderOpen size={14} /> Choose .omniforge File
                     <input type="file" accept=".omniforge,.uap" onChange={handleLoadProject} style={{ display: 'none' }} />
                   </label>
+                </div>
+              </div>
+            )}
+
+            {modal === 'auth' && (
+              <div>
+                <p style={{ color: 'var(--text-muted)', marginTop: 0 }}>
+                  Provide an <code>X-API-Key</code> (from <code>OMNIFORGE_SECURITY__API_KEY</code> or{' '}
+                  <code>.omniforge_workspace/.secrets/api_key</code>) or a <code>Bearer</code> JWT token for remote / non-loopback servers.
+                </p>
+                <label className="field" style={{ marginBottom: 8 }}>API Key (X-API-Key)
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    value={apiKeyInput}
+                    placeholder="Paste server API key..."
+                    onChange={(e) => setApiKeyInput(e.target.value)}
+                  />
+                </label>
+                <label className="field" style={{ marginBottom: 12 }}>Bearer JWT Token (optional)
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    value={bearerInput}
+                    placeholder="Paste Bearer JWT token..."
+                    onChange={(e) => setBearerInput(e.target.value)}
+                  />
+                </label>
+                <div className="row" style={{ gap: 8 }}>
+                  <button
+                    className="btn btn-primary"
+                    onClick={() => {
+                      setStoredCredentials({ apiKey: apiKeyInput, bearerToken: bearerInput });
+                      setApiKeyInput('');
+                      setBearerInput('');
+                      setModal('none');
+                      setCacheError(null);
+                      syncState();
+                    }}
+                  >
+                    Save Credentials &amp; Connect
+                  </button>
+                  {hasStoredCredentials() && (
+                    <button
+                      className="btn btn-sm"
+                      onClick={() => {
+                        clearStoredCredentials();
+                        setApiKeyInput('');
+                        setBearerInput('');
+                        setModal('none');
+                        syncState();
+                      }}
+                    >
+                      Clear Saved Credentials
+                    </button>
+                  )}
                 </div>
               </div>
             )}
