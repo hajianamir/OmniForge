@@ -157,7 +157,7 @@ def create_app() -> FastAPI:
                 tenant_mlops.move_to_end(tenant)
                 return tenant_mlops[tenant]
             slug = hashlib.sha256(tenant.encode("utf-8", errors="replace")).hexdigest()[:16]
-            base = Path("./.omniforge_workspace/tenants") / slug / "api_v1"
+            base = settings.paths.workspace_dir / "tenants" / slug / "api_v1"
             reg = ModelRegistry(
                 db_path=base / "model_registry.db",
                 artifact_dir=base / "artifacts" / "registry",

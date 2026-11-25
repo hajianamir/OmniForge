@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 from pydantic import BaseModel, Field
@@ -29,6 +29,7 @@ from omniforge.core.logging import get_logger
 from omniforge.simulation.engines import DigitalTwinEngine
 
 logger = get_logger(__name__)
+MPCFeasibility = Literal["hard_feasible", "soft_state_feasible", "solver_failed"]
 
 
 # --------------------------------------------------------------------------- result models
@@ -47,6 +48,7 @@ class MPCSolveResult:
     constraint_violations: list[str] = field(default_factory=list)
     solve_time_ms: float = 0.0
     slack_used: float = 0.0
+    feasibility: MPCFeasibility = "solver_failed"
 
 
 class TwinControlReport(BaseModel):
@@ -61,6 +63,7 @@ class TwinControlReport(BaseModel):
     total_cost: float
     all_constraints_satisfied: bool
     constraint_violations: list[str] = Field(default_factory=list)
+    step_feasibility: list[MPCFeasibility] = Field(default_factory=list)
     solved_at: str = Field(default_factory=lambda: __import__("datetime").datetime.now(__import__("datetime").UTC).isoformat())
 
 
@@ -73,7 +76,7 @@ class ClosedLoopMPCController:
     At each step the controller solves a finite-horizon quadratic program over the
     predicted state/control trajectory, applies only the first control action
     (receding horizon), assimilates the next measurement via the twin's Kalman filter,
-    and repeats. Input and state safety bounds are enforced as hard constraints.
+    and repeats. Input limits are hard constraints. State bounds can use reported slack.
     """
 
     def __init__(
@@ -222,6 +225,8 @@ class ClosedLoopMPCController:
         x0 = np.asarray(x0, dtype=float).ravel()
         if x0.shape != (n_x,):
             raise SimulationError(f"x0 must be shape ({n_x},), got {x0.shape}.")
+        if not np.isfinite(x0).all() or not np.isfinite(r_path).all() or not np.isfinite(slack_penalty):
+            raise SimulationError("Initial state, reference path, and slack penalty must be finite.")
 
         n_z_base = H * (n_u + n_x)
         # Dynamically consistent initial guess so equality constraints hold at iteration 0.
@@ -316,14 +321,17 @@ class ClosedLoopMPCController:
                         }
                     )
 
+                # Preserve the minimizer while keeping the initial gradient in a
+                # numerically tractable range for SLSQP's line search.
+                scale = max(1.0, float(np.max(np.abs(_objective_grad_with_slack(z0_slack, r_path)))))
                 return minimize(
-                    fun=lambda z: _objective_with_slack(z, r_path),
+                    fun=lambda z: _objective_with_slack(z, r_path) / scale,
                     x0=z0_slack,
-                    jac=lambda z: _objective_grad_with_slack(z, r_path),
+                    jac=lambda z: _objective_grad_with_slack(z, r_path) / scale,
                     method="SLSQP",
                     bounds=bds,
                     constraints=constraints,
-                    options={"maxiter": 300, "ftol": 1e-8, "disp": False},
+                    options={"maxiter": 300, "ftol": 1e-10, "disp": False},
                 )
 
             bds_hard = self._to_scipy_bounds(u_lo, u_hi, H) + self._to_scipy_bounds(x_lo, x_hi, H)
@@ -349,81 +357,46 @@ class ClosedLoopMPCController:
         result = _solve_with_bounds(self.u_min, self.u_max, self.x_min, self.x_max)
         U, X = self._unpack(result.x) if getattr(result, "x", None) is not None else (U0, X0)
         dyn_residual = float(np.max(np.abs(self._dynamics_constraints(self._pack(U, X), x0))))
-        hard_bounds_ok = bool(
-            np.all(U >= self.u_min - 1e-5)
-            and np.all(U <= self.u_max + 1e-5)
-            and np.all(X >= self.x_min - 1e-5)
-            and np.all(X <= self.x_max + 1e-5)
-        )
-        hard_ok = bool(result.success) and dyn_residual <= 1e-5 and hard_bounds_ok
+        U = np.clip(U, self.u_min, self.u_max)
+        X = self._rollout_open_loop(x0, U)
+        state_excess = np.maximum(self.x_min - X, X - self.x_max)
+        feasibility: MPCFeasibility = "solver_failed"
+        if result.success and dyn_residual <= 1e-6 and np.all(state_excess <= 1e-6):
+            feasibility = "hard_feasible"
 
         # Stage 2: If hard bounds are infeasible, soften state safety bounds with slack variables.
         slack_used = 0.0
-        if not hard_ok:
-            result_slack = _solve_with_bounds(
+        if feasibility == "solver_failed":
+            result = _solve_with_bounds(
                 self.u_min, self.u_max, self.x_min, self.x_max, use_slack=True
             )
-            if result_slack.success:
-                z_slack = result_slack.x
-                U_s, X_s = self._unpack(z_slack[:n_z_base])
-                u_bounds_ok = bool(
-                    np.all(U_s >= self.u_min - 1e-4) and np.all(U_s <= self.u_max + 1e-4)
-                )
-                if (
-                    u_bounds_ok
-                    and float(np.max(np.abs(self._dynamics_constraints(self._pack(U_s, X_s), x0))))
-                    <= 1e-4
-                ):
-                    U_s = np.clip(U_s, self.u_min, self.u_max)
-                    X_s = self._rollout_open_loop(x0, U_s)
-                    slack_vals = np.maximum(0.0, z_slack[n_z_base:])
-                    slack_used = float(np.max(slack_vals)) if slack_vals.size > 0 else 0.0
-                    result = result_slack
-                    U, X = U_s, X_s
-                    hard_ok = True
-
-        # Stage 3: Outward bound-expansion fallback (last resort, widens finite intervals up to +20%).
-        relax = 1.0
-        while not hard_ok and relax < 1.2:
-            relax = round(relax + 0.05, 4)
-            margin = relax - 1.0
-            u_lo = np.where(
-                np.isfinite(self.u_min),
-                self.u_min - margin * np.maximum(np.abs(self.u_min), 1.0),
-                -np.inf,
-            )
-            u_hi = np.where(
-                np.isfinite(self.u_max),
-                self.u_max + margin * np.maximum(np.abs(self.u_max), 1.0),
-                np.inf,
-            )
-            x_lo = np.where(
-                np.isfinite(self.x_min),
-                self.x_min - margin * np.maximum(np.abs(self.x_min), 1.0),
-                -np.inf,
-            )
-            x_hi = np.where(
-                np.isfinite(self.x_max),
-                self.x_max + margin * np.maximum(np.abs(self.x_max), 1.0),
-                np.inf,
-            )
-            result = _solve_with_bounds(u_lo, u_hi, x_lo, x_hi)
             if result.success:
-                U_r, X_r = self._unpack(result.x)
-                if float(np.max(np.abs(self._dynamics_constraints(self._pack(U_r, X_r), x0)))) <= 1e-4:
-                    U, X = U_r, X_r
-                    hard_ok = True
+                z_slack = result.x
+                U_s, X_s = self._unpack(z_slack[:n_z_base])
+                candidate = np.clip(U_s, self.u_min, self.u_max)
+                trajectory = self._rollout_open_loop(x0, candidate)
+                slack = z_slack[n_z_base:].reshape(H, n_x)
+                state_excess = np.maximum(self.x_min - trajectory, trajectory - self.x_max)
+                if (
+                    np.all(np.abs(U_s - candidate) <= 1e-6)
+                    and np.all(np.abs(X_s - trajectory) <= 1e-6)
+                    and np.all(state_excess <= slack + 1e-6)
+                    and np.all(slack >= -1e-6)
+                ):
+                    U, X = candidate, trajectory
+                    slack_used = max(0.0, float(state_excess.max()))
+                    feasibility = "soft_state_feasible" if slack_used > 1e-6 else "hard_feasible"
 
-        if not hard_ok:
-            # Guarantee returned trajectory remains physically consistent with applied controls.
-            U = np.clip(U, self.u_min, self.u_max)
-            X = self._rollout_open_loop(x0, U)
+        success = feasibility != "solver_failed"
+        if not success:
+            # Return the bounded, dynamically consistent initial trajectory.
+            U, X = U0, X0
 
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0
 
         violations: list[str] = []
-        if not hard_ok:
-            violations.append(f"solver did not converge: {result.message}")
+        if not success:
+            violations.append(f"solver returned no verified feasible solution: {result.message}")
         # Explicit bound check against ORIGINAL (unrelaxed) bounds.
         for k in range(H):
             for j in range(n_u):
@@ -437,17 +410,18 @@ class ClosedLoopMPCController:
                         f"x[{k}][{j}]={X[k, j]:.6f} outside [{self.x_min[j]}, {self.x_max[j]}]"
                     )
 
-        traj_cost = self._objective(self._pack(U, X), r_path) if hard_ok else float("inf")
+        traj_cost = self._objective(self._pack(U, X), r_path) if success else float("inf")
         return MPCSolveResult(
             optimal_control=U[0].copy(),
             full_control_sequence=U.copy(),
             state_trajectory=np.vstack([x0.reshape(1, -1), X]),
             cost=traj_cost,
-            success=hard_ok,
+            success=success,
             solver_message=str(result.message),
             constraint_violations=violations,
             solve_time_ms=round(elapsed_ms, 2),
             slack_used=round(slack_used, 6),
+            feasibility=feasibility,
         )
 
     def _dynamics_jacobian(self, z: np.ndarray, x0: np.ndarray | None = None) -> np.ndarray:
@@ -510,6 +484,7 @@ class ClosedLoopMPCController:
         state_traj: list[list[float]] = []
         control_hist: list[list[float]] = []
         stage_costs: list[float] = []
+        step_feasibility: list[MPCFeasibility] = []
         all_violations: list[str] = []
         all_satisfied = True
 
@@ -522,6 +497,7 @@ class ClosedLoopMPCController:
             r_path_t = np.tile(setpoint_arr[t], (self.horizon, 1))
 
             solve_res = self.solve(z_t, r_path_t, warm_start=warm_start)
+            step_feasibility.append(solve_res.feasibility)
             if not solve_res.success:
                 all_satisfied = False
             all_violations.extend(solve_res.constraint_violations)
@@ -562,6 +538,7 @@ class ClosedLoopMPCController:
             total_cost=round(total_cost, 6),
             all_constraints_satisfied=all_satisfied and len(all_violations) == 0,
             constraint_violations=all_violations,
+            step_feasibility=step_feasibility,
         )
 
     # -- session persistence ----------------------------------------------------
@@ -619,13 +596,16 @@ def build_default_twin(
     dt: float = 1.0,
     random_seed: int = 42,
 ) -> DigitalTwinEngine:
-    """Construct a default stable second-order linear Digital Twin (demo / test helper).
+    """Construct a second-order linear Digital Twin with two states and one input.
 
     Discretized double integrator with mild process/measurement noise:
         x_{k+1} = [1 dt; 0 1] x_k + [0.5 dt^2; dt] u_k + w
-        y_k     = [1 0] x_k + v
+        y_k     = x_k + v
     """
-    np.random.default_rng(random_seed)
+    if (n_x, n_u) != (2, 1):
+        raise SimulationError("The default double-integrator twin requires n_x=2 and n_u=1.")
+    if not np.isfinite(dt) or dt <= 0:
+        raise SimulationError("The default twin time step must be finite and positive.")
     A = np.array([[1.0, dt], [0.0, 1.0]], dtype=float)
     B = np.array([[0.5 * dt * dt], [dt]], dtype=float)
     H = np.eye(n_x, dtype=float)

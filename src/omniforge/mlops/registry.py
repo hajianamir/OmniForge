@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -17,6 +18,7 @@ from pydantic import BaseModel, Field
 from omniforge.core.exceptions import MLOpsError, SecurityError
 from omniforge.core.logging import get_logger
 from omniforge.core.types import ModelStage
+from omniforge.mlops.fairness_evidence import FairnessEvidence, RegisteredFairnessEvidence, model_fingerprint
 from omniforge.models.base import BaseOmniForgeModel, SklearnEstimatorAdapter
 
 logger = get_logger(__name__)
@@ -88,6 +90,7 @@ class RegisteredModelVersion(BaseModel):
     approved_domains: list[str] = Field(default_factory=list)
     risk_tier: Literal["low", "medium", "high", "critical"] = "medium"
     fairness_passed: bool | None = None
+    fairness_evidence: RegisteredFairnessEvidence | None = None
     encrypted_at_rest: bool = False
     registered_at: str
     updated_at: str
@@ -99,19 +102,22 @@ class ModelRegistry:
     _SELECT_COLS = (
         "model_name, version, stage, artifact_path, checksum_sha256, metrics_json, tags_json, "
         "description, owner, intended_use, approved_domains_json, risk_tier, fairness_passed, "
-        "encrypted_at_rest, registered_at, updated_at"
+        "encrypted_at_rest, registered_at, updated_at, fairness_evidence_json"
     )
 
     def __init__(
         self,
-        db_path: str | Path = "./.omniforge_workspace/model_registry.db",
-        artifact_dir: str | Path = "./.omniforge_workspace/artifacts/registry",
+        db_path: str | Path | None = None,
+        artifact_dir: str | Path | None = None,
         *,
         require_fairness_gate: bool | None = None,
     ) -> None:
-        self.db_path = Path(db_path)
+        from omniforge.config.settings import get_settings
+
+        paths = get_settings().paths
+        self.db_path = Path(db_path) if db_path is not None else paths.registry_db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.artifact_dir = Path(artifact_dir)
+        self.artifact_dir = Path(artifact_dir) if artifact_dir is not None else paths.artifact_store_dir / "registry"
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         env_gate = os.getenv("OMNIFORGE_REQUIRE_FAIRNESS_FOR_PRODUCTION", "").strip().lower() in {
             "1",
@@ -140,6 +146,7 @@ class ModelRegistry:
                     approved_domains_json TEXT NOT NULL DEFAULT '[]',
                     risk_tier TEXT NOT NULL DEFAULT 'medium',
                     fairness_passed INTEGER DEFAULT NULL,
+                    fairness_evidence_json TEXT DEFAULT NULL,
                     encrypted_at_rest INTEGER DEFAULT 0,
                     registered_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -156,6 +163,7 @@ class ModelRegistry:
                 ("approved_domains_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("risk_tier", "TEXT NOT NULL DEFAULT 'medium'"),
                 ("fairness_passed", "INTEGER DEFAULT NULL"),
+                ("fairness_evidence_json", "TEXT DEFAULT NULL"),
                 ("encrypted_at_rest", "INTEGER DEFAULT 0"),
             ]
             for col_name, col_ddl in migrations:
@@ -169,6 +177,7 @@ class ModelRegistry:
         model_name: str,
         version: int,
         fairness_passed: bool | None,
+        evidence_bound: bool,
         require_fairness_gate: bool | None,
         override_reason: str | None,
         tags: dict[str, str],
@@ -176,7 +185,7 @@ class ModelRegistry:
         """Enforce Responsible AI fairness promotion gate when transitioning to PRODUCTION (NIST AI RMF MANAGE 2.2)."""
         eff_require = self.require_fairness_gate if require_fairness_gate is None else bool(require_fairness_gate)
         failed_audit = fairness_passed is False
-        missing_required_audit = eff_require and fairness_passed is None
+        missing_required_audit = eff_require and (not evidence_bound or fairness_passed is not True)
         if not failed_audit and not missing_required_audit:
             return tags
 
@@ -185,7 +194,7 @@ class ModelRegistry:
             reason_msg = (
                 f"Model '{model_name}' v{version} failed its Responsible AI fairness audit (fairness_passed=False)"
                 if failed_audit
-                else f"Model '{model_name}' v{version} has no completed fairness audit (require_fairness_gate=True)"
+                else f"Model '{model_name}' v{version} requires a current fairness assessment bound to its artifact and holdout"
             )
             _audit_registry_event(
                 "registry:fairness_gate_blocked",
@@ -225,6 +234,7 @@ class ModelRegistry:
         approved_domains: list[str] | None = None,
         risk_tier: str = "medium",
         fairness_report: Any | None = None,
+        fairness_evidence: FairnessEvidence | None = None,
         fairness_passed: bool | None = None,
         require_fairness_gate: bool | None = None,
         override_reason: str | None = None,
@@ -244,6 +254,10 @@ class ModelRegistry:
         norm_tier = str(risk_tier or "medium").strip().lower()
         if norm_tier not in _VALID_RISK_TIERS:
             raise MLOpsError(f"Invalid risk_tier '{risk_tier}'. Choose one of: {sorted(_VALID_RISK_TIERS)}.")
+        if fairness_evidence is not None:
+            if fairness_evidence.model_fingerprint != model_fingerprint(model):
+                raise MLOpsError("Fairness evidence does not match the model being registered.")
+            fairness_report = fairness_evidence.report
         eff_fairness: bool | None = fairness_passed
         extra_fair_metrics: dict[str, float | None] = {}
         if fairness_report is not None:
@@ -261,53 +275,64 @@ class ModelRegistry:
                 raise MLOpsError(f"Cannot register object of type {type(model).__name__} without a predict() method.")
             model = SklearnEstimatorAdapter(model, name=model_name)
         with _sqlite_conn(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT MAX(version) FROM model_versions WHERE model_name = ?", (model_name,)
             ).fetchone()
             next_ver = int(row[0] or 0) + 1
 
-        eff_tags = dict(tags or {})
-        if stage == ModelStage.PRODUCTION:
-            eff_tags = self._enforce_fairness_gate(
+            eff_tags = dict(tags or {})
+            if stage == ModelStage.PRODUCTION:
+                eff_tags = self._enforce_fairness_gate(
+                    model_name=model_name,
+                    version=next_ver,
+                    fairness_passed=eff_fairness,
+                    evidence_bound=fairness_evidence is not None and fairness_evidence.report.assessment_status is not None,
+                    require_fairness_gate=require_fairness_gate,
+                    override_reason=override_reason,
+                    tags=eff_tags,
+                )
+
+            root_resolved = self.artifact_dir.resolve()
+            dest = (self.artifact_dir / model_name / f"v{next_ver}" / "model.joblib").resolve()
+            if not dest.is_relative_to(root_resolved):
+                raise SecurityError(f"Artifact path escapes registry root for model {model_name!r}.")
+            saved_path = model.save(dest, encrypt=encrypt)
+            now = datetime.now(UTC).isoformat()
+            merged_metrics = {
+                **{k: float(v) for k, v in model.metadata_.metrics.items() if isinstance(v, (int, float))},
+                **extra_fair_metrics,
+                **{k: float(v) for k, v in (metrics or {}).items() if isinstance(v, (int, float))},
+            }
+            rec = RegisteredModelVersion(
                 model_name=model_name,
                 version=next_ver,
-                fairness_passed=eff_fairness,
-                require_fairness_gate=require_fairness_gate,
-                override_reason=override_reason,
+                stage=stage,
+                artifact_path=str(saved_path.resolve()),
+                checksum_sha256=model.metadata_.artifact_checksum,
+                metrics=merged_metrics,
                 tags=eff_tags,
+                description=description,
+                owner=str(owner).strip(),
+                intended_use=str(intended_use).strip(),
+                approved_domains=[str(d).strip() for d in (approved_domains or []) if str(d).strip()],
+                risk_tier=norm_tier,  # type: ignore[arg-type]
+                fairness_passed=eff_fairness,
+                fairness_evidence=RegisteredFairnessEvidence(
+                    model_name=model_name,
+                    version=next_ver,
+                    artifact_checksum=model.metadata_.artifact_checksum,
+                    holdout_fingerprint=fairness_evidence.holdout_fingerprint,
+                    n_holdout_rows=fairness_evidence.n_holdout_rows,
+                    protected_attribute=fairness_evidence.report.protected_attribute,
+                    passed=fairness_evidence.report.passed,
+                    assessment_status=fairness_evidence.report.assessment_status,
+                ) if fairness_evidence is not None else None,
+                encrypted_at_rest=encrypt,
+                registered_at=now,
+                updated_at=now,
             )
 
-        root_resolved = self.artifact_dir.resolve()
-        dest = (self.artifact_dir / model_name / f"v{next_ver}" / "model.joblib").resolve()
-        if not dest.is_relative_to(root_resolved):
-            raise SecurityError(f"Artifact path escapes registry root for model {model_name!r}.")
-        saved_path = model.save(dest, encrypt=encrypt)
-        now = datetime.now(UTC).isoformat()
-        merged_metrics = {
-            **{k: float(v) for k, v in model.metadata_.metrics.items() if isinstance(v, (int, float))},
-            **extra_fair_metrics,
-            **{k: float(v) for k, v in (metrics or {}).items() if isinstance(v, (int, float))},
-        }
-        rec = RegisteredModelVersion(
-            model_name=model_name,
-            version=next_ver,
-            stage=stage,
-            artifact_path=str(saved_path.resolve()),
-            checksum_sha256=model.metadata_.artifact_checksum,
-            metrics=merged_metrics,
-            tags=eff_tags,
-            description=description,
-            owner=str(owner).strip(),
-            intended_use=str(intended_use).strip(),
-            approved_domains=[str(d).strip() for d in (approved_domains or []) if str(d).strip()],
-            risk_tier=norm_tier,  # type: ignore[arg-type]
-            fairness_passed=eff_fairness,
-            encrypted_at_rest=encrypt,
-            registered_at=now,
-            updated_at=now,
-        )
-
-        with _sqlite_conn(self.db_path) as conn:
             if stage == ModelStage.PRODUCTION:
                 conn.execute(
                     "UPDATE model_versions SET stage = ?, updated_at = ? WHERE model_name = ? AND stage = ?",
@@ -318,8 +343,8 @@ class ModelRegistry:
                 INSERT INTO model_versions
                 (model_name, version, stage, artifact_path, checksum_sha256, metrics_json, tags_json,
                  description, owner, intended_use, approved_domains_json, risk_tier, fairness_passed,
-                 encrypted_at_rest, registered_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 encrypted_at_rest, registered_at, updated_at, fairness_evidence_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     rec.model_name,
@@ -338,6 +363,7 @@ class ModelRegistry:
                     int(rec.encrypted_at_rest),
                     rec.registered_at,
                     rec.updated_at,
+                    rec.fairness_evidence.model_dump_json() if rec.fairness_evidence is not None else None,
                 ),
             )
             conn.commit()
@@ -358,19 +384,18 @@ class ModelRegistry:
         """Promote or transition a registered model version across lifecycle stages with Responsible AI gate."""
         target_stage = _normalize_stage(target_stage)
         current = self.get_version(model_name, version)
-        eff_fairness = current.fairness_passed
         if fairness_report is not None:
-            if hasattr(fairness_report, "passed"):
-                eff_fairness = bool(fairness_report.passed)
-            elif isinstance(fairness_report, dict) and "passed" in fairness_report:
-                eff_fairness = bool(fairness_report["passed"])
+            raise MLOpsError("Stage transitions use the fairness evidence saved with the target version.")
+        eff_fairness = current.fairness_passed
 
         eff_tags = dict(current.tags)
         if target_stage == ModelStage.PRODUCTION:
+            evidence_bound = self._verify_version_evidence(current)
             eff_tags = self._enforce_fairness_gate(
                 model_name=model_name,
                 version=version,
                 fairness_passed=eff_fairness,
+                evidence_bound=evidence_bound,
                 require_fairness_gate=require_fairness_gate,
                 override_reason=override_reason,
                 tags=eff_tags,
@@ -399,6 +424,27 @@ class ModelRegistry:
         logger.info("model_stage_transitioned", name=model_name, version=version, stage=target_stage.value)
         return self.get_version(model_name, version)
 
+    @staticmethod
+    def _verify_version_evidence(record: RegisteredModelVersion) -> bool:
+        evidence = record.fairness_evidence
+        if evidence is None:
+            return False
+        if (
+            evidence.model_name != record.model_name or evidence.version != record.version
+            or evidence.artifact_checksum != record.checksum_sha256
+            or evidence.passed != record.fairness_passed
+            or (evidence.assessment_status is not None and evidence.passed != (evidence.assessment_status == "thresholds_met"))
+        ):
+            raise MLOpsError("The registry fairness evidence does not match this model version.")
+        try:
+            with Path(record.artifact_path).open("rb") as artifact:
+                checksum = hashlib.file_digest(artifact, "sha256").hexdigest()
+        except OSError as exc:
+            raise MLOpsError("The model artifact required by its fairness evidence is unavailable.") from exc
+        if checksum != evidence.artifact_checksum:
+            raise MLOpsError("The model artifact does not match its fairness evidence.")
+        return evidence.assessment_status is not None
+
     def rollback_production(
         self,
         model_name: str,
@@ -424,6 +470,7 @@ class ModelRegistry:
                 for v in versions
                 if (current_prod is None or v.version != current_prod.version)
                 and v.fairness_passed is not False
+                and (not self.require_fairness_gate or v.fairness_evidence is not None)
             ]
             # Prefer previously deployed ARCHIVED or STAGING versions in reverse chronological order
             preferred = [v for v in prior if v.stage in (ModelStage.ARCHIVED, ModelStage.STAGING)]
@@ -436,7 +483,15 @@ class ModelRegistry:
             )
 
         now = datetime.now(UTC).isoformat()
-        cand_tags = dict(candidate.tags)
+        cand_tags = self._enforce_fairness_gate(
+            model_name=model_name,
+            version=candidate.version,
+            fairness_passed=candidate.fairness_passed,
+            evidence_bound=self._verify_version_evidence(candidate),
+            require_fairness_gate=None,
+            override_reason=None,
+            tags=dict(candidate.tags),
+        )
         cand_tags["rollback_restored_at"] = now
         cand_tags["rollback_reason"] = str(reason).strip() or "SLA rollback"
 
@@ -539,4 +594,5 @@ class ModelRegistry:
             encrypted_at_rest=bool(int(row[13])) if row[13] is not None else False,
             registered_at=row[14],
             updated_at=row[15],
+            fairness_evidence=RegisteredFairnessEvidence.model_validate_json(row[16]) if row[16] else None,
         )

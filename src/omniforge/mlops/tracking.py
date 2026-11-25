@@ -57,12 +57,15 @@ class ExperimentTracker:
 
     def __init__(
         self,
-        db_path: str | Path = "./.omniforge_workspace/mlops_tracking.db",
-        artifact_root: str | Path = "./.omniforge_workspace/artifacts",
+        db_path: str | Path | None = None,
+        artifact_root: str | Path | None = None,
     ) -> None:
-        self.db_path = Path(db_path)
+        from omniforge.config.settings import get_settings
+
+        paths = get_settings().paths
+        self.db_path = Path(db_path) if db_path is not None else paths.tracking_db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.artifact_root = Path(artifact_root)
+        self.artifact_root = Path(artifact_root) if artifact_root is not None else paths.artifact_store_dir
         self.artifact_root.mkdir(parents=True, exist_ok=True)
         self._active_run_id: str | None = None
         self._init_db()

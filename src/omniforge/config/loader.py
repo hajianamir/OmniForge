@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 from pathlib import Path
 from typing import Any
 
 import yaml
+from pydantic_settings import EnvSettingsSource
 
 from omniforge.config.settings import OmniForgeSettings
 from omniforge.core.exceptions import ConfigurationError
 from omniforge.core.logging import get_logger
 
 logger = get_logger(__name__)
+_PLATFORM_FIELDS = ("environment", "debug", "random_seed", "default_tenant_id")
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -80,6 +83,17 @@ def _resolve_env_interpolation(obj: Any) -> Any:
     return obj
 
 
+def _normalize_platform_layer(layer: dict[str, Any]) -> dict[str, Any]:
+    """Map the YAML platform section to settings field names within its own layer."""
+    layer = dict(layer)
+    platform = layer.pop("platform", {})
+    if isinstance(platform, dict):
+        for field in _PLATFORM_FIELDS:
+            if field in platform:
+                layer.setdefault(field, platform[field])
+    return layer
+
+
 class ConfigLoader:
     """Composes OmniForge configuration from base YAML, domain YAML, custom overlays, and dotlist overrides."""
 
@@ -123,7 +137,7 @@ class ConfigLoader:
         extra_files: list[str | Path] | None = None,
         overrides: list[str] | None = None,
     ) -> OmniForgeSettings:
-        """Compose layered configuration into a validated :class:`OmniForgeSettings` object.
+        """Compose settings with CLI overrides above environment variables and YAML layers.
 
         Args:
             base_file: Optional path to base YAML (defaults to ``configs/default.yaml``).
@@ -137,11 +151,17 @@ class ConfigLoader:
         merged: dict[str, Any] = {}
         default_yaml = Path(base_file) if base_file else (self.config_dir / "default.yaml")
         if default_yaml.exists():
-            merged = deep_merge(merged, self.load_yaml(default_yaml))
+            merged = deep_merge(merged, _normalize_platform_layer(self.load_yaml(default_yaml)))
 
         domain_cfg: dict[str, Any] = {}
         if domain:
-            domain_path = self.config_dir / "domains" / f"{domain.lower()}.yaml"
+            slug = domain.lower()
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", slug):
+                raise ConfigurationError("Domain names must use letters, digits, underscores, or hyphens.")
+            domain_root = (self.config_dir / "domains").resolve()
+            domain_path = (domain_root / f"{slug}.yaml").resolve()
+            if not domain_path.is_relative_to(domain_root):
+                raise ConfigurationError("Domain configuration must be inside the configured domains directory.")
             if domain_path.exists():
                 domain_cfg = self.load_yaml(domain_path)
             else:
@@ -152,23 +172,15 @@ class ConfigLoader:
 
         if extra_files:
             for extra in extra_files:
-                merged = deep_merge(merged, self.load_yaml(extra))
-
-        if overrides:
-            merged = deep_merge(merged, parse_dotlist_overrides(overrides))
-
-        # Map top-level platform section keys onto root OmniForgeSettings fields
-        platform_section = merged.pop("platform", {})
-        if isinstance(platform_section, dict):
-            for field_name in ("environment", "debug", "random_seed", "default_tenant_id"):
-                if field_name in platform_section:
-                    merged.setdefault(field_name, platform_section[field_name])
+                merged = deep_merge(merged, _normalize_platform_layer(self.load_yaml(extra)))
 
         if domain_cfg:
             merged["domain_overrides"] = domain_cfg
 
+        cli = _normalize_platform_layer(parse_dotlist_overrides(overrides or []))
         try:
-            settings = OmniForgeSettings(**merged)
+            env = EnvSettingsSource(OmniForgeSettings)()
+            settings = OmniForgeSettings.model_validate(deep_merge(deep_merge(merged, env), cli))
             logger.info(
                 "configuration_composed",
                 environment=settings.environment,

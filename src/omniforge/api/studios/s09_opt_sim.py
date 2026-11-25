@@ -821,7 +821,7 @@ def s09_twin_control(
 
     # Build a default or state-cached twin.
     twin = state.get("uap_digital_twin")
-    if twin is None:
+    if twin is None or twin.A[0, 1] != req.dt:
         twin = build_default_twin(n_x=req.n_x, n_u=req.n_u, dt=req.dt)
         state["uap_digital_twin"] = twin
 

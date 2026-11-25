@@ -22,6 +22,22 @@ class PathsSettings(BaseModel):
     audit_log_path: Path = Path("./.omniforge_workspace/audit.jsonl")
 
 
+    @model_validator(mode="after")
+    def _default_paths_under_workspace(self) -> PathsSettings:
+        defaults = {
+            "artifact_store_dir": "artifacts",
+            "cache_dir": "cache",
+            "feature_store_dir": "feature_store",
+            "tracking_db_path": "mlops_tracking.db",
+            "registry_db_path": "model_registry.db",
+            "audit_log_path": "audit.jsonl",
+        }
+        for key, relative in defaults.items():
+            if key not in self.model_fields_set:
+                setattr(self, key, self.workspace_dir / relative)
+        return self
+
+
 class LoggingSettings(BaseModel):
     """Structured logging configuration."""
 

@@ -226,6 +226,32 @@ omniforge check
 
 ---
 
+## Reproducible container deployment
+
+The Docker image pins its Python base by digest and installs hash-verified
+binary dependencies for Linux amd64 and arm64. The local project wheel builds
+offline. Regenerate the runtime and build locks from `pyproject.toml` with
+`bash scripts/build_docker_locks.sh`.
+
+```bash
+docker build -f docker/Dockerfile -t omniforge:local .
+python3 scripts/smoke_docker_registry.py omniforge:local
+```
+
+The smoke test registers tenant-scoped models through the REST and Workbench
+APIs in one container, removes it, and verifies registered versions, signed
+artifacts, and saved fairness evidence from a replacement container on the same
+volume. Production containers must reuse their signing and encryption keys
+with the volume. When moving an existing registry to a new workspace directory,
+back up its database and signed artifacts and preserve the absolute paths stored
+in the registry, or migrate them together before replacing the old container.
+
+When `OMNIFORGE_REQUIRE_FAIRNESS_FOR_PRODUCTION=true`, run the Studio 07
+fairness audit on the active model's holdout before registering it in Studio 11.
+The registry stores the holdout fingerprint and assessment outcome alongside
+the model version and signed-artifact checksum. Older unbound fairness records
+require a fresh evaluation and registration to satisfy the strict gate.
+
 ## Running Tests
 
 ```bash

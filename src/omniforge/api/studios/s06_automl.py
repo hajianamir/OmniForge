@@ -34,6 +34,7 @@ from omniforge.models.deep import (
     TabNetModel,
 )
 from omniforge.models.nonparametric import NonParametricAnalyticalSuite
+from omniforge.ui.state import record_active_holdout
 
 router = APIRouter(tags=["workbench-s06"])
 
@@ -215,6 +216,7 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
         else:
             state["uap_active_X_test"] = None
             state["uap_active_y_test"] = None
+        record_active_holdout(state)
         state["uap_automl"] = res
         state["uap_active_model_equation"] = eq_dict
         state["uap_model_equations"] = {target: {res.best_model_name: eq_dict}} if eq_dict else {}
@@ -393,6 +395,7 @@ def s06_run_nonparametric_analytical(
         state["uap_active_feature_cols"] = feat_cols
         state["uap_active_input_preprocessor"] = input_preprocessor
         state["uap_active_X_test"], state["uap_active_y_test"] = holdout if holdout is not None else (None, None)
+        record_active_holdout(state)
 
     _wb().record_lineage(
         state,
