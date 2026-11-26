@@ -78,6 +78,7 @@ _DOWNSTREAM_KEYS: tuple[str, ...] = (
     "uap_supervisory_result",
     "uap_supervisory_scored_df",
     "uap_supervisory_input_df",
+    "uap_supervisory_residual_sequence",
     "uap_supervisory_models",
     "uap_s02_pending_feedback",
     "uap_fs_selected_cols",
@@ -640,7 +641,10 @@ def get_all_deleted_records_df(state: dict[str, Any]) -> pd.DataFrame:
 
 def clear_supervisory_evaluation(state: dict[str, Any]) -> None:
     """Drop current telemetry and diagnostics when a catalog fit changes."""
-    for key in ("uap_supervisory_result", "uap_supervisory_scored_df", "uap_supervisory_input_df"):
+    for key in (
+        "uap_supervisory_result", "uap_supervisory_scored_df",
+        "uap_supervisory_input_df", "uap_supervisory_residual_sequence",
+    ):
         state[key] = None
     results = state.get("uap_studio_results")
     if isinstance(results, dict):

@@ -817,6 +817,7 @@ class SupervisoryPredictionMonitor:
         ratio_points: list[dict[str, Any]] = []
         error_hist: list[dict[str, Any]] = []
         spc_limits: dict[str, float] = {}
+        residual_sequence: np.ndarray | None = None
 
         if resolved_actual is not None and not is_clf:
             actuals = pd.to_numeric(work_df[resolved_actual], errors="coerce").to_numpy(dtype=float)
@@ -824,6 +825,7 @@ class SupervisoryPredictionMonitor:
             b_num = pd.to_numeric(pd.Series(base_preds), errors="coerce").to_numpy(dtype=float)
 
             residuals = actuals - p_num
+            residual_sequence = residuals
             abs_errors = np.abs(residuals)
             denom = np.where(np.abs(actuals) > 1e-6, np.abs(actuals), np.maximum(np.abs(p_num), 1.0))
             pct_errors = (abs_errors / denom) * 100.0
@@ -1273,6 +1275,7 @@ class SupervisoryPredictionMonitor:
         # Persist latest result and longitudinal monitoring history for Reporting & Supervisory Dashboard
         state["uap_supervisory_result"] = result
         state["uap_supervisory_scored_df"] = pd.DataFrame(rows_out)
+        state["uap_supervisory_residual_sequence"] = residual_sequence
         # Retain the analysis inputs needed for cohort diagnostics. Unrelated
         # columns from operational uploads stay out of saved workspace results.
         study_columns = ref_df.columns if ref_df is not None else X_primary.columns

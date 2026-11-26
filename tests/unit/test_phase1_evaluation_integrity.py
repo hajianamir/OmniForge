@@ -68,10 +68,14 @@ def test_saved_holdout_requires_aligned_ids_and_same_model() -> None:
 
 
 def test_spc_uses_frozen_residual_reference_and_reports_missing_observations() -> None:
+    from omniforge.reporting.live_charts import generate_live_chart
+
     state, data = _regression_state()
     monitor = SupervisoryPredictionMonitor()
     batch = data.iloc[:6].copy()
     first = monitor.evaluate_incoming(state, batch, model_id="active_champion")
+    cusum = generate_live_chart(state, chart_id="cusum_sequential_control", studio_id="14")
+    assert cusum["kpis"]["Baseline SD σ₀"] == round(first["spc_limits"]["sigma"], 4)
     batch.loc[batch.index[1:], "outcome"] += [10, -20, 30, -40, 50]
     batch.loc[batch.index[0], "outcome"] = np.nan
     shifted = monitor.evaluate_incoming(state, batch, model_id="active_champion")
@@ -80,6 +84,8 @@ def test_spc_uses_frozen_residual_reference_and_reports_missing_observations() -
     assert shifted["spc_points"][1]["status"] == "BREACH"
     assert shifted["telemetry_rows"][0]["residual"] is None
     assert shifted["telemetry_rows"][0]["status"] == "UNAVAILABLE"
+    with pytest.raises(ValueError, match="complete sequential residual series"):
+        generate_live_chart(state, chart_id="cusum_sequential_control", studio_id="14")
     assert shifted["kpis"]["evaluated_rows"] == 5
     assert shifted["kpis"]["comparison_rows"] == 0
     assert shifted["kpis"]["baseline_label"] is None
@@ -223,3 +229,33 @@ def test_chart_library_errors_do_not_expose_exception_values(monkeypatch: pytest
     assert response.status_code == 400
     assert sentinel not in response.text
     assert response.json()["detail"] == "The chart could not be produced from the supplied data."
+
+
+def test_score_gauge_reports_observed_metric_without_an_invented_baseline() -> None:
+    from omniforge.reporting.live_charts import generate_live_chart
+
+    state, _ = _regression_state()
+    state["uap_active_model_metrics"] = {"baseline_score": 0.99}
+    score = generate_live_chart(state, chart_id="model_champion_gauge", studio_id="14")
+    expected = state["uap_active_model"].score(state["uap_active_X_test"], state["uap_active_y_test"])
+    assert score["data"]["value"] == round(expected * 100, 2)
+    assert score["data"]["thresholds"] == []
+    assert "Baseline Reference (%)" not in score["kpis"]
+
+    state["uap_active_model_target"] = "missing_outcome"
+    state["uap_supervisory_result"] = {"kpis": {"model_label": "some other model", "mape_pct": 2}}
+    with pytest.raises(ValueError, match="outcome is absent"):
+        generate_live_chart(state, chart_id="model_champion_gauge", studio_id="14")
+
+
+def test_score_only_report_labels_compliance_unavailable() -> None:
+    from omniforge.api.studios.s12_reports import _compile_report_payload
+    from omniforge.api.studios.schemas import ReportCompileReq
+
+    state, data = _regression_state()
+    SupervisoryPredictionMonitor().evaluate_incoming(state, data[["input"]], model_id="active_champion")
+    report = _compile_report_payload(state, ReportCompileReq(selected_sections=["future_predictions"], include_charts=False))
+    section = next(section for section in report["sections"] if section["section_id"] == "future_predictions")
+    assert "compliance unavailable" in section["body"]
+    assert "100.00% compliance" not in section["body"]
+    assert "Unevaluable records: 30" in section["body"]

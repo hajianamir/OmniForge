@@ -93,7 +93,7 @@ LIVE_CHART_SPECS: tuple[LiveChartSpec, ...] = (
         chart_type="gauge",
         title="Champion Model Primary Score Gauge",
         category="Model Evaluation & Diagnostics",
-        description="Radial score dial for the active trained model vs. baseline benchmark threshold.",
+        description="Radial score dial for the selected trained model on the displayed evaluation cohort.",
         studios=("03", "06", "07", "11", "12", "14"),
         requirement="model_any",
     ),
@@ -687,7 +687,9 @@ def _spec_readiness(
             return True, None
         return False, "Run a Supervisory Evaluation batch or simulation in Studio 14 first."
     if spec.requirement == "model_any":
-        if model_eval is not None or isinstance(state.get("uap_supervisory_result"), dict):
+        if model_eval is not None or (
+            spec.id != "model_champion_gauge" and isinstance(state.get("uap_supervisory_result"), dict)
+        ):
             return True, None
         return False, model_error or "Train a model in Studio 03 (Diagnostics), Studio 06 (AutoML / DL), or Studio 14 first."
     if spec.requirement == "model_clf":
@@ -853,7 +855,7 @@ def generate_live_chart(
     if chart_id == "dataset_readiness_gauge":
         payload = _build_dataset_readiness_gauge(state, df)
     elif chart_id == "model_champion_gauge":
-        payload = _build_model_champion_gauge(state, model_eval)
+        payload = _build_model_champion_gauge(model_eval)
     elif chart_id == "supervisory_compliance_gauge":
         payload = _build_supervisory_compliance_gauge(state)
     elif chart_id == "quality_6d_radar":
@@ -925,7 +927,7 @@ def generate_live_chart(
     elif chart_id == "bland_altman_agreement":
         payload = _build_bland_altman_agreement(state, model_eval)
     elif chart_id == "cusum_sequential_control":
-        col_x = _pick_num_x(prefer_non_target=False)
+        col_x = _pick_num_x(prefer_non_target=False) if studio_id != "14" else ""
         payload = _build_cusum_sequential_control(state, num_df, col_x, _disp(col_x), studio_id)
     elif chart_id == "lorenz_gini_curve":
         col_x = _pick_num_x(prefer_non_target=False)
@@ -1006,52 +1008,43 @@ def _build_dataset_readiness_gauge(state: dict[str, Any], df: pd.DataFrame) -> d
     }
 
 
-def _build_model_champion_gauge(state: dict[str, Any], model_eval: _ResolvedModelEval | None) -> dict[str, Any]:
-    metrics = state.get("uap_active_model_metrics") or {}
-    if model_eval is not None:
-        if model_eval.task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
-            acc = float(accuracy_score(model_eval.y_true.astype(str), pd.Series(model_eval.y_pred).astype(str)))
-            f1 = float(f1_score(model_eval.y_true.astype(str), pd.Series(model_eval.y_pred).astype(str), average="macro", zero_division=0))
-            val = round(f1 * 100.0, 2)
-            metric_name = "Macro-F1 (%)"
-            base_val = round(float(metrics.get("baseline_score", max(0.35, f1 - 0.08))) * 100.0, 2)
-            extra_kpi = {"Accuracy (%)": round(acc * 100.0, 2)}
-        else:
-            y_t = pd.to_numeric(model_eval.y_true, errors="coerce").fillna(0.0).to_numpy(dtype=float)
-            y_p = np.asarray(model_eval.y_pred, dtype=float)
-            r2 = float(r2_score(y_t, y_p))
-            val = round(max(0.0, min(100.0, r2 * 100.0)), 2)
-            metric_name = "Explained Variance R² (%)"
-            base_raw = _finite_float(metrics.get("baseline_score"), max(0.0, r2 - 0.1))
-            base_val = round(max(0.0, min(100.0, base_raw * 100.0)), 2)
-            extra_kpi = {"Raw R²": round(r2, 4), "RMSE": round(float(root_mean_squared_error(y_t, y_p)), 4)}
-        m_label = model_eval.model_name
+def _build_model_champion_gauge(model_eval: _ResolvedModelEval | None) -> dict[str, Any]:
+    if model_eval is None:
+        raise LiveChartUnavailable("A model and evaluable outcome cohort are required for the score gauge.")
+    if model_eval.task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
+        y_true = model_eval.y_true
+        y_pred = model_eval.y_pred
+        acc = float(accuracy_score(y_true, y_pred))
+        score = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+        metric_name = "Macro-F1 (%)"
+        extra_kpi = {"Accuracy (%)": round(acc * 100.0, 2)}
     else:
-        sup = state.get("uap_supervisory_result") or {}
-        kpis = sup.get("kpis") or {}
-        val = round(max(0.0, 100.0 - _finite_float(kpis.get("mape_pct"), 10.0)), 2)
-        metric_name = "100 - MAPE (%)"
-        base_val = 85.0
-        m_label = str(kpis.get("model_label") or "Supervisory Model")
-        extra_kpi = {}
-
+        y_true = pd.to_numeric(model_eval.y_true, errors="coerce").to_numpy(dtype=float)
+        y_pred = np.asarray(model_eval.y_pred, dtype=float)
+        finite = np.isfinite(y_true) & np.isfinite(y_pred)
+        if finite.sum() < 2 or np.ptp(y_true[finite]) == 0:
+            raise LiveChartUnavailable("R² requires at least two finite observations and a nonconstant outcome.")
+        score = float(r2_score(y_true[finite], y_pred[finite], force_finite=False))
+        metric_name = "R² (%)"
+        extra_kpi = {"RMSE": round(float(root_mean_squared_error(y_true[finite], y_pred[finite])), 4)}
+    if not math.isfinite(score):
+        raise LiveChartUnavailable("The model score is undefined on the evaluation cohort.")
+    val = round(score * 100.0, 2)
+    label = model_eval.model_name
     return {
-        "title": f"Champion Model Score Gauge — {m_label}",
-        "subtitle": f"{metric_name} = {val:.2f}% (Baseline reference: {base_val:.2f}%)",
-        "kpis": {metric_name: val, "Baseline Reference (%)": base_val, **extra_kpi},
+        "title": f"Champion Model Score Gauge — {label}",
+        "subtitle": f"{metric_name} = {val:.2f}% · {model_eval.eval_scope}",
+        "kpis": {metric_name: val, **extra_kpi},
         "data": {
             "value": val,
-            "min": 0.0,
+            "min": min(0.0, val),
             "max": 100.0,
             "unit": "%",
-            "status_label": m_label[:28],
-            "thresholds": [
-                {"value": max(5.0, min(95.0, base_val)), "label": f"Baseline ({base_val:.1f}%)", "color": "#a78bfa"},
-                {"value": 85.0, "label": "High Bar (85%)", "color": "#34d399"},
-            ],
+            "status_label": label[:28],
+            "thresholds": [],
         },
-        "table_columns": ["Model", "Metric", "Score_Pct", "Baseline_Pct"],
-        "table_rows": [[m_label, metric_name, val, base_val]],
+        "table_columns": ["Model", "Metric", "Score_Pct", "Evaluation_Scope"],
+        "table_rows": [[label, metric_name, val, model_eval.eval_scope]],
     }
 
 
@@ -2645,24 +2638,38 @@ def _build_cusum_sequential_control(
     disp_x: str,
     studio_id: str,
 ) -> dict[str, Any]:
-    sup = state.get("uap_supervisory_result")
-    if studio_id == "14" and isinstance(sup, dict) and sup.get("spc_points"):
-        raw_r = [_finite_float(p.get("residual"), math.nan) for p in sup["spc_points"] if isinstance(p, dict)]
-        arr = np.asarray([v for v in raw_r if math.isfinite(v)], dtype=float)
-        src_name = "Studio 14 Supervisory Residuals"
+    if studio_id == "14":
+        sup = state.get("uap_supervisory_result") or {}
+        limits = sup.get("spc_limits") or {}
+        mu0 = _finite_float(limits.get("center"), math.nan)
+        sigma0 = _finite_float(limits.get("sigma"), math.nan)
+        if not math.isfinite(mu0) or not math.isfinite(sigma0) or sigma0 <= 0:
+            raise LiveChartUnavailable("Supervisory CUSUM requires a verified held-out residual reference.")
+        residual_sequence = state.get("uap_supervisory_residual_sequence")
+        if isinstance(residual_sequence, np.ndarray) and residual_sequence.ndim == 1:
+            arr = residual_sequence
+        else:
+            points = sup.get("spc_points") or []
+            arr = np.asarray([_finite_float(p.get("residual"), math.nan) for p in points], dtype=float)
+        if len(arr) != (sup.get("kpis") or {}).get("n_records"):
+            raise LiveChartUnavailable("Supervisory CUSUM requires the full, ordered residual sequence.")
+        if not np.isfinite(arr).all():
+            raise LiveChartUnavailable("Supervisory CUSUM requires a complete sequential residual series.")
+        src_name = "Studio 14 residuals · held-out reference"
     else:
         arr = num_df[col_x].dropna().to_numpy(dtype=float)
-        src_name = disp_x
+        src_name = f"{disp_x} · retrospective reference"
+        if len(arr) < 6:
+            raise LiveChartUnavailable("Retrospective CUSUM needs at least five reference rows and one subsequent row.")
+        ref_n = max(5, len(arr) // 2)
+        mu0 = float(np.mean(arr[:ref_n]))
+        sigma0 = float(np.std(arr[:ref_n], ddof=1))
+        arr = arr[ref_n:]
+        if not math.isfinite(sigma0) or sigma0 <= 0:
+            raise LiveChartUnavailable("The retrospective reference has no estimable variation.")
 
-    if len(arr) < 5:
-        raise LiveChartUnavailable(f"CUSUM chart requires at least 5 finite sequential observations in '{src_name}'.")
-
-    # Reference baseline mean & SD estimated from baseline Phase-I window (first half, min 5)
-    ref_n = max(5, len(arr) // 2)
-    mu0 = float(np.mean(arr[:ref_n]))
-    sigma0 = float(np.std(arr[:ref_n], ddof=1))
-    if sigma0 <= 1e-12:
-        sigma0 = float(np.std(arr, ddof=1)) or 1.0
+    if not len(arr):
+        raise LiveChartUnavailable("No sequential observations are available for CUSUM.")
 
     z = (arr - mu0) / sigma0
     k_slack = 0.5
@@ -2694,7 +2701,7 @@ def _build_cusum_sequential_control(
     return {
         "title": f"Tabular CUSUM (C+ / C-) Drift Control Chart — {src_name}",
         "subtitle": f"Slack k = {k_slack}σ, Decision Interval H = ±{h_limit}σ · {n_alarms} alarm points"
-        + (f" (First shift at t = {first_alarm})" if first_alarm else " (In statistical control)"),
+        + (f" (First threshold crossing at t = {first_alarm})" if first_alarm else " (No threshold crossings)"),
         "kpis": {
             "Baseline Mean μ₀": round(mu0, 4),
             "Baseline SD σ₀": round(sigma0, 4),
