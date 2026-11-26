@@ -133,6 +133,7 @@ class _FittedCleanerState:
     iterative_columns: list[str] = field(default_factory=list)
     missforest_models: dict[str, tuple[Any, list[str]]] = field(default_factory=dict)
     missing_indicator_cols: list[str] = field(default_factory=list)
+    missing_indicator_names: dict[str, str] = field(default_factory=dict)
     outlier_bounds: dict[str, tuple[float, float]] = field(default_factory=dict)
     outlier_flag_columns: dict[str, str] = field(default_factory=dict)
     multivariate_flag_column: str = "__is_multivariate_outlier"
@@ -250,10 +251,12 @@ class DataCleaner:
             )
 
         # Canonical Stage 9: Record pre-outlier missingness indicator columns
+        used_columns = set(df.columns)
         if self.config.add_missing_indicators:
             for col in work.columns:
                 if col not in excluded and work[col].isna().any():
                     self._state.missing_indicator_cols.append(str(col))
+                    self._state.missing_indicator_names[str(col)] = self._reserve_flag_column(used_columns, str(col), "__is_missing")
 
         base_cols = list(work.columns)
         num_cols = [
@@ -341,7 +344,6 @@ class DataCleaner:
             self._state.detector_fitted = True
 
         if self.config.outlier_action == "flag":
-            used_columns = set(work.columns)
             for source_col in self._state.outlier_bounds:
                 flag_name = self._reserve_flag_column(used_columns, source_col, "__is_outlier")
                 self._state.outlier_flag_columns[source_col] = flag_name
@@ -551,7 +553,7 @@ class DataCleaner:
         if self.config.add_missing_indicators:
             for col in self._state.missing_indicator_cols:
                 if col in work.columns:
-                    ind_name = f"{col}__is_missing"
+                    ind_name = getattr(self._state, "missing_indicator_names", {}).get(col, f"{col}__is_missing")
                     work[ind_name] = work[col].isna().astype(np.int8)
                     added_cols.append(ind_name)
             if added_cols:

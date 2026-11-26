@@ -33,8 +33,7 @@ def s05_engineer_features(
     state = _wb().get_session_state(sid)
     df = _wb()._require_df(state)
     targets = set(_wb().get_selected_targets(state, df))
-    excluded = set(_wb().get_excluded_columns(state, df))
-    feat_cols = [c for c in df.columns if c not in targets and c not in excluded]
+    feat_cols = [c for c in _wb().get_analysis_dataframe(state, df).columns if c not in targets]
     mode = req.mode.lower()
     if mode == "complete":
         cfg = FeatureConfig(
@@ -182,7 +181,7 @@ def s05_select_features(
     sources = preprocessor.feature_sources()
     selected_raw = list(dict.fromkeys(sources[feature] for feature in selected))
     if req.commit and selected_raw:
-        keep_raw = protected | set(selected_raw)
+        keep_raw = protected | set(selected_raw) | set(_wb().get_audit_only_columns(state, full_df))
         dropped = [c for c in full_df.columns if c not in keep_raw]
         if dropped:
             _wb().set_excluded_columns(

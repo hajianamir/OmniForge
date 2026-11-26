@@ -462,6 +462,29 @@ def get_audit_anomaly_dataframe(state: dict[str, Any], df: pd.DataFrame | None =
     return get_analysis_dataframe(state, df)
 
 
+_AUDIT_COLUMNS_ATTR = "omniforge.audit_only_columns"
+
+
+def set_audit_only_columns(df: pd.DataFrame, columns: list[str]) -> None:
+    df.attrs[_AUDIT_COLUMNS_ATTR] = [c for c in dict.fromkeys(columns) if c in df.columns]
+
+
+def get_audit_only_columns(state: dict[str, Any], df: pd.DataFrame | None = None) -> list[str]:
+    frame = df if df is not None else state.get("uap_df")
+    if not isinstance(frame, pd.DataFrame):
+        return []
+    columns = frame.attrs.get(_AUDIT_COLUMNS_ATTR)
+    if not isinstance(columns, list):
+        # Older workspaces recorded the generated names in the cleaning report.
+        report = state.get("uap_clean_report") or {}
+        renamed = report.get("renamed_columns") or {}
+        original = state.get("uap_raw_df")
+        raw_columns = set(original.columns) if isinstance(original, pd.DataFrame) else set()
+        columns = [renamed.get(c, c) for c in report.get("columns_added", []) if c not in raw_columns]
+        columns = [c for c in columns if c not in raw_columns]
+    return [c for c in columns if c in frame.columns]
+
+
 def get_analysis_dataframe(state: dict[str, Any], df: pd.DataFrame | None = None) -> pd.DataFrame:
     """Return the active DataFrame with user-excluded columns removed for tests & studies.
 
@@ -471,7 +494,7 @@ def get_analysis_dataframe(state: dict[str, Any], df: pd.DataFrame | None = None
     active_df = df if df is not None else state.get("uap_df")
     if active_df is None:
         return pd.DataFrame()
-    excluded = get_excluded_columns(state, active_df)
+    excluded = set(get_excluded_columns(state, active_df)) | set(get_audit_only_columns(state, active_df))
     if not excluded:
         return active_df
     return active_df.drop(columns=excluded)
@@ -494,7 +517,8 @@ def set_excluded_columns(
     if active_df is None or active_df.empty:
         state["uap_excluded_columns"] = []
         return []
-    all_cols = list(active_df.columns)
+    audit = set(get_audit_only_columns(state, active_df))
+    all_cols = [c for c in active_df.columns if c not in audit]
     valid = [c for c in dict.fromkeys(excluded_cols) if c in all_cols]
     if len(valid) >= len(all_cols):
         valid = valid[: max(0, len(all_cols) - 1)]
@@ -636,9 +660,9 @@ def get_selected_targets(state: dict[str, Any], df: pd.DataFrame | None = None) 
     active_df = df if df is not None else state.get("uap_df")
     if active_df is None or active_df.empty:
         return []
-    cols = list(active_df.columns)
-    excluded_set = set(get_excluded_columns(state, active_df))
-    included_cols = [c for c in cols if c not in excluded_set] or cols
+    included_cols = list(get_analysis_dataframe(state, active_df).columns)
+    if not included_cols:
+        return []
     raw = state.get("uap_targets") or []
     valid = [c for c in raw if c in included_cols]
     if not valid:
@@ -688,18 +712,19 @@ def set_selected_targets(state: dict[str, Any], targets: list[str], df: pd.DataF
         state["uap_targets"] = []
         state["uap_target"] = None
         return []
-    cols = list(active_df.columns)
+    audit = set(get_audit_only_columns(state, active_df))
+    cols = [c for c in active_df.columns if c not in audit]
     previous = get_selected_targets(state, active_df)
     cur_excl = list(state.get("uap_excluded_columns") or [])
     previous_lock = state.get("uap_split_lock")
     valid = [c for c in dict.fromkeys(targets) if c in cols]
     if not valid:
-        valid = [cols[-1]]
+        valid = cols[-1:]
     # Selecting a column as target automatically includes it in study scope.
     remaining_exclusions = [c for c in cur_excl if c not in set(valid)]
     state["uap_excluded_columns"] = remaining_exclusions
     state["uap_targets"] = valid
-    state["uap_target"] = valid[0]
+    state["uap_target"] = valid[0] if valid else None
     if valid != previous or remaining_exclusions != cur_excl:
         locked_target = previous_lock.get("target_col") if isinstance(previous_lock, dict) else None
         preserve_split = bool(previous and previous[0] == valid[0] and locked_target not in remaining_exclusions)
@@ -738,6 +763,7 @@ def load_new_dataset(
 ) -> None:
     """Store a newly ingested DataFrame, snapshot raw copy, run format audit, and clear stale caches."""
     clean_df = _ensure_unique_str_columns(df.copy())
+    set_audit_only_columns(clean_df, [])
     state["uap_df"] = clean_df
     state["uap_raw_df"] = clean_df.copy()
     state["uap_prev_df"] = None
@@ -947,8 +973,14 @@ def update_active_dataset(
     """
     previous = state.get("uap_df")
     if isinstance(previous, pd.DataFrame):
-        state["uap_prev_df"] = previous.copy()
+        snapshot = previous.copy()
+        set_audit_only_columns(snapshot, get_audit_only_columns(state, previous))
+        state["uap_prev_df"] = snapshot
     updated = new_df.copy()
+    if _AUDIT_COLUMNS_ATTR not in updated.attrs:
+        set_audit_only_columns(updated, get_audit_only_columns(state, previous))
+    else:
+        set_audit_only_columns(updated, get_audit_only_columns(state, updated))
     state["uap_df"] = updated
 
     # Prune excluded columns if any were dropped by cleaning/feature selection

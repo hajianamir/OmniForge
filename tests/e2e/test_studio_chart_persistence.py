@@ -628,3 +628,87 @@ def test_studio01_preserves_temporal_gap_rows_and_split_keys_on_cleaning() -> No
     assert body["cleaning_report"]["effective_numeric_imputation"] == "causal_ffill"
     assert body["state"]["split_lock"]["active"]
     assert body["state"]["columns"] == ["Event Time", "sensor_reading", "target", "sensor_reading_is_outlier"]
+
+
+def test_audit_flags_survive_saved_workspace_without_entering_baseline_or_automl() -> None:
+    client, headers = _client()
+    frame = pd.DataFrame({
+        "signal": [None if i % 8 == 0 else i for i in range(80)],
+        "signal__is_missing": [i * 2 for i in range(80)],
+        "temp": [(i * 7) % 33 for i in range(80)],
+        "target": [i % 2 for i in range(80)],
+    })
+    upload = client.post("/api/workbench/s01/upload", headers=headers, files={
+        "file": ("audit-columns.csv", frame.to_csv(index=False).encode(), "text/csv"),
+    })
+    assert upload.status_code == 200, upload.text
+    lock = client.post("/api/workbench/split-lock", headers=headers, json={"strategy": "stratified", "test_size": 0.25})
+    assert lock.status_code == 200, lock.text
+    clean = client.post("/api/workbench/s01/clean", headers=headers, json={
+        "mode": "custom", "add_missing_indicators": True, "standardize_column_names": True,
+        "drop_duplicates": False, "handle_outliers": "flag",
+    })
+    assert clean.status_code == 200, clean.text
+    summary = clean.json()["state"]
+    flags = set(summary["audit_only_columns"])
+    assert "signal_2_is_missing" in flags
+    assert "signal_is_outlier" in flags
+    assert "signal_is_missing" not in flags
+    assert not any(c.startswith("target_") for c in flags)
+    assert flags <= set(summary["columns"])
+    assert clean.json()["cleaning_report"]["split_lock_leakage_safe"]
+    denied = client.post("/api/workbench/targets", headers=headers, json={"targets": ["signal_2_is_missing"]})
+    assert denied.status_code == 400
+    csv = client.get("/api/workbench/s01/export-clean/csv", headers=headers)
+    assert csv.status_code == 200, csv.text
+    exported = pd.read_csv(io.BytesIO(csv.content))
+    assert flags <= set(exported.columns)
+    assert exported["signal_is_missing"].tolist() == frame["signal__is_missing"].tolist()
+
+    saved = client.post("/api/workbench/workspace/save", headers=headers, data={"project_name": "audit-columns"})
+    assert saved.status_code == 200, saved.text
+    restored_headers = {"X-Session-ID": f"audit-{uuid.uuid4().hex}"}
+    restored = client.post("/api/workbench/workspace/load", headers=restored_headers, files={
+        "file": ("audit-columns.omniforge", saved.content, "application/octet-stream"),
+    })
+    assert restored.status_code == 200, restored.text
+    assert set(restored.json()["state"]["audit_only_columns"]) == flags
+
+    baseline = client.post("/api/workbench/s03/run", headers=restored_headers, json={
+        "mode": "custom", "selected_modules": ["baseline_benchmark"],
+    })
+    assert baseline.status_code == 200, baseline.text
+    assert baseline.json()["report"]["baseline_feature_cols"]["target"] == ["signal", "signal_is_missing", "temp"]
+
+    automl = client.post("/api/workbench/s06/automl", headers=restored_headers, json={
+        "target": "target", "backend": "omniforge_native", "time_budget_seconds": 5,
+    })
+    assert automl.status_code == 200, automl.text
+    assert automl.json()["state"]["active_input_feature_cols"] == ["signal", "signal_is_missing", "temp"]
+
+
+def test_mining_requires_explicit_target_for_multiple_outcomes() -> None:
+    client, headers = _client()
+    frame = pd.DataFrame({
+        "x": range(60), "z": [(i * 3) % 7 for i in range(60)],
+        "outcome_a": [i % 3 for i in range(60)], "outcome_b": [i * 3.0 + i % 4 for i in range(60)],
+    })
+    upload = client.post("/api/workbench/s01/upload", headers=headers, files={
+        "file": ("mining.csv", frame.to_csv(index=False).encode(), "text/csv"),
+    })
+    assert upload.status_code == 200, upload.text
+    targets = client.post("/api/workbench/targets", headers=headers, json={"targets": ["outcome_a", "outcome_b"]})
+    assert targets.status_code == 200, targets.text
+    req = {"mode": "custom", "tasks": ["subgroups", "manifold"]}
+    assert client.post("/api/workbench/s02/mining", headers=headers, json=req).status_code == 400
+    assert client.post("/api/workbench/s02/advanced_mining", headers=headers).status_code == 400
+    assert client.post("/api/workbench/s06/automl", headers=headers, json={}).status_code == 400
+    assert client.post("/api/workbench/s02/mining", headers=headers, json={**req, "target": "x"}).status_code == 400
+    mined = client.post("/api/workbench/s02/mining", headers=headers, json={**req, "target": "outcome_b"})
+    assert mined.status_code == 200, mined.text
+    assert mined.json()["target"] == "outcome_b"
+    assert {row["feature"] for row in mined.json()["manifold"]["loadings"]} == {"x", "z"}
+    advanced = client.post("/api/workbench/s02/advanced_mining?target_col=outcome_b", headers=headers)
+    assert advanced.status_code == 200, advanced.text
+    assert advanced.json()["target"] == "outcome_b"
+    assert set(advanced.json()["distance_correlation"]) == {"x", "z"}

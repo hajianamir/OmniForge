@@ -690,6 +690,13 @@ def _spec_readiness(
 # ---------------------------------------------------------------------------
 
 
+def _chart_studio(studio_id: str) -> str:
+    studio = (studio_id or "all").strip().lower().removeprefix("s")
+    if studio not in {"all", *(f"{index:02d}" for index in range(15))}:
+        raise ValueError("Choose a studio from 00 through 14 or the all-studio chart gallery.")
+    return studio
+
+
 def get_live_chart_catalog(state: dict[str, Any], studio_id: str = "all") -> dict[str, Any]:
     """Return available live charts and column selectors for ``studio_id`` (or ``'all'``)."""
     raw_active = state.get("uap_df")
@@ -709,11 +716,13 @@ def get_live_chart_catalog(state: dict[str, Any], studio_id: str = "all") -> dic
 
     model_eval = _resolve_model_eval(state, df) if has_df else None
 
-    studio_norm = (studio_id or "all").strip()
+    studio_norm = _chart_studio(studio_id)
     charts_out: list[dict[str, Any]] = []
     for spec in LIVE_CHART_SPECS:
+        in_studio = studio_norm == "all" or studio_norm in spec.studios
+        if not in_studio and studio_norm != "12":
+            continue
         ready, reason = _spec_readiness(spec, state, has_df, model_eval)
-        in_studio = studio_norm in ("all", "") or studio_norm in spec.studios
         charts_out.append(
             {
                 "id": spec.id,
@@ -772,6 +781,9 @@ def generate_live_chart(
     spec = _SPEC_BY_ID.get(chart_id)
     if spec is None:
         raise ValueError(f"Unknown chart_id {chart_id!r}. Valid IDs: {sorted(_SPEC_BY_ID)}")
+    studio_id = _chart_studio(studio_id)
+    if studio_id not in ("all", "12") and studio_id not in spec.studios:
+        raise ValueError("The requested chart is outside this studio's chart catalog.")
 
     raw_active = state.get("uap_df")
     if not isinstance(raw_active, pd.DataFrame) or raw_active.empty:

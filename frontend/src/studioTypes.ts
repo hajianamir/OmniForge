@@ -175,6 +175,7 @@ export interface ManifoldPayload {
 }
 
 export interface MiningResponse extends StateEnvelope {
+  target?: string | null;
   tasks_executed?: string[];
   association_rules?: { rules?: JsonRow[] } | null;
   subgroups?: { subgroups?: JsonRow[] } | null;
