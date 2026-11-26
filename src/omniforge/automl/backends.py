@@ -267,6 +267,7 @@ class _CaruanaStackPredictor:
         *,
         is_clf: bool,
         classes: np.ndarray | None = None,
+        stack_features: list[str] | None = None,
     ) -> None:
         self.preprocessor = preprocessor
         self.l1_models = l1_models
@@ -274,6 +275,7 @@ class _CaruanaStackPredictor:
         self.weights = weights
         self.is_clf = is_clf
         self.classes_ = classes
+        self.stack_features = list(l1_models) if stack_features is None else stack_features
 
     def _transform_and_l1(self, X: pd.DataFrame | np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray], np.ndarray]:
         if not isinstance(X, pd.DataFrame) and hasattr(self.preprocessor, "feature_names_in_"):
@@ -287,7 +289,8 @@ class _CaruanaStackPredictor:
             name: MultiLayerStackingAutoML._response(estimator, X_mat, self.classes_ if self.is_clf else None)
             for name, estimator in self.l1_models.items()
         }
-        stack_blocks = [X_mat, *l1_preds.values()]
+        stack_features = getattr(self, "stack_features", self.l1_models)
+        stack_blocks = [X_mat, *[l1_preds[name] for name in stack_features]]
         return X_mat, l1_preds, np.hstack(stack_blocks)
 
     def predict_proba(self, X: pd.DataFrame | np.ndarray) -> np.ndarray:
@@ -582,21 +585,22 @@ class MultiLayerStackingAutoML:
         # All stacking folds must have the same base-model feature blocks.
         # Each outer scope learns the augmented training matrix solely from
         # inner OOF predictions within that outer training set.
+        stack_features = [name for name in names if all(name in scope.inner_preds for _, _, scope in outer_scopes)]
         nested_matrices = []
         for train, valid, scope in outer_scopes:
-            if any(name not in scope.inner_preds for name in names):
+            if not stack_features:
                 break
-            inner = np.hstack([scope.train_matrix, *[scope.inner_preds[name] for name in names]])
+            inner = np.hstack([scope.train_matrix, *[scope.inner_preds[name] for name in stack_features]])
             usable = np.isfinite(inner).all(axis=1)
             if usable.sum() < 2 or (classes is not None and not np.array_equal(np.unique(y[train][usable]), classes)):
                 break
-            held_out = np.hstack([scope.eval_matrix, *[scope.eval_preds[name] for name in names]])
+            held_out = np.hstack([scope.eval_matrix, *[scope.eval_preds[name] for name in stack_features]])
             nested_matrices.append((train[usable], valid, inner[usable], held_out))
 
         l2_fitted: dict[str, Any] = {}
         if len(nested_matrices) == len(outer_scopes):
-            dev = np.hstack([final.train_matrix[scored_rows], *[oof_preds[name] for name in names]])
-            validation = np.hstack([final.eval_matrix, *[final.eval_preds[name] for name in names]])
+            dev = np.hstack([final.train_matrix[scored_rows], *[oof_preds[name] for name in stack_features]])
+            validation = np.hstack([final.eval_matrix, *[final.eval_preds[name] for name in stack_features]])
             l2_specs = (
                 {
                     "L2_Stack_HistGBM": HistGradientBoostingClassifier(max_iter=100, max_depth=5, random_state=self.random_seed),
@@ -621,14 +625,21 @@ class MultiLayerStackingAutoML:
                     logger.warning("stack_l2_candidate_skipped", model=name, error_type=type(exc).__name__)
 
         weights, _ = _caruana_greedy_weights(oof_preds, y[scored_rows], is_clf=is_clf, classes=classes, n_rounds=15)
-        predictor = _CaruanaStackPredictor(final.preprocessor, l1_fitted, l2_fitted, weights, is_clf=is_clf, classes=classes)
+        predictor = _CaruanaStackPredictor(
+            final.preprocessor, l1_fitted, l2_fitted, weights,
+            is_clf=is_clf, classes=classes, stack_features=stack_features,
+        )
         ensemble_predictions = predictor.predict_proba(X_val) if is_clf else predictor.predict(X_val)
         ens_score = validation_score(ensemble_predictions)
         ensemble_name = "L3_WeightedEnsemble_Caruana" if l2_fitted else "L1_WeightedEnsemble_Caruana"
         leaderboard.append({"model": ensemble_name, "layer": "L3_Ensemble" if l2_fitted else "L1_Ensemble",
                             "metric": metric, "score": round(ens_score, 6)})
         leaderboard.sort(key=lambda row: float(row["score"]), reverse=is_clf)
-        summary = {"n_oof_rows": len(scored_rows), "n_outer_folds": len(folds), "layer_two_candidates": list(l2_fitted)}
+        summary = {
+            "n_oof_rows": len(scored_rows), "n_outer_folds": len(folds),
+            "layer_two_candidates": list(l2_fitted),
+            "layer_two_inputs": stack_features if l2_fitted else [],
+        }
         return {
             "best_model": _WrappedSklearnModel(
                 name="MultiLayerStackEnsemble", estimator=predictor, task_type=task_type, classes=classes,

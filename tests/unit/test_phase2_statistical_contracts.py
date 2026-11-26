@@ -165,3 +165,24 @@ def test_backend_hub_preserves_explicit_stacking_split(monkeypatch: pytest.Monke
     )
     assert result.extra["stacking_validation"]["layer_two_candidates"]
     assert np.isfinite(result.best_score)
+
+
+def test_small_inner_fold_excludes_only_the_base_model_that_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    class MinimumRowsRidge(Ridge):
+        def fit(self, X, y, sample_weight=None):
+            if len(X) < 15:
+                raise ValueError("More inner training observations are required.")
+            return super().fit(X, y, sample_weight=sample_weight)
+
+    X = pd.DataFrame({"x": np.linspace(-2, 2, 120)})
+    y = X["x"] * 3 + np.sin(X["x"])
+    stacker = MultiLayerStackingAutoML(cv_folds=3)
+    monkeypatch.setattr(stacker, "_layer1_specs", lambda _: {"always_fits": Ridge(), "needs_more": MinimumRowsRidge()})
+    result = stacker.fit(
+        X.iloc[:110], y.iloc[:110], X.iloc[110:], y.iloc[110:], TaskType.REGRESSION,
+        time_ordered=True, gap=2,
+    )
+    assert {row["model"] for row in result["leaderboard"] if row["layer"] == "L1"} == {"always_fits", "needs_more"}
+    assert result["stacking_validation"]["layer_two_candidates"]
+    assert result["stacking_validation"]["layer_two_inputs"] == ["always_fits"]
+    assert np.isfinite(result["best_model"].predict(X.iloc[110:])).all()
