@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from urllib.parse import quote
+
 import numpy as np
 import pandas as pd
 
@@ -16,7 +18,9 @@ class HierarchicalReconciler:
     """
 
     def __init__(self, method: str = "ols") -> None:
-        self.method = method.lower()  # bottom_up, top_down, ols, wls, wls_var, wls_struct, mint_shrink
+        self.method = method.lower()
+        if self.method not in {"bottom_up", "top_down", "ols", "wls", "wls_var", "wls_struct", "mint_shrink"}:
+            raise ForecastingError("Unknown hierarchical reconciliation method.")
         self.last_shrinkage_lambda_: float | None = None
 
     @staticmethod
@@ -63,7 +67,12 @@ class HierarchicalReconciler:
         Y = np.asarray(base_forecasts, dtype=float)
         if Y.ndim == 1:
             Y = Y[:, None]
+        if S.ndim != 2 or not S.size or Y.ndim != 2 or not Y.size or not np.isfinite(S).all() or not np.isfinite(Y).all():
+            raise ForecastingError("The summing matrix and forecasts must be nonempty, finite matrices.")
         n_total, n_bottom = S.shape
+        if n_total < n_bottom or not np.array_equal(S[-n_bottom:], np.eye(n_bottom)):
+            raise ForecastingError("The summing matrix must end with one identity row per bottom-level series.")
+        self.last_shrinkage_lambda_ = None
         if Y.shape[0] != n_total:
             raise ForecastingError(
                 f"Base forecasts row count ({Y.shape[0]}) must match summing matrix rows ({n_total})."
@@ -74,17 +83,27 @@ class HierarchicalReconciler:
             return np.asarray(S @ bottom, dtype=float)
 
         if self.method == "top_down":
+            if not np.all(S[0] == 1):
+                raise ForecastingError("Top-down reconciliation requires the total series in the first row.")
             top = Y[0:1, :]
             if historical_bottom_shares is None:
                 shares = np.full((n_bottom, 1), 1.0 / max(n_bottom, 1), dtype=float)
             else:
-                sh = np.asarray(historical_bottom_shares, dtype=float).reshape(n_bottom, 1)
-                shares = sh / max(float(sh.sum()), 1e-12)
+                sh = np.asarray(historical_bottom_shares, dtype=float)
+                if sh.shape not in {(n_bottom,), (n_bottom, 1)} or not np.isfinite(sh).all() or (sh < 0).any() or sh.sum() <= 0:
+                    raise ForecastingError("Historical shares must be finite, nonnegative, and sum to a positive value.")
+                shares = sh.reshape(n_bottom, 1) / sh.sum()
             return np.asarray(S @ (shares @ top), dtype=float)
 
+        res_arr = None
+        if self.method in {"wls", "wls_var", "mint_shrink"} and residuals is not None:
+            res_arr = np.asarray(residuals, dtype=float)
+            if res_arr.ndim != 2 or res_arr.shape[0] != n_total or not res_arr.shape[1] or not np.isfinite(res_arr).all():
+                raise ForecastingError("Residuals must be finite and aligned to every series in the summing matrix.")
         if self.method in ("wls", "wls_var", "wls_struct"):
-            if self.method != "wls_struct" and residuals is not None and residuals.shape[0] == n_total:
-                res_arr = np.asarray(residuals, dtype=float)
+            if self.method == "wls_var" and res_arr is None:
+                raise ForecastingError("Variance-weighted reconciliation requires aligned residuals.")
+            if res_arr is not None:
                 ddof_val = 1 if res_arr.ndim >= 2 and res_arr.shape[1] > 1 else 0
                 variances = np.var(res_arr, axis=1, ddof=ddof_val) + 1e-6
             else:
@@ -94,8 +113,10 @@ class HierarchicalReconciler:
             G = np.linalg.pinv(S.T @ W_inv @ S) @ S.T @ W_inv
             return np.asarray(S @ G @ Y, dtype=float)
 
-        if self.method == "mint_shrink" and residuals is not None and residuals.shape[0] == n_total:
-            W, lam = self._schafer_strimmer_shrinkage(residuals)
+        if self.method == "mint_shrink":
+            if res_arr is None or res_arr.shape[1] < 2:
+                raise ForecastingError("MinT shrinkage requires at least two residual observations per series.")
+            W, lam = self._schafer_strimmer_shrinkage(res_arr)
             self.last_shrinkage_lambda_ = round(lam, 6)
             W_inv = np.linalg.pinv(W)
             G = np.linalg.pinv(S.T @ W_inv @ S) @ S.T @ W_inv
@@ -119,27 +140,36 @@ class HierarchicalReconciler:
 
     @staticmethod
     def build_summing_matrix(hierarchy_df: pd.DataFrame, level_cols: list[str]) -> tuple[np.ndarray, list[str]]:
-        """Construct summing matrix ``S`` and ordered series labels from a tidy hierarchy table."""
-        bottom_col = level_cols[-1]
-        bottom_ids = sorted(hierarchy_df[bottom_col].astype(str).unique().tolist())
-        n_bottom = len(bottom_ids)
-        bottom_index = {b: i for i, b in enumerate(bottom_ids)}
+        """Use full paths as series identities and order bottom columns by path.
 
+        Repeated observations of a path describe the same series. Repeated node
+        names under different parents describe separate series.
+        """
+        if not level_cols or len(set(level_cols)) != len(level_cols) or not hierarchy_df.columns.is_unique:
+            raise ForecastingError("Specify distinct hierarchy level columns in a uniquely named table.")
+        if any(col not in hierarchy_df.columns for col in level_cols):
+            raise ForecastingError("A hierarchy level column is absent from the table.")
+        hierarchy = hierarchy_df.loc[:, level_cols]
+        if hierarchy.empty or hierarchy.isna().any().any():
+            raise ForecastingError("Each hierarchy row must provide an observed identifier at every level.")
+
+        # Escape separators so free-text values cannot alias a different path.
+        # Reject values whose distinct source identifiers render identically.
+        normalized = hierarchy.map(lambda value: quote(str(value), safe=""))
+        for col in level_cols:
+            if hierarchy[col].nunique() != normalized[col].nunique():
+                raise ForecastingError("Distinct hierarchy identifiers must have distinct textual representations.")
+        paths = sorted(set(normalized.itertuples(index=False, name=None)))
+        n_bottom = len(paths)
         rows: list[np.ndarray] = [np.ones(n_bottom, dtype=float)]
         labels: list[str] = ["Total"]
-
-        for col in level_cols[:-1]:
-            for grp, sub in hierarchy_df.groupby(col, observed=True):
-                vec = np.zeros(n_bottom, dtype=float)
-                for b in sub[bottom_col].astype(str).unique():
-                    vec[bottom_index[b]] = 1.0
-                rows.append(vec)
-                labels.append(f"{col}={grp}")
-
-        for b in bottom_ids:
-            vec = np.zeros(n_bottom, dtype=float)
-            vec[bottom_index[b]] = 1.0
-            rows.append(vec)
-            labels.append(f"{bottom_col}={b}")
-
+        for depth in range(1, len(level_cols) + 1):
+            indices: dict[tuple[str, ...], list[int]] = {}
+            for index, path in enumerate(paths):
+                indices.setdefault(path[:depth], []).append(index)
+            for path, columns in indices.items():
+                row = np.zeros(n_bottom, dtype=float)
+                row[columns] = 1.0
+                rows.append(row)
+                labels.append("/".join(f"{quote(col, safe='')}={value}" for col, value in zip(level_cols, path, strict=False)))
         return np.vstack(rows), labels
