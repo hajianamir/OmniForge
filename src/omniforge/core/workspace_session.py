@@ -226,8 +226,8 @@ class WorkspaceSessionManager:
                 joblib.dump(val, probe, compress=0)
                 serializable[key] = val
             except Exception as exc:
-                logger.warning("workspace_session_key_skipped", key=key, error=str(exc))
-                skipped.append({"key": key, "reason": str(exc)[:200]})
+                logger.warning("workspace_session_key_skipped", key=key, error_type=type(exc).__name__)
+                skipped.append({"key": key, "reason": "The workspace value could not be serialized."})
 
         payload_buf = io.BytesIO()
         joblib.dump(serializable, payload_buf, compress=("zlib", 3))
@@ -606,7 +606,7 @@ class WorkspaceSessionManager:
                     )
                 )
             except Exception as exc:
-                logger.warning("local_project_manifest_unreadable", path=str(path), error=str(exc))
+                logger.warning("local_project_manifest_unreadable", error_type=type(exc).__name__)
         summaries.sort(key=lambda s: s.manifest.saved_at_utc, reverse=True)
         return summaries
 

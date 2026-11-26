@@ -141,7 +141,6 @@ def s05_select_features(
     selected: list[str] = []
     scores: dict[str, float] = {}
 
-    last_error: Exception | None = None
     for m_name in methods:
         try:
             selector = FeatureSelector(
@@ -158,15 +157,15 @@ def s05_select_features(
                 selected = list(selector.selected_features_)
                 scores = {k: float(v) for k, v in s_dict.items()}
         except Exception as exc:
-            last_error = exc
+            _wb().logger.warning("feature_selection_failed", method=m_name, error_type=type(exc).__name__)
             if len(methods) == 1:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+                raise HTTPException(status_code=400, detail="The feature selection method could not evaluate this study.") from exc
             continue
 
     if not method_breakdown:
         raise HTTPException(
             status_code=400,
-            detail=str(last_error) if last_error is not None else "No feature selection method succeeded.",
+            detail="No feature selection method could evaluate this study.",
         )
 
     if len(methods) > 1:

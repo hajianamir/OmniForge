@@ -621,6 +621,7 @@ class UniversalDiagnosticsSuite:
                             "model": bl_m,
                             "feature_cols": list(X_tr.columns),
                             "input_preprocessor": preprocessor,
+                            "evaluation_holdout": (X_val, y_val),
                             "metrics": eq_d["metrics"],
                         }
                     report.baseline_equations[t_col] = enriched_eqs

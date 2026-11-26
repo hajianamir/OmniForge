@@ -75,6 +75,8 @@ _BLOCKED_SQL_QUERY_OPTIONS: frozenset[str] = frozenset(
         "unix_socket",
         "dsn",
         "odbc_connect",
+        "service",
+        "servicefile",
     }
 )
 
@@ -425,7 +427,7 @@ def _assert_ip_not_ssrf(
             )
 
 
-def _validate_remote_db_host(host: str | None, port: int | None) -> None:
+def _validate_remote_db_host(host: str | None, port: int | None) -> tuple[str, ...]:
     """Block SSRF against cloud metadata services and unauthorized private/loopback endpoints."""
     if not host or not host.strip():
         raise SecurityError("Remote SQL connection URL must specify a valid hostname.")
@@ -455,8 +457,10 @@ def _validate_remote_db_host(host: str | None, port: int | None) -> None:
                 ip_str = str(info[4][0]).split("%", 1)[0]
                 resolved_ips.append(ipaddress.ip_address(ip_str))
         except OSError as exc:
-            raise DataIngestionError(f"Unable to resolve SQL database host '{norm_host}': {exc}") from exc
+            raise DataIngestionError("Unable to resolve the SQL database hostname.") from exc
 
+    if not resolved_ips:
+        raise DataIngestionError("The SQL database hostname yielded no usable address.")
     for ip in resolved_ips:
         _assert_ip_not_ssrf(
             ip,
@@ -467,6 +471,8 @@ def _validate_remote_db_host(host: str | None, port: int | None) -> None:
             allowlist_env="OMNIFORGE_ALLOWED_DB_HOSTS",
             private_env="OMNIFORGE_ALLOW_PRIVATE_DB_HOSTS",
         )
+
+    return tuple(dict.fromkeys(str(ip) for ip in resolved_ips))
 
 
 @dataclass(frozen=True)
@@ -660,7 +666,11 @@ def _validated_sql_url(connection_url: str) -> tuple[Any, str, Path | None]:
             allowed_suffixes=_ALLOWED_SQLITE_SUFFIXES,
             verify_sqlite_magic=True,
         )
-    _validate_remote_db_host(parsed.host, parsed.port)
+    default_port = {"postgresql": 5432, "mysql": 3306, "mariadb": 3306, "mssql": 1433}.get(backend, 5432)
+    addresses = _validate_remote_db_host(parsed.host, parsed.port or default_port)
+    if backend == "postgresql" and parsed.get_driver_name() in {"psycopg2", "psycopg", "psycopg2cffi"}:
+        # libpq dials hostaddr and retains the original hostname for TLS verification.
+        parsed = parsed.update_query_dict({"hostaddr": addresses[0]})
     return parsed, backend, None
 
 
@@ -671,7 +681,7 @@ def _create_readonly_sql_engine(
 ) -> tuple[Any, str]:
     """Create a hardened read-only SQLAlchemy engine for SQLite or remote SQL databases."""
     parsed, backend, local_path = _validated_sql_url(connection_url)
-    from sqlalchemy import create_engine
+    from sqlalchemy import create_engine, event
 
     if local_path is not None:
         readonly_uri = f"file:{quote(str(local_path))}?mode=ro"
@@ -686,7 +696,16 @@ def _create_readonly_sql_engine(
         engine = create_engine("sqlite://", creator=_sqlite_creator)
         return engine, "sqlite"
 
-    engine = create_engine(parsed, pool_pre_ping=True)
+    execution_options = {"postgresql_readonly": True} if backend == "postgresql" else {}
+    engine = create_engine(parsed, pool_pre_ping=True, execution_options=execution_options)
+    if backend in {"mysql", "mariadb"}:
+        @event.listens_for(engine, "connect", insert=True)
+        def _set_read_only(dbapi_connection: Any, _connection_record: Any) -> None:
+            cursor = dbapi_connection.cursor()
+            try:
+                cursor.execute("SET SESSION TRANSACTION READ ONLY")
+            finally:
+                cursor.close()
     return engine, backend
 
 
@@ -826,7 +845,7 @@ def read_excel_sheet(raw_bytes: bytes, sheet_name: str | int = 0) -> pd.DataFram
 
 def ensure_demo_sqlite_database(workspace_dir: Path | None = None) -> Path:
     """Create (or refresh) a realistic built-in SQLite database for live SQL & Supervisory Dashboard testing."""
-    target_dir = workspace_dir or (Path.cwd() / ".omniforge_workspace" / "demo_databases")
+    target_dir = workspace_dir or (get_settings().paths.workspace_dir / "demo_databases")
     target_dir.mkdir(parents=True, exist_ok=True)
     db_path = target_dir / "omniforge_enterprise_demo.sqlite"
     if db_path.exists() and db_path.stat().st_size > 10_000:
@@ -979,7 +998,7 @@ def sql_inspect_database(connection_url: str) -> dict[str, Any]:
     except (SecurityError, DataIngestionError):
         raise
     except Exception as exc:
-        raise DataIngestionError(f"SQL connection failed ({type(exc).__name__}): {exc}") from exc
+        raise DataIngestionError("The SQL database connection failed.") from exc
     finally:
         engine.dispose()
 
@@ -1055,7 +1074,7 @@ def sql_load_dataframe(
         except (SecurityError, DataIngestionError):
             raise
         except Exception as exc:
-            raise DataIngestionError(f"SQL query execution failed: {exc}") from exc
+            raise DataIngestionError("The SQL query could not be executed.") from exc
         finally:
             engine.dispose()
 
@@ -1090,7 +1109,7 @@ def sql_load_dataframe(
     except (SecurityError, DataIngestionError):
         raise
     except Exception as exc:
-        raise DataIngestionError(f"SQL query execution failed: {exc}") from exc
+        raise DataIngestionError("The SQL query could not be executed.") from exc
     finally:
         engine.dispose()
 

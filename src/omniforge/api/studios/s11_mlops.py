@@ -9,13 +9,13 @@ import pandas as pd
 from fastapi import APIRouter, Depends, Header, HTTPException
 
 from omniforge.api.auth import authorize_principal, require_permission
+from omniforge.api.studios.root_cause import analyze_study_cohorts
 from omniforge.api.studios.schemas import DriftReq, PromoteModelReq, RegisterModelReq, RollbackModelReq, RootCauseReq
 from omniforge.core.exceptions import MLOpsError
 from omniforge.core.types import ModelStage, Principal
 from omniforge.core.utils import to_json_object
 from omniforge.mlops.drift import DriftDetector
 from omniforge.mlops.fairness_evidence import FairnessEvidence, holdout_fingerprint
-from omniforge.mlops.root_cause import DriftRootCauseAnalyzer
 
 router = APIRouter(tags=["workbench-s11"])
 
@@ -133,7 +133,7 @@ def s11_rollback(req: RollbackModelReq, principal: Principal = Depends(require_p
     )
 
 
-@router.post("/s11/drift")
+@router.post("/s11/drift", dependencies=[Depends(require_permission("mlops:read"))])
 def s11_drift(req: DriftReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     state = _wb().get_session_state(_wb()._sid(x_session_id))
     df = _wb().get_analysis_dataframe(state, _wb()._require_df(state))
@@ -147,31 +147,13 @@ def s11_drift(req: DriftReq, x_session_id: str | None = Header(default="default"
     return payload
 
 
-@router.post("/s11/root-cause")
+@router.post("/s11/root-cause", dependencies=[Depends(require_permission("mlops:read"))])
 def s11_root_cause(
     req: RootCauseReq, x_session_id: str | None = Header(default="default")
 ) -> dict[str, Any]:
     """C5 causal drift root-cause attribution: drift -> Delta-attribution -> DAG ancestors."""
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
-    df = _wb().get_analysis_dataframe(state, _wb()._require_df(state))
-    num_df = df.select_dtypes(include=[np.number]).dropna()
-    if len(num_df) < 20:
-        raise HTTPException(status_code=400, detail="Root-cause analysis requires at least 20 numeric rows.")
-    cut = max(5, min(len(num_df) - 5, int(len(num_df) * 0.5)))
-    ref_df = num_df.iloc[:cut]
-    cur_df = num_df.iloc[cut:]
-    model = state.get("uap_active_model")
-    feat_cols = list(state.get("uap_active_feature_cols") or num_df.columns)
-    analyzer = DriftRootCauseAnalyzer(
-        psi_warning=req.psi_warning,
-        psi_critical=req.psi_critical,
-        max_cond_set_size=req.max_cond_set_size,
-    )
-    report = analyzer.analyze(
-        ref_df, cur_df, model=model, feature_cols=feat_cols,
-        target_col=req.target_col, time_col=req.time_col,
-    )
-    payload = to_json_object({"root_cause_report": report.model_dump()})
+    payload = to_json_object(analyze_study_cohorts(state, req))
     _wb().save_studio_result(state, "s11_root_cause", payload)
     return payload

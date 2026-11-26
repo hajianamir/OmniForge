@@ -10,7 +10,9 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, r2_score, root_mean_squared_error
 
+from omniforge.core.exceptions import EvaluationError
 from omniforge.core.logging import get_logger
+from omniforge.core.types import TaskType
 from omniforge.core.utils import to_json_safe
 from omniforge.evaluation.equations import ModelEquationExtractor
 from omniforge.features.inference import WorkbenchInputPreprocessor
@@ -25,6 +27,10 @@ def _is_classification_target(series: pd.Series) -> bool:
     return n_uniq <= 15 and n_uniq < max(5, int(len(series) * 0.15))
 
 
+def _finite_round(value: float, digits: int) -> float | None:
+    return round(float(value), digits) if math.isfinite(value) else None
+
+
 class SupervisoryPredictionMonitor:
     """Evaluates live incoming data against ANY workspace model (Baseline, AutoML, or Neural Network),
     compares observed Reality vs. Model Prediction vs. Reference Baseline Prediction, checks user-defined
@@ -37,7 +43,7 @@ class SupervisoryPredictionMonitor:
         models: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
 
-        def _add(mid: str, label: str, family: str, target: str, feature_cols: list[str], obj: Any, metrics: dict[str, Any] | None = None, preprocessor: WorkbenchInputPreprocessor | None = None) -> None:
+        def _add(mid: str, label: str, family: str, target: str, feature_cols: list[str], obj: Any, metrics: dict[str, Any] | None = None, preprocessor: WorkbenchInputPreprocessor | None = None, evaluation_holdout: tuple[pd.DataFrame, pd.Series] | None = None) -> None:
             if mid in seen_ids or obj is None or not hasattr(obj, "predict"):
                 return
             seen_ids.add(mid)
@@ -47,11 +53,15 @@ class SupervisoryPredictionMonitor:
                     "label": label,
                     "family": family,
                     "target": target,
+                    "task_type": SupervisoryPredictionMonitor._model_task(obj),
                     "n_features": len(feature_cols),
                     "feature_cols": list(feature_cols),
+                    "input_columns": list(preprocessor.input_columns) if isinstance(preprocessor, WorkbenchInputPreprocessor) else list(feature_cols),
+                    "input_types": dict(preprocessor.column_types) if isinstance(preprocessor, WorkbenchInputPreprocessor) else {},
                     "metrics": metrics or {},
                     "_estimator": obj,
                     "_input_preprocessor": preprocessor,
+                    "_evaluation_holdout": evaluation_holdout,
                 }
             )
 
@@ -86,6 +96,7 @@ class SupervisoryPredictionMonitor:
                         entry["model"],
                         entry.get("metrics") or {},
                         entry.get("input_preprocessor"),
+                        entry.get("evaluation_holdout"),
                     )
                 elif hasattr(entry, "predict"):
                     _add(
@@ -114,6 +125,7 @@ class SupervisoryPredictionMonitor:
                             entry["model"],
                             entry.get("metrics") or {},
                             entry.get("input_preprocessor"),
+                        entry.get("evaluation_holdout"),
                         )
                     elif hasattr(entry, "predict"):
                         _add(
@@ -142,6 +154,7 @@ class SupervisoryPredictionMonitor:
                             entry["model"],
                             entry.get("metrics") or {},
                             entry.get("input_preprocessor"),
+                        entry.get("evaluation_holdout"),
                         )
 
         # 4. Studio 14 Quick-Fit Models
@@ -158,9 +171,71 @@ class SupervisoryPredictionMonitor:
                         entry["model"],
                         entry.get("metrics") or {},
                         entry.get("input_preprocessor"),
+                        entry.get("evaluation_holdout"),
                     )
 
         return models
+
+    @staticmethod
+    def _model_task(estimator: Any) -> TaskType | None:
+        declared = getattr(estimator, "task_type", None)
+        if declared in (TaskType.REGRESSION, TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
+            return TaskType(declared)
+        kind = getattr(estimator, "_estimator_type", None)
+        classes = getattr(estimator, "classes_", None)
+        if kind == "regressor":
+            return TaskType.REGRESSION
+        if classes is not None and len(classes) >= 2:
+            return TaskType.MULTICLASS_CLASSIFICATION if len(classes) > 2 else TaskType.BINARY_CLASSIFICATION
+        if kind == "classifier":
+            return TaskType.BINARY_CLASSIFICATION
+        return None
+
+    @classmethod
+    def model_pair(
+        cls, catalog: list[dict[str, Any]], model_id: str | None, baseline_model_id: str | None,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        primary = next((m for m in catalog if m["model_id"] == model_id), None) if model_id else next(iter(catalog), None)
+        if primary is None:
+            raise EvaluationError("The requested model is unavailable in this workspace.")
+        task = cls._model_task(primary["_estimator"])
+        eligible = [
+            m for m in catalog
+            if m["target"] == primary["target"] and m["model_id"] != primary["model_id"]
+            and (task is None or cls._model_task(m["_estimator"]) == task)
+        ]
+        if baseline_model_id:
+            matched = next((m for m in eligible if m["model_id"] == baseline_model_id), None)
+            if matched is None:
+                raise EvaluationError("The requested comparison model is unavailable or targets a different outcome or task.")
+            return primary, matched
+        return primary, next((m for m in eligible if m["family"] == "Baseline"), None)
+
+    @staticmethod
+    def _evaluation_holdout(state: dict[str, Any], entry: dict[str, Any]) -> tuple[pd.DataFrame, pd.Series] | None:
+        from omniforge.mlops.fairness_evidence import holdout_fingerprint
+
+        if entry["model_id"] == "active_champion":
+            if entry["_estimator"] is not state.get("uap_active_holdout_model"):
+                return None
+            digest = state.get("uap_active_holdout_fingerprint")
+            if not digest:
+                return None
+            X, y = state.get("uap_active_X_test"), state.get("uap_active_y_test")
+        else:
+            saved = entry.get("_evaluation_holdout")
+            if not isinstance(saved, tuple) or len(saved) != 2:
+                return None
+            X, y = saved
+            digest = None
+        if (
+            not isinstance(X, pd.DataFrame) or not isinstance(y, pd.Series) or X.empty
+            or not X.index.is_unique or not X.index.equals(y.index) or y.isna().any()
+            or y.name != entry["target"] or list(X.columns) != entry["feature_cols"]
+            or (digest is not None and holdout_fingerprint(X, y) != digest)
+        ):
+            return None
+        return X, y
 
     @staticmethod
     def _align_features(
@@ -204,50 +279,55 @@ class SupervisoryPredictionMonitor:
     @classmethod
     def _model_input(
         cls, incoming_df: pd.DataFrame, entry: dict[str, Any], ref_df: pd.DataFrame | None,
-        fallback_features: list[str] | None = None,
+        fallback_features: list[str] | None = None, *, strict: bool = False,
     ) -> pd.DataFrame:
         preprocessor = entry.get("_input_preprocessor")
+        feature_cols = entry["feature_cols"] or fallback_features or []
         if isinstance(preprocessor, WorkbenchInputPreprocessor):
-            return preprocessor.transform(incoming_df)
-        return cls._align_features(incoming_df, entry["feature_cols"] or fallback_features or [], ref_df=ref_df)
+            if strict and not set(preprocessor.input_columns).issubset(incoming_df.columns):
+                raise ValueError("One or more fitted model inputs are absent.")
+            transformed = preprocessor.transform(incoming_df)
+            if strict and feature_cols and list(transformed.columns) != feature_cols:
+                raise ValueError("Fitted preprocessing output does not match the model feature schema.")
+            return transformed
+        if strict:
+            if not feature_cols or not set(feature_cols).issubset(incoming_df.columns):
+                raise ValueError("The raw model input schema could not be verified.")
+            return incoming_df.loc[:, feature_cols]
+        return cls._align_features(incoming_df, feature_cols, ref_df=ref_df)
 
     @staticmethod
-    def _predict_safe(estimator: Any, X: pd.DataFrame) -> np.ndarray:
-        """Predict cleanly across both raw-DataFrame and numeric-only estimators."""
+    def _probabilities(estimator: Any, X: pd.DataFrame) -> tuple[pd.Index, np.ndarray] | None:
+        classes = getattr(estimator, "classes_", None)
+        if classes is None or len(classes) < 2 or not hasattr(estimator, "predict_proba"):
+            return None
+        labels = pd.Index(classes)
         try:
-            return np.asarray(estimator.predict(X))
+            pmat = np.asarray(estimator.predict_proba(X), dtype=float)
         except Exception:
-            X_num = pd.DataFrame(
-                {c: pd.to_numeric(X[c], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0) for c in X.columns},
-                index=X.index,
-            )
-            return np.asarray(estimator.predict(X_num))
+            return None
+        if (
+            not labels.is_unique or labels.hasnans or pmat.shape != (len(X), len(labels))
+            or not np.isfinite(pmat).all() or (pmat < 0).any() or (pmat > 1).any()
+            or not np.allclose(pmat.sum(axis=1), 1, atol=1e-6, rtol=0)
+        ):
+            return None
+        return labels, pmat
 
-    @staticmethod
-    def _predict_scalar_response(estimator: Any, X: pd.DataFrame, is_clf: bool) -> np.ndarray:
-        """Return a continuous scalar response (y_hat for regression or P(y=1) for classification)."""
-        if is_clf and hasattr(estimator, "predict_proba"):
-            try:
-                pmat = np.asarray(estimator.predict_proba(X), dtype=float)
-                if pmat.ndim == 2 and pmat.shape[1] >= 2:
-                    return pmat[:, 1].ravel()
-                return pmat.ravel()
-            except Exception:
-                try:
-                    X_num = pd.DataFrame(
-                        {c: pd.to_numeric(X[c], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0) for c in X.columns},
-                        index=X.index,
-                    )
-                    pmat = np.asarray(estimator.predict_proba(X_num), dtype=float)
-                    return pmat[:, 1].ravel() if (pmat.ndim == 2 and pmat.shape[1] >= 2) else pmat.ravel()
-                except Exception:
-                    pass
-        raw = SupervisoryPredictionMonitor._predict_safe(estimator, X)
-        num = pd.to_numeric(pd.Series(raw), errors="coerce").to_numpy(dtype=float)
-        if np.isnan(num).all():
-            codes, _ = pd.factorize(pd.Series(raw).astype(str))
-            return np.asarray(codes, dtype=float)
-        return np.asarray(np.nan_to_num(num, nan=0.0), dtype=float)
+    @classmethod
+    def _predict_scalar_response(cls, estimator: Any, X: pd.DataFrame, response_class: Any) -> np.ndarray:
+        """Return a numeric prediction or the probability of one explicitly identified class."""
+        if response_class is None:
+            values = np.asarray(estimator.predict(X), dtype=float)
+            if values.shape == (len(X),):
+                return values
+        else:
+            probabilities = cls._probabilities(estimator, X)
+            if probabilities is not None:
+                labels, pmat = probabilities
+                if response_class in labels:
+                    return pmat[:, labels.get_loc(response_class)]
+        raise EvaluationError("The model did not provide a comparable numeric response.")
 
     @classmethod
     def extract_model_equation(
@@ -276,7 +356,7 @@ class SupervisoryPredictionMonitor:
             safe_eq: dict[str, Any] = dict(to_json_safe(eq_dict))
             return safe_eq
         except Exception as exc:
-            logger.debug("supervisory_equation_extract_skipped", error=str(exc))
+            logger.debug("supervisory_equation_extract_skipped", error_type=type(exc).__name__)
             return None
 
     @classmethod
@@ -289,7 +369,7 @@ class SupervisoryPredictionMonitor:
         preds_scalar: np.ndarray,
         base_scalar: np.ndarray | None,
         actuals_scalar: np.ndarray | None,
-        is_clf: bool,
+        response_class: Any,
         target_name: str,
         breach_indices: list[int],
     ) -> tuple[dict[str, Any], dict[int, dict[str, Any]]]:
@@ -352,7 +432,7 @@ class SupervisoryPredictionMonitor:
 
         ref_df_one = pd.DataFrame([ref_row], columns=X_primary.columns)
         try:
-            y_ref = float(cls._predict_scalar_response(estimator, ref_df_one, is_clf)[0])
+            y_ref = float(cls._predict_scalar_response(estimator, ref_df_one, response_class)[0])
         except Exception:
             y_ref = float(np.nanmedian(preds_scalar)) if len(preds_scalar) else 0.0
 
@@ -380,11 +460,11 @@ class SupervisoryPredictionMonitor:
             try:
                 X_fwd = base_ref_block.copy()
                 X_fwd[col] = X_sub[col].to_numpy()
-                y_fwd = cls._predict_scalar_response(estimator, X_fwd, is_clf)
+                y_fwd = cls._predict_scalar_response(estimator, X_fwd, response_class)
 
                 X_bwd = X_sub.copy()
                 X_bwd[col] = ref_row[col]
-                y_bwd = cls._predict_scalar_response(estimator, X_bwd, is_clf)
+                y_bwd = cls._predict_scalar_response(estimator, X_bwd, response_class)
 
                 phi_j = 0.5 * ((y_fwd - y_ref) + (y_sub - y_bwd))
                 phi_mat[:, j] = np.nan_to_num(phi_j, nan=0.0, posinf=0.0, neginf=0.0)
@@ -617,7 +697,7 @@ class SupervisoryPredictionMonitor:
         state: dict[str, Any],
         incoming_df: pd.DataFrame,
         *,
-        model_id: str,
+        model_id: str | None,
         baseline_model_id: str | None = None,
         actual_col: str | None = None,
         id_col: str | None = None,
@@ -633,61 +713,54 @@ class SupervisoryPredictionMonitor:
     ) -> dict[str, Any]:
         """Run full live prediction, actual-vs-baseline comparison, tolerance verification & alarm generation."""
         if incoming_df is None or incoming_df.empty:
-            raise ValueError("Incoming operational dataset is empty.")
+            raise EvaluationError("Incoming operational dataset is empty.")
 
         catalog = self.catalog_available_models(state)
         if not catalog:
-            raise ValueError(
+            raise EvaluationError(
                 "No trained model or baseline is available yet. Run Studio 03 (Baselines), Studio 06 (AutoML / Deep Learning), "
                 "or click 'Quick-Train Model' inside Studio 14."
             )
 
-        primary_entry = next((m for m in catalog if m["model_id"] == model_id), catalog[0])
-        baseline_entry = None
-        if baseline_model_id:
-            baseline_entry = next((m for m in catalog if m["model_id"] == baseline_model_id), None)
-        if baseline_entry is None:
-            baseline_entry = next(
-                (m for m in catalog if m["family"] == "Baseline" and m["model_id"] != primary_entry["model_id"]),
-                next((m for m in catalog if m["family"] == "Baseline"), None),
-            )
-
-        ref_df = state.get("uap_df") if isinstance(state.get("uap_df"), pd.DataFrame) else None
+        primary_entry, baseline_entry = self.model_pair(catalog, model_id, baseline_model_id)
         target_name = primary_entry["target"]
-        resolved_actual = actual_col if (actual_col and actual_col in incoming_df.columns) else (
-            target_name if target_name in incoming_df.columns else None
-        )
+        ref_df = state.get("uap_df") if isinstance(state.get("uap_df"), pd.DataFrame) else None
+        if actual_col and actual_col not in incoming_df.columns:
+            raise EvaluationError("The selected actual column is absent from the incoming data.")
+        known_outcomes = {m["target"] for m in catalog} | set(state.get("uap_targets") or ())
+        if actual_col != target_name and actual_col in known_outcomes:
+            raise EvaluationError("The selected actual column belongs to a different trained outcome.")
+        resolved_actual = actual_col or (target_name if target_name in incoming_df.columns else None)
 
-        # Cap row telemetry table at 5,000 rows while computing full-batch KPIs
         work_df = incoming_df.copy().reset_index(drop=True)
-        X_primary = self._model_input(work_df, primary_entry, ref_df)
-        preds = self._predict_safe(primary_entry["_estimator"], X_primary)
-
-        if baseline_entry is not None:
-            X_base = self._model_input(work_df, baseline_entry, ref_df, primary_entry["feature_cols"])
-            base_preds = self._predict_safe(baseline_entry["_estimator"], X_base)
-            baseline_label = baseline_entry["label"]
-        else:
-            # Fallback statistical mean/mode baseline computed from reference dataset
-            baseline_label = "Reference Mean/Mode Floor"
-            b_val: Any
-            if ref_df is not None and target_name in ref_df.columns:
-                if pd.api.types.is_numeric_dtype(ref_df[target_name]):
-                    b_val = float(pd.to_numeric(ref_df[target_name], errors="coerce").median())
-                else:
-                    b_val = str(ref_df[target_name].mode().iloc[0])
-            else:
-                b_val = float(np.nanmedian(preds)) if np.issubdtype(preds.dtype, np.number) else preds[0]
-            base_preds = np.full(len(work_df), b_val)
-
-        # Determine classification vs regression mode
-        is_clf = False
-        if resolved_actual is not None:
-            is_clf = _is_classification_target(work_df[resolved_actual])
-        elif not np.issubdtype(preds.dtype, np.number):
-            is_clf = True
+        try:
+            X_primary = self._model_input(work_df, primary_entry, ref_df, strict=primary_entry.get("_input_preprocessor") is None)
+            preds = np.asarray(primary_entry["_estimator"].predict(X_primary))
+        except Exception as exc:
+            raise EvaluationError("The fitted model could not score the incoming feature schema.") from exc
+        if preds.shape != (len(work_df),):
+            raise EvaluationError("The model returned an invalid prediction shape.")
+        model_task = self._model_task(primary_entry["_estimator"])
+        if model_task is not None:
+            is_clf = model_task != TaskType.REGRESSION
         elif ref_df is not None and target_name in ref_df.columns:
             is_clf = _is_classification_target(ref_df[target_name])
+        else:
+            is_clf = not pd.api.types.is_numeric_dtype(preds)
+
+        baseline_label = baseline_entry["label"] if baseline_entry is not None else None
+        X_base = None
+        base_preds = np.full(len(work_df), np.nan)
+        if baseline_entry is not None:
+            try:
+                X_base = self._model_input(
+                    work_df, baseline_entry, ref_df, strict=baseline_entry.get("_input_preprocessor") is None,
+                )
+                base_preds = np.asarray(baseline_entry["_estimator"].predict(X_base))
+            except Exception as exc:
+                raise EvaluationError("The comparison model could not score the incoming feature schema.") from exc
+            if base_preds.shape != (len(work_df),):
+                raise EvaluationError("The comparison model returned an invalid prediction shape.")
 
         # Compute reference feature means/stds for root-cause deviation hints on breach rows
         feat_stats: dict[str, tuple[float, float]] = {}
@@ -724,14 +797,19 @@ class SupervisoryPredictionMonitor:
         n_breach = 0
         n_warn = 0
         n_in_spec = 0
+        n_unavailable = 0
 
         kpis: dict[str, Any] = {
             "n_records": int(len(work_df)),
             "has_actuals": resolved_actual is not None,
             "task_mode": "classification" if is_clf else "regression",
             "model_label": primary_entry["label"],
+            "model_id": primary_entry["model_id"],
+            "target": target_name,
+            "baseline_model_id": baseline_entry["model_id"] if baseline_entry is not None else None,
             "model_family": primary_entry["family"],
             "baseline_label": baseline_label,
+            "baseline_unavailable_reason": "No eligible comparison model is available." if baseline_entry is None else None,
         }
 
         trend_series: list[dict[str, Any]] = []
@@ -753,58 +831,68 @@ class SupervisoryPredictionMonitor:
             base_denom = np.where(np.abs(b_num) > 1e-6, b_num, np.nan)
             actual_base_ratio = actuals / base_denom
 
-            # Estimate baseline residual sigma (from training holdout or robust MAD of current batch)
-            valid_res = residuals[np.isfinite(residuals)]
-            res_std = float(np.std(valid_res, ddof=1)) if len(valid_res) > 2 else 1.0
-            mad_sigma = float(1.4826 * np.median(np.abs(valid_res - np.median(valid_res)))) if len(valid_res) > 2 else res_std
-            sigma_ref = max(mad_sigma if mad_sigma > 1e-6 else res_std, 1e-6)
-            res_z = residuals / sigma_ref
-
-            ucl = float(max_sigma_z * sigma_ref)
-            warn_lim = float(warning_fraction * ucl)
-            spc_limits = {
-                "center": 0.0,
-                "ucl": round(ucl, 4),
-                "lcl": round(-ucl, 4),
-                "warn_upper": round(warn_lim, 4),
-                "warn_lower": round(-warn_lim, 4),
-                "sigma": round(sigma_ref, 4),
-            }
+            recorded = self._evaluation_holdout(state, primary_entry)
+            res_z = np.full(len(work_df), np.nan)
+            if recorded is not None:
+                X_ref, y_ref = recorded
+                raw_ref = np.asarray(primary_entry["_estimator"].predict(X_ref))
+                if raw_ref.shape == (len(y_ref),):
+                    ref_res = pd.to_numeric(y_ref, errors="coerce").to_numpy(dtype=float) - pd.to_numeric(raw_ref, errors="coerce")
+                    ref_res = ref_res[np.isfinite(ref_res)]
+                    if len(ref_res) >= 3:
+                        center = float(np.mean(ref_res))
+                        sigma = float(np.std(ref_res, ddof=1))
+                        if math.isfinite(center) and math.isfinite(sigma) and sigma > 0:
+                            res_z = (residuals - center) / sigma
+                            ucl = max_sigma_z * sigma
+                            warn_lim = warning_fraction * ucl
+                            spc_limits = {
+                                "center": center,
+                                "ucl": center + ucl,
+                                "lcl": center - ucl,
+                                "warn_upper": center + warn_lim,
+                                "warn_lower": center - warn_lim,
+                                "sigma": sigma,
+                            }
 
             for i in range(len(work_df)):
                 act = float(actuals[i]) if math.isfinite(actuals[i]) else None
-                prd = float(p_num[i]) if math.isfinite(p_num[i]) else 0.0
-                bpr = float(b_num[i]) if math.isfinite(b_num[i]) else 0.0
-                ae = float(abs_errors[i]) if math.isfinite(abs_errors[i]) else 0.0
-                pe = float(pct_errors[i]) if math.isfinite(pct_errors[i]) else 0.0
-                rz = float(res_z[i]) if math.isfinite(res_z[i]) else 0.0
+                prd = float(p_num[i]) if math.isfinite(p_num[i]) else None
+                bpr = float(b_num[i]) if math.isfinite(b_num[i]) else None
+                ae = float(abs_errors[i]) if math.isfinite(abs_errors[i]) else None
+                pe = float(pct_errors[i]) if math.isfinite(pct_errors[i]) else None
+                rz = float(res_z[i]) if math.isfinite(res_z[i]) else None
                 rat = float(actual_base_ratio[i]) if math.isfinite(actual_base_ratio[i]) else None
-                bae = float(base_abs_errors[i]) if math.isfinite(base_abs_errors[i]) else 0.0
+                bae = float(base_abs_errors[i]) if math.isfinite(base_abs_errors[i]) else None
 
                 breach_reasons: list[str] = []
                 warn_reasons: list[str] = []
 
-                if pe > max_pct_error:
+                if pe is not None and pe > max_pct_error:
                     breach_reasons.append(f"%Err {pe:.2f}% > {max_pct_error:.1f}%")
-                elif pe > max_pct_error * warning_fraction:
+                elif pe is not None and pe > max_pct_error * warning_fraction:
                     warn_reasons.append(f"%Err {pe:.2f}% near limit")
 
-                if max_abs_error is not None and max_abs_error > 0:
+                if ae is not None and max_abs_error is not None and max_abs_error > 0:
                     if ae > max_abs_error:
                         breach_reasons.append(f"|Err| {ae:.3f} > {max_abs_error:.3f}")
                     elif ae > max_abs_error * warning_fraction:
                         warn_reasons.append(f"|Err| {ae:.3f} near limit")
 
-                if abs(rz) > max_sigma_z:
+                if rz is not None and abs(rz) > max_sigma_z:
                     breach_reasons.append(f"SPC |Z|={abs(rz):.2f}σ > {max_sigma_z:.1f}σ")
-                elif abs(rz) > max_sigma_z * warning_fraction:
+                elif rz is not None and abs(rz) > max_sigma_z * warning_fraction:
                     warn_reasons.append(f"SPC |Z|={abs(rz):.2f}σ warning")
 
                 if rat is not None:
                     if rat < baseline_ratio_min or rat > baseline_ratio_max:
                         breach_reasons.append(f"Act/Base ratio {rat:.3f} outside [{baseline_ratio_min:.2f}, {baseline_ratio_max:.2f}]")
 
-                if breach_reasons:
+                if act is None or prd is None:
+                    st = "UNAVAILABLE"
+                    n_unavailable += 1
+                    reason_str = "Observed outcome or model prediction is missing or invalid."
+                elif breach_reasons:
                     st = "BREACH"
                     n_breach += 1
                     breach_indices.append(i)
@@ -816,9 +904,9 @@ class SupervisoryPredictionMonitor:
                                 "row_id": row_ids[i],
                                 "severity": "CRITICAL",
                                 "actual": round(act, 4) if act is not None else None,
-                                "predicted": round(prd, 4),
-                                "baseline_predicted": round(bpr, 4),
-                                "pct_error": round(pe, 2),
+                                "predicted": round(prd, 4) if prd is not None else None,
+                                "baseline_predicted": round(bpr, 4) if bpr is not None else None,
+                                "pct_error": round(pe, 2) if pe is not None else None,
                                 "actual_to_baseline_ratio": round(rat, 4) if rat is not None else None,
                                 "reason": reason_str,
                                 "feature_drivers": _top_deviations(i),
@@ -838,54 +926,59 @@ class SupervisoryPredictionMonitor:
                         {
                             "row_id": row_ids[i],
                             "actual": round(act, 4) if act is not None else None,
-                            "model_pred": round(prd, 4),
-                            "baseline_pred": round(bpr, 4),
-                            "abs_error": round(ae, 4),
-                            "pct_error": round(pe, 2),
-                            "residual": round(float(residuals[i]), 4) if math.isfinite(residuals[i]) else 0.0,
-                            "z_score": round(rz, 2),
+                            "model_pred": round(prd, 4) if prd is not None else None,
+                            "baseline_pred": round(bpr, 4) if bpr is not None else None,
+                            "abs_error": round(ae, 4) if ae is not None else None,
+                            "pct_error": round(pe, 2) if pe is not None else None,
+                            "residual": _finite_round(residuals[i], 4),
+                            "z_score": round(rz, 2) if rz is not None else None,
                             "actual_vs_baseline_ratio": round(rat, 4) if rat is not None else None,
-                            "baseline_error": round(bae, 4),
+                            "baseline_error": round(bae, 4) if bae is not None else None,
                             "status": st,
                             "alert_reason": reason_str,
                         }
                     )
 
-            # Aggregate Regression KPIs
-            fin = np.isfinite(actuals) & np.isfinite(p_num) & np.isfinite(b_num)
-            if fin.sum() >= 2:
-                mae = float(mean_absolute_error(actuals[fin], p_num[fin]))
-                rmse = float(root_mean_squared_error(actuals[fin], p_num[fin]))
-                r2 = float(r2_score(actuals[fin], p_num[fin]))
-                mape = float(np.mean(pct_errors[fin]))
-                bias = float(np.mean(p_num[fin] - actuals[fin]))
-                b_mae = float(mean_absolute_error(actuals[fin], b_num[fin]))
-                b_rmse = float(root_mean_squared_error(actuals[fin], b_num[fin]))
-                b_mape = float(np.mean((base_abs_errors[fin] / denom[fin]) * 100.0))
-                err_reduction_pct = ((b_rmse - rmse) / max(b_rmse, 1e-9)) * 100.0
-                fin_rat = actual_base_ratio[np.isfinite(actual_base_ratio)]
-                mean_ratio = float(np.mean(fin_rat)) if len(fin_rat) else 1.0
+            # Report primary performance on all valid rows and lift on matched rows only.
+            valid = np.isfinite(actuals) & np.isfinite(p_num) & np.isfinite(residuals)
+            kpis["evaluated_rows"] = int(valid.sum())
+            if valid.any():
                 kpis.update(
                     {
-                        "mae": round(mae, 4),
-                        "rmse": round(rmse, 4),
-                        "mape_pct": round(mape, 2),
-                        "r2": round(r2, 4),
-                        "mean_bias": round(bias, 4),
-                        "baseline_mae": round(b_mae, 4),
-                        "baseline_rmse": round(b_rmse, 4),
-                        "baseline_mape_pct": round(b_mape, 2),
-                        "model_vs_baseline_lift_pct": round(err_reduction_pct, 2),
-                        "mean_actual_to_baseline_ratio": round(mean_ratio, 4),
-                        "max_pct_error_observed": round(float(np.max(pct_errors[fin])), 2),
-                        "max_abs_error_observed": round(float(np.max(abs_errors[fin])), 4),
+                        "mae": _finite_round(mean_absolute_error(actuals[valid], p_num[valid]), 4),
+                        "rmse": _finite_round(root_mean_squared_error(actuals[valid], p_num[valid]), 4),
+                        "mape_pct": _finite_round(np.mean(pct_errors[valid]), 2),
+                        "mean_bias": _finite_round(np.mean(p_num[valid] - actuals[valid]), 4),
+                        "max_pct_error_observed": _finite_round(np.max(pct_errors[valid]), 2),
+                        "max_abs_error_observed": _finite_round(np.max(abs_errors[valid]), 4),
+                    }
+                )
+            if valid.sum() >= 2:
+                kpis["r2"] = _finite_round(r2_score(actuals[valid], p_num[valid], force_finite=False), 4)
+            matched = valid & np.isfinite(b_num) & np.isfinite(base_abs_errors)
+            kpis["comparison_rows"] = int(matched.sum())
+            if matched.any():
+                b_rmse = float(root_mean_squared_error(actuals[matched], b_num[matched]))
+                matched_rmse = float(root_mean_squared_error(actuals[matched], p_num[matched]))
+                fin_rat = actual_base_ratio[matched & np.isfinite(actual_base_ratio)]
+                kpis.update(
+                    {
+                        "baseline_mae": _finite_round(mean_absolute_error(actuals[matched], b_num[matched]), 4),
+                        "baseline_rmse": _finite_round(b_rmse, 4),
+                        "baseline_mape_pct": _finite_round(np.mean((base_abs_errors[matched] / denom[matched]) * 100.0), 2),
+                        "model_vs_baseline_lift_pct": _finite_round((b_rmse - matched_rmse) / b_rmse * 100.0, 2) if b_rmse > 0 else None,
+                        "mean_actual_to_baseline_ratio": _finite_round(np.mean(fin_rat), 4) if len(fin_rat) else None,
                     }
                 )
 
             # Subsample charts cleanly to <= 180 points for crisp engineering rendering
-            step = max(1, len(work_df) // 180)
+            step = max(1, math.ceil(len(work_df) / 180))
             for idx in range(0, len(work_df), step):
-                st_i = "BREACH" if (pct_errors[idx] > max_pct_error or abs(res_z[idx]) > max_sigma_z or (max_abs_error and abs_errors[idx] > max_abs_error)) else "IN_SPEC"
+                st_i = "UNAVAILABLE"
+                if math.isfinite(res_z[idx]):
+                    st_i = "BREACH" if abs(res_z[idx]) > max_sigma_z else (
+                        "WARNING" if abs(res_z[idx]) > max_sigma_z * warning_fraction else "IN_SPEC"
+                    )
                 trend_series.append(
                     {
                         "label": row_ids[idx],
@@ -897,9 +990,9 @@ class SupervisoryPredictionMonitor:
                 spc_points.append(
                     {
                         "label": row_ids[idx],
-                        "residual": round(float(residuals[idx]), 4) if math.isfinite(residuals[idx]) else 0.0,
-                        "ucl": spc_limits["ucl"],
-                        "lcl": spc_limits["lcl"],
+                        "residual": _finite_round(residuals[idx], 4),
+                        "ucl": spc_limits.get("ucl"),
+                        "lcl": spc_limits.get("lcl"),
                         "status": st_i,
                     }
                 )
@@ -928,37 +1021,48 @@ class SupervisoryPredictionMonitor:
                 ]
 
         elif resolved_actual is not None and is_clf:
-            actuals_s = work_df[resolved_actual].astype(str).to_numpy()
-            preds_s = pd.Series(preds).astype(str).to_numpy()
-            base_s = pd.Series(base_preds).astype(str).to_numpy()
+            actuals_s = work_df[resolved_actual].reset_index(drop=True)
+            preds_s = pd.Series(preds)
+            base_s = pd.Series(base_preds)
+            classes = getattr(primary_entry["_estimator"], "classes_", None)
+            valid_labels = actuals_s.notna() & preds_s.notna()
+            if classes is not None:
+                valid_labels &= actuals_s.isin(classes) & preds_s.isin(classes)
+            matches = actuals_s.eq(preds_s).fillna(False)
+            base_matches = actuals_s.eq(base_s).fillna(False)
+            matched_labels = valid_labels & base_s.notna()
             probas = None
-            if hasattr(primary_entry["_estimator"], "predict_proba"):
-                try:
-                    pmat = primary_entry["_estimator"].predict_proba(X_primary)
-                    probas = np.max(pmat, axis=1)
-                except Exception:
-                    probas = None
+            probabilities = self._probabilities(primary_entry["_estimator"], X_primary)
+            if probabilities is not None:
+                labels, pmat = probabilities
+                indices = labels.get_indexer(preds)
+                probas = np.where(indices >= 0, pmat[np.arange(len(preds)), indices] * 100, np.nan)
 
             for i in range(len(work_df)):
-                match_m = actuals_s[i] == preds_s[i]
-                match_b = actuals_s[i] == base_s[i]
-                conf = float(probas[i] * 100.0) if probas is not None else None
-                if not match_m:
+                actual = actuals_s.iloc[i] if pd.notna(actuals_s.iloc[i]) else None
+                prediction = preds_s.iloc[i] if pd.notna(preds_s.iloc[i]) else None
+                baseline = base_s.iloc[i] if pd.notna(base_s.iloc[i]) else None
+                match_b = bool(base_matches.iloc[i]) if matched_labels.iloc[i] else None
+                conf = _finite_round(probas[i], 1) if probas is not None else None
+                if not valid_labels.iloc[i]:
+                    st = "UNAVAILABLE"
+                    n_unavailable += 1
+                    reason_str = "Observed outcome or prediction is missing or outside the model's class labels."
+                elif not matches.iloc[i]:
                     st = "BREACH"
                     n_breach += 1
                     breach_indices.append(i)
-                    reason_str = f"Misclassification: Actual={actuals_s[i]} vs Pred={preds_s[i]}"
+                    reason_str = "Predicted class differs from the observed class."
                     if len(alarms) < 80:
                         alarms.append(
                             {
                                 "_row_idx": i,
                                 "row_id": row_ids[i],
                                 "severity": "CRITICAL",
-                                "actual": actuals_s[i],
-                                "predicted": preds_s[i],
-                                "baseline_predicted": base_s[i],
+                                "actual": actual,
+                                "predicted": prediction,
+                                "baseline_predicted": baseline,
                                 "pct_error": 100.0,
-                                "actual_to_baseline_ratio": 1.0 if match_b else 0.0,
                                 "reason": reason_str,
                                 "feature_drivers": _top_deviations(i),
                             }
@@ -971,105 +1075,78 @@ class SupervisoryPredictionMonitor:
                     st = "IN_SPEC"
                     n_in_spec += 1
                     reason_str = "Exact match"
-
                 if i < 500:
                     rows_out.append(
                         {
                             "row_id": row_ids[i],
-                            "actual": actuals_s[i],
-                            "model_pred": preds_s[i],
-                            "baseline_pred": base_s[i],
-                            "confidence_pct": round(conf, 1) if conf is not None else None,
-                            "baseline_match": "Match" if match_b else "Miss",
+                            "actual": actual,
+                            "model_pred": prediction,
+                            "baseline_pred": baseline,
+                            "confidence_pct": conf,
+                            "baseline_match": ("Match" if match_b else "Miss") if match_b is not None else None,
                             "status": st,
                             "alert_reason": reason_str,
                         }
                     )
 
-            acc = float(accuracy_score(actuals_s, preds_s) * 100.0)
-            f1 = float(f1_score(actuals_s, preds_s, average="weighted", zero_division=0) * 100.0)
-            b_acc = float(accuracy_score(actuals_s, base_s) * 100.0)
-            kpis.update(
-                {
-                    "accuracy_pct": round(acc, 2),
-                    "f1_weighted_pct": round(f1, 2),
-                    "baseline_accuracy_pct": round(b_acc, 2),
-                    "model_vs_baseline_lift_pct": round(acc - b_acc, 2),
-                    "min_accuracy_threshold_pct": min_classification_accuracy_pct,
-                }
-            )
-            # Rolling accuracy trend
+            kpis["evaluated_rows"] = int(valid_labels.sum())
+            kpis["comparison_rows"] = int(matched_labels.sum())
+            kpis["min_accuracy_threshold_pct"] = min_classification_accuracy_pct
+            if valid_labels.any():
+                kpis["accuracy_pct"] = round(float(accuracy_score(actuals_s[valid_labels], preds_s[valid_labels])) * 100, 2)
+                kpis["f1_weighted_pct"] = round(float(f1_score(actuals_s[valid_labels], preds_s[valid_labels], average="weighted", zero_division=0)) * 100, 2)
+            if matched_labels.any():
+                b_acc = float(base_matches[matched_labels].mean()) * 100.0
+                acc = float(matches[matched_labels].mean()) * 100.0
+                kpis["baseline_accuracy_pct"] = round(b_acc, 2)
+                kpis["model_vs_baseline_lift_pct"] = round(acc - b_acc, 2)
+
             win = max(5, len(work_df) // 25)
-            matches_arr = (actuals_s == preds_s).astype(float) * 100.0
-            b_matches_arr = (actuals_s == base_s).astype(float) * 100.0
             for idx in range(win, len(work_df) + 1, max(1, win // 2)):
+                window = slice(idx - win, idx)
+                valid_window = valid_labels.iloc[window]
+                matched_window = matched_labels.iloc[window]
                 trend_series.append(
                     {
                         "label": row_ids[idx - 1],
-                        "actual": min_classification_accuracy_pct,
-                        "predicted": round(float(np.mean(matches_arr[max(0, idx - win) : idx])), 2),
-                        "baseline": round(float(np.mean(b_matches_arr[max(0, idx - win) : idx])), 2),
+                        "actual": None,
+                        "threshold": min_classification_accuracy_pct,
+                        "predicted": _finite_round(matches.iloc[window][valid_window].mean() * 100.0, 2),
+                        "baseline": _finite_round(base_matches.iloc[window][matched_window].mean() * 100.0, 2),
                     }
                 )
         else:
-            # Score-only mode (no actual column in incoming data): compare Model vs Baseline deviation!
-            p_num = pd.to_numeric(pd.Series(preds), errors="coerce").to_numpy(dtype=float) if not is_clf else None
-            b_num = pd.to_numeric(pd.Series(base_preds), errors="coerce").to_numpy(dtype=float) if not is_clf else None
+            # Predictions without observed outcomes cannot establish compliance.
             for i in range(len(work_df)):
-                if not is_clf and p_num is not None and b_num is not None and math.isfinite(p_num[i]) and math.isfinite(b_num[i]):
-                    ratio = p_num[i] / b_num[i] if abs(b_num[i]) > 1e-6 else 1.0
-                    pct_gap = abs(p_num[i] - b_num[i]) / max(abs(b_num[i]), 1.0) * 100.0
-                    if ratio < baseline_ratio_min or ratio > baseline_ratio_max:
-                        st = "WARNING"
-                        n_warn += 1
-                        reason_str = f"Model/Baseline divergence ratio={ratio:.3f} (no observed actual yet)"
-                    else:
-                        st = "IN_SPEC"
-                        n_in_spec += 1
-                        reason_str = "Aligned with baseline expectation"
-                    if i < 500:
-                        rows_out.append(
-                            {
-                                "row_id": row_ids[i],
-                                "actual": None,
-                                "model_pred": round(float(p_num[i]), 4),
-                                "baseline_pred": round(float(b_num[i]), 4),
-                                "model_vs_baseline_gap_pct": round(pct_gap, 2),
-                                "model_to_baseline_ratio": round(ratio, 4),
-                                "status": st,
-                                "alert_reason": reason_str,
-                            }
-                        )
-                    if i % max(1, len(work_df) // 150) == 0:
-                        trend_series.append(
-                            {
-                                "label": row_ids[i],
-                                "actual": None,
-                                "predicted": round(float(p_num[i]), 4),
-                                "baseline": round(float(b_num[i]), 4),
-                            }
-                        )
-                else:
-                    n_in_spec += 1
-                    if i < 500:
-                        rows_out.append(
-                            {
-                                "row_id": row_ids[i],
-                                "actual": None,
-                                "model_pred": str(preds[i]),
-                                "baseline_pred": str(base_preds[i]),
-                                "status": "IN_SPEC",
-                                "alert_reason": "Scored (awaiting observed actual)",
-                            }
-                        )
+                prediction = preds[i] if pd.notna(preds[i]) else None
+                baseline = base_preds[i] if pd.notna(base_preds[i]) else None
+                if not is_clf:
+                    prediction = _finite_round(pd.to_numeric(prediction, errors="coerce"), 4)
+                    baseline = _finite_round(pd.to_numeric(baseline, errors="coerce"), 4)
+                if not is_clf and i % max(1, math.ceil(len(work_df) / 180)) == 0:
+                    trend_series.append({"label": row_ids[i], "actual": None, "predicted": prediction, "baseline": baseline})
+                n_unavailable += 1
+                if i < 500:
+                    rows_out.append(
+                        {
+                            "row_id": row_ids[i],
+                            "actual": None,
+                            "model_pred": prediction,
+                            "baseline_pred": baseline,
+                            "status": "UNAVAILABLE",
+                            "alert_reason": "An observed outcome is required to evaluate tolerance compliance.",
+                        }
+                    )
 
-        breach_rate = round(n_breach / max(len(work_df), 1) * 100.0, 2)
-        compliance_rate = round((len(work_df) - n_breach) / max(len(work_df), 1) * 100.0, 2)
+        evaluated = n_breach + n_warn + n_in_spec
+        breach_rate = round(n_breach / evaluated * 100.0, 2) if evaluated else None
+        compliance_rate = round((evaluated - n_breach) / evaluated * 100.0, 2) if evaluated else None
         kpis.update(
             {
                 "in_spec_count": n_in_spec,
                 "warning_count": n_warn,
                 "breach_count": n_breach,
+                "unavailable_count": n_unavailable,
                 "breach_rate_pct": breach_rate,
                 "compliance_rate_pct": compliance_rate,
             }
@@ -1077,9 +1154,9 @@ class SupervisoryPredictionMonitor:
 
         # System-Level Health & Executive Alarm Banner
         system_alerts: list[str] = []
-        if breach_rate > max_batch_breach_rate_pct:
+        if breach_rate is not None and breach_rate > max_batch_breach_rate_pct:
             system_alerts.append(
-                f"CRITICAL TOLERANCE BREACH: {n_breach:,} / {len(work_df):,} records ({breach_rate:.2f}%) exceeded permissible error threshold (batch limit: {max_batch_breach_rate_pct:.1f}%)."
+                f"CRITICAL TOLERANCE BREACH: {n_breach:,} / {evaluated:,} evaluable records ({breach_rate:.2f}%) exceeded permissible error threshold (batch limit: {max_batch_breach_rate_pct:.1f}%)."
             )
         elif n_breach > 0:
             system_alerts.append(
@@ -1094,76 +1171,55 @@ class SupervisoryPredictionMonitor:
                 f"EARLY WARNING: {n_warn:,} record(s) are approaching error tolerance boundaries (>={int(warning_fraction * 100)}% of limit)."
             )
 
-        if breach_rate > max_batch_breach_rate_pct or (
+        if n_unavailable:
+            system_alerts.append(f"{n_unavailable:,} record(s) could not be evaluated for tolerance compliance.")
+        if (breach_rate is not None and breach_rate > max_batch_breach_rate_pct) or (
             is_clf and resolved_actual and kpis.get("accuracy_pct", 100.0) < min_classification_accuracy_pct
         ):
             system_status = "CRITICAL_ALARM"
-        elif n_breach > 0 or n_warn > 0:
+        elif not evaluated:
+            system_status = "UNAVAILABLE"
+        elif n_breach or n_warn or n_unavailable:
             system_status = "WARNING"
         else:
             system_status = "NORMAL"
 
-        # Extract Exact Mathematical Equations for BOTH Champion Model & Reference Baseline Model
         champion_equation = self.extract_model_equation(primary_entry, ref_df=ref_df)
         baseline_equation = self.extract_model_equation(baseline_entry, ref_df=ref_df)
-        if baseline_equation is None:
-            b_val = float(pd.to_numeric(pd.Series(base_preds), errors="coerce").dropna().mean()) if len(base_preds) else 0.0
-            if not math.isfinite(b_val):
-                b_val = 0.0
-            b_label = "Training Majority-Class Prior Baseline" if is_clf else "Training Historical Mean Baseline"
-            safe_t = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in target_name).strip("_") or "target"
-            baseline_equation = {
-                "model_name": b_label,
-                "model_family": "baseline",
-                "task_type": "classification" if is_clf else "regression",
-                "target_name": target_name,
-                "equation_type": "constant_baseline",
-                "formula_plain": f"{target_name}_baseline = {b_val:.6g}  (constant historical reference)",
-                "formula_latex": rf"\widehat{{\text{{{target_name}}}}}_{{\text{{base}}}} = {b_val:.6g}",
-                "formula_python": f"def predict_{safe_t}_baseline(row: dict) -> float:\n    return {b_val:.8f}\n",
-                "formula_excel": f"={b_val:.6f}",
-                "formula_sql": f"SELECT {b_val:.6f} AS predicted_{safe_t}_baseline FROM your_table;",
-                "formula_c_matlab": f"double predicted_{safe_t}_baseline = {b_val:.8f};",
-                "external_usage_summary": (
-                    f"CONSTANT REFERENCE BASELINE ({b_label}): Represents the historical in-control mean/prior "
-                    f"({b_val:.4g}). Run Studio 03 Baselines to upgrade to a full multivariate Ridge/Logistic/GAM reference equation."
-                ),
-                "intercept": round(b_val, 6),
-                "n_features_total": len(primary_entry["feature_cols"]),
-                "n_features_active": 0,
-                "coefficients_table": [],
-                "notes": [
-                    "No separate Studio 03 multivariate baseline was selected; using historical training mean/prior reference.",
-                    "Run Studio 03 (Universal Diagnostics & Baselines) to benchmark against Ridge, Logistic, or B-Spline GAM baselines.",
-                ],
-            }
 
-        # Compute Signed Root-Cause Attribution (What Caused Increase (+) or Decrease (-) vs Baseline)
-        preds_scalar = self._predict_scalar_response(primary_entry["_estimator"], X_primary, is_clf)
-        base_scalar: np.ndarray | None
-        if baseline_entry is not None:
-            X_base_rc = self._model_input(work_df, baseline_entry, ref_df, primary_entry["feature_cols"])
-            base_scalar = self._predict_scalar_response(baseline_entry["_estimator"], X_base_rc, is_clf)
-        else:
-            b_num_rc = pd.to_numeric(pd.Series(base_preds), errors="coerce").to_numpy(dtype=float)
-            base_scalar = np.nan_to_num(b_num_rc, nan=0.0) if not np.isnan(b_num_rc).all() else None
-        actuals_scalar = (
-            pd.to_numeric(work_df[resolved_actual], errors="coerce").to_numpy(dtype=float)
-            if (resolved_actual is not None and not is_clf)
-            else None
-        )
-
-        root_cause_analysis, per_row_diag = self._analyze_root_causes(
-            estimator=primary_entry["_estimator"],
-            X_primary=X_primary,
-            ref_df=ref_df,
-            preds_scalar=preds_scalar,
-            base_scalar=base_scalar,
-            actuals_scalar=actuals_scalar,
-            is_clf=is_clf,
-            target_name=target_name,
-            breach_indices=breach_indices,
-        )
+        # Explain only directly comparable numeric responses. In classification
+        # both models must predict the probability of the same explicit class.
+        root_cause_analysis: dict[str, Any] | None = None
+        per_row_diag: dict[int, dict[str, Any]] = {}
+        if baseline_entry is not None and X_base is not None:
+            estimator = primary_entry["_estimator"]
+            baseline_estimator = baseline_entry["_estimator"]
+            classes = getattr(estimator, "classes_", None)
+            response_class = classes[-1] if is_clf and classes is not None and len(classes) >= 2 else None
+            if not is_clf or response_class is not None:
+                try:
+                    preds_scalar = self._predict_scalar_response(estimator, X_primary, response_class)
+                    base_scalar = self._predict_scalar_response(baseline_estimator, X_base, response_class)
+                except (EvaluationError, TypeError, ValueError):
+                    pass
+                else:
+                    if np.isfinite(preds_scalar).all() and np.isfinite(base_scalar).all():
+                        actuals_scalar = (
+                            pd.to_numeric(work_df[resolved_actual], errors="coerce").to_numpy(dtype=float)
+                            if resolved_actual is not None and not is_clf else None
+                        )
+                        root_cause_analysis, per_row_diag = self._analyze_root_causes(
+                            estimator=estimator,
+                            X_primary=X_primary,
+                            ref_df=ref_df,
+                            preds_scalar=preds_scalar,
+                            base_scalar=base_scalar,
+                            actuals_scalar=actuals_scalar,
+                            response_class=response_class,
+                            target_name=target_name,
+                            breach_indices=breach_indices,
+                        )
+                        root_cause_analysis["response_class"] = response_class
 
         # Enrich every alarm record with its exact signed Increase/Decrease root-cause diagnosis & fix
         enriched_alarms: list[dict[str, Any]] = []
@@ -1200,7 +1256,11 @@ class SupervisoryPredictionMonitor:
                 "champion_equation": champion_equation,
                 "baseline_equation": baseline_equation,
                 "root_cause_analysis": root_cause_analysis,
-                "spc_limits": spc_limits,
+                "spc_limits": spc_limits or None,
+                "spc_unavailable_reason": (
+                    "SPC requires a verified held-out residual reference with nonzero variation."
+                    if resolved_actual is not None and not is_clf and not spc_limits else None
+                ),
                 "trend_series": trend_series,
                 "spc_points": spc_points,
                 "ratio_points": ratio_points,
@@ -1213,12 +1273,18 @@ class SupervisoryPredictionMonitor:
         # Persist latest result and longitudinal monitoring history for Reporting & Supervisory Dashboard
         state["uap_supervisory_result"] = result
         state["uap_supervisory_scored_df"] = pd.DataFrame(rows_out)
+        # Retain the analysis inputs needed for cohort diagnostics. Unrelated
+        # columns from operational uploads stay out of saved workspace results.
+        study_columns = ref_df.columns if ref_df is not None else X_primary.columns
+        shared_columns = [column for column in work_df.columns if column in study_columns]
+        state["uap_supervisory_input_df"] = work_df.loc[:, shared_columns].copy()
         hist = state.setdefault("uap_supervisory_history", [])
         hist.append(
             {
                 "timestamp": result["timestamp_utc"],
                 "source": source_label,
                 "model": primary_entry["label"],
+                "target": target_name,
                 "baseline": baseline_label,
                 "records": len(work_df),
                 "compliance_pct": compliance_rate,

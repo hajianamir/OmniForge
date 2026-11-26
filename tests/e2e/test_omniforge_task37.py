@@ -200,6 +200,10 @@ def test_api_s06_export_formula_and_s14_equations_and_root_cause() -> None:
     r_load = client.post("/api/workbench/s01/load-sample", json={"dataset_key": "02_industrial_predictive_maint"})
     assert r_load.status_code == 200, r_load.text
 
+    # Fit an actual comparison model for the same outcome and task.
+    baseline = client.post("/api/workbench/s14/quick-train", json={"method": "ridge"})
+    assert baseline.status_code == 200, baseline.text
+
     # 2. Run Studio 06 AutoML
     r_automl = client.post(
         "/api/workbench/s06/automl",

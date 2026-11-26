@@ -5,9 +5,11 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, cast
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Depends, Header
 
+from omniforge.api.auth import authorize_principal, require_permission
 from omniforge.api.studios.schemas import DiagnosticsReq, wb_cache_and_respond
+from omniforge.core.types import Principal
 from omniforge.core.utils import to_json_object
 from omniforge.eda.diagnostics import (
     DIAGNOSTIC_TEST_CATALOG,
@@ -15,6 +17,7 @@ from omniforge.eda.diagnostics import (
     StatisticalCriteriaConfig,
     UniversalDiagnosticsSuite,
 )
+from omniforge.ui.state import clear_supervisory_evaluation
 
 router = APIRouter(tags=["workbench-s03"])
 
@@ -36,7 +39,11 @@ def s03_catalog() -> dict[str, Any]:
 
 
 @router.post("/s03/run")
-def s03_run_diagnostics(req: DiagnosticsReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
+def s03_run_diagnostics(
+    req: DiagnosticsReq,
+    x_session_id: str | None = Header(default="default"),
+    principal: Principal = Depends(require_permission("data:read")),
+) -> dict[str, Any]:
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
     active = _wb()._require_df(state)
@@ -64,12 +71,17 @@ def s03_run_diagnostics(req: DiagnosticsReq, x_session_id: str | None = Header(d
         modules = list(req.selected_modules)
     else:
         modules = None  # Complete / Select All
+    fit_baselines = bool(targets and (modules is None or "baseline_benchmark" in modules))
+    if fit_baselines:
+        authorize_principal(principal, "model:train")
     report = suite.run(df, target_cols=targets, selected_modules=modules, criteria=criteria, baseline_partitions=partitions)
     state["uap_diag_report"] = report
     state["uap_diag_criteria"] = criteria.model_dump() if hasattr(criteria, "model_dump") else dataclasses.asdict(criteria)
     state["uap_baseline_results"] = report.baseline_benchmarks
     state["uap_baseline_equations"] = report.baseline_equations
-    state["uap_baseline_models"] = dict(getattr(suite, "last_baseline_models_", {}) or {})
+    if fit_baselines:
+        clear_supervisory_evaluation(state)
+        state["uap_baseline_models"] = dict(getattr(suite, "last_baseline_models_", {}) or {})
     state["uap_risk_report"] = report.risk_assessment
     _wb().record_lineage(
         state,

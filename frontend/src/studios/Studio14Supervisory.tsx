@@ -33,6 +33,7 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
   const [selectedModelId, setSelectedModelId] = useState('');
   const [selectedBaselineId, setSelectedBaselineId] = useState('');
   const [quickMethod, setQuickMethod] = useState('ridge');
+  const [quickTarget, setQuickTarget] = useState('');
   const [sourceTab, setSourceTab] = useState<'file' | 'sql' | 'access' | 'sim' | 'single'>('file');
 
   // Tolerance & Alarm configuration
@@ -109,14 +110,23 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
     return () => { current = false; };
   }, [ws]);
 
+  const selectedModel = models.find((model) => model.model_id === selectedModelId) ?? models[0];
+  const eligibleBaselines = selectedModel ? models.filter((model) =>
+    model.model_id !== selectedModel.model_id && model.target === selectedModel.target &&
+    (!selectedModel.task_type || model.task_type === selectedModel.task_type),
+  ) : [];
+  const baselineId = eligibleBaselines.some((model) => model.model_id === selectedBaselineId) ? selectedBaselineId : '';
+  const availableTargets = ws.targets;
+  const trainingTarget = availableTargets.includes(quickTarget) ? quickTarget : (availableTargets.length === 1 ? availableTargets[0] : '');
+
   useEffect(() => {
     if (!models.length) return;
-    const mid = selectedModelId || models[0]?.model_id || '';
+    const mid = selectedModel?.model_id;
     if (!mid) return;
     let current = true;
     const q = new URLSearchParams();
     q.set('model_id', mid);
-    if (selectedBaselineId) q.set('baseline_model_id', selectedBaselineId);
+    if (baselineId) q.set('baseline_model_id', baselineId);
     apiGet<SupervisoryStatusResponse>(`/api/workbench/s14/equations?${q.toString()}`)
       .then((r) => {
         if (!current) return;
@@ -125,15 +135,11 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
       })
       .catch(() => {});
     return () => { current = false; };
-  }, [selectedModelId, selectedBaselineId, models]);
-
-  useEffect(() => {
-    if (ws.primary_target && !actualCol) setActualCol(ws.primary_target);
-  }, [ws.primary_target, actualCol]);
+  }, [selectedModel?.model_id, baselineId, models]);
 
   const tolPayload = () => ({
-    model_id: selectedModelId || models[0]?.model_id || 'active_champion',
-    baseline_model_id: selectedBaselineId || null,
+    model_id: selectedModel?.model_id || 'active_champion',
+    baseline_model_id: baselineId || null,
     actual_col: actualCol.trim() || null,
     id_col: idCol.trim() || null,
     max_pct_error: maxPctErr,
@@ -149,9 +155,9 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
   const handleQuickTrain = async () => {
     setBusy(true); setErr(null); setMsg(null);
     try {
-      const res = await apiPost<SupervisoryTrainResponse>('/api/workbench/s14/quick-train', { method: quickMethod, epochs: 15 });
+      const res = await apiPost<SupervisoryTrainResponse>('/api/workbench/s14/quick-train', { method: quickMethod, target: trainingTarget, epochs: 15 });
       setModels(res.models || []);
-      const newest = (res.models || []).find((m) => m.label.includes(res.trained_model ?? '')) || (res.models || [])[0];
+      const newest = (res.models || []).find((m) => m.target === trainingTarget && m.label.includes(res.trained_model ?? '')) || (res.models || [])[0];
       if (newest) setSelectedModelId(newest.model_id);
       onSync(res.state);
       setMsg(`Trained '${res.trained_model}' (${res.metric}=${res.score}) and registered in Supervisory Monitor.`);
@@ -281,40 +287,44 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
   const evaluateSingle = async () => {
     setBusy(true); setErr(null); setMsg(null);
     try {
-      const activeModelObj = models.find((m) => m.model_id === selectedModelId) || models[0];
-      const fCols: string[] = activeModelObj?.feature_cols?.length ? activeModelObj.feature_cols : ws.numeric_columns.slice(0, 8);
       const rec: Record<string, string | number> = {};
-      fCols.forEach((c) => {
-        const rawV = singleInputs[c];
-        rec[c] = rawV !== undefined && rawV !== '' ? (Number.isNaN(Number(rawV)) ? rawV : Number(rawV)) : 0;
+      singleFeatCols.forEach((column) => {
+        const value = singleInputs[column];
+        if (value === undefined || value === '') return;
+        const kind = selectedModel?.input_types?.[column];
+        rec[column] = !kind && ws.numeric_columns.includes(column) && Number.isFinite(Number(value)) ? Number(value) : value;
       });
+      const numericOutcome = ws.numeric_columns.includes(selectedModel?.target ?? '');
+      const observed = singleActual.trim();
       const res = await apiPost<SupervisoryEvaluateResponse>('/api/workbench/s14/evaluate-single', {
         ...tolPayload(),
         record: rec,
-        actual_value: singleActual.trim() ? (Number.isNaN(Number(singleActual)) ? singleActual : Number(singleActual)) : null,
+        actual_value: observed ? (numericOutcome && Number.isFinite(Number(observed)) ? Number(observed) : observed) : null,
       });
       onSync(res.state); setEvalRes(res);
       setMsg(`Single reading evaluated — Status: ${res.system_status}.`);
     } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
   };
 
-  const activeModelMeta = models.find((m) => m.model_id === selectedModelId) || models[0];
-  const singleFeatCols: string[] = activeModelMeta?.feature_cols?.length ? activeModelMeta.feature_cols.slice(0, 12) : ws.numeric_columns.slice(0, 8);
+  const singleFeatCols = selectedModel?.input_columns ?? selectedModel?.feature_cols ?? [];
 
   const statusKey =
     evalRes?.system_status === 'CRITICAL_ALARM'
       ? 'critical'
       : evalRes?.system_status === 'WARNING'
         ? 'warning'
-        : 'normal';
+        : evalRes?.system_status === 'NORMAL' ? 'normal' : 'unavailable';
 
   const filteredAlarms = (evalRes?.alarms || []).filter((a) =>
     alarmFilter === 'ALL' ? true : String(a.severity || '').toUpperCase().includes(alarmFilter),
   );
   const activeChampEq = evalRes?.champion_equation || previewChampEq;
-  const activeBaseEq = evalRes?.baseline_equation || previewBaseEq;
+  const activeBaseEq = evalRes ? evalRes.baseline_equation : previewBaseEq;
   const rootCause = evalRes?.root_cause_analysis || null;
   const gainVsBase = evalRes?.kpis?.model_vs_baseline_lift_pct ?? evalRes?.kpis?.mae_improvement_vs_baseline_pct;
+  const compliance = evalRes?.kpis?.compliance_rate_pct;
+  const complianceText = typeof compliance === 'number' ? `${compliance.toFixed(1)}%` : 'Unavailable';
+  const classification = evalRes?.kpis?.task_mode === 'classification';
   const alarmDisplayRows = filteredAlarms.map((a) => ({
     row_id: a.row_id,
     severity: a.severity,
@@ -367,7 +377,7 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
 
         <div className="grid-2" style={{ marginBottom: 12 }}>
           <label className="field">Primary Evaluation Model (Baseline / AutoML / Deep Learning)
-            <select value={selectedModelId} onChange={(e) => setSelectedModelId(e.target.value)}>
+            <select value={selectedModelId} onChange={(e) => { setSelectedModelId(e.target.value); setSelectedBaselineId(''); setActualCol(''); }}>
               {models.length === 0 && <option value="">No models trained yet — use Quick-Train below or run Studio 03 / 06</option>}
               {models.map((m) => (
                 <option key={m.model_id} value={m.model_id}>
@@ -377,9 +387,9 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
             </select>
           </label>
           <label className="field">Comparison Reference Baseline (Auto-selected if blank)
-            <select value={selectedBaselineId} onChange={(e) => setSelectedBaselineId(e.target.value)}>
-              <option value="">Auto-Select Best Fitted Baseline</option>
-              {models.map((m) => (
+            <select value={baselineId} onChange={(e) => setSelectedBaselineId(e.target.value)}>
+              <option value="">Select fitted baseline automatically</option>
+              {eligibleBaselines.map((m) => (
                 <option key={m.model_id} value={m.model_id}>[{m.family}] {m.label}</option>
               ))}
             </select>
@@ -408,7 +418,13 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
               <option value="mlp">Residual MLP Neural Network</option>
             </optgroup>
           </select>
-          <button className="btn btn-primary btn-sm" disabled={busy || !ws.has_dataset} onClick={handleQuickTrain}>
+          <label className="field">Training outcome
+            <select value={trainingTarget} onChange={(event) => setQuickTarget(event.target.value)}>
+              <option value="">Select an outcome</option>
+              {availableTargets.map((target) => <option key={target} value={target}>{target}</option>)}
+            </select>
+          </label>
+          <button className="btn btn-primary btn-sm" disabled={busy || !ws.has_dataset || !trainingTarget} onClick={handleQuickTrain}>
             {busy ? <span className="spinner" /> : null} Quick-Train &amp; Select Model
           </button>
         </div>
@@ -481,7 +497,7 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
             <input type="number" step={0.5} min={0} max={100} value={maxBatchBreachPct} onChange={(e) => setMaxBatchBreachPct(Number(e.target.value))} />
           </label>
           <label className="field">Actual Ground-Truth Column
-            <input type="text" placeholder={ws.primary_target || 'auto-detect target col'} value={actualCol} onChange={(e) => setActualCol(e.target.value)} />
+            <input type="text" placeholder={selectedModel?.target || 'Use the fitted model outcome'} value={actualCol} onChange={(e) => setActualCol(e.target.value)} />
           </label>
         </div>
         <div className="grid-2" style={{ marginTop: 10 }}>
@@ -603,10 +619,10 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
             <div className="grid-4" style={{ marginBottom: 10 }}>
               {singleFeatCols.map((c) => (
                 <label key={c} className="field">{c}
-                  <input type="text" placeholder="0" value={singleInputs[c] || ''} onChange={(e) => setSingleInputs((p) => ({ ...p, [c]: e.target.value }))} />
+                  <input type="text" placeholder="Enter a measurement" value={singleInputs[c] || ''} onChange={(e) => setSingleInputs((p) => ({ ...p, [c]: e.target.value }))} />
                 </label>
               ))}
-              <label className="field">Measured Actual ({ws.primary_target || 'Target'})
+              <label className="field">Measured Actual ({selectedModel?.target || 'Outcome'})
                 <input type="text" placeholder="Optional measured value" value={singleActual} onChange={(e) => setSingleActual(e.target.value)} />
               </label>
             </div>
@@ -637,7 +653,8 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
               </div>
             </div>
             <div className="row" style={{ gap: 8 }}>
-              <span className="badge badge-green">Compliance: {Number(evalRes.kpis?.compliance_rate_pct ?? 100).toFixed(1)}%</span>
+              <span className={typeof compliance === 'number' ? 'badge badge-green' : 'badge'}>Compliance: {complianceText}</span>
+              {(evalRes.kpis?.unavailable_count ?? 0) > 0 && <span className="badge">Unevaluable: {evalRes.kpis?.unavailable_count}</span>}
               <span className="badge badge-red">Breaches: {String(evalRes.kpis?.breach_count ?? 0)}</span>
               <span className="badge badge-amber">Warnings: {String(evalRes.kpis?.warning_count ?? 0)}</span>
             </div>
@@ -655,11 +672,11 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
           {/* Executive Engineering KPI Grid */}
           <div className="kpi-grid">
             <div className="kpi-card"><div className="kpi-label">Records Evaluated</div><div className="kpi-value">{String(evalRes.kpis?.n_records ?? 0)}</div></div>
-            <div className="kpi-card"><div className="kpi-label">Tolerance Compliance</div><div className="kpi-value" style={{ color: Number(evalRes.kpis?.compliance_rate_pct ?? 100) >= 95 ? 'var(--green)' : 'var(--red)' }}>{Number(evalRes.kpis?.compliance_rate_pct ?? 100).toFixed(1)}%</div></div>
-            <div className="kpi-card"><div className="kpi-label">Critical Breaches</div><div className="kpi-value" style={{ color: Number(evalRes.kpis?.breach_count ?? 0) > 0 ? 'var(--red)' : 'var(--green)' }}>{String(evalRes.kpis?.breach_count ?? 0)}</div></div>
-            <div className="kpi-card"><div className="kpi-label">Model MAE / MAPE</div><div className="kpi-value" style={{ fontSize: 16 }}>{evalRes.kpis?.mae !== undefined ? `${Number(evalRes.kpis.mae).toFixed(3)} (${Number(evalRes.kpis.mape_pct ?? 0).toFixed(2)}%)` : `${Number(evalRes.kpis?.accuracy_pct ?? 0).toFixed(1)}% Acc`}</div></div>
-            <div className="kpi-card"><div className="kpi-label">Baseline MAE</div><div className="kpi-value" style={{ fontSize: 16 }}>{evalRes.kpis?.baseline_mae !== undefined ? Number(evalRes.kpis.baseline_mae).toFixed(3) : 'N/A'}</div></div>
-            <div className="kpi-card"><div className="kpi-label">Gain vs Baseline</div><div className="kpi-value" style={{ color: (gainVsBase ?? 0) >= 0 ? 'var(--green)' : 'var(--amber)' }}>{gainVsBase !== undefined ? `${Number(gainVsBase) >= 0 ? '+' : ''}${Number(gainVsBase).toFixed(1)}%` : 'N/A'}</div></div>
+            <div className="kpi-card"><div className="kpi-label">Tolerance Compliance</div><div className="kpi-value" style={{ color: typeof compliance === 'number' ? (compliance >= 95 ? 'var(--green)' : 'var(--red)') : undefined }}>{complianceText}</div></div>
+            <div className="kpi-card"><div className="kpi-label">Critical Breaches</div><div className="kpi-value">{String(evalRes.kpis?.breach_count ?? 0)}</div></div>
+            <div className="kpi-card"><div className="kpi-label">{classification ? 'Model Accuracy' : 'Model MAE / MAPE'}</div><div className="kpi-value" style={{ fontSize: 16 }}>{typeof evalRes.kpis?.mae === 'number' && typeof evalRes.kpis?.mape_pct === 'number' ? `${evalRes.kpis.mae.toFixed(3)} (${evalRes.kpis.mape_pct.toFixed(2)}%)` : typeof evalRes.kpis?.accuracy_pct === 'number' ? `${evalRes.kpis.accuracy_pct.toFixed(1)}%` : 'Unavailable'}</div></div>
+            <div className="kpi-card"><div className="kpi-label">{classification ? 'Baseline Accuracy' : 'Baseline MAE'}</div><div className="kpi-value" style={{ fontSize: 16 }}>{typeof evalRes.kpis?.baseline_mae === 'number' ? evalRes.kpis.baseline_mae.toFixed(3) : typeof evalRes.kpis?.baseline_accuracy_pct === 'number' ? `${evalRes.kpis.baseline_accuracy_pct.toFixed(1)}%` : 'Unavailable'}</div></div>
+            <div className="kpi-card"><div className="kpi-label">Gain vs Baseline</div><div className="kpi-value" style={{ color: typeof gainVsBase === 'number' ? (gainVsBase >= 0 ? 'var(--green)' : 'var(--amber)') : undefined }}>{typeof gainVsBase === 'number' ? `${gainVsBase >= 0 ? '+' : ''}${gainVsBase.toFixed(1)}${classification ? ' pp' : '%'}` : 'Unavailable'}</div></div>
           </div>
 
           {/* 4B. SIGNED ROOT-CAUSE DEVIATION ATTRIBUTION (WHAT CAUSED INCREASE / DECREASE VS BASELINE & HOW TO FIX IT) */}
@@ -805,10 +822,11 @@ export const Studio14Supervisory: React.FC<StudioProps> = ({ ws, onSync, studioC
           {/* 4 Engineering Charts (All automatically Zoomable + Pop-Out!) */}
           <div className="grid-2" style={{ marginBottom: 14 }}>
             <div className="card" style={{ marginBottom: 0 }}>
-              <SupervisoryTrendSVG points={evalRes.trend_series || []} />
+              <SupervisoryTrendSVG points={evalRes.trend_series || []} title={classification ? "Rolling classification accuracy" : undefined} />
             </div>
             <div className="card" style={{ marginBottom: 0 }}>
-              <SPCControlSVG points={evalRes.spc_points || []} limits={evalRes.spc_limits || undefined} />
+              {evalRes.spc_unavailable_reason && <p>{evalRes.spc_unavailable_reason}</p>}
+              <SPCControlSVG points={evalRes.spc_points || []} limits={evalRes.spc_limits || undefined} title={evalRes.spc_limits ? undefined : "Residuals"} />
             </div>
           </div>
 

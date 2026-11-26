@@ -35,7 +35,7 @@ from omniforge.models.deep import (
     TabNetModel,
 )
 from omniforge.models.nonparametric import NonParametricAnalyticalSuite
-from omniforge.ui.state import record_active_holdout
+from omniforge.ui.state import clear_supervisory_evaluation, record_active_holdout
 
 router = APIRouter(tags=["workbench-s06"])
 
@@ -150,7 +150,7 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
             )
             eq_dict = eq_rep.model_dump() if hasattr(eq_rep, "model_dump") else dict(eq_rep)
         except Exception as exc:
-            _wb().logger.debug("equation_extract_skipped", error=str(exc))
+            _wb().logger.debug("equation_extract_skipped", error_type=type(exc).__name__)
 
         regression = task == _wb().TaskType.REGRESSION
         baseline_score = round(float(
@@ -361,6 +361,7 @@ def s06_run_nonparametric_analytical(
     fitted_map = res.pop("_fitted_models", {})
     feat_cols = list(X.columns)
 
+    clear_supervisory_evaluation(state)
     np_store = state.setdefault("uap_nonparametric_models", {})
     tgt_map: dict[str, Any] = {}
     lb_lookup = {r["model_name"]: r for r in (res.get("leaderboard") or [])}
@@ -527,6 +528,7 @@ def s06_run_deep_benchmark(req: DeepBenchReq, x_session_id: str | None = Header(
 
     rows.sort(key=lambda r: r["score"] if r["score"] is not None else -float("inf"), reverse=True)
     state["uap_dl_benchmark_df"] = pd.DataFrame([{k: v for k, v in r.items() if k != "loss_curve"} for r in rows])
+    clear_supervisory_evaluation(state)
     state["uap_dl_models"] = fitted_dl
     winner = next((row for row in rows if row["score"] is not None), None)
     outcome = f"Top={winner['model']} ({winner['score']:.4f})" if winner is not None else "No candidate or baseline produced a score."
@@ -557,7 +559,7 @@ def _prediction_frame(state: dict[str, Any], frame: pd.DataFrame) -> pd.DataFram
         try:
             return preprocessor.transform(frame)
         except (TypeError, ValueError) as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            raise HTTPException(status_code=422, detail="The supplied values do not match the fitted input schema.") from exc
     # Older saved workspaces may only contain already-encoded numeric feature names.
     # Preserve their historic scoring behavior until they are retrained.
     feat_cols = state.get("uap_active_feature_cols") or []
@@ -565,7 +567,7 @@ def _prediction_frame(state: dict[str, Any], frame: pd.DataFrame) -> pd.DataFram
     return aligned.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
 
-@router.post("/s06/predict-single")
+@router.post("/s06/predict-single", dependencies=[Depends(require_permission("model:read"))])
 def s06_predict_single(req: SinglePredictReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
@@ -579,7 +581,7 @@ def s06_predict_single(req: SinglePredictReq, x_session_id: str | None = Header(
     try:
         pred = model.predict(row_df)[0]
     except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=422, detail=f"Unable to score the provided features: {exc}") from exc
+        raise HTTPException(status_code=422, detail="Unable to score the provided features.") from exc
     proba = None
     if hasattr(model, "predict_proba"):
         try:
@@ -595,7 +597,7 @@ def s06_predict_single(req: SinglePredictReq, x_session_id: str | None = Header(
     )
 
 
-@router.post("/s06/predict-batch")
+@router.post("/s06/predict-batch", dependencies=[Depends(require_permission("model:read"))])
 async def s06_predict_batch(
     file: UploadFile = File(...),
     x_session_id: str | None = Header(default="default"),
@@ -612,7 +614,7 @@ async def s06_predict_batch(
         # JSON does; the fitted schema parses numeric and datetime columns afterward.
         inc_df = pd.read_csv(io.BytesIO(raw), dtype=str, keep_default_na=False)
     except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError) as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid CSV: {exc}") from exc
+        raise HTTPException(status_code=400, detail="The uploaded CSV could not be parsed.") from exc
     if inc_df.empty:
         raise HTTPException(status_code=400, detail="The CSV must contain at least one record.")
     ref_df = state.get("uap_df")
@@ -621,7 +623,7 @@ async def s06_predict_batch(
     try:
         preds = model.predict(aligned)
     except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=422, detail=f"Unable to score the provided features: {exc}") from exc
+        raise HTTPException(status_code=422, detail="Unable to score the provided features.") from exc
     scored = inc_df.copy()
     scored[f"predicted_{target}"] = preds
     state["uap_future_prediction_result"] = {"n_rows": len(scored), "preview": scored.head(100).to_dict(orient="records"), "scored_df": scored}

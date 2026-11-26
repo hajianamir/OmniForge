@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+from omniforge.api.auth import require_permission
 from omniforge.reporting.chart_exporter import export_live_chart_artifact
-from omniforge.reporting.live_charts import generate_live_chart, get_live_chart_catalog
+from omniforge.reporting.live_charts import LiveChartUnavailable, generate_live_chart, get_live_chart_catalog
 
 router = APIRouter(tags=["workbench-charts"])
 
@@ -43,8 +44,10 @@ def charts_catalog(
     state = _wb().get_session_state(sid)
     try:
         return get_live_chart_catalog(state, studio_id=studio_id)
-    except ValueError as exc:
+    except LiveChartUnavailable as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="The chart could not be produced from the supplied data.") from exc
 
 
 @router.post("/charts/generate")
@@ -64,11 +67,13 @@ def charts_generate_single(
             feature_y=req.feature_y or None,
             group_col=req.group_col or None,
         )
-    except ValueError as exc:
+    except LiveChartUnavailable as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="The chart could not be produced from the supplied data.") from exc
 
 
-@router.post("/charts/export")
+@router.post("/charts/export", dependencies=[Depends(require_permission("report:generate"))])
 def charts_export_single(
     req: LiveChartExportReq,
     x_session_id: str | None = Header(default="default"),
@@ -90,8 +95,10 @@ def charts_export_single(
             fmt=req.format,
             theme=req.theme,
         )
-    except ValueError as exc:
+    except LiveChartUnavailable as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="The chart could not be produced from the supplied data.") from exc
 
     return Response(
         content=file_bytes,

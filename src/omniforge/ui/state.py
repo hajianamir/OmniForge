@@ -43,6 +43,7 @@ _DOWNSTREAM_KEYS: tuple[str, ...] = (
     "uap_active_X_test",
     "uap_active_y_test",
     "uap_active_holdout_fingerprint",
+    "uap_active_holdout_model",
     "uap_model_equations",
     "uap_baseline_equations",
     "uap_dl_benchmark_df",
@@ -76,12 +77,16 @@ _DOWNSTREAM_KEYS: tuple[str, ...] = (
     "uap_mining_result",
     "uap_supervisory_result",
     "uap_supervisory_scored_df",
+    "uap_supervisory_input_df",
     "uap_supervisory_models",
     "uap_s02_pending_feedback",
     "uap_fs_selected_cols",
     "uap_fs_scores",
     "uap_fs_dropped",
     "uap_split_lock",
+    "uap_copilot",
+    "uap_chat_history",
+    "uap_copilot_history",
     "uap_split_audit_report",
     "uap_serving_engine",
 )
@@ -309,7 +314,7 @@ def _reset_downstream_state(state: dict[str, Any], *, keep_keys: set[str] | None
             state[key] = {}
         elif key == "uap_active_model_metrics":
             state[key] = {}
-        elif key == "uap_active_feature_cols":
+        elif key in {"uap_active_feature_cols", "uap_chat_history", "uap_copilot_history"}:
             state[key] = []
         else:
             state[key] = None
@@ -633,6 +638,16 @@ def get_all_deleted_records_df(state: dict[str, Any]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True, sort=False)
 
 
+def clear_supervisory_evaluation(state: dict[str, Any]) -> None:
+    """Drop current telemetry and diagnostics when a catalog fit changes."""
+    for key in ("uap_supervisory_result", "uap_supervisory_scored_df", "uap_supervisory_input_df"):
+        state[key] = None
+    results = state.get("uap_studio_results")
+    if isinstance(results, dict):
+        for key in ("s14_supervisory", "s14_root_cause", "s11_root_cause"):
+            results.pop(key, None)
+
+
 def record_active_holdout(state: dict[str, Any]) -> None:
     """Record the holdout for a newly published champion and invalidate old evidence."""
     from omniforge.mlops.fairness_evidence import holdout_fingerprint
@@ -644,14 +659,18 @@ def record_active_holdout(state: dict[str, Any]) -> None:
         and X_test.index.is_unique and X_test.index.equals(y_test.index) and not y_test.isna().any()
         else None
     )
+    state["uap_active_holdout_model"] = (
+        state.get("uap_active_model") if state["uap_active_holdout_fingerprint"] is not None else None
+    )
+    clear_supervisory_evaluation(state)
     for key in (
         "uap_fairness_result", "uap_fairness_evidence", "uap_model_card", "uap_shap_result",
-        "uap_supervisory_result", "uap_supervisory_scored_df", "uap_future_prediction_result",
+        "uap_future_prediction_result",
     ):
         state[key] = None
     results = state.get("uap_studio_results")
     if isinstance(results, dict):
-        for key in ("s07_fairness", "s07_explain", "s14_supervisory", "s06_predict_single", "s06_predict_batch"):
+        for key in ("s07_fairness", "s07_explain", "s06_predict_single", "s06_predict_batch"):
             results.pop(key, None)
 
 
