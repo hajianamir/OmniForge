@@ -354,7 +354,7 @@ Add the field to the right sub-model with a safe default, and keep it overridabl
 
 - **The generic `ingest()` does not confine local paths.** Local-path confinement exists only for Copilot 
 ingestion (§12) and local DB files (§8.1 connectors). **Any new code path that takes a path from a client must add its own confinement.** **Invariants in this file:**
-- Pickle ingestion is refused unless `allow_unsafe_pickle=True` (CWE-502).
+- Pickle and HDF5 require explicit trusted-local opt-ins. Remote HTTP and API upload paths reject both formats.
 - XML is parsed with `defusedxml`. Documents containing `<!DOCTYPE` or `<!ENTITY` are rejected.
 - SQLite is opened read-only through `file:...?mode=ro` plus an authorizer.
 - DuckDB is opened with `read_only=True` and `enable_external_access=False`.
@@ -485,9 +485,8 @@ upload/quality/clean, EDA, AutoML, forecast, causal, optimization, serving, regi
 ->- **Middleware stack** (innermost outermost): CORS (explicit methods and headers, including 
 `X-Session-ID` and `X-CSRF-Token`); GZip (≥ 500 bytes); `RequestBodySizeLimitMiddleware`; `SlidingWindowRateLimitMiddleware`; security-headers middleware (sets `X-Content-Type-Options`, `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy: same-origin`, `Content-Security-Policy-Report-Only`, HSTS).
 - **SPA serving:** `GET /{path}` serves files from `ui/static_app`, confined with `is_relative_to`. Falls back
-to `index.html` with `no-store` headers. 404s for paths starting with `api/`, `docs`, `redoc`, `openapi.json` or `health`. **The SPA index response sets the admin auth cookies** when auto-bootstrap is on (§14.2).
-- **Two separate registry instances and stores:** `api.main` creates `default_registry` and 
-`default_serving`. `api.workbench` creates `_SHARED_REGISTRY` and `_SHARED_TRACKER`. The default tenant uses the same SQLite file in both. Non-default tenants use `tenants/<sha256(tenant)[:16]>/api_v1/...` in `api.main` but `tenants/<slug>/...` in `api.workbench`. **The two surfaces do not share models for non-default tenants.** In workbench code, always obtain stores via `get_tenant_registry()` / `get_tenant_tracker()`.
+to `index.html` with `no-store` headers. 404s for paths starting with `api/`, `docs`, `redoc`, `openapi.json` or `health`. The SPA index response sets admin cookies only when bootstrap is enabled, the Host and ASGI peer are loopback, and production mode is off (§14.2).
+- **Shared tenant registry:** `api.main` maintains a tenant-scoped serving cache. The REST and Workbench surfaces resolve each tenant’s registry through `get_tenant_registry()`. The Workbench catalog imports old REST entries from `api_v1/model_registry.db` in one transaction, retaining versions and signed artifact paths. Stop legacy writers and preserve the workspace volume and signing keys during the upgrade. An identifier or Production-stage collision requires operator resolution.
 ### 14.2 Authentication and authorization (`auth.py`) **[V]**
 Credentials are checked in this order by `_resolve_current_principal`:
 1. `Authorization: Bearer <JWT>`. A malformed header or invalid token gives 401.

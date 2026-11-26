@@ -280,6 +280,7 @@ class PipelineBuilder:
         config: dict[str, Any] | None = None,
         cacheable: bool = False,
         retries: int = 0,
+        implementation_version: str | None = None,
     ) -> PipelineBuilder:
         """Add a built-in declarative step, custom :class:`PipelineStep`, or Python callable."""
         deps = list(depends_on or [])
@@ -290,6 +291,8 @@ class PipelineBuilder:
             step = step_or_type
             if deps:
                 step.depends_on = deps
+            if implementation_version is not None:
+                step.implementation_version = implementation_version
         elif isinstance(step_or_type, str):
             key = step_or_type.lower()
             if key not in self._handlers:
@@ -305,6 +308,7 @@ class PipelineBuilder:
                 cacheable=cacheable,
                 retries=retries,
                 step_type=key,
+                implementation_version=implementation_version or "builtin",
             )
         elif callable(step_or_type):
             step = FunctionStep(
@@ -315,6 +319,7 @@ class PipelineBuilder:
                 cacheable=cacheable,
                 retries=retries,
                 step_type="custom_callable",
+                implementation_version=implementation_version,
             )
         else:
             raise PipelineError("step_or_type must be a PipelineStep, built-in type string, or callable.")
@@ -340,6 +345,7 @@ class PipelineBuilder:
                 config=dict(item.get("config", {})),
                 cacheable=bool(item.get("cacheable", False)),
                 retries=int(item.get("retries", 0)),
+                implementation_version=item.get("implementation_version"),
             )
         return builder.build()
 

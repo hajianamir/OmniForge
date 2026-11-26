@@ -705,7 +705,13 @@ class ReportChartBuilder:
             if not isinstance(eq_map, dict):
                 continue
             for m_name, eq_d in eq_map.items():
-                terms = (eq_d or {}).get("terms") or []
+                equation = eq_d or {}
+                coefficients = equation.get("surrogate_coefficients") or equation.get("coefficients") or {}
+                terms = equation.get("terms") or [
+                    {"feature": name, "coefficient": value}
+                    for name, value in coefficients.items()
+                    if isinstance(value, (int, float)) and np.isfinite(value)
+                ]
                 if terms and len(terms) > len(chosen_terms):
                     chosen_terms = [t for t in terms if isinstance(t, dict) and "feature" in t and "coefficient" in t]
                     chosen_model = m_name
@@ -740,10 +746,14 @@ class ReportChartBuilder:
 
     @staticmethod
     def _chart_future_predictions(fut_res: Any) -> ReportChartArtifact | None:
-        scored_df = getattr(fut_res, "scored_df", None)
+        scored_df = fut_res.get("scored_df") if isinstance(fut_res, dict) else getattr(fut_res, "scored_df", None)
         if not isinstance(scored_df, pd.DataFrame) or scored_df.empty:
             return None
-        pred_cols = [c for c in scored_df.columns if str(c).startswith("pred_")]
+        pred_cols = [
+            c for c in scored_df.columns
+            if str(c).startswith(("pred_", "predicted_", "future_"))
+            and not str(c).endswith(("_low", "_high"))
+        ]
         if not pred_cols:
             return None
 
@@ -764,8 +774,9 @@ class ReportChartBuilder:
         ax0.grid(axis="y", linestyle="--", alpha=0.35)
 
         ax1 = axes[1]
-        if "ood_shift_score" in scored_df.columns:
-            ood = pd.to_numeric(scored_df["ood_shift_score"], errors="coerce").dropna()
+        ood_col = next((col for col in ("max_feature_zscore", "ood_shift_score") if col in scored_df.columns), None)
+        if ood_col is not None:
+            ood = pd.to_numeric(scored_df[ood_col], errors="coerce").dropna()
             ax1.hist(ood, bins=20, color=_AMBER, alpha=0.85, edgecolor="white")
             ax1.axvline(3.0, color=_RED, linestyle="--", linewidth=1.5, label="OOD Threshold (z = 3.0)")
             ax1.legend(fontsize=8)

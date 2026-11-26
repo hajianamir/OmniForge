@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import marshal
 import os
 import pickle
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from functools import lru_cache
+from importlib import metadata
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
@@ -19,11 +23,30 @@ from omniforge.core.exceptions import PipelineError
 from omniforge.core.logging import get_logger
 from omniforge.core.security import ArtifactSigner, safe_joblib_load_bytes
 from omniforge.core.types import CarbonReport
-from omniforge.pipelines.base import PipelineContext, PipelineStep, StepExecutionRecord
+from omniforge.pipelines.base import FunctionStep, PipelineContext, PipelineStep, StepExecutionRecord
 from omniforge.pipelines.dag import PipelineDAG
+from omniforge.version import __version__
 
 logger = get_logger(__name__)
-_CACHE_HMAC_CONTEXT = b"omniforge:pipeline-cache:v3:"
+_CACHE_HMAC_CONTEXT = b"omniforge:pipeline-cache:v4:"
+
+
+@lru_cache(maxsize=1)
+def _cache_build_identity() -> tuple[str, tuple[tuple[str, str | None], ...]]:
+    """Fingerprint installed source and core execution dependencies once per process."""
+    root = Path(__file__).resolve().parents[1]
+    digest = hashlib.sha256()
+    for source in sorted(root.rglob("*.py")):
+        digest.update(source.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(source.read_bytes()).digest())
+    dependencies: list[tuple[str, str | None]] = []
+    for name in ("numpy", "pandas", "scikit-learn", "scipy", "pyarrow"):
+        try:
+            dependencies.append((name, metadata.version(name)))
+        except metadata.PackageNotFoundError:
+            dependencies.append((name, None))
+    return digest.hexdigest(), tuple(dependencies)
 
 
 def _state_snapshot(ctx: PipelineContext) -> dict[str, dict[str, Any]]:
@@ -233,20 +256,33 @@ class PipelineExecutor:
         self, pipeline_name: str, step: PipelineStep, ctx: PipelineContext, state_digest: str | None
     ) -> Path | None:
         assert self.cache_dir is not None
+        # Callers version closures, external reads, and other dependencies whose
+        # identity cannot be derived from the step body or the artifact bus.
+        implementation_version = getattr(step, "implementation_version", None)
+        if not implementation_version:
+            return None
         base_dir = self.cache_dir.resolve()
         # Steps share the artifact bus, including outputs from earlier undeclared readers.
         # Cache identity covers the entire state that a step is allowed to read/write.
         try:
             if state_digest is None:
                 state_digest = hashlib.sha256(pickle.dumps(_state_snapshot(ctx), protocol=5)).hexdigest()
-            data = pickle.dumps((ctx.tenant_id, pipeline_name, step.to_spec(), state_digest), protocol=5)
+            handler = step.fn if isinstance(step, FunctionStep) else type(step).run
+            code = getattr(handler, "__code__", None)
+            code_digest = hashlib.sha256(marshal.dumps(code)).hexdigest() if code is not None else None
+            identity = (type(step).__module__, type(step).__qualname__, implementation_version, code_digest)
+            namespace = (
+                __version__, sys.implementation.cache_tag, _cache_build_identity(),
+                os.getenv("OMNIFORGE_PIPELINE_CACHE_NAMESPACE", ""),
+            )
+            data = pickle.dumps((namespace, ctx.tenant_id, pipeline_name, step.to_spec(), identity, state_digest), protocol=5)
         except Exception as exc:
             logger.debug("pipeline_step_uncacheable_input", step_id=step.step_id, error_type=type(exc).__name__)
             return None
         digest = hashlib.sha256(data).hexdigest()[:24]
         safe_pipe = re.sub(r"[^A-Za-z0-9._-]", "_", pipeline_name).strip("._-")[:64] or "pipeline"
         safe_step = re.sub(r"[^A-Za-z0-9._-]", "_", step.step_id).strip("._-")[:64] or "step"
-        filename = f"{safe_pipe}_{safe_step}_{digest}.cache-v3"
+        filename = f"{safe_pipe}_{safe_step}_{digest}.cache-v4"
         if ".." in filename or "/" in filename or "\\" in filename:
             raise PipelineError("Pipeline cache filename could not be safely resolved.")
         candidate = (base_dir / filename).resolve()

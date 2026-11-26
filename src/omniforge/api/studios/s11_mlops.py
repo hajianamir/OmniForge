@@ -83,6 +83,7 @@ def s11_register(
             fairness_evidence=evidence,
             override_reason=req.override_reason,
             stage=stage,
+            principal=principal,
         )
     except MLOpsError as exc:
         if "fairness" in str(exc).lower():
@@ -95,8 +96,12 @@ def s11_register(
     return payload
 
 
-@router.post("/s11/promote", dependencies=[Depends(require_permission("model:promote"))])
-def s11_promote(req: PromoteModelReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
+@router.post("/s11/promote")
+def s11_promote(
+    req: PromoteModelReq,
+    x_session_id: str | None = Header(default="default"),
+    principal: Principal = Depends(require_permission("model:promote")),
+) -> dict[str, Any]:
     reg = _wb().get_tenant_registry()
     stage = _wb().parse_model_stage(req.stage, error_status=400)
     try:
@@ -105,6 +110,7 @@ def s11_promote(req: PromoteModelReq, x_session_id: str | None = Header(default=
             req.version,
             stage,
             override_reason=req.override_reason,
+            principal=principal,
         )
     except MLOpsError as exc:
         if "fairness" in str(exc).lower():
@@ -115,11 +121,11 @@ def s11_promote(req: PromoteModelReq, x_session_id: str | None = Header(default=
     )
 
 
-@router.post("/s11/rollback", dependencies=[Depends(require_permission("model:promote"))])
-def s11_rollback(req: RollbackModelReq) -> dict[str, Any]:
+@router.post("/s11/rollback")
+def s11_rollback(req: RollbackModelReq, principal: Principal = Depends(require_permission("model:promote"))) -> dict[str, Any]:
     reg = _wb().get_tenant_registry()
     try:
-        restored = reg.rollback_production(req.model_name, reason=req.reason)
+        restored = reg.rollback_production(req.model_name, reason=req.reason, principal=principal)
     except MLOpsError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return to_json_object(

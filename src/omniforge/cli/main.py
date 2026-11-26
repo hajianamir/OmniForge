@@ -45,9 +45,11 @@ def cmd_domains(
         except Exception as exc:
             console.print(f"[red]Unknown domain plugin '{export_sample}': {exc}[/red]")
             raise typer.Exit(code=1) from exc
+        from omniforge.core.utils import sanitize_spreadsheet_frame
+
         df = plugin.generate_sample_dataset(n_samples=rows)
         out.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(out, index=False)
+        sanitize_spreadsheet_frame(df).to_csv(out, index=False)
         console.print(f"[green]Generated {len(df)} rows for domain '{export_sample}' -> {out}[/green]")
         return
 
@@ -89,12 +91,14 @@ def cmd_clean(
     out: Path = typer.Option(Path("cleaned.csv"), "--out", help="Output path for cleaned dataset."),
 ) -> None:
     """Clean missing values, duplicates, strings, and outliers and save cleaned data."""
+    from omniforge.core.utils import sanitize_spreadsheet_frame
     from omniforge.data.cleaning import DataCleaner
     from omniforge.data.ingestion import DataIngestionEngine
 
     ing = DataIngestionEngine().ingest(source)
     cleaned, rep = DataCleaner().fit_transform(ing.data)
-    cleaned.to_csv(out, index=False)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    sanitize_spreadsheet_frame(cleaned).to_csv(out, index=False)
     console.print(
         f"[green]Cleaned dataset saved to {out}[/green] | Rows: {rep.input_shape[0]} -> {rep.output_shape[0]}"
     )

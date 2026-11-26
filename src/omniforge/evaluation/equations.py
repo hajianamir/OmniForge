@@ -103,7 +103,7 @@ def _excel_col_letter(zero_idx: int) -> str:
 
 def _safe_identifier(name: str) -> str:
     """Sanitize a column name into a clean C/MATLAB/Python identifier."""
-    cleaned = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in str(name).strip())
+    cleaned = "".join(ch if (ch.isascii() and ch.isalnum()) or ch == "_" else "_" for ch in str(name).strip())
     if not cleaned:
         return "x"
     if cleaned[0].isdigit():
@@ -141,7 +141,7 @@ def _build_external_deployment_formulas(
     if not used_terms and intercept is None:
         return {
             "formula_python": (
-                f"# {model_name} ({equation_type})\n"
+                f"# Model: {model_name!r} ({equation_type!r})\n"
                 f"def predict_{safe_tgt}(row: dict) -> float:\n"
                 f"    \"\"\"Constant / structural model fallback.\"\"\"\n"
                 f"    return {b0:.6f}\n"
@@ -157,12 +157,12 @@ def _build_external_deployment_formulas(
     # 1. Standalone Zero-Dependency Python Function
     py_lines = [
         "# Standalone External Prediction Script — Exported from OmniForge",
-        f"# Model: {model_name} | Target: {target_name} | Mode: {'High-Fidelity Analytical Surrogate (R2=' + f'{surrogate_r2:.4f})' if is_surrogate and surrogate_r2 is not None else ('Analytical Formula' if is_surrogate else 'Exact Closed-Form')}",
+        f"# Model: {model_name!r} | Target: {target_name!r} | Mode: {'Reference-Fitted Analytical Surrogate (R2=' + f'{surrogate_r2:.4f})' if is_surrogate and surrogate_r2 is not None else ('Analytical Formula' if is_surrogate else 'Closed-Form Expression')}",
         "# Zero external libraries required (uses Python standard library only).",
         "import math",
         "",
         f"def predict_{safe_tgt}(row: dict) -> float:",
-        f'    """Predict {target_name} from a dict of raw input feature values."""',
+        "    " + repr(f"Predict {target_name} from input feature values."),
         f"    val = {b0:.8f}",
     ]
     for fname, coef in used_terms:
@@ -180,7 +180,7 @@ def _build_external_deployment_formulas(
         "",
         'if __name__ == "__main__":',
         f"    sample = {{{sample_dict}}}",
-        f"    print('Predicted {target_name}:', predict_{safe_tgt}(sample))",
+        f"    print({f'Predicted {target_name}:'!r}, predict_{safe_tgt}(sample))",
     ])
     formula_python = "\n".join(py_lines)
 

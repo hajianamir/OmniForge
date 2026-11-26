@@ -60,12 +60,14 @@ class PipelineStep(ABC):
         config: dict[str, Any] | None = None,
         cacheable: bool = False,
         retries: int = 0,
+        implementation_version: str | None = None,
     ) -> None:
         self.step_id = step_id
         self.depends_on = list(depends_on or [])
         self.config = dict(config or {})
         self.cacheable = cacheable
         self.retries = max(0, int(retries))
+        self.implementation_version = implementation_version
 
     @abstractmethod
     def run(self, context: PipelineContext) -> Any:
@@ -80,6 +82,7 @@ class PipelineStep(ABC):
             "config": dict(self.config),
             "cacheable": self.cacheable,
             "retries": self.retries,
+            "implementation_version": self.implementation_version,
         }
 
 
@@ -98,6 +101,7 @@ class FunctionStep(PipelineStep):
         cacheable: bool = False,
         retries: int = 0,
         step_type: str = "function",
+        implementation_version: str | None = None,
     ) -> None:
         super().__init__(
             step_id=step_id,
@@ -105,6 +109,7 @@ class FunctionStep(PipelineStep):
             config=config,
             cacheable=cacheable,
             retries=retries,
+            implementation_version=implementation_version,
         )
         self.fn = fn
         self.step_type = step_type

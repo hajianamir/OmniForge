@@ -18,7 +18,7 @@ import pandas as pd
 from omniforge.core.exceptions import DataIngestionError, DependencyMissingError, SecurityError
 from omniforge.core.logging import get_logger
 from omniforge.core.types import TaskType
-from omniforge.data.connectors import validate_readonly_sql
+from omniforge.data.connectors import _create_readonly_sql_engine, _validated_sql_url, validate_readonly_sql
 from omniforge.data.ingestion import DataIngestionEngine
 
 logger = get_logger(__name__)
@@ -160,11 +160,13 @@ class FutureTargetPredictor:
         if not query.strip():
             raise DataIngestionError("SQL query cannot be empty.")
         validated_sql = validate_readonly_sql(query.strip())
-        create_engine, text = _require_sqlalchemy()
+        _, text = _require_sqlalchemy()
         engine: Any = None
         try:
-            engine = create_engine(raw_uri)
+            engine, dialect = _create_readonly_sql_engine(raw_uri)
             with engine.connect() as conn:
+                if dialect == "postgresql":
+                    conn = conn.execution_options(postgresql_readonly=True)
                 df = pd.read_sql_query(text(validated_sql), conn)
         except SecurityError:
             raise
@@ -196,8 +198,13 @@ class FutureTargetPredictor:
         clean_table = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in table_name.strip()) or "omniforge_future_predictions"
         engine: Any = None
         try:
-            engine = create_engine(raw_uri)
+            validated_url, _, local_path = _validated_sql_url(raw_uri)
+            if local_path is not None:
+                validated_url = validated_url.set(database=str(local_path), query={})
+            engine = create_engine(validated_url)
             predictions_df.to_sql(clean_table, engine, if_exists=if_exists, index=False)
+        except SecurityError:
+            raise
         except Exception as exc:
             safe_uri = DataIngestionEngine._sanitize_uri(raw_uri)
             safe_err = _redact_uri_secret_in_error(str(exc), raw_uri)

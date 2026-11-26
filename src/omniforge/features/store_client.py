@@ -19,12 +19,12 @@ class FeatureStoreClient:
 
     def __init__(
         self,
-        repo_path: str | Path = "./.omniforge_workspace/feature_store",
+        repo_path: str | Path | None = None,
         *,
         use_feast_backend: bool = False,
     ) -> None:
-        self.repo_path = Path(repo_path)
-        self._local = LocalFeatureStore(self.repo_path)
+        self._local = LocalFeatureStore(repo_path)
+        self.repo_path = self._local.repo_path
         self._feast: Any = None
         if use_feast_backend and is_package_available("feast"):
             try:

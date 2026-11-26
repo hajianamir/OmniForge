@@ -463,7 +463,7 @@ def test_mlops_adwin_scale_equivariance_jsd_base2_monitor_onnx_and_copilot_confi
     assert by_col["num"].js_divergence is not None and 0.8 <= by_col["num"].js_divergence <= 1.0
 
     # 3. ModelMonitor tracks paired (prediction, actual) feedback accurately despite unlabeled inferences
-    mon = ModelMonitor("fraud_clf", min_accuracy=0.80, max_mae=0.30, max_window_size=50)
+    mon = ModelMonitor("fraud_clf", task_type=TaskType.BINARY_CLASSIFICATION, min_accuracy=0.80, max_mae=0.30, max_window_size=50)
     for _ in range(40):
         mon.record_inference(latency_ms=12.0, prediction=1, actual=None)
     # Record 10 labeled events with 50% accuracy (below 0.80 SLA) and MAE=0.50 (above 0.30 SLA)

@@ -68,6 +68,13 @@ _BLOCKED_SQL_QUERY_OPTIONS: frozenset[str] = frozenset(
         "load_data_local_infile",
         "allowloadlocalinfile",
         "allowurlinlocalinfile",
+        "host",
+        "hostaddr",
+        "port",
+        "server",
+        "unix_socket",
+        "dsn",
+        "odbc_connect",
     }
 )
 
@@ -245,11 +252,14 @@ def _validate_readonly_sql(query: str) -> str:
             "Write, DDL, PRAGMA, ATTACH, or file-access SQL statements are blocked for security. "
             "Provide a read-only SELECT query."
         )
-    # Defense in depth: block string-literal file paths (e.g. DuckDB FROM 'file.csv').
-    # Check ``cleaned`` because ``code_only`` has string literals replaced with `` '' ``.
-    if _FILE_PATH_LITERAL_RE.search(cleaned):
+    # Keep path-shaped tokens out of relation names and function arguments.
+    # An ordinary string on the right of a comparison is a scalar filter value.
+    for match in _FILE_PATH_LITERAL_RE.finditer(cleaned):
+        literal = match.group()
+        if literal.startswith("'") and literal.endswith("'") and cleaned[:match.start()].rstrip().endswith(("=", "<>", "!=")):
+            continue
         raise SecurityError(
-            "File path string literals are forbidden in SQL queries. "
+            "File path string literals are forbidden outside scalar SQL comparisons. "
             "Provide a read-only SELECT query referencing tables, not files."
         )
     return cleaned
@@ -614,15 +624,10 @@ def _resolve_duckdb_url_path(connection_url: str) -> Path | None:
     )
 
 
-def _create_readonly_sql_engine(
-    connection_url: str,
-    *,
-    allow_introspection_pragmas: bool = False,
-) -> tuple[Any, str]:
-    """Create a hardened read-only SQLAlchemy engine for SQLite or remote SQL databases."""
+def _validated_sql_url(connection_url: str) -> tuple[Any, str, Path | None]:
+    """Validate connection options and endpoints for read-only and explicitly writable SDK operations."""
     url = _normalize_sql_url(connection_url)
     try:
-        from sqlalchemy import create_engine
         from sqlalchemy.engine.url import make_url
     except ImportError as exc:
         raise DataIngestionError(
@@ -632,7 +637,7 @@ def _create_readonly_sql_engine(
     try:
         parsed = make_url(url)
     except Exception as exc:
-        raise DataIngestionError(f"Invalid SQL connection URL: {exc}") from exc
+        raise DataIngestionError("Invalid SQL connection URL.") from exc
 
     backend = parsed.get_backend_name().lower()
     if backend not in _ALLOWED_SQL_BACKENDS:
@@ -650,12 +655,26 @@ def _create_readonly_sql_engine(
             raise SecurityError("In-memory or empty SQLite URLs are not permitted on connector endpoints.")
         if db_target.lower().startswith("file:"):
             raise SecurityError("Raw SQLite URI parameters are forbidden; supply a workspace file path.")
-        resolved_path = _resolve_allowed_local_db_path(
+        return parsed, backend, _resolve_allowed_local_db_path(
             db_target,
             allowed_suffixes=_ALLOWED_SQLITE_SUFFIXES,
             verify_sqlite_magic=True,
         )
-        readonly_uri = f"file:{quote(str(resolved_path))}?mode=ro"
+    _validate_remote_db_host(parsed.host, parsed.port)
+    return parsed, backend, None
+
+
+def _create_readonly_sql_engine(
+    connection_url: str,
+    *,
+    allow_introspection_pragmas: bool = False,
+) -> tuple[Any, str]:
+    """Create a hardened read-only SQLAlchemy engine for SQLite or remote SQL databases."""
+    parsed, backend, local_path = _validated_sql_url(connection_url)
+    from sqlalchemy import create_engine
+
+    if local_path is not None:
+        readonly_uri = f"file:{quote(str(local_path))}?mode=ro"
         authorizer = _make_sqlite_authorizer(allow_introspection_pragmas=allow_introspection_pragmas)
 
         def _sqlite_creator() -> sqlite3.Connection:
@@ -667,7 +686,6 @@ def _create_readonly_sql_engine(
         engine = create_engine("sqlite://", creator=_sqlite_creator)
         return engine, "sqlite"
 
-    _validate_remote_db_host(parsed.host, parsed.port)
     engine = create_engine(parsed, pool_pre_ping=True)
     return engine, backend
 
@@ -1059,7 +1077,11 @@ def sql_load_dataframe(
                 )
             q_tbl = _quote_dialect_identifier(requested_table, dialect_name)
             row_limit = int(max(1, min(limit, 500_000)))
-            sql = f"SELECT * FROM {q_tbl} LIMIT {row_limit}"
+            sql = (
+                f"SELECT TOP {row_limit} * FROM {q_tbl}"
+                if dialect_name == "mssql"
+                else f"SELECT * FROM {q_tbl} LIMIT {row_limit}"
+            )
             if dialect_name == "postgresql":
                 conn = conn.execution_options(postgresql_readonly=True)
             df = pd.read_sql_query(text(sql), conn)

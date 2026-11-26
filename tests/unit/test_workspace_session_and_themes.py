@@ -185,7 +185,8 @@ def test_workspace_local_project_save_list_and_delete(tmp_path: Path) -> None:
     assert len(restored["uap_df"]) == 75
 
     # Deletion cleans file cleanly
-    assert WorkspaceSessionManager.delete_local_project(p1) is True
+    assert WorkspaceSessionManager.delete_local_project(p1) is False
+    assert WorkspaceSessionManager.delete_local_project(p1, projects_dir=proj_dir) is True
     assert not p1.exists()
     assert len(WorkspaceSessionManager.list_local_projects(projects_dir=proj_dir)) == 1
 

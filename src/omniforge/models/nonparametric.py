@@ -833,13 +833,6 @@ class NonParametricAnalyticalSuite:
                     target_name=target_name,
                 )
                 eq_d = eq.model_dump()
-                eq_d["formula_plain"] = eq_d.get("plain_equation", "")
-                eq_d["formula_latex"] = eq_d.get("latex_equation", "")
-                eq_d["formula_python"] = (
-                    f"# {row['model_name']} ({row['paradigm']})\n"
-                    f"# {eq_d.get('plain_equation', '')}\n"
-                    f"y_hat = model.predict(X)"
-                )
                 eq_d["rank"] = rank_i
                 eq_d["paradigm"] = row["paradigm"]
                 eq_d["model_paradigm"] = row["paradigm"]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import UTC, datetime
@@ -37,6 +38,7 @@ class DatasetVersion(BaseModel):
     version_id: str
     tag: str | None = None
     checksum_sha256: str
+    artifact_checksum_sha256: str | None = None
     parent_version_id: str | None = None
     n_rows: int
     n_columns: int
@@ -51,8 +53,10 @@ class DatasetVersion(BaseModel):
 class DatasetVersionManager:
     """Git/DVC-style content-addressed versioning store for datasets."""
 
-    def __init__(self, store_dir: str | Path = "./.omniforge_workspace/data_versions") -> None:
-        self.store_dir = Path(store_dir)
+    def __init__(self, store_dir: str | Path | None = None) -> None:
+        from omniforge.config.settings import get_settings
+
+        self.store_dir = Path(store_dir) if store_dir is not None else get_settings().paths.workspace_dir / "data_versions"
         self.store_dir.mkdir(parents=True, exist_ok=True)
         self._manifest_path = self.store_dir / "manifest.json"
         if not self._manifest_path.exists():
@@ -104,11 +108,15 @@ class DatasetVersionManager:
             artifact_path = self._resolve_confined_snapshot_path(ds_dir / f"{version_id}.json")
             df.to_json(artifact_path, orient="table")
 
+        with artifact_path.open("rb") as artifact:
+            artifact_checksum = hashlib.file_digest(artifact, "sha256").hexdigest()
+
         version = DatasetVersion(
             dataset_name=safe_ds,
             version_id=version_id,
             tag=safe_tag,
             checksum_sha256=checksum,
+            artifact_checksum_sha256=artifact_checksum,
             parent_version_id=parent_id,
             n_rows=int(len(df)),
             n_columns=int(len(df.columns)),
@@ -146,15 +154,18 @@ class DatasetVersionManager:
                 f"Version or tag '{version_or_tag}' not found for dataset '{safe_ds}'."
             )
         path = self._resolve_confined_snapshot_path(selected.storage_path)
-        if path.suffix == ".parquet":
-            df = pd.read_parquet(path)
-        elif path.suffix == ".json":
-            df = pd.read_json(path, orient="table")
-        else:
+        if path.suffix not in {".parquet", ".json"}:
             raise DataError(
                 f"Refusing to load unsafe legacy dataset snapshot format '{path.suffix}' (CWE-502 protection). "
                 "Re-commit the dataset version in Parquet or JSON format."
             )
+        with path.open("rb") as artifact:
+            if selected.artifact_checksum_sha256 is not None:
+                checksum = hashlib.file_digest(artifact, "sha256").hexdigest()
+                if checksum != selected.artifact_checksum_sha256:
+                    raise DataError("The dataset snapshot does not match its stored SHA-256 checksum.")
+                artifact.seek(0)
+            df = pd.read_parquet(artifact) if path.suffix == ".parquet" else pd.read_json(artifact, orient="table")
         return df, selected
 
     def list_versions(self, dataset_name: str) -> list[DatasetVersion]:

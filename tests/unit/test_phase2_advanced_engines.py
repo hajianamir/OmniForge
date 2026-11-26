@@ -5,6 +5,7 @@ from __future__ import annotations
 import networkx as nx
 import numpy as np
 import pandas as pd
+import pytest
 
 from omniforge.automl.backends import (
     AutoMLBackendHub,
@@ -14,6 +15,7 @@ from omniforge.automl.backends import (
     MultiLayerStackingAutoML,
     probe_automl_backends,
 )
+from omniforge.core.exceptions import DependencyMissingError
 from omniforge.core.performance import (
     TTLCache,
     compact_scatter_payload,
@@ -22,6 +24,7 @@ from omniforge.core.performance import (
     smart_sample_df,
 )
 from omniforge.core.types import TaskType
+from omniforge.core.utils import is_package_available
 from omniforge.models.computer_vision.foundation import VisionFoundationHub, probe_vision_backends
 from omniforge.models.deep import (
     FTTransformerModel,
@@ -132,6 +135,10 @@ def test_phase2_2_paper_grade_deep_learning_and_forecasting() -> None:
     # GNN (GCN, GraphSAGE, Multi-Head GAT)
     for arch in ("gcn", "graphsage", "gat"):
         gnn = GraphNeuralNetworkModel(architecture=arch, hidden_dim=16, epochs=8, task_type=TaskType.BINARY_CLASSIFICATION, track_carbon=False)
+        if arch == "gat" and not is_package_available("torch"):
+            with pytest.raises(DependencyMissingError, match="Graph attention requires"):
+                gnn.fit(X[:60], y[:60])
+            continue
         gnn.fit(X[:60], y[:60])
         assert len(gnn.predict(X[60:80])) == 20
 

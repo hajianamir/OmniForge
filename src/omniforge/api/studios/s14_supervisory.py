@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import io
 import math
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -23,8 +22,7 @@ from omniforge.api.studios.schemas import (
     wb_cache_and_respond,
 )
 from omniforge.core.types import TaskType
-from omniforge.core.utils import to_json_object
-from omniforge.data.ingestion import DataIngestionEngine
+from omniforge.core.utils import sanitize_spreadsheet_frame, to_json_object
 from omniforge.features.inference import WorkbenchInputPreprocessor
 from omniforge.mlops.root_cause import DriftRootCauseAnalyzer
 from omniforge.mlops.supervisory_monitor import SupervisoryPredictionMonitor
@@ -217,6 +215,7 @@ def s14_quick_train(req: SupervisoryQuickTrainReq, x_session_id: str | None = He
         state["uap_baseline_models"] = bl_all
     else:
         state["uap_active_model"] = model
+        state["uap_active_model_target"] = target
         state["uap_active_model_name"] = label
         state["uap_active_model_metrics"] = {metric_name: round(score, 4)}
         state["uap_active_feature_cols"] = list(X_tr.columns)
@@ -301,7 +300,7 @@ def _run_supervisory_eval(
     )
 
 
-@router.post("/s14/evaluate-file")
+@router.post("/s14/evaluate-file", dependencies=[Depends(require_permission("data:write"))])
 async def s14_evaluate_file(
     file: UploadFile = File(...),
     sheet_name: str | None = Form(default=None),
@@ -322,23 +321,8 @@ async def s14_evaluate_file(
     sid = _wb()._sid(x_session_id)
     state = get_session_state(sid)
     fname = file.filename or "live_batch.xlsx"
-    suffix = Path(fname).suffix.lower() or ".csv"
-    if suffix in {".pkl", ".pickle", ".joblib", ".dill"}:
-        raise HTTPException(
-            status_code=400,
-            detail="Pickle/joblib uploads are blocked for security (CWE-502). Please upload CSV, Parquet, Excel, or JSON.",
-        )
     raw = await _wb().read_upload_bounded(file)
-    if suffix in {".xlsx", ".xls", ".xlsm"} and sheet_name:
-        incoming = _wb().read_excel_sheet(raw, sheet_name=sheet_name)
-    else:
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(raw)
-            tmp_path = Path(tmp.name)
-        try:
-            incoming = DataIngestionEngine().ingest(tmp_path).data
-        finally:
-            tmp_path.unlink(missing_ok=True)
+    incoming = _wb().parse_tabular_upload(raw, fname, sheet_name=sheet_name)
     return _run_supervisory_eval(
         state,
         sid,
@@ -359,7 +343,7 @@ async def s14_evaluate_file(
     )
 
 
-@router.post("/s14/evaluate-sql")
+@router.post("/s14/evaluate-sql", dependencies=[Depends(require_permission("data:write"))])
 def s14_evaluate_sql(req: SupervisorySQLReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _wb()._sid(x_session_id)
     state = get_session_state(sid)
@@ -384,7 +368,7 @@ def s14_evaluate_sql(req: SupervisorySQLReq, x_session_id: str | None = Header(d
     )
 
 
-@router.post("/s14/evaluate-access")
+@router.post("/s14/evaluate-access", dependencies=[Depends(require_permission("data:write"))])
 def s14_evaluate_access(req: SupervisoryAccessReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _wb()._sid(x_session_id)
     state = get_session_state(sid)
@@ -536,6 +520,7 @@ def s14_export_results(fmt: str, x_session_id: str | None = Header(default="defa
     res_df = state.get("uap_supervisory_scored_df")
     if not isinstance(res_df, pd.DataFrame) or res_df.empty:
         raise HTTPException(status_code=400, detail="Run a supervisory evaluation first before exporting.")
+    res_df = sanitize_spreadsheet_frame(res_df)
     if fmt.lower() == "xlsx":
         buf = io.BytesIO()
         res_df.to_excel(buf, index=False)

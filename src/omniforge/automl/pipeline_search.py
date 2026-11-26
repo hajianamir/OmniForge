@@ -304,6 +304,8 @@ class AutoMLPipelineSearch:
         t0 = time.perf_counter()
         X_work = X.reset_index(drop=True).copy()
         y_arr = np.asarray(y)
+        if y_arr.ndim != 1 or len(y_arr) != len(X_work):
+            raise AutoMLError("AutoML requires one target value per predictor row.")
         task = self.task_type or self.infer_task_type(y_arr)
         is_clf = task in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION)
         primary_metric = "f1_weighted" if is_clf else "rmse"

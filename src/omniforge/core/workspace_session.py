@@ -200,6 +200,12 @@ class WorkspaceSessionManager:
     DEFAULT_PROJECTS_DIR = Path(".omniforge_workspace") / "projects"
 
     @classmethod
+    def _project_root(cls, projects_dir: str | Path | None) -> Path:
+        from omniforge.config.settings import get_settings
+
+        return Path(projects_dir) if projects_dir is not None else get_settings().paths.workspace_dir / cls.DEFAULT_PROJECTS_DIR.name
+
+    @classmethod
     def export_to_bytes(
         cls,
         session_state: Mapping[str, Any],
@@ -357,7 +363,7 @@ class WorkspaceSessionManager:
         projects_dir: str | Path | None = None,
     ) -> tuple[Path, WorkspaceManifest]:
         """Save a named workspace project snapshot under the local projects directory for 1-click resume."""
-        target_dir = Path(projects_dir) if projects_dir is not None else cls.DEFAULT_PROJECTS_DIR
+        target_dir = cls._project_root(projects_dir)
         stem = _sanitize_project_filename(project_name)
         return cls.save_to_file(
             session_state,
@@ -583,7 +589,7 @@ class WorkspaceSessionManager:
     @classmethod
     def list_local_projects(cls, projects_dir: str | Path | None = None) -> list[WorkspaceSnapshotSummary]:
         """List all valid ``.omniforge`` (and legacy ``.uap``) project snapshots in ``projects_dir``, newest first."""
-        target_dir = Path(projects_dir) if projects_dir is not None else cls.DEFAULT_PROJECTS_DIR
+        target_dir = cls._project_root(projects_dir)
         if not target_dir.exists():
             return []
         summaries: list[WorkspaceSnapshotSummary] = []
@@ -605,11 +611,13 @@ class WorkspaceSessionManager:
         return summaries
 
     @classmethod
-    def delete_local_project(cls, path: str | Path) -> bool:
+    def delete_local_project(cls, path: str | Path, *, projects_dir: str | Path | None = None) -> bool:
         """Delete a local ``.omniforge`` or legacy ``.uap`` project snapshot file if it exists."""
         target = Path(path)
+        root = cls._project_root(projects_dir)
         if (
             not target.is_symlink()
+            and target.resolve().parent == root.resolve()
             and target.exists()
             and target.is_file()
             and target.suffix.lower() in LEGACY_PROJECT_EXTENSIONS

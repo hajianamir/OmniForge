@@ -21,6 +21,7 @@ from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC, SVR
 
+from omniforge.core.exceptions import ModelTrainingError
 from omniforge.core.types import TaskType
 from omniforge.core.utils import is_package_available
 from omniforge.models.base import BaseOmniForgeModel
@@ -30,6 +31,23 @@ class ClassicalMLModel(BaseOmniForgeModel):
     """Unified wrapper over scikit-learn, XGBoost, LightGBM, and CatBoost algorithms."""
 
     model_family = "classical_ml"
+    _ESTIMATOR_PARAMETERS = {
+        "xgboost": {"n_estimators", "max_depth", "learning_rate"},
+        "lightgbm": {"n_estimators", "num_leaves", "learning_rate"},
+        "catboost": {"n_estimators", "max_depth", "learning_rate"},
+        "random_forest": {"n_estimators", "max_depth", "min_samples_leaf"},
+        "extra_trees": {"n_estimators", "max_depth"},
+        "gradient_boosting": {"n_estimators", "learning_rate", "max_depth"},
+        "gbdt": {"n_estimators", "learning_rate", "max_depth"},
+        "hist_gradient_boosting": {"n_estimators", "learning_rate", "max_depth"},
+        "logistic_regression": {"C"},
+        "ridge": {"alpha"},
+        "lasso": {"alpha"},
+        "elasticnet": {"alpha", "l1_ratio"},
+        "svm": {"C", "kernel"},
+        "knn": {"n_neighbors"},
+        "naive_bayes": set(),
+    }
 
     def __init__(
         self,
@@ -55,10 +73,41 @@ class ClassicalMLModel(BaseOmniForgeModel):
             "knn",
         }
         self.scale_features = needs_scaling if scale_features is None else scale_features
+        self._requested_scale_features = scale_features
         self._scaler: StandardScaler | None = StandardScaler() if self.scale_features else None
         self._estimator: Any = None
         self._label_to_idx: dict[Any, int] | None = None
         self._idx_to_label: dict[int, Any] | None = None
+
+    def get_params(self, deep: bool = True) -> dict[str, Any]:
+        """Return the arguments accepted by the classical wrapper constructor."""
+        return {
+            **self.hyperparameters,
+            "task_type": self.task_type,
+            "scale_features": getattr(self, "_requested_scale_features", self.scale_features),
+            "random_seed": self.random_seed,
+            "track_carbon": self.track_carbon,
+            "country_iso": self.country_iso,
+        }
+
+    def set_params(self, **params: Any) -> ClassicalMLModel:
+        if not params:
+            return self
+        previous = self.get_params(deep=False)
+        algorithm = str(params.get("algorithm", previous["algorithm"])).lower()
+        if algorithm not in self._ESTIMATOR_PARAMETERS:
+            raise ModelTrainingError("Unknown classical model algorithm.")
+        estimator_keys = self._ESTIMATOR_PARAMETERS[algorithm]
+        shared = {"algorithm", "task_type", "scale_features", "random_seed", "track_carbon", "country_iso"}
+        invalid = params.keys() - (shared | estimator_keys)
+        if invalid:
+            raise ModelTrainingError(f"Unsupported parameters for {algorithm}: {', '.join(sorted(invalid))}.")
+        if algorithm != self.algorithm:
+            previous = {key: value for key, value in previous.items() if key in shared or key in estimator_keys}
+        replacement = type(self)(**(previous | params))
+        self.__dict__.clear()
+        self.__dict__.update(replacement.__dict__)
+        return self
 
     def _build_estimator(self, n_classes: int = 2) -> Any:
         is_clf = self.task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION)

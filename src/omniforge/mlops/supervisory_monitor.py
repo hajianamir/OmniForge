@@ -64,7 +64,7 @@ class SupervisoryPredictionMonitor:
                 "active_champion",
                 f"Champion · {m_name}",
                 "AutoML / Champion",
-                primary_target,
+                str(state.get("uap_active_model_target") or primary_target),
                 list(state.get("uap_active_feature_cols") or []),
                 state.get("uap_active_model"),
                 state.get("uap_active_model_metrics") or {},

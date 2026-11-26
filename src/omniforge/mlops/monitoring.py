@@ -10,6 +10,7 @@ import numpy as np
 from pydantic import BaseModel, Field
 
 from omniforge.core.logging import get_logger
+from omniforge.core.types import TaskType
 
 if TYPE_CHECKING:
     from omniforge.mlops.registry import ModelRegistry
@@ -35,6 +36,7 @@ class ModelMonitor:
         self,
         model_name: str,
         *,
+        task_type: TaskType | None = None,
         max_p95_latency_ms: float = 250.0,
         min_accuracy: float | None = 0.75,
         max_mae: float | None = None,
@@ -42,6 +44,7 @@ class ModelMonitor:
         max_window_size: int = 10_000,
     ) -> None:
         self.model_name = model_name
+        self.task_type = task_type
         self.max_p95_latency_ms = max_p95_latency_ms
         self.min_accuracy = min_accuracy
         self.max_mae = max_mae
@@ -133,10 +136,8 @@ class ModelMonitor:
             abs_err = np.abs(preds - acts)
             live_mae = float(np.mean(abs_err))
             live_rmse = float(np.sqrt(np.mean((preds - acts) ** 2)))
-            # Classification accuracy when targets are integer/boolean class labels (or min_accuracy SLA is enabled)
-            is_discrete_labels = bool(np.all(np.isclose(acts, np.round(acts), atol=1e-9)))
-            if is_discrete_labels:
-                live_acc = float(np.mean(np.round(preds) == np.round(acts)))
+            if self.task_type in {TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION}:
+                live_acc = float(np.mean(preds == acts))
                 if self.min_accuracy is not None and live_acc < self.min_accuracy:
                     new_alerts.append(
                         AlertEvent(
@@ -172,7 +173,8 @@ class ModelMonitor:
         quality_breaches = [
             a
             for a in new_alerts
-            if a.alert_type in {"accuracy_degradation", "regression_error_breach", "error_rate_breach"}
+            if a.alert_type == "error_rate_breach"
+            or (self.task_type is not None and a.alert_type in {"accuracy_degradation", "regression_error_breach"})
         ]
         if (
             auto_rollback
@@ -195,6 +197,7 @@ class ModelMonitor:
 
         return {
             "model_name": self.model_name,
+            "task_type": self.task_type.value if self.task_type is not None else None,
             "status": "degraded" if new_alerts else "healthy",
             "total_requests": self._total_requests,
             "labeled_feedback_count": len(self._paired_feedback),

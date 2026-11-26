@@ -71,8 +71,9 @@ class InitialIntakeAuditor:
                     "severity": sev,
                     "category": "Format & Schema",
                     "column": str(getattr(issue, "column", "*")),
-                    "finding": str(getattr(issue, "issue_type", "Format issue")),
-                    "metric": f"{getattr(issue, 'affected_rows', 0):,} rows ({getattr(issue, 'affected_pct', 0.0):.1f}%)",
+                    "finding": issue.description,
+                    "issue_code": issue.issue_code,
+                    "metric": f"{issue.affected_count:,} rows ({issue.affected_pct:.1f}%)",
                     "recommended_fix": str(getattr(issue, "recommendation", "Apply Auto-Clean type/string normalization.")),
                 }
             )
@@ -332,7 +333,7 @@ class InitialIntakeAuditor:
             "numeric_imputation": "median" if (any_missing or any_inf) else "median",
             "categorical_imputation": "most_frequent",
             "outlier_method": "iqr" if any_heavy_outliers else "none",
-            "outlier_action": "clip" if any_heavy_outliers else "none",
+            "outlier_action": "flag" if any_heavy_outliers else "none",
             "outlier_threshold": 1.5,
             "drop_constant_columns": len(constant_cols) > 0,
         }

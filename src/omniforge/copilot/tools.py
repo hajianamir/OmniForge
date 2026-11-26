@@ -13,6 +13,7 @@ import pandas as pd
 
 from omniforge.copilot.memory import CopilotMemory
 from omniforge.core.exceptions import CopilotError, SecurityError
+from omniforge.core.types import Principal
 from omniforge.core.utils import to_json_object
 
 _FORBIDDEN_SYSTEM_PREFIXES: tuple[str, ...] = ("/etc", "/proc", "/sys", "/root", "/dev", "/var/run")
@@ -111,7 +112,7 @@ class CopilotToolRegistry:
             ) from exc
 
     def _register_platform_tools(self) -> None:
-        def _authorize_if_http_principal(permission: str) -> None:
+        def _authorize_if_http_principal(permission: str) -> Principal | None:
             try:
                 from omniforge.api.auth import access_controller, get_request_principal
 
@@ -120,6 +121,7 @@ class CopilotToolRegistry:
                 req_principal = None
             if req_principal is not None:
                 access_controller.authorize(req_principal, permission)
+            return req_principal
 
         def tool_ingest_data(source: str, dataset_name: str = "dataset") -> dict[str, Any]:
             from omniforge.data.ingestion import DataIngestionEngine
@@ -481,8 +483,9 @@ class CopilotToolRegistry:
             """C8 zero-trust PII audit: detect + pseudonymize or block."""
             from omniforge.core.security import DataFramePIIGuard
 
+            principal = _authorize_if_http_principal("data:write")
             _, df = self.memory.get_dataset(dataset_name)
-            guard = DataFramePIIGuard(tenant_id="copilot", pii_policy=pii_policy)
+            guard = DataFramePIIGuard(tenant_id=principal.tenant_id if principal is not None else "copilot", pii_policy=pii_policy)
             redacted, report = guard.transform(df)
             out_name = f"{self.memory.working_state.get('active_dataset', 'dataset')}_pii_guarded"
             self.memory.set_dataset(out_name, redacted)
@@ -591,13 +594,13 @@ class CopilotToolRegistry:
                     "error": f"Invalid model stage '{stage}'.",
                     "available_stages": [s.value for s in ModelStage],
                 }
-            _authorize_if_http_principal(
+            principal = _authorize_if_http_principal(
                 "model:promote" if ms == ModelStage.PRODUCTION else "mlops:write"
             )
             reg = wb.get_tenant_registry()
             ver = reg.register_model(
                 model=model, model_name=model_name, owner="copilot", intended_use="",
-                stage=ms,
+                stage=ms, principal=principal,
             )
             return {"registered": ver.model_dump() if hasattr(ver, "model_dump") else dict(ver)}
 
@@ -621,7 +624,7 @@ class CopilotToolRegistry:
                     "error": f"Invalid model stage '{stage}'.",
                     "available_stages": [s.value for s in ModelStage],
                 }
-            _authorize_if_http_principal(
+            principal = _authorize_if_http_principal(
                 "model:promote" if ms == ModelStage.PRODUCTION else "model:deploy"
             )
             reg = wb.get_tenant_registry()
@@ -637,7 +640,7 @@ class CopilotToolRegistry:
                 # If registry listing fails, let the promotion attempt surface its own error.
                 pass
             updated = reg.transition_stage(
-                model_name, version, ms, fairness_report=None,
+                model_name, version, ms, fairness_report=None, principal=principal,
             )
             return {"updated": updated.model_dump() if hasattr(updated, "model_dump") else dict(updated)}
 

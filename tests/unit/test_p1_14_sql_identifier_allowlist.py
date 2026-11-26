@@ -13,7 +13,8 @@ from omniforge.data.ingestion import DataIngestionEngine, _quote_sql_identifier
 
 
 @pytest.fixture()
-def sqlite_db(tmp_path: Path) -> Path:
+def sqlite_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv("OMNIFORGE_ALLOWED_DB_DIRS", str(tmp_path))
     db = tmp_path / "sample.db"
     conn = sqlite3.connect(db)
     conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)")
@@ -25,7 +26,8 @@ def sqlite_db(tmp_path: Path) -> Path:
 
 
 @pytest.fixture()
-def duckdb_db(tmp_path: Path) -> Path:
+def duckdb_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv("OMNIFORGE_ALLOWED_DB_DIRS", str(tmp_path))
     db = tmp_path / "sample.duckdb"
     conn = duckdb.connect(str(db))
     conn.execute("CREATE TABLE users (id INTEGER, email VARCHAR)")

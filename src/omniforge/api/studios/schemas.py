@@ -39,7 +39,7 @@ class CleanReq(BaseModel):
     constant_fill_numeric: float = 0.0
     constant_fill_categorical: str = "MISSING"
     drop_duplicates: bool = True
-    handle_outliers: str = "clip"
+    handle_outliers: str = "flag"
     outlier_method: str = "iqr"
     outlier_threshold: float = 1.5
     contamination: float = Field(default=0.05, gt=0.0, lt=0.5)
@@ -228,13 +228,13 @@ class NLPReq(BaseModel):
     task: str = "overview"
     text_col: str | None = None
     custom_texts: list[str] = Field(default_factory=list)
-    candidate_labels: list[str] = Field(default_factory=lambda: ["Finance", "Operations", "Risk", "Customer Support"])
+    candidate_labels: list[str] = Field(default_factory=list)
     question: str = ""
     context: str = ""
     query: str = ""
     aspects: list[str] = Field(default_factory=list)
-    n_topics: int = 4
-    n_clusters: int = 3
+    n_topics: int = Field(default=4, ge=2, le=20)
+    n_clusters: int = Field(default=3, ge=2, le=20)
     use_pretrained: bool = False
 
 
@@ -245,19 +245,20 @@ class GraphReq(BaseModel):
     run_supervised: bool = True
     run_neural_gae: bool = True
     edge_operator: str = "hadamard"
-    top_k: int = 12
+    top_k: int = Field(default=12, ge=1, le=50)
 
 
 class RecommendReq(BaseModel):
     user_col: str | None = None
     item_col: str | None = None
     rating_col: str | None = None
-    top_k: int = 8
+    user_id: str | None = None
+    top_k: int = Field(default=12, ge=1, le=25)
 
 
 class SurvivalReq(BaseModel):
-    duration_col: str
-    event_col: str
+    duration_col: str | None = None
+    event_col: str | None = None
 
 
 class DAGRunReq(BaseModel):

@@ -33,7 +33,7 @@ def s12_report_catalog(x_session_id: str | None = Header(default="default")) -> 
         "executive_summary": has_df,
         "analyses_performed": bool(state.get("uap_lineage")) or has_df,
         "data_exclusions": bool(
-            state.get("uap_clean_report") or state.get("uap_exclusions") or state.get("uap_deleted_data_log")
+            state.get("uap_clean_report") or state.get("uap_exclusions") or state.get("uap_deleted_records_log")
         ),
         "intake_audit": bool(state.get("uap_intake_audit")),
         "quality_diagnostics": bool(state.get("uap_diag_report") or state.get("uap_quality")) or has_df,
@@ -94,6 +94,31 @@ def _compile_report_payload(state: dict[str, Any], req: ReportCompileReq) -> dic
         quality.model_dump() if hasattr(quality, "model_dump") else quality
     )
     targets = _wb().get_selected_targets(state, df)
+    modeling = state.get("uap_automl")
+    model_name = state.get("uap_active_model_name")
+    metrics = state.get("uap_active_model_metrics") or {}
+    metric_name = getattr(modeling, "primary_metric", None)
+    if metric_name is None and "score" in metrics:
+        metric_name = "score"
+    model_summary = {
+        "best_model_name": model_name,
+        "primary_metric": metric_name or "Model Score",
+        "best_score": metrics.get(metric_name),
+        "lift_over_best_baseline": metrics.get("lift_over_baseline"),
+        "metrics": metrics,
+    } if model_name else None
+    lineage = [
+        {
+            **entry,
+            "studio": entry.get("studio") or entry.get("stage", ""),
+            "analysis_name": entry.get("analysis_name") or entry.get("action", ""),
+            "outcome_summary": entry.get("outcome_summary") or entry.get("details", ""),
+            "inputs": entry.get("inputs") or f"{entry['rows']:,} rows × {entry['columns']:,} columns"
+            if isinstance(entry.get("rows"), int) and isinstance(entry.get("columns"), int)
+            else entry.get("inputs", ""),
+        }
+        for entry in state.get("uap_lineage") or [] if isinstance(entry, dict)
+    ]
     gen = ReportGenerator()
     payload = gen.build_report(
         title=req.title,
@@ -103,11 +128,16 @@ def _compile_report_payload(state: dict[str, Any], req: ReportCompileReq) -> dic
         include_tables=req.include_tables,
         include_dataset_appendix=req.include_dataset_appendix,
         max_table_rows=req.max_table_rows,
-        dataset_summary={"name": state.get("uap_dataset_name"), "rows": len(df), "columns": df.shape[1], "targets": targets},
+        dataset_summary={
+            "dataset_name": state.get("uap_dataset_name") or "Active Dataset",
+            "n_rows": len(df),
+            "n_columns": df.shape[1],
+            "target_columns": ", ".join(targets),
+        },
         quality_report=q_dict,
-        model_summary={"active_model": state.get("uap_active_model_name"), "metrics": state.get("uap_active_model_metrics")} if state.get("uap_active_model_name") else None,
+        model_summary=model_summary,
         fairness_report=state.get("uap_fairness_result"),
-        analyses_performed=state.get("uap_lineage"),
+        analyses_performed=lineage,
         exclusions=state.get("uap_exclusions"),
         df=downsample_table_for_plot(df, max_rows=15_000),
         raw_df=downsample_table_for_plot(raw_df, max_rows=15_000) if isinstance(raw_df, pd.DataFrame) else None,
@@ -131,6 +161,14 @@ def _compile_report_payload(state: dict[str, Any], req: ReportCompileReq) -> dic
     selected_set = set(req.selected_sections or [s.section_id for s in REPORT_SECTIONS_CATALOG])
     tables = payload.setdefault("tables", {})
     sections = payload.setdefault("sections", [])
+
+    if req.include_tables and "data_exclusions" in selected_set:
+        deleted = state.get("uap_deleted_records_log") or []
+        if deleted:
+            tables["Deleted Records Audit"] = [
+                {key: entry.get(key) for key in ("timestamp", "stage", "reason", "rows_removed", "columns_removed")}
+                for entry in deleted[:req.max_table_rows] if isinstance(entry, dict)
+            ]
 
     if "intake_audit" in selected_set and isinstance(state.get("uap_intake_audit"), dict):
         ia = state["uap_intake_audit"]
@@ -305,7 +343,7 @@ def s12_compile_report(req: ReportCompileReq, x_session_id: str | None = Header(
     )
 
 
-@router.get("/s12/export/{fmt}")
+@router.get("/s12/export/{fmt}", dependencies=[Depends(require_permission("report:generate"))])
 def s12_export_report(fmt: str, x_session_id: str | None = Header(default="default")) -> StreamingResponse:
     state = _wb().get_session_state(_wb()._sid(x_session_id))
     payload = state.get("uap_report_payload")

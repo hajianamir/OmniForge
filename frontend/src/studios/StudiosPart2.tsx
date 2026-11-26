@@ -32,6 +32,8 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
   const [selectedBackend, setSelectedBackend] = useState('omniforge_native');
   const [budget, setBudget] = useState(25);
   const [cvFolds, setCvFolds] = useState(3);
+  const [selectedTarget, setSelectedTarget] = useState('');
+  const modelingTarget = ws.targets.length === 1 ? ws.targets[0] : ws.targets.includes(selectedTarget) ? selectedTarget : '';
   const automlRes = studioCache.s06_automl ?? null;
 
   // Non-Parametric Analytical Suite state
@@ -65,6 +67,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
     setBusy(true); setErr(null);
     try {
       const res = await apiPost<AutoMLResponse>('/api/workbench/s06/automl', {
+        target: modelingTarget,
         backend: selectedBackend,
         time_budget_seconds: budget,
         cv_folds: cvFolds,
@@ -84,6 +87,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
       const allModels = ['gam_spline', 'nadaraya_watson', 'kernel_ridge_rbf', 'weighted_knn', 'isotonic'];
       const chosen = npMode === 'custom' ? npModels : npMode === 'auto' ? ['gam_spline', 'nadaraya_watson', 'kernel_ridge_rbf', 'weighted_knn'] : allModels;
       const res = await apiPost<NonParametricResponse>('/api/workbench/s06/nonparametric', {
+        target: modelingTarget,
         models: chosen.length ? chosen : allModels,
         n_knots: npKnots,
         spline_degree: npDegree,
@@ -104,7 +108,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
   const runDeep = async () => {
     setBusy(true); setErr(null);
     try {
-      const res = await apiPost<DeepLearningResponse>('/api/workbench/s06/deep-learning', { architectures: dlArchs, epochs: dlEpochs });
+      const res = await apiPost<DeepLearningResponse>('/api/workbench/s06/deep-learning', { target: modelingTarget, architectures: dlArchs, epochs: dlEpochs });
       onSync(res.state);
       setStudioResult('s06_dl', res);
     } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
@@ -145,6 +149,15 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
         <ProvenancePill ws={ws} />
       </div>
       {err && <div className="alert alert-error">{err}</div>}
+      {tab !== 'predict' && ws.targets.length > 1 && (
+        <label className="field">
+          Target for this run
+          <select value={modelingTarget} onChange={(e) => setSelectedTarget(e.target.value)} disabled={busy}>
+            <option value="">Choose one target</option>
+            {ws.targets.map((target) => <option key={target} value={target}>{target}</option>)}
+          </select>
+        </label>
+      )}
       <LiveChartGenerator studioId="06" ws={ws} studioCache={studioCache} />
       <div className="tabs">
         <button className={`tab-btn ${tab === 'automl' ? 'active' : ''}`} onClick={() => setTab('automl')}>Multi-Backend AutoML Hub</button>
@@ -192,7 +205,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
               <label className="field">CV Folds
                 <input type="number" min={2} max={10} value={cvFolds} onChange={(e) => setCvFolds(Number(e.target.value))} style={{ width: 80 }} />
               </label>
-              <button className="btn btn-primary" disabled={busy || !ws.has_dataset} onClick={runAutoML}>
+              <button className="btn btn-primary" disabled={busy || !ws.has_dataset || !modelingTarget} onClick={runAutoML}>
                 {busy ? <span className="spinner" /> : null} Launch AutoML Tournament
               </button>
             </div>
@@ -201,7 +214,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
           {automlRes && (
             <div className="card">
               <div className="card-title">
-                <span>Champion Model Leaderboard ({automlRes.backend_used ?? 'native'})</span>
+                <span>Champion Model Leaderboard{automlRes.target ? ` · ${automlRes.target}` : ''} ({automlRes.backend_used ?? 'native'})</span>
                 <span className="badge badge-green">Lift vs Baseline: {Number(automlRes.lift_over_baseline ?? 0) >= 0 ? '+' : ''}{Number(automlRes.lift_over_baseline ?? 0).toFixed(4)}</span>
               </div>
               {automlRes.fallback_reason && <div className="alert alert-warn">{automlRes.fallback_reason}</div>}
@@ -303,7 +316,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
                 </div>
               </label>
             </div>
-            <button className="btn btn-primary" disabled={busy || !ws.has_dataset} onClick={runNonParametric}>
+            <button className="btn btn-primary" disabled={busy || !ws.has_dataset || !modelingTarget} onClick={runNonParametric}>
               {busy ? <span className="spinner" /> : null} Run Non-Parametric Analytical Benchmark ({npMode.toUpperCase()})
             </button>
           </div>
@@ -415,7 +428,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
             <label className="field">Epochs
               <input type="number" min={5} max={100} value={dlEpochs} onChange={(e) => setDlEpochs(Number(e.target.value))} style={{ width: 90 }} />
             </label>
-            <button className="btn btn-primary" disabled={busy || !ws.has_dataset || !dlArchs.length} onClick={runDeep}>
+            <button className="btn btn-primary" disabled={busy || !ws.has_dataset || !modelingTarget || !dlArchs.length} onClick={runDeep}>
               {busy ? <span className="spinner" /> : null} Benchmark Deep Architectures
             </button>
           </div>

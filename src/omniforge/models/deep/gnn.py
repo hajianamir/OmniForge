@@ -9,6 +9,7 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 
+from omniforge.core.exceptions import DependencyMissingError, ModelTrainingError
 from omniforge.core.types import TaskType
 from omniforge.core.utils import is_package_available
 from omniforge.models.base import BaseOmniForgeModel
@@ -113,9 +114,18 @@ class GraphNeuralNetworkModel(BaseOmniForgeModel):
             y_enc = np.asarray(y, dtype=np.float32)
             out_dim = 1
 
-        if is_package_available("torch") and len(X_scaled) <= 4000:
+        torch_available = is_package_available("torch")
+        if torch_available and len(X_scaled) <= 4000:
             self._fit_torch(X_scaled, y_enc, adjacency=adjacency, out_dim=out_dim, is_clf=is_clf)
+            self.framework = "pytorch"
+            self.metadata_.framework = self.framework
+            self.metadata_.hyperparameters.update(requested_architecture=self.architecture, executed_architecture=self.architecture)
             return
+
+        if self.architecture == "gat":
+            if not torch_available:
+                raise DependencyMissingError("Graph attention requires the optional PyTorch backend.")
+            raise ModelTrainingError("Graph attention exceeds the 4,000-row limit of the current PyTorch implementation.")
 
         rng = np.random.default_rng(self.random_seed)
         self._proj_weights = []
@@ -136,6 +146,12 @@ class GraphNeuralNetworkModel(BaseOmniForgeModel):
             track_carbon=False,
         )
         self._head.fit(emb, y)
+        self.framework = f"numpy_{self.architecture}_random_projection"
+        self.metadata_.framework = self.framework
+        self.metadata_.hyperparameters.update(
+            requested_architecture=self.architecture,
+            executed_architecture=f"{self.architecture}_random_projection",
+        )
 
     def _fit_torch(
         self,

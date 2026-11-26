@@ -6,9 +6,10 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from sklearn.base import is_regressor
 
+from omniforge.api.auth import require_permission
 from omniforge.api.studios.schemas import ExplainReq, FairnessReq
 from omniforge.core.exceptions import MLOpsError
 from omniforge.core.types import ModelMetadata, TaskType
@@ -43,13 +44,13 @@ def s07_explain(req: ExplainReq, x_session_id: str | None = Header(default="defa
     local_shap = eng.explain_shap_local(model, X_te, X_te.iloc[[local_idx]], n_samples=48)
     pdp_col = req.feature_for_pdp if (req.feature_for_pdp and req.feature_for_pdp in X_te.columns) else str(X_te.columns[0])
     pdp = eng.partial_dependence(model, X_te, feature=pdp_col, grid_resolution=15)
-    state["uap_shap_result"] = {"global": perm, "local": local_shap, "pdp": pdp}
+    state["uap_shap_result"] = {"global_importance": perm, "local_explanation": local_shap, "pdp": pdp}
     payload = to_json_object({"global_importance": perm, "local_explanation": local_shap, "pdp": pdp, "pdp_feature": pdp_col})
     _wb().save_studio_result(state, "s07_explain", payload)
     return payload
 
 
-@router.post("/s07/fairness")
+@router.post("/s07/fairness", dependencies=[Depends(require_permission("mlops:write"))])
 def s07_fairness(req: FairnessReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     state = _wb().get_session_state(_wb()._sid(x_session_id))
     full_df = _wb()._require_df(state)

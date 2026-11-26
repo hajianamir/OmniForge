@@ -25,6 +25,8 @@ from omniforge.core.logging import get_logger
 from omniforge.core.utils import to_json_object, to_json_safe
 
 logger = get_logger(__name__)
+_PUBLIC_JOB_FAILURE = "The job failed. Check the inputs and retry."
+_PUBLIC_JOB_SCHEDULE_FAILURE = "The job could not be scheduled. Retry shortly."
 
 
 class JobQueueFullError(RuntimeError):
@@ -73,6 +75,13 @@ class JobRecord:
         if self.started_at is not None:
             end = self.finished_at if self.finished_at is not None else time.time()
             duration = round(end - self.started_at, 3)
+        message, error = self.message, self.error
+        if self.status == "failed" and error not in {
+            _PUBLIC_JOB_FAILURE,
+            _PUBLIC_JOB_SCHEDULE_FAILURE,
+            "Worker lease expired; job was not resumed",
+        }:
+            message = error = _PUBLIC_JOB_FAILURE
         return to_json_object(
             {
                 "job_id": self.job_id,
@@ -80,10 +89,10 @@ class JobRecord:
                 "status": self.status,
                 "can_cancel": self.status == "queued" or (self.status == "running" and self.cancellable),
                 "progress": round(float(self.progress), 3),
-                "message": self.message,
+                "message": message,
                 "duration_seconds": duration,
                 "result": self.result if self.status == "completed" else None,
-                "error": self.error,
+                "error": error,
             }
         )
 
@@ -288,8 +297,9 @@ class BackgroundJobManager:
                 # ThreadPoolExecutor captures SystemExit/KeyboardInterrupt too; make
                 # their jobs terminal rather than leaving an immortal running row.
                 result_json = None
-                error = str(exc) or type(exc).__name__
-                status, message = "failed", f"Failed: {error}"
+                logger.warning("workbench_job_failed", job_id=rec.job_id, error_type=type(exc).__name__)
+                error = _PUBLIC_JOB_FAILURE
+                status, message = "failed", error
             with self._connection() as conn:
                 conn.execute(
                     """UPDATE workbench_jobs SET status = ?, progress = ?, message = ?, result_json = ?, error = ?,
@@ -301,11 +311,12 @@ class BackgroundJobManager:
         try:
             self._executor.submit(_runner)
         except Exception as exc:
+            logger.warning("workbench_job_schedule_failed", job_id=rec.job_id, error_type=type(exc).__name__)
             self._local_pending.release()
             with self._connection() as conn:
                 conn.execute(
                     "UPDATE workbench_jobs SET status = 'failed', message = ?, error = ?, finished_at = ? WHERE job_id = ?",
-                    ("Failed to schedule job", str(exc), time.time(), rec.job_id),
+                    ("Failed to schedule job", _PUBLIC_JOB_SCHEDULE_FAILURE, time.time(), rec.job_id),
                 )
             raise
         return rec

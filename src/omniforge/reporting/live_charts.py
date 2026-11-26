@@ -522,6 +522,8 @@ class _ResolvedModelEval:
     classes: list[Any]
     feature_cols: list[str]
     eval_scope: str
+    decision_scores: np.ndarray | None = None
+    probability_error: str | None = None
 
 
 def _resolve_model_eval(state: dict[str, Any], df: pd.DataFrame) -> _ResolvedModelEval | None:
@@ -590,29 +592,32 @@ def _resolve_model_eval(state: dict[str, Any], df: pd.DataFrame) -> _ResolvedMod
     raw_classes = getattr(est, "classes_", None)
     classes: list[Any] = list(raw_classes) if raw_classes is not None else []
     y_proba: np.ndarray | None = None
+    decision_scores: np.ndarray | None = None
+    probability_error: str | None = None
     if task in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
+        probability_error = "The estimator does not provide valid class probabilities."
         if hasattr(est, "predict_proba"):
             try:
                 raw_p = np.asarray(est.predict_proba(X_eval), dtype=float)
-                if raw_p.ndim == 1:
-                    raw_p = np.column_stack([1.0 - raw_p, raw_p])
-                y_proba = np.clip(np.nan_to_num(raw_p, nan=0.5), 0.0, 1.0)
+                if (
+                    len(classes) >= 2
+                    and raw_p.shape == (len(X_eval), len(classes))
+                    and np.isfinite(raw_p).all()
+                    and (raw_p >= 0.0).all()
+                    and (raw_p <= 1.0).all()
+                    and np.allclose(raw_p.sum(axis=1), 1.0, atol=1e-6, rtol=0.0)
+                ):
+                    y_proba = raw_p
+                    probability_error = None
             except Exception:
-                y_proba = None
-        elif hasattr(est, "decision_function"):
+                pass
+        if y_proba is None and len(classes) == 2 and hasattr(est, "decision_function"):
             try:
-                dec = np.asarray(est.decision_function(X_eval), dtype=float)
-                if dec.ndim == 1:
-                    p1 = 1.0 / (1.0 + np.exp(-np.clip(dec, -30.0, 30.0)))
-                    y_proba = np.column_stack([1.0 - p1, p1])
-                else:
-                    shifted = dec - np.max(dec, axis=1, keepdims=True)
-                    exp_d = np.exp(np.clip(shifted, -30.0, 30.0))
-                    y_proba = exp_d / np.maximum(exp_d.sum(axis=1, keepdims=True), 1e-12)
+                scores = np.asarray(est.decision_function(X_eval), dtype=float)
+                if scores.shape == (len(X_eval),) and np.isfinite(scores).all():
+                    decision_scores = scores
             except Exception:
-                y_proba = None
-        if not classes:
-            classes = sorted(pd.Series(y_eval).dropna().unique().tolist(), key=str)
+                pass
 
     return _ResolvedModelEval(
         model_name=model_name,
@@ -626,6 +631,8 @@ def _resolve_model_eval(state: dict[str, Any], df: pd.DataFrame) -> _ResolvedMod
         classes=classes,
         feature_cols=list(X_eval.columns),
         eval_scope=eval_scope,
+        decision_scores=decision_scores,
+        probability_error=probability_error,
     )
 
 
@@ -925,70 +932,30 @@ def generate_live_chart(
 # ---------------------------------------------------------------------------
 
 
-def _compute_6d_quality_scores(df: pd.DataFrame) -> tuple[float, dict[str, float]]:
-    total_cells = max(1, df.shape[0] * df.shape[1])
-    completeness = 100.0 * (1.0 - float(df.isna().sum().sum()) / total_cells)
-    uniqueness = 100.0 * (1.0 - float(df.duplicated().sum()) / max(1, len(df)))
-    const_cols = sum(1 for c in df.columns if df[c].nunique(dropna=True) <= 1)
-    schema_integrity = 100.0 * (1.0 - const_cols / max(1, df.shape[1]))
-
-    num_df = df.select_dtypes(include=[np.number])
-    if not num_df.empty:
-        inf_cells = int(np.isinf(num_df.to_numpy(dtype=float, na_value=0.0)).sum())
-        validity = 100.0 * (1.0 - inf_cells / max(1, num_df.size))
-        outlier_rates: list[float] = []
-        for c in num_df.columns:
-            s = pd.to_numeric(num_df[c], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-            if len(s) >= 4:
-                q1, q3 = float(np.percentile(s, 25)), float(np.percentile(s, 75))
-                iqr = q3 - q1
-                if iqr > 0:
-                    out_frac = float(((s < q1 - 1.5 * iqr) | (s > q3 + 1.5 * iqr)).mean())
-                    outlier_rates.append(out_frac)
-        outlier_health = max(0.0, 100.0 * (1.0 - (float(np.mean(outlier_rates)) if outlier_rates else 0.0)))
-    else:
-        validity = 100.0
-        outlier_health = 95.0
-
-    high_miss = sum(1 for c in df.columns if float(df[c].isna().mean()) > 0.3)
-    consistency = 100.0 * (1.0 - high_miss / max(1, df.shape[1]))
-    dims = {
-        "Completeness": round(completeness, 2),
-        "Uniqueness": round(uniqueness, 2),
-        "Validity": round(validity, 2),
-        "Consistency": round(consistency, 2),
-        "Outlier Health": round(outlier_health, 2),
-        "Schema Health": round(schema_integrity, 2),
+def _quality_profile(state: dict[str, Any], df: pd.DataFrame) -> tuple[float, str, dict[str, float]]:
+    stored = state.get("uap_quality")
+    if stored is not None and hasattr(stored, "model_dump"):
+        stored = stored.model_dump()
+    if not isinstance(stored, dict) or not isinstance(stored.get("dimensions"), dict):
+        stored = DataQualityProfiler().profile(df).model_dump()
+    dimensions = {
+        name.title(): float(value)
+        for name, value in stored["dimensions"].items()
+        if isinstance(value, (int, float)) and np.isfinite(value)
     }
-    overall = round(float(np.mean(list(dims.values()))), 2)
-    return overall, dims
+    return float(stored["overall_score"]), str(stored.get("grade") or ""), dimensions
 
 
 def _build_dataset_readiness_gauge(state: dict[str, Any], df: pd.DataFrame) -> dict[str, Any]:
-    q = state.get("uap_quality")
-    if q is not None and hasattr(q, "overall_score"):
-        score = _finite_float(getattr(q, "overall_score", 0.0))
-        grade = str(getattr(q, "grade", ""))
-    elif isinstance(q, dict) and "overall_score" in q:
-        score = _finite_float(q.get("overall_score"))
-        grade = str(q.get("grade") or "")
-    else:
-        try:
-            prof = DataQualityProfiler().profile(df)
-            score = _finite_float(prof.overall_score)
-            grade = str(prof.grade)
-        except Exception:
-            score, _ = _compute_6d_quality_scores(df)
-            grade = "A" if score >= 90 else "B" if score >= 80 else "C" if score >= 65 else "D"
-
+    score, grade, _ = _quality_profile(state, df)
     missing_pct = round(100.0 * float(df.isna().sum().sum()) / max(1, df.size), 2)
     dup_rows = int(df.duplicated().sum())
     return {
         "title": "Data Quality & Readiness Score Gauge",
-        "subtitle": f"Grade {grade or 'B'} · Missing cells {missing_pct:.2f}% · Duplicate rows {dup_rows:,}",
+        "subtitle": f"Grade {grade or 'Unavailable'} · Missing cells {missing_pct:.2f}% · Duplicate rows {dup_rows:,}",
         "kpis": {
             "Readiness Score": round(score, 2),
-            "Quality Grade": grade or "B",
+            "Quality Grade": grade or "Unavailable",
             "Missing Cell %": missing_pct,
             "Duplicate Rows": dup_rows,
         },
@@ -1093,25 +1060,27 @@ def _build_supervisory_compliance_gauge(state: dict[str, Any]) -> dict[str, Any]
 
 
 def _build_quality_6d_radar(state: dict[str, Any], df: pd.DataFrame) -> dict[str, Any]:
-    overall_act, dims_act = _compute_6d_quality_scores(df)
-    axes = list(dims_act.keys())
+    overall_act, _, dims_act = _quality_profile(state, df)
+    axes = list(dims_act)
+    raw_df = state.get("uap_raw_df")
+    dims_raw: dict[str, float] = {}
+    if isinstance(raw_df, pd.DataFrame) and not raw_df.empty and not raw_df.equals(df):
+        _, _, raw_scores = _quality_profile({}, raw_df)
+        if all(axis in raw_scores for axis in axes):
+            dims_raw = raw_scores
+    if not axes:
+        raise ValueError("No quality dimensions could be evaluated for this dataset.")
     series: list[dict[str, Any]] = [
         {"name": "Active Dataset", "values": [dims_act[a] for a in axes], "color": "#38bdf8"},
     ]
-    raw_df = state.get("uap_raw_df")
-    if isinstance(raw_df, pd.DataFrame) and not raw_df.empty and raw_df.shape != df.shape or (
-        isinstance(raw_df, pd.DataFrame) and not raw_df.empty and int(raw_df.isna().sum().sum()) != int(df.isna().sum().sum())
-    ):
-        _overall_raw, dims_raw = _compute_6d_quality_scores(raw_df)
+    if dims_raw:
         series.append({"name": "Raw Intake", "values": [dims_raw[a] for a in axes], "color": "#a78bfa"})
-    else:
-        series.append({"name": "Enterprise SLA (85%)", "values": [85.0 for _ in axes], "color": "#a78bfa"})
 
     rows = [[ax, *(round(float(s["values"][idx]), 2) for s in series)] for idx, ax in enumerate(axes)]
     return {
         "title": "6D Data Quality & Integrity Radar",
-        "subtitle": f"Composite 6D Mean = {overall_act:.2f}/100 across {len(df):,} rows × {df.shape[1]} columns",
-        "kpis": {"Composite 6D Score": overall_act, **{k: v for k, v in dims_act.items()}},
+        "subtitle": f"Weighted Data Quality Index = {overall_act:.2f}/100 across {len(df):,} rows × {df.shape[1]} columns",
+        "kpis": {"Data Quality Index": overall_act, **{k: v for k, v in dims_act.items()}},
         "data": {"axes": axes, "series": series, "max_scale": 100.0},
         "table_columns": ["Dimension", *(s["name"] for s in series)],
         "table_rows": rows,
@@ -1199,21 +1168,22 @@ def _build_model_multimetric_radar(model_eval: _ResolvedModelEval | None) -> dic
         f1_m = float(f1_score(y_t, y_p, average="macro", zero_division=0)) * 100.0
         f1_w = float(f1_score(y_t, y_p, average="weighted", zero_division=0)) * 100.0
         mcc_norm = (float(matthews_corrcoef(y_t, y_p)) + 1.0) * 50.0
-        if model_eval.y_proba is not None and len(model_eval.classes) == 2:
-            pos_cls = str(model_eval.classes[1])
-            y_bin = (y_t == pos_cls).astype(int).to_numpy()
-            auc_v = float(roc_auc_score(y_bin, model_eval.y_proba[:, 1])) * 100.0 if len(np.unique(y_bin)) > 1 else acc
-        else:
-            auc_v = f1_w
-        axes = ["Accuracy", "Macro-F1", "Weighted-F1", "Scaled MCC", "Discrimination"]
-        m_vals = [round(x, 2) for x in (acc, f1_m, f1_w, mcc_norm, auc_v)]
+        axes = ["Accuracy", "Macro-F1", "Weighted-F1", "Scaled MCC"]
+        m_vals = [round(x, 2) for x in (acc, f1_m, f1_w, mcc_norm)]
         # Majority-class baseline on exact same y_true
         maj = y_t.value_counts().index[0]
         y_base = pd.Series([maj] * len(y_t))
         b_acc = float(accuracy_score(y_t, y_base)) * 100.0
         b_f1m = float(f1_score(y_t, y_base, average="macro", zero_division=0)) * 100.0
         b_f1w = float(f1_score(y_t, y_base, average="weighted", zero_division=0)) * 100.0
-        b_vals = [round(x, 2) for x in (b_acc, b_f1m, b_f1w, 50.0, 50.0)]
+        b_mcc = (float(matthews_corrcoef(y_t, y_base)) + 1.0) * 50.0
+        b_vals = [round(x, 2) for x in (b_acc, b_f1m, b_f1w, b_mcc)]
+        if len(model_eval.classes) == 2 and (model_eval.y_proba is not None or model_eval.decision_scores is not None):
+            y_bin, scores, _ = _extract_binary_clf_scores(model_eval)
+            if len(np.unique(y_bin)) == 2:
+                axes.append("ROC AUC")
+                m_vals.append(round(float(roc_auc_score(y_bin, scores)) * 100.0, 2))
+                b_vals.append(round(float(roc_auc_score(y_bin, np.full(len(y_bin), 1.0))) * 100.0, 2))
     else:
         y_t_arr = pd.to_numeric(model_eval.y_true, errors="coerce").fillna(0.0).to_numpy(dtype=float)
         y_p_arr = np.asarray(model_eval.y_pred, dtype=float)
@@ -1431,8 +1401,9 @@ def _build_model_attribution_waterfall(state: dict[str, Any], model_eval: _Resol
     base_val = 0.0
     scope_desc = ""
 
-    if isinstance(shap_res, dict) and shap_res.get("local_explanation"):
-        loc = shap_res["local_explanation"]
+    local_shap = (shap_res.get("local_explanation") or shap_res.get("local")) if isinstance(shap_res, dict) else None
+    if local_shap:
+        loc = local_shap
         if isinstance(loc, dict):
             base_val = _finite_float(loc.get("base_value", loc.get("expected_value", 0.0)))
             contribs_raw = loc.get("contributions") or loc.get("shap_values") or {}
@@ -1791,8 +1762,9 @@ def _build_feature_importance_pareto(
     source_label = ""
     pairs: list[tuple[str, float]] = []
 
-    if isinstance(shap_res, dict) and isinstance(shap_res.get("global_importance"), dict):
-        gi = shap_res["global_importance"]
+    global_shap = (shap_res.get("global_importance") or shap_res.get("global")) if isinstance(shap_res, dict) else None
+    if isinstance(global_shap, dict):
+        gi = global_shap
         for k, v in gi.items():
             if isinstance(v, dict):
                 pairs.append((str(k), abs(_finite_float(v.get("importance_mean")))))
@@ -2251,28 +2223,27 @@ def _build_bivariate_regression_ci(
     }
 
 
-def _extract_binary_clf_scores(model_eval: _ResolvedModelEval) -> tuple[np.ndarray, np.ndarray, str]:
-    """Return ``(y_true_bin, y_score, pos_label_str)`` for binary or macro-dominant class."""
-    y_str = model_eval.y_true.astype(str).to_numpy()
-    if model_eval.y_proba is not None and model_eval.y_proba.shape[1] >= 2:
-        if len(model_eval.classes) == 2:
-            pos_cls = str(model_eval.classes[1])
+def _extract_binary_clf_scores(
+    model_eval: _ResolvedModelEval, *, require_probabilities: bool = False,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """Return one-vs-rest labels and validated probabilities or binary decision scores."""
+    classes = model_eval.classes
+    if model_eval.y_proba is not None and len(classes) >= 2:
+        if len(classes) == 2:
             pos_idx = 1
         else:
-            # Pick most informative / positive class in multiclass One-vs-Rest
-            vc = pd.Series(y_str).value_counts()
-            pos_cls = str(vc.index[-1] if len(vc) > 1 else vc.index[0])
-            cls_strs = [str(c) for c in model_eval.classes]
-            pos_idx = cls_strs.index(pos_cls) if pos_cls in cls_strs else (model_eval.y_proba.shape[1] - 1)
-        y_bin = (y_str == pos_cls).astype(int)
-        scores = np.asarray(model_eval.y_proba[:, pos_idx], dtype=float)
-        return y_bin, scores, pos_cls
-
-    uniq = list(pd.Series(y_str).unique())
-    pos_cls = uniq[-1]
-    y_bin = (y_str == pos_cls).astype(int)
-    scores = (pd.Series(model_eval.y_pred).astype(str).to_numpy() == pos_cls).astype(float)
-    return y_bin, scores, pos_cls
+            counts = model_eval.y_true.value_counts()
+            observed = [(int(counts.get(label, 0)), pos) for pos, label in enumerate(classes)]
+            pos_idx = min((entry for entry in observed if entry[0] > 0), default=(0, 0))[1]
+        label = classes[pos_idx]
+        scores = model_eval.y_proba[:, pos_idx]
+    elif not require_probabilities and model_eval.decision_scores is not None and len(classes) == 2:
+        label = classes[1]
+        scores = model_eval.decision_scores
+    else:
+        raise ValueError(model_eval.probability_error or "The estimator does not provide valid scores for this chart.")
+    y_bin = (model_eval.y_true == label).to_numpy(dtype=int)
+    return y_bin, np.asarray(scores, dtype=float), str(label)
 
 
 def _build_classifier_roc_curve(model_eval: _ResolvedModelEval) -> dict[str, Any]:
@@ -2297,7 +2268,7 @@ def _build_classifier_roc_curve(model_eval: _ResolvedModelEval) -> dict[str, Any
     ]
     return {
         "title": f"ROC Curve & Youden Threshold — {model_eval.model_name}",
-        "subtitle": f"Positive Class '{pos_cls}' ({model_eval.eval_scope}) · ROC-AUC = {auc_val:.4f}, Gini = {gini:.4f}",
+        "subtitle": f"Positive Class '{pos_cls}' ({model_eval.eval_scope}, {'probabilities' if model_eval.y_proba is not None else 'decision scores'}) · ROC-AUC = {auc_val:.4f}, Gini = {gini:.4f}",
         "kpis": {
             "ROC-AUC": round(auc_val, 4),
             "Gini (2·AUC-1)": round(gini, 4),
@@ -2364,7 +2335,7 @@ def _build_classifier_pr_curve(model_eval: _ResolvedModelEval) -> dict[str, Any]
 
 
 def _build_classifier_calibration(model_eval: _ResolvedModelEval) -> dict[str, Any]:
-    y_bin, scores, pos_cls = _extract_binary_clf_scores(model_eval)
+    y_bin, scores, pos_cls = _extract_binary_clf_scores(model_eval, require_probabilities=True)
     if len(np.unique(y_bin)) < 2:
         raise ValueError("Calibration reliability diagram requires both positive and negative outcomes.")
 
@@ -2534,7 +2505,7 @@ def _extract_actual_and_pred_numeric(state: dict[str, Any], model_eval: _Resolve
         raise ValueError("Train a model or run Studio 14 Supervisory Evaluation first.")
 
     if model_eval.task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
-        y_bin, scores, pos_cls = _extract_binary_clf_scores(model_eval)
+        y_bin, scores, pos_cls = _extract_binary_clf_scores(model_eval, require_probabilities=True)
         return y_bin.astype(float), scores.astype(float), f"{model_eval.model_name} (P[{pos_cls}])"
 
     y_a = pd.to_numeric(model_eval.y_true, errors="coerce").to_numpy(dtype=float)

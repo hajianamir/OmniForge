@@ -507,7 +507,7 @@ def test_registry_governance_fairness_gate_and_automated_rollback(tmp_path: Path
     assert reg.get_version("credit_scorer", 1).stage == ModelStage.ARCHIVED
 
     # Live SLA degradation on v2 automatically rolls PRODUCTION back to fair v1!
-    mon = ModelMonitor("credit_scorer", min_accuracy=0.80)
+    mon = ModelMonitor("credit_scorer", task_type=TaskType.BINARY_CLASSIFICATION, min_accuracy=0.80)
     for _ in range(8):
         mon.record_inference(latency_ms=12.0, prediction=1, actual=0)  # 0% live accuracy < 0.80 SLA
     tracker = ExperimentTracker(db_path=tmp_path / "exp_track.db")

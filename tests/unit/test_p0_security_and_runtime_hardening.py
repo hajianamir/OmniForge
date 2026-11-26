@@ -201,13 +201,17 @@ def test_p0_3_and_p0_4_auth_rbac_csrf_cors_health_and_500_hygiene() -> None:
     prev_opt_in = sec.auto_bootstrap_local_ui
     sec.auto_bootstrap_local_ui = True
     try:
-        browser = TestClient(app)
+        browser = TestClient(app, base_url="http://localhost", client=("127.0.0.1", 51000))
         assert browser.get("/").status_code == 200
         assert WORKBENCH_AUTH_COOKIE in browser.cookies and WORKBENCH_CSRF_COOKIE in browser.cookies
         assert browser.get("/api/workbench/state").status_code == 200
         assert browser.post("/api/workbench/theme", json={"theme": "light"}).status_code == 403
         csrf = browser.cookies[WORKBENCH_CSRF_COOKIE]
         assert browser.post("/api/workbench/theme", json={"theme": "light"}, headers={"X-CSRF-Token": csrf}).status_code == 200
+        for host, peer in (("localhost", "192.0.2.1"), ("example.test", "127.0.0.1")):
+            other_client = TestClient(app, base_url=f"http://{host}", client=(peer, 51000))
+            assert other_client.get("/").status_code == 200
+            assert WORKBENCH_AUTH_COOKIE not in other_client.cookies
     finally:
         sec.auto_bootstrap_local_ui = prev_opt_in
 

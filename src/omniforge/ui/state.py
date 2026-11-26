@@ -26,11 +26,17 @@ _DOWNSTREAM_KEYS: tuple[str, ...] = (
     "uap_validation_report",
     "uap_eda_report",
     "uap_feature_report",
+    "uap_s05_engineered",
+    "uap_digital_twin",
+    "uap_mpc_controller",
+    "uap_twin_control_report",
     "uap_automl",
     "uap_target_automls",
     "uap_target_models",
     "uap_active_model",
     "uap_active_model_name",
+    "uap_active_model_target",
+    "uap_active_model_equation",
     "uap_active_model_metrics",
     "uap_active_feature_cols",
     "uap_active_input_preprocessor",
@@ -163,6 +169,7 @@ def default_workspace_dict() -> dict[str, Any]:
         "uap_automl": None,
         "uap_active_model": None,
         "uap_active_model_name": None,
+        "uap_active_model_target": None,
         "uap_active_model_metrics": {},
         "uap_active_feature_cols": [],
         "uap_active_input_preprocessor": None,
@@ -613,11 +620,14 @@ def record_active_holdout(state: dict[str, Any]) -> None:
         and X_test.index.is_unique and X_test.index.equals(y_test.index) and not y_test.isna().any()
         else None
     )
-    for key in ("uap_fairness_result", "uap_fairness_evidence", "uap_model_card", "uap_shap_result"):
+    for key in (
+        "uap_fairness_result", "uap_fairness_evidence", "uap_model_card", "uap_shap_result",
+        "uap_supervisory_result", "uap_supervisory_scored_df", "uap_future_prediction_result",
+    ):
         state[key] = None
     results = state.get("uap_studio_results")
     if isinstance(results, dict):
-        for key in ("s07_fairness", "s07_explain"):
+        for key in ("s07_fairness", "s07_explain", "s14_supervisory", "s06_predict_single", "s06_predict_batch"):
             results.pop(key, None)
 
 

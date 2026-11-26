@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from omniforge.data.cleaning import CleaningConfig, DataCleaner
 from omniforge.data.feature_store import LocalFeatureStore
@@ -18,7 +19,10 @@ from omniforge.data.validation import DataValidator, ValidationRule
 from omniforge.data.versioning import DatasetVersionManager
 
 
-def test_ingestion_formats_and_sql(classification_df: pd.DataFrame, workspace_tmp: Path) -> None:
+def test_ingestion_formats_and_sql(
+    classification_df: pd.DataFrame, workspace_tmp: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIFORGE_ALLOWED_DB_DIRS", str(workspace_tmp))
     eng = DataIngestionEngine()
     csv_p = workspace_tmp / "data.csv"
     pq_p = workspace_tmp / "data.parquet"

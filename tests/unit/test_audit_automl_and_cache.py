@@ -135,7 +135,7 @@ def test_pipeline_retry_and_cache_replay_preserve_mutation_and_deletion(tmp_path
         assert ctx.params["updated"]
         return ctx.artifacts["payload"]["values"]
 
-    dag = PipelineDAG("mutable").add_step(FunctionStep("mutate", mutate, cacheable=True, retries=1))
+    dag = PipelineDAG("mutable").add_step(FunctionStep("mutate", mutate, cacheable=True, retries=1, implementation_version="1"))
     dag.add_step(FunctionStep("observe", observe, depends_on=["mutate"]))
     executor = PipelineExecutor(cache_dir=tmp_path, track_carbon=False)
     inputs = {"payload": {"values": [1]}, "obsolete": "value"}
@@ -157,7 +157,7 @@ def test_pipeline_concurrent_publish_keeps_complete_cache_entries(tmp_path: Path
         ctx.set("value", 9)
         return 9
 
-    dag = PipelineDAG("parallel").add_step(FunctionStep("value", step, cacheable=True))
+    dag = PipelineDAG("parallel").add_step(FunctionStep("value", step, cacheable=True, implementation_version="1"))
     executor = PipelineExecutor(cache_dir=tmp_path, track_carbon=False)
     with ThreadPoolExecutor(max_workers=2) as workers:
         runs = list(workers.map(lambda _: executor.execute(dag), range(2)))
