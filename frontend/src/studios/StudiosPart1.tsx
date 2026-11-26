@@ -1624,7 +1624,7 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
 };
 
 // ============================================================================
-// Studio 04 — Automated EDA & Expanded 17-Test Hypothesis Lab
+// Studio 04 — Automated EDA & Hypothesis Lab
 // ============================================================================
 export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, setStudioResult, openHelp }) => {
   const eda = studioCache.s04_eda ?? null;
@@ -1673,8 +1673,8 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
       <div className="studio-hero">
         <div>
           <div className="row" style={{ gap: 8, alignItems: 'center' }}>
-            <h1>04 · Automated EDA &amp; 17-Test Hypothesis Lab</h1>
-            <StudioHelpButton section="studio-04" onOpenHelp={openHelp} title="Open Chapter 04: Complete 17-Test Hypothesis Reference, Formulas & Effect Sizes" />
+            <h1>04 · Automated EDA &amp; Hypothesis Lab</h1>
+            <StudioHelpButton section="studio-04" onOpenHelp={openHelp} title="Open Chapter 04: Hypothesis Tests, Formulas & Effect Sizes" />
           </div>
           <p>Distribution histograms, correlation heatmaps, automated insights, goodness-of-fit testing &amp; full Auto / Complete / Custom hypothesis batteries.</p>
         </div>
@@ -1767,7 +1767,7 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
       <div className="card">
         <div className="card-title">
           <span className="row" style={{ gap: 6, alignItems: 'center' }}>
-            Interactive 17-Test Statistical Hypothesis Lab
+            Hypothesis Lab
             <StudioHelpButton section="stat-atlas" onOpenHelp={openHelp} label="Test Selection Atlas" title="Open Master Statistical Test Decision Atlas" />
           </span>
           <ModeBar mode={hypMode} onChange={setHypMode} />

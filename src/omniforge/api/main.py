@@ -5,6 +5,8 @@ from __future__ import annotations
 import threading
 import uuid
 from collections import OrderedDict
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,7 @@ from omniforge.api.auth import (
     should_auto_bootstrap_local_ui,
     verify_api_key,
 )
+from omniforge.api.jobs import job_manager
 from omniforge.api.schemas import (
     AutoMLRequest,
     CausalRequest,
@@ -69,15 +72,30 @@ logger = get_logger(__name__)
 
 def create_app() -> FastAPI:
     """Create and configure the enterprise OmniForge FastAPI application."""
+    from omniforge.core.rate_limit import build_rate_limiter
+
+    settings = get_settings()
+    limiter = build_rate_limiter(settings.api, max_requests_per_minute=settings.api.rate_limit_per_minute)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        try:
+            async with job_manager.lifespan():
+                yield
+        finally:
+            close_limiter = getattr(limiter, "aclose", None)
+            if close_limiter is not None:
+                await close_limiter()
+
     app = FastAPI(
         title="OmniForge Enterprise Analytics & AI API",
         description="Production REST API for multi-source data, automatic format auditing, EDA, AutoML, Forecasting, Causal, Optimization, Responsible AI, MLOps, and AI Copilot.",
         version=get_version_info()["version"],
         docs_url="/docs",
         redoc_url="/redoc",
+        lifespan=lifespan,
     )
 
-    settings = get_settings()
     allowed_origins = [o.strip() for o in settings.api.cors_origins if o and o.strip()]
     allow_credentials = bool(settings.api.cors_allow_credentials) and ("*" not in allowed_origins)
 
@@ -100,12 +118,10 @@ def create_app() -> FastAPI:
     app.add_middleware(RequestBodySizeLimitMiddleware, max_body_bytes=settings.api.max_request_body_bytes)
     # Enforce the declared `api.rate_limit_per_minute` policy (429 + Retry-After).
     # 0 disables (used by the test-suite to avoid cross-test throttling).
-    from omniforge.core.rate_limit import build_rate_limiter
-
     app.add_middleware(
         SlidingWindowRateLimitMiddleware,
         max_requests_per_minute=settings.api.rate_limit_per_minute,
-        limiter=build_rate_limiter(settings.api, max_requests_per_minute=settings.api.rate_limit_per_minute),
+        limiter=limiter,
     )
 
     @app.middleware("http")

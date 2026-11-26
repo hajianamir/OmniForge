@@ -49,6 +49,17 @@ jobs:
             tail -c 3000 /tmp/pytest-output.log | tr '\n' ' ' | sed 's/%/%25/g' | cut -c1-2800 | while IFS= read -r line; do echo "::error title=pytest-tail::$line"; done
           fi
           exit "$status"
+      - name: Verify SDK resources and typing from the installed release
+        run: |
+          set -euo pipefail
+          release_dir=$(mktemp -d)
+          python -m pip install build
+          python -m build --outdir "$release_dir/dist"
+          python -m pip install --no-deps --force-reinstall "$release_dir"/dist/*.whl
+          cp scripts/verify_installed_sdk.py "$release_dir/"
+          cd "$release_dir"
+          python -I verify_installed_sdk.py
+          python -m mypy --strict --cache-dir "$release_dir/mypy-cache" verify_installed_sdk.py
   lock-verify:
     runs-on: ubuntu-latest
     steps:

@@ -9,6 +9,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Lock
 from typing import Any
 
+from omniforge.core.exceptions import ConfigurationError, MLOpsError
+
 
 def configure_remote_mlflow_tracking(
     tracking_uri: str,
@@ -33,28 +35,42 @@ def configure_remote_mlflow_tracking(
 
 
 class BackgroundJobQueue:
-    """Thread-safe asynchronous job queue for long-running AutoML and pipeline tasks."""
+    """Bound waiting work and terminal results for process-local background tasks."""
 
-    def __init__(self, max_workers: int = 2, max_history: int | None = None) -> None:
-        self._executor = ThreadPoolExecutor(max_workers=max(1, max_workers), thread_name_prefix="omniforge-job")
+    def __init__(self, max_workers: int = 2, max_history: int | None = None, *, max_queue_depth: int = 128) -> None:
+        self._max_history = 128 if max_history is None else max_history
+        if max_workers < 1 or max_queue_depth < 1 or self._max_history < 1:
+            raise ConfigurationError("Worker count, queue depth and terminal history must be positive.")
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="omniforge-job")
+        self._max_unfinished = max_workers + max_queue_depth
         self._jobs: dict[str, Future[Any]] = {}
         self._lock = Lock()
-        self._max_history = max_history
-        self._job_order: list[str] = []  # insertion order for LRU eviction
+        self._closed = False
 
     def submit(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> str:
         job_id = uuid.uuid4().hex[:12]
-        fut = self._executor.submit(fn, *args, **kwargs)
         with self._lock:
+            if self._closed:
+                raise MLOpsError("The background job queue has shut down.")
+            if sum(not job.done() for job in self._jobs.values()) >= self._max_unfinished:
+                raise MLOpsError("The background job queue is full.", suggestions=["Retry after a waiting job finishes."])
+            fut = self._executor.submit(fn, *args, **kwargs)
             self._jobs[job_id] = fut
-            self._job_order.append(job_id)
-            # Evict oldest jobs when max_history is exceeded
-            if self._max_history is not None and len(self._job_order) > self._max_history:
-                evict_count = len(self._job_order) - self._max_history
-                for _ in range(evict_count):
-                    old_id = self._job_order.pop(0)
-                    self._jobs.pop(old_id, None)
+        # Future invokes callbacks synchronously if it has already finished.
+        fut.add_done_callback(self._prune_history)
         return job_id
+
+    def _prune_history(self, _future: Future[Any]) -> None:
+        with self._lock:
+            terminal = [job_id for job_id, future in self._jobs.items() if future.done()]
+            for job_id in terminal[:-self._max_history]:
+                del self._jobs[job_id]
+
+    def shutdown(self, *, wait: bool = True, cancel_pending: bool = False) -> None:
+        """Stop accepting work, optionally cancel queued tasks, and optionally join workers."""
+        with self._lock:
+            self._closed = True
+        self._executor.shutdown(wait=wait, cancel_futures=cancel_pending)
 
     def status(self, job_id: str) -> str:
         with self._lock:
@@ -63,6 +79,8 @@ class BackgroundJobQueue:
             return "not_found"
         if not fut.done():
             return "running"
+        if fut.cancelled():
+            return "cancelled"
         return "failed" if fut.exception() is not None else "completed"
 
     def result(self, job_id: str, timeout: float | None = 30.0) -> Any:

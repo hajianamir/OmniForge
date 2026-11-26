@@ -254,14 +254,14 @@ class TestClaim4_JobQueueMaxHistory:
         jq = BackgroundJobQueue(max_workers=2, max_history=5)
         job_ids = []
         for i in range(10):
-            jid = jq.submit(f"job-{i}", lambda: None, owner_key="default")
-            job_ids.append(jid)
+            job_id = jq.submit(int, i)
+            assert jq.result(job_id) == i
+            job_ids.append(job_id)
+        jq.shutdown()
 
-        # Only the last 5 jobs should remain
-        remaining = [jid for jid in job_ids if jq.status(jid) != "not_found"]
-        assert len(remaining) <= 5, (
-            f"FIX NOT APPLIED: {len(remaining)} jobs remain (max_history=5)."
-        )
+        assert [jq.status(job_id) for job_id in job_ids[:5]] == ["not_found"] * 5
+        assert [jq.status(job_id) for job_id in job_ids[5:]] == ["completed"] * 5
+
 
 
 # ===========================================================================

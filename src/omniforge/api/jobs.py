@@ -7,15 +7,16 @@ marked failed after its lease expires rather than being silently re-executed.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -119,6 +120,10 @@ class BackgroundJobManager:
             raise ValueError("Worker count, history, queue depth and worker timeout must be positive.")
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="omniforge-job")
         self._lock = threading.RLock()
+        self._submission_lock = threading.Lock()
+        self._shutdown_lock = threading.Lock()
+        self._accepting_jobs = True
+        self._shutdown_complete = False
         self._max_history = max_history
         self._max_queue_depth = max_queue_depth
         # Bound the executor's local waiting work items even if another process
@@ -200,13 +205,13 @@ class BackgroundJobManager:
                 with self._connection() as conn:
                     self._touch_worker(conn)
             except sqlite3.Error as exc:
-                logger.warning("job_worker_heartbeat_failed", error=str(exc))
+                logger.warning("job_worker_heartbeat_failed", error_type=type(exc).__name__)
 
     def _reap_expired_workers(self, conn: sqlite3.Connection) -> None:
         if self._db_path is None:
             return
         now = time.time()
-        conn.execute(
+        expired = conn.execute(
             """UPDATE workbench_jobs SET status = 'failed', finished_at = ?,
                    message = 'Worker lost before job completed', error = 'Worker lease expired; job was not resumed'
                WHERE status IN ('queued', 'running', 'cancelling', 'committing') AND worker_id IN
@@ -218,6 +223,8 @@ class BackgroundJobManager:
                AND worker_id NOT IN (SELECT worker_id FROM workbench_jobs WHERE status IN ('queued', 'running', 'cancelling', 'committing'))""",
             (now - self._worker_timeout,),
         )
+        if expired.rowcount:
+            self._prune(conn)
 
     def _prune(self, conn: sqlite3.Connection) -> None:
         conn.execute(
@@ -247,26 +254,7 @@ class BackgroundJobManager:
         **kwargs: Any,
     ) -> JobRecord:
         """Schedule work; opted-in callables receive a ``cancellation_token`` keyword."""
-        if not self._local_pending.acquire(blocking=False):
-            raise JobQueueFullError("The local job queue is full. Try again later.")
         rec = JobRecord(job_id=uuid.uuid4().hex, name=name, owner_key=owner_key or "default", cancellable=cancellable)
-        try:
-            with self._connection() as conn:
-                self._touch_worker(conn)
-                self._reap_expired_workers(conn)
-                queued = int(conn.execute("SELECT COUNT(*) FROM workbench_jobs WHERE status = 'queued'").fetchone()[0])
-                if queued >= self._max_queue_depth:
-                    raise JobQueueFullError("The shared job queue is full. Try again later.")
-                conn.execute(
-                    """INSERT INTO workbench_jobs
-                       (job_id, name, status, progress, message, created_at, owner_key, worker_id, cancellable)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (rec.job_id, rec.name, rec.status, rec.progress, rec.message, rec.created_at, rec.owner_key, self._worker_id, int(cancellable)),
-                )
-                self._prune(conn)
-        except Exception:
-            self._local_pending.release()
-            raise
 
         def _runner() -> None:
             self._local_pending.release()
@@ -308,17 +296,41 @@ class BackgroundJobManager:
                 )
                 self._prune(conn)
 
-        try:
-            self._executor.submit(_runner)
-        except Exception as exc:
-            logger.warning("workbench_job_schedule_failed", job_id=rec.job_id, error_type=type(exc).__name__)
-            self._local_pending.release()
-            with self._connection() as conn:
-                conn.execute(
-                    "UPDATE workbench_jobs SET status = 'failed', message = ?, error = ?, finished_at = ? WHERE job_id = ?",
-                    ("Failed to schedule job", _PUBLIC_JOB_SCHEDULE_FAILURE, time.time(), rec.job_id),
-                )
-            raise
+        with self._submission_lock:
+            if not self._accepting_jobs:
+                raise JobQueueFullError("The job worker is shutting down. Try again later.")
+            if not self._local_pending.acquire(blocking=False):
+                raise JobQueueFullError("The local job queue is full. Try again later.")
+            try:
+                with self._connection() as conn:
+                    self._touch_worker(conn)
+                    self._reap_expired_workers(conn)
+                    queued = int(conn.execute("SELECT COUNT(*) FROM workbench_jobs WHERE status = 'queued'").fetchone()[0])
+                    if queued >= self._max_queue_depth:
+                        raise JobQueueFullError("The shared job queue is full. Try again later.")
+                    conn.execute(
+                        """INSERT INTO workbench_jobs
+                           (job_id, name, status, progress, message, created_at, owner_key, worker_id, cancellable)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (rec.job_id, rec.name, rec.status, rec.progress, rec.message, rec.created_at, rec.owner_key, self._worker_id, int(cancellable)),
+                    )
+                    self._prune(conn)
+            except Exception:
+                self._local_pending.release()
+                raise
+
+            try:
+                self._executor.submit(_runner)
+            except Exception as exc:
+                logger.warning("workbench_job_schedule_failed", job_id=rec.job_id, error_type=type(exc).__name__)
+                self._local_pending.release()
+                with self._connection() as conn:
+                    conn.execute(
+                        "UPDATE workbench_jobs SET status = 'failed', message = ?, error = ?, finished_at = ? WHERE job_id = ?",
+                        ("Failed to schedule job", _PUBLIC_JOB_SCHEDULE_FAILURE, time.time(), rec.job_id),
+                    )
+                    self._prune(conn)
+                raise
         return rec
 
     def _check_cancellation(self, job_id: str) -> None:
@@ -390,14 +402,27 @@ class BackgroundJobManager:
 
     def shutdown(self) -> None:
         """Wait for local work, then release the worker lease and database handle."""
-        self._executor.shutdown(wait=True)
-        self._stop_heartbeat.set()
-        if self._heartbeat_thread is not None:
-            self._heartbeat_thread.join()
-        with self._connection() as conn:
-            conn.execute("DELETE FROM workbench_job_workers WHERE worker_id = ?", (self._worker_id,))
-        if self._memory_db is not None:
-            self._memory_db.close()
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+            with self._submission_lock:
+                self._accepting_jobs = False
+            self._executor.shutdown(wait=True)
+            self._stop_heartbeat.set()
+            if self._heartbeat_thread is not None:
+                self._heartbeat_thread.join()
+            with self._connection() as conn:
+                conn.execute(
+                    """UPDATE workbench_jobs SET status = 'failed', message = ?, error = ?, finished_at = ?
+                       WHERE worker_id = ? AND status IN ('queued', 'running', 'cancelling', 'committing')""",
+                    (_PUBLIC_JOB_FAILURE, _PUBLIC_JOB_FAILURE, time.time(), self._worker_id),
+                )
+                self._prune(conn)
+                conn.execute("DELETE FROM workbench_job_workers WHERE worker_id = ?", (self._worker_id,))
+            with self._lock:
+                if self._memory_db is not None:
+                    self._memory_db.close()
+                self._shutdown_complete = True
 
 
 class _ConfiguredJobManager:
@@ -410,6 +435,7 @@ class _ConfiguredJobManager:
         self._pid = os.getpid()
         self._lock = threading.RLock()
         self._manager: BackgroundJobManager | None = None
+        self._lifespans = 0
         if hasattr(os, "register_at_fork"):
             os.register_at_fork(after_in_child=self._after_fork)
 
@@ -417,6 +443,25 @@ class _ConfiguredJobManager:
         self._pid = os.getpid()
         self._lock = threading.RLock()
         self._manager = None
+        self._lifespans = 0
+
+    @asynccontextmanager
+    async def lifespan(self) -> AsyncIterator[None]:
+        """Keep the lazy process worker alive until the last local app shuts down."""
+        if self._pid != os.getpid():
+            self._after_fork()
+        with self._lock:
+            self._lifespans += 1
+        try:
+            yield
+        finally:
+            manager = None
+            with self._lock:
+                self._lifespans -= 1
+                if self._lifespans == 0:
+                    manager, self._manager = self._manager, None
+            if manager is not None:
+                await asyncio.to_thread(manager.shutdown)
 
     def _instance(self) -> BackgroundJobManager:
         if self._pid != os.getpid():

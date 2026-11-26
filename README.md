@@ -47,12 +47,14 @@ v4.0.0 is a major SemVer bump from 3.3.0. It delivers three contracted capabilit
 
 ## 15-Studio CRISP-DM Workbench Map
 
+The map follows an iterative CRISP-DM workflow. Domain plugins provide optional example datasets, configuration, and domain analysis. Studio 03 provides diagnostics and inclusive baselines before optional Studio 05 feature selection.
+
 | Studio | ID | Name | Primary Purpose | Phase 6 Enhancement |
 |---|---|---|---|---|
-| Studio 00 | `s00` | Data Relationships | Multi-source data loading, schema relationships & initial intake audit | — |
-| Studio 01 | `s01` | Cleaning | Leakage-safe cleaning, imputation, outlier handling | — |
+| Studio 00 | `s00` | Data Ingestion & Split Lock | Data loading, intake audit, study scope, and locked evaluation cohorts | — |
+| Studio 01 | `s01` | Data Preparation & Cleaning | Profile and validate data, preview cleaning, flag outliers, and apply approved transformations | — |
 | Studio 02 | `s02` | Mining | Clustering, anomaly screening, data mining | — |
-| Studio 03 | `s03` | Industry Domains | 18 vertical industry domain solutions, KPIs & diagnostics | — |
+| Studio 03 | `s03` | Universal Diagnostics, Baselines & Risk | Evaluate assumptions, benchmark eligible study predictors, and assess tail risk | — |
 | Studio 04 | `s04` | EDA & Hypothesis | Automated exploratory data analysis & statistical hypothesis lab | — |
 | Studio 05 | `s05` | Feature Engineering | Feature creation & multi-method consensus selection | — |
 | Studio 06 | `s06` | AutoML | Multi-backend AutoML, non-parametric analytical, deep learning & Green-AI Pareto | — |
