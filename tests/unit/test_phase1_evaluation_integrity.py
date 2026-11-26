@@ -180,11 +180,11 @@ def test_readonly_connector_pins_postgres_and_sets_mysql_session_read_only(monke
 
     monkeypatch.setattr("sqlalchemy.create_engine", create_engine)
     monkeypatch.setattr(event, "listens_for", listen)
-    monkeypatch.setattr(connectors, "_validate_remote_db_host", lambda host, port: ("192.0.2.5",))
+    monkeypatch.setattr(connectors, "_validate_remote_db_host", lambda host, port: ("2001:db8::5", "192.0.2.5"))
     connectors._create_readonly_sql_engine("postgresql+psycopg://localhost/study?sslmode=verify-full")
     pg_url, pg_options = created.pop()
-    assert pg_url.host == "localhost"
-    assert pg_url.query["hostaddr"] == "192.0.2.5"
+    assert pg_url.host == "localhost,localhost"
+    assert pg_url.query["hostaddr"] == "2001:db8::5,192.0.2.5"
     assert pg_url.query["sslmode"] == "verify-full"
     assert pg_options["execution_options"]["postgresql_readonly"]
     connectors._create_readonly_sql_engine("mysql+pymysql://localhost/study")

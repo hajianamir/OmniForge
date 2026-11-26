@@ -670,7 +670,10 @@ def _validated_sql_url(connection_url: str) -> tuple[Any, str, Path | None]:
     addresses = _validate_remote_db_host(parsed.host, parsed.port or default_port)
     if backend == "postgresql" and parsed.get_driver_name() in {"psycopg2", "psycopg", "psycopg2cffi"}:
         # libpq dials hostaddr and retains the original hostname for TLS verification.
-        parsed = parsed.update_query_dict({"hostaddr": addresses[0]})
+        hostname = parsed.host or ""
+        parsed = parsed.set(host=",".join([hostname] * len(addresses))).update_query_dict(
+            {"hostaddr": ",".join(addresses)}
+        )
     return parsed, backend, None
 
 
