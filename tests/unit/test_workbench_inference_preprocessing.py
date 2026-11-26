@@ -319,3 +319,64 @@ def test_studio14_uses_locked_holdout_and_reuses_training_preprocessing() -> Non
         wb.SupervisoryPredictionMonitor._model_input(obs, ranked_entry, frame),
         entry["input_preprocessor"].transform(obs),
     )
+
+
+def test_deep_benchmark_uses_locked_rows_and_training_schema_under_row_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omniforge.api.studios import s06_automl
+
+    n = 140
+    frame = pd.DataFrame({
+        "time": pd.date_range("2022-02-01", periods=n, freq="D"),
+        "sensor": [*range(112), *([1e10] * 28)],
+        "site": ["train_a", "train_b"] * 56 + ["holdout_only"] * 28,
+        "target": [i % 2 for i in range(n)],
+        "other_outcome": [i % 2 for i in range(n)],
+    })
+    session = f"dl-{uuid.uuid4().hex}"
+    principal = Principal(subject="api_key_principal", roles=["admin"], tenant_id=get_settings().default_tenant_id)
+    state = get_session_state(wb._sid(session, principal))
+    load_new_dataset(state, frame, "test", "test", default_target="target")
+    observed: dict[str, pd.Index] = {}
+
+    class RecordingMLP:
+        name = "Fixture estimator"
+        framework = "test"
+
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def fit(self, X: pd.DataFrame, y: pd.Series) -> None:
+            observed["train"] = X.index
+            assert X["sensor"].max() < 112
+            self.model = LogisticRegression().fit(X, y)
+
+        def predict(self, X: pd.DataFrame) -> np.ndarray:
+            observed["test"] = X.index
+            assert (X[["site_train_a", "site_train_b"]] == 0).all().all()
+            return self.model.predict(X)
+
+    monkeypatch.setattr(s06_automl, "MLPModel", RecordingMLP)
+    client = TestClient(create_app(), headers={"X-API-Key": get_api_key(), "X-Session-ID": session})
+    targets = client.post("/api/workbench/targets", json={"targets": ["target", "other_outcome"]})
+    assert targets.status_code == 200, targets.text
+    lock = client.post("/api/workbench/split-lock", json={
+        "strategy": "time_series", "target_col": "target", "time_col": "time", "test_size": 0.2, "gap": 3,
+    })
+    assert lock.status_code == 200, lock.text
+    response = client.post("/api/workbench/s06/deep-learning", json={
+        "target": "target", "architectures": ["mlp"], "epochs": 5, "max_rows": 100,
+    })
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["evaluation"] == {
+        "source": "split_lock", "strategy": "time_series", "n_train": 79, "n_test": 21,
+        "available_train_rows": 109, "available_test_rows": 28,
+        "input_columns": ["sensor", "site"], "encoded_columns": ["sensor", "site_train_a", "site_train_b"],
+    }
+    assert set(observed["train"]).issubset(range(109))
+    assert set(observed["test"]).issubset(range(112, 140))
+    assert any(row["model"] == "Fixture estimator" and row["score"] is not None for row in payload["results"])
+    entry = state["uap_dl_models"]["mlp"]
+    assert entry["input_preprocessor"].categories == {"site": ["train_a", "train_b"]}

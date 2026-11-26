@@ -147,3 +147,41 @@ def test_default_target_derived_domain_indicators_remain_descriptive(domain, exc
     engineered = plugin.engineer_domain_features(sample)
     assert excluded.isdisjoint(engineered.columns)
     assert np.isfinite(plugin.compute_domain_kpis(sample)[descriptive_kpi])
+
+
+def test_layer_one_and_landmarking_fit_preprocessing_only_on_fold_training_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sklearn.compose import ColumnTransformer
+    from sklearn.linear_model import Ridge
+    from sklearn.model_selection import KFold
+
+    from omniforge.automl.backends import MetaFeatureWarmStartAutoML, MultiLayerStackingAutoML
+    from omniforge.core.types import TaskType
+
+    fit_rows: list[tuple[int, ...]] = []
+    original = ColumnTransformer.fit_transform
+
+    def track(self, X, y=None, **params):
+        fit_rows.append(tuple(X.index))
+        return original(self, X, y, **params)
+
+    monkeypatch.setattr(ColumnTransformer, "fit_transform", track)
+    n = 35
+    X = pd.DataFrame({
+        "signal": np.arange(n, dtype=float),
+        "site": [f"site-{index // 3}" for index in range(n)],
+    })
+    y = pd.Series(2.5 * X["signal"] + np.sin(X["signal"]))
+    train, holdout = X.iloc[:30], X.iloc[30:]
+    stacker = MultiLayerStackingAutoML(cv_folds=3)
+    monkeypatch.setattr(stacker, "_layer1_specs", lambda is_clf: {"L1_Ridge": Ridge()})
+    result = stacker.fit(train, y.iloc[:30], holdout, y.iloc[30:], TaskType.REGRESSION)
+    splits = KFold(n_splits=3, shuffle=True, random_state=42).split(train)
+    assert fit_rows == [tuple(train.index), *[tuple(train.index[rows]) for rows, _ in splits]]
+    assert np.isfinite(result["best_model"].predict(holdout)).all()
+
+    fit_rows.clear()
+    features = MetaFeatureWarmStartAutoML.extract_meta_features(train, y.iloc[:30], False)
+    assert fit_rows == [tuple(train.index[15:]), tuple(train.index[:15])]
+    assert np.isfinite(features["landmark_stump_score"])
