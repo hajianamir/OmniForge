@@ -114,7 +114,7 @@ test('small Studio 04 results and exclusions survive Studio 01 cleaning', async 
   await expect(page.getByRole('button', { name: 'Exclusions (1)' })).toBeVisible();
 
   await page.locator('[data-studio="04"]').click();
-  await page.getByLabel('Statistical Test (17 Available)').selectOption('shapiro');
+  await page.getByRole('combobox', { name: 'Statistical Test', exact: true }).selectOption('shapiro');
   const input = page.getByLabel('Column A (Value)');
   await expect(input.locator('option', { hasText: 'Skip Me' })).toHaveCount(0);
   await input.selectOption('Reading');
@@ -149,4 +149,38 @@ test('native AutoML labels candidate validation and champion test scores separat
   await expect(page.getByText('Test f1_weighted', { exact: true })).toBeVisible({ timeout: 20_000 });
   await expect(page.getByText(/16 held-out rows/)).toBeVisible();
   await expect(page.getByText('Validation f1_weighted (higher is better)').first()).toBeVisible();
+});
+
+test('mining selects each outcome explicitly and live charts follow studio scope', async ({ page }) => {
+  await page.addInitScript((key) => localStorage.setItem('omniforge_api_key', key), apiKey!);
+  await page.goto('/');
+  const rows = ['x,z,outcome_a,outcome_b'];
+  for (let i = 0; i < 60; i++) rows.push(`${i},${(i * 7) % 31},${i % 3},${i * 3 + i % 4}`);
+  await page.locator('input[accept=".csv,.tsv,.xlsx,.xls,.xlsm,.parquet,.json"]').setInputFiles({
+    name: 'scoped-mining.csv', mimeType: 'text/csv', buffer: Buffer.from(rows.join('\n')),
+  });
+  await expect(page.getByText(/Ingested 'scoped-mining.csv'/)).toBeVisible();
+  await page.getByRole('button', { name: 'Targets (1)' }).click();
+  await page.locator('.modal-panel').getByRole('button', { name: 'outcome_a', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Targets (2)' })).toBeVisible();
+  await page.locator('.modal-backdrop').click({ position: { x: 5, y: 5 } });
+
+  await page.locator('[data-studio="02"]').click();
+  await page.getByRole('button', { name: /3\. Data Mining Lab/ }).click();
+  const run = page.getByRole('button', { name: /Execute Data Mining Suite/ });
+  const target = page.getByLabel('Target for this mining run');
+  await expect(run).toBeDisabled();
+  await target.selectOption('outcome_b');
+  await run.click();
+  await expect(page.getByText('Mining target: outcome_b', { exact: true })).toBeVisible();
+  await target.selectOption('outcome_a');
+  await run.click();
+  await expect(page.getByText('Mining target: outcome_a', { exact: true })).toBeVisible();
+
+  const picker = page.getByLabel('Select professional chart to generate');
+  await page.locator('[data-studio="04"]').click();
+  await expect(picker.locator('option[value="normality_qq_plot"]')).toHaveCount(1);
+  await expect(picker.locator('option[value="classifier_roc_curve"]')).toHaveCount(0);
+  await page.locator('[data-studio="12"]').click();
+  await expect(picker.locator('option[value="classifier_roc_curve"]')).toHaveCount(1);
 });

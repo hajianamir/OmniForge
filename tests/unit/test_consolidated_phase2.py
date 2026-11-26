@@ -185,3 +185,16 @@ def test_layer_one_and_landmarking_fit_preprocessing_only_on_fold_training_rows(
     features = MetaFeatureWarmStartAutoML.extract_meta_features(train, y.iloc[:30], False)
     assert fit_rows == [tuple(train.index[15:]), tuple(train.index[:15])]
     assert np.isfinite(features["landmark_stump_score"])
+
+
+def test_iqr_outlier_treatment_precedes_learning_imputation() -> None:
+    from omniforge.data.cleaning import CleaningConfig, DataCleaner
+
+    cfg = CleaningConfig(numeric_imputation="mean", outlier_action="nan", drop_exact_duplicates=False)
+    assert cfg.outlier_method == "iqr"
+    train = pd.DataFrame({"x": [0.0, 1.0, 2.0, 3.0, 100.0, None]})
+    holdout = pd.DataFrame({"x": [None, 1000.0]})
+    cleaned, evaluated, report, _ = DataCleaner(cfg).fit_transform_split(train, holdout)
+    assert cleaned["x"].tolist() == [0.0, 1.0, 2.0, 3.0, 1.5, 1.5]
+    assert evaluated["x"].tolist() == [1.5, 1.5]
+    assert report.steps_executed.index("outliers:iqr:nan") < report.steps_executed.index("impute_missing")

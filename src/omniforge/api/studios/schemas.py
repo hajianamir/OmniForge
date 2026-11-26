@@ -116,6 +116,7 @@ class MiningReq(BaseModel):
     min_confidence: float = Field(default=0.55, ge=0.1, le=1.0)
     min_lift: float = Field(default=1.1, ge=0.5, le=20.0)
     color_col: str | None = None
+    target: str | None = None
 
 
 class DiagnosticsReq(BaseModel):

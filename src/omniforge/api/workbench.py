@@ -58,6 +58,7 @@ from omniforge.ui.state import (
     get_all_deleted_records_df,
     get_analysis_dataframe,
     get_audit_anomaly_dataframe,
+    get_audit_only_columns,
     get_dataset_processing_status,
     get_excluded_columns,
     get_selected_targets,
@@ -73,6 +74,7 @@ from omniforge.ui.state import (
     revert_to_raw_dataset,
     run_format_audit,
     save_studio_result,
+    set_audit_only_columns,
     set_excluded_columns,
     set_selected_targets,
     studio_completion_map,
@@ -339,6 +341,7 @@ def _state_summary(state: dict[str, Any], session_id: str) -> dict[str, Any]:
     num_cols = list(df_ok.select_dtypes(include=[np.number]).columns) if df_ok is not None else []
     cat_cols = [c for c in cols if c not in num_cols]
     excluded = get_excluded_columns(state, df) if has_df else []
+    audit_only = get_audit_only_columns(state, df) if has_df else []
     targets = get_selected_targets(state, df) if has_df else []
     status = get_dataset_processing_status(state) if has_df else {}
     lock = state.get("uap_split_lock")
@@ -375,7 +378,8 @@ def _state_summary(state: dict[str, Any], session_id: str) -> dict[str, Any]:
             "targets": targets,
             "primary_target": targets[0] if targets else None,
             "excluded_columns": excluded,
-            "analysis_cols_count": max(0, len(cols) - len(excluded)),
+            "audit_only_columns": audit_only,
+            "analysis_cols_count": len(cols) - len(set(excluded) | set(audit_only)),
             "can_undo": state.get("uap_prev_df") is not None,
             "processing_status": status,
             "split_lock": split_summary,
@@ -604,6 +608,8 @@ def update_targets(req: TargetsReq, x_session_id: str | None = Header(default="d
     sid = _sid(x_session_id)
     state = get_session_state(sid)
     df = _require_df(state)
+    if set(req.targets) & set(get_audit_only_columns(state, df)):
+        raise HTTPException(status_code=400, detail="Cleaning audit flags cannot be selected as study targets.")
     valid = set_selected_targets(state, req.targets, df)
     return {"targets": valid, "state": _state_summary(state, sid)}
 
@@ -1007,7 +1013,7 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
         lock[key] for key in ("time_col", "group_col", "row_id_col", "target_col") if isinstance(lock.get(key), str)
     } if lock else set()
     protected_columns = list(dict.fromkeys([
-        *get_excluded_columns(state, df), *get_selected_targets(state, df),
+        *get_excluded_columns(state, df), *get_selected_targets(state, df), *get_audit_only_columns(state, df),
         *sorted(lock_columns),
     ]))
 
@@ -1088,6 +1094,7 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
         if not reserved.empty:
             cleaned = recombine_split_frames(cleaned, reserved.reindex(columns=cleaned.columns), work_in.index)
         rep_dict = rep_tr.model_dump()
+        rep_dict["columns_added"] = list(dict.fromkeys([*rep_tr.columns_added, *rep_te.columns_added]))
         rep_dict["rows_reserved_by_split"] = len(reserved)
         rep_dict["exact_duplicates_removed"] = int(rep_tr.exact_duplicates_removed + rep_te.exact_duplicates_removed)
         rep_dict["fuzzy_duplicates_removed"] = int(rep_tr.fuzzy_duplicates_removed + rep_te.fuzzy_duplicates_removed)
@@ -1115,11 +1122,7 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
     dropped_const_cols: list[str] = []
     if drop_const:
         excl_set = set(protected_columns)
-        if cfg.outlier_action == "flag":
-            excl_set.update(
-                col for col in cleaned.columns
-                if col not in before_cols and col.endswith(("__is_outlier", "__is_multivariate_outlier"))
-            )
+        excl_set.update(rep_dict["columns_added"])
         const_source = (
             cleaned_tr
             if (rep_dict.get("split_lock_leakage_safe") and isinstance(cleaned_tr, pd.DataFrame) and not cleaned_tr.empty)
@@ -1163,6 +1166,9 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
     rep_dict["mode_used"] = mode
     rep_dict["dropped_constant_columns"] = dropped_const_cols
     rep_dict["renamed_columns"] = renamed_non_trivial
+    audit_only = [rename_map.get(c, c) for c in [*get_audit_only_columns(state, df), *rep_dict["columns_added"]]]
+    set_audit_only_columns(cleaned, audit_only)
+    rep_dict["audit_only_columns"] = get_audit_only_columns(state, cleaned)
     rep_dict["rows_before"] = int(len(df))
     rep_dict["rows_after"] = int(len(cleaned))
     rep_dict["cols_before"] = int(df.shape[1])
@@ -1290,7 +1296,6 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
         )
 
     state["uap_s01_cleaned"] = True
-    state["uap_clean_report"] = rep_dict
     update_active_dataset(
         state,
         cleaned,
@@ -1300,6 +1305,7 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
         preserve_stage="s01",
         row_index_preserved=True,  # DataCleaner and recombine_split_frames retain surviving row labels.
     )
+    state["uap_clean_report"] = rep_dict
     return _cache_and_respond(
         state,
         sid,
@@ -1941,29 +1947,39 @@ def s02_data_mining(req: MiningReq, x_session_id: str | None = Header(default="d
     state = get_session_state(sid)
     df = get_analysis_dataframe(state, _require_df(state))
     targets = get_selected_targets(state, df)
-    target = targets[0] if targets else None
     mode = req.mode.lower()
     tasks = ["association_rules", "subgroups", "manifold"] if mode in ("complete", "auto") else (req.tasks or ["association_rules"])
+    target = resolve_mining_target(targets, req.target) if req.target is not None or "subgroups" in tasks else None
+    predictors = df.drop(columns=targets)
+    if predictors.shape[1] == 0:
+        raise HTTPException(status_code=400, detail="Data mining requires an eligible predictor.")
 
-    out: dict[str, Any] = {"mode": mode, "tasks_executed": tasks}
+    if "subgroups" in tasks and target is None:
+        raise HTTPException(status_code=400, detail="Select a study target before running subgroup discovery.")
+    out: dict[str, Any] = {"mode": mode, "target": target, "tasks_executed": tasks}
     if "association_rules" in tasks:
         out["association_rules"] = AssociationRuleMiner().mine(
-            df,
+            predictors,
             min_support=req.min_support,
             min_confidence=req.min_confidence,
             min_lift=req.min_lift,
         )
     if "subgroups" in tasks and target:
-        out["subgroups"] = SubgroupDiscoveryMiner().discover(df, target_col=target)
+        out["subgroups"] = SubgroupDiscoveryMiner().discover(df.drop(columns=[c for c in targets if c != target]), target_col=target)
     if "manifold" in tasks:
         try:
-            proj_df = df
-            if df.select_dtypes(include=[np.number]).shape[1] < 2:
-                proj_df, _ = _prepare_numeric_feature_frame(df, set(), None, min_cols=2)
+            color = req.color_col or target or (targets[0] if len(targets) == 1 else None)
+            if color is not None and color not in df.columns:
+                raise ValueError("Choose a color column inside the study scope.")
+            proj_df = predictors.drop(columns=[color], errors="ignore")
+            if proj_df.select_dtypes(include=[np.number]).shape[1] < 2:
+                proj_df, _ = _prepare_numeric_feature_frame(proj_df, set(), None, min_cols=2)
+            if color is not None:
+                proj_df = proj_df.assign(**{color: df[color]})
             out["manifold"] = ManifoldProjector().project(
                 proj_df,
                 method=req.manifold_method,
-                color_col=req.color_col or target,
+                color_col=color,
             )
         except Exception as exc:
             out["manifold"] = {"error": str(exc)}
@@ -1978,6 +1994,7 @@ def s02_data_mining(req: MiningReq, x_session_id: str | None = Header(default="d
 from omniforge.api.studios.charts_hub import router as charts_hub_router  # noqa: E402
 from omniforge.api.studios.s00_ingestion import router as s00_router  # noqa: E402
 from omniforge.api.studios.s01_cleaning import router as s01_router  # noqa: E402
+from omniforge.api.studios.s02_mining import resolve_mining_target  # noqa: E402
 from omniforge.api.studios.s02_mining import router as s02_router  # noqa: E402
 from omniforge.api.studios.s03_eda import router as s03_router  # noqa: E402
 from omniforge.api.studios.s04_stats import router as s04_router  # noqa: E402

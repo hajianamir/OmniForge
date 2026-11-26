@@ -33,7 +33,7 @@ def _upload_csv_df(client: TestClient, headers: dict[str, str], df: pd.DataFrame
     assert res.status_code == 200, res.text
 
 
-def test_catalog_lists_all_specs_without_computing_charts_and_tracks_readiness() -> None:
+def test_catalog_filters_by_studio_and_tracks_readiness() -> None:
     client, headers = _make_client()
 
     # Before dataset upload: has_dataset=False and all charts marked ready=False
@@ -41,7 +41,7 @@ def test_catalog_lists_all_specs_without_computing_charts_and_tracks_readiness()
     assert r0.status_code == 200, r0.text
     body0 = r0.json()
     assert body0["has_dataset"] is False
-    assert len(body0["charts"]) == len(LIVE_CHART_SPECS)
+    assert {c["id"] for c in body0["charts"]} == {spec.id for spec in LIVE_CHART_SPECS if "04" in spec.studios}
     assert all(c["ready"] is False for c in body0["charts"])
 
     # Upload a live tabular dataset
@@ -65,9 +65,16 @@ def test_catalog_lists_all_specs_without_computing_charts_and_tracks_readiness()
     assert by_id["normality_qq_plot"]["ready"] is True
     assert by_id["empirical_ecdf_ks"]["ready"] is True
     assert by_id["stratified_violin_box"]["ready"] is True
-    assert by_id["model_residual_diagnostics"]["ready"] is False
-    assert by_id["classifier_roc_curve"]["ready"] is False
-    assert any(c["recommended_for_studio"] for c in body1["charts"])
+    assert all(c["recommended_for_studio"] and "04" in c["studios"] for c in body1["charts"])
+    report_gallery = client.get("/api/workbench/charts/catalog?studio_id=12", headers=headers).json()
+    assert len(report_gallery["charts"]) == len(LIVE_CHART_SPECS)
+    outside = next(spec.id for spec in LIVE_CHART_SPECS if "04" not in spec.studios)
+    for endpoint, extra in (("generate", {}), ("export", {"format": "svg"})):
+        denied = client.post(
+            f"/api/workbench/charts/{endpoint}", headers=headers, json={"chart_id": outside, "studio_id": "s04", **extra},
+        )
+        assert denied.status_code == 400
+        assert "outside this studio" in denied.json()["detail"]
 
 
 def test_all_regression_and_dataset_chart_types_generate_and_export_svg_png_xlsx() -> None:
@@ -250,7 +257,7 @@ def test_classification_model_diagnostic_charts_and_exports() -> None:
         "classifier_gain_lift",
     ]
     for cid in clf_chart_ids:
-        r_gen = client.post("/api/workbench/charts/generate", headers=headers, json={"chart_id": cid, "studio_id": "06"})
+        r_gen = client.post("/api/workbench/charts/generate", headers=headers, json={"chart_id": cid, "studio_id": "all"})
         assert r_gen.status_code == 200, f"{cid} failed: {r_gen.text}"
         body = r_gen.json()
         assert body["chart_id"] == cid

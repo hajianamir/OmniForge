@@ -97,7 +97,10 @@ def s10_run_dag(
                     exclude_columns=list(dict.fromkeys(col for col in (target, locked_time) if col is not None)),
                 ))
                 if len(te_in) > 0:
-                    clean_tr, clean_te, _, _ = cleaner.fit_transform_split(tr_in, te_in)
+                    clean_tr, clean_te, train_report, test_report = cleaner.fit_transform_split(tr_in, te_in)
+                    audit_only = list(dict.fromkeys([*train_report.columns_added, *test_report.columns_added]))
+                    clean_tr = clean_tr.drop(columns=audit_only, errors="ignore")
+                    clean_te = clean_te.drop(columns=audit_only, errors="ignore")
                     if clock_added:
                         clean_tr = clean_tr.drop(columns=[locked_time])
                         clean_te = clean_te.drop(columns=[locked_time])
@@ -105,7 +108,9 @@ def s10_run_dag(
                     ctx.set("train_df", clean_tr)
                     ctx.set("test_df", clean_te)
                 else:
-                    combined, _ = cleaner.fit_transform(tr_in)
+                    combined, report = cleaner.fit_transform(tr_in)
+                    audit_only = report.columns_added
+                    combined = combined.drop(columns=audit_only)
                     ctx.set("train_df", combined)
                 ctx.set("data", combined)
                 return {
@@ -114,6 +119,7 @@ def s10_run_dag(
                     "test_rows": int(len(ctx.get("test_df"))),
                     "leakage_safe_split_fit": not te_in.empty,
                     "fit_scope": "train_only" if not te_in.empty else "full_frame",
+                    "audit_only_columns": audit_only,
                     "output_fingerprint": compute_df_fingerprint(combined),
                 }
 

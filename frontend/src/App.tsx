@@ -543,7 +543,7 @@ export const App: React.FC = () => {
               <div>
                 <p style={{ color: 'var(--text-muted)', marginTop: 0 }}>Click columns to toggle target selection across Diagnostics, Feature Selection, AutoML, Supervisory Monitor &amp; Reporting.</p>
                 <div className="chip-grid">
-                  {ws.columns.map((c) => (
+                  {ws.columns.filter((c) => !ws.audit_only_columns?.includes(c)).map((c) => (
                     <button key={c} className={`chip ${ws.targets.includes(c) ? 'selected' : ''}`} onClick={() => toggleTarget(c)}>{c}</button>
                   ))}
                 </div>
@@ -554,10 +554,11 @@ export const App: React.FC = () => {
               <div>
                 <p style={{ color: 'var(--text-muted)', marginTop: 0 }}>Excluded columns are masked reversibly across all 14 studios without mutating raw data.</p>
                 <div className="chip-grid" style={{ marginBottom: 14 }}>
-                  {ws.columns.map((c) => (
+                  {ws.columns.filter((c) => !ws.audit_only_columns?.includes(c)).map((c) => (
                     <button key={c} disabled={savingExclusions} aria-pressed={ws.excluded_columns.includes(c)} className={`chip ${ws.excluded_columns.includes(c) ? 'excluded' : ''}`} onClick={() => toggleExclude(c)}>{c}</button>
                   ))}
                 </div>
+                {Boolean(ws.audit_only_columns?.length) && <p>Cleaning audit flags kept in the dataset: {ws.audit_only_columns?.join(', ')}</p>}
                 {exclusionError && <div className="alert alert-error" role="alert">{exclusionError}</div>}
                 {ws.excluded_columns.length > 0 && (
                   <button className="btn btn-sm" disabled={savingExclusions} onClick={() => void saveExclusions([])}>

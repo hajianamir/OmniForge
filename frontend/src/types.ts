@@ -94,6 +94,7 @@ export interface WorkspaceState {
   targets: string[];
   primary_target: string | null;
   excluded_columns: string[];
+  audit_only_columns?: string[];
   analysis_cols_count: number;
   can_undo: boolean;
   processing_status: {

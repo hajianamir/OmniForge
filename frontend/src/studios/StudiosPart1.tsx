@@ -490,7 +490,7 @@ export const Studio01Data: React.FC<StudioProps & { sectionMode?: 'ingestion' | 
       {msg && <div className="alert alert-success">{msg}</div>}
       {err && <div className="alert alert-error">{err}</div>}
 
-      <LiveChartGenerator studioId={sectionMode === 'ingestion' ? '00' : '01'} ws={ws} studioCache={studioCache} />
+      <LiveChartGenerator key={sectionMode} studioId={sectionMode === 'ingestion' ? '00' : '01'} ws={ws} studioCache={studioCache} />
 
       {/* Multi-Source Ingestion Hub */}
       {sectionMode === 'ingestion' && (
@@ -949,6 +949,8 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
 
   // Data Mining Lab state
   const [mineMode, setMineMode] = useState<ExecutionMode>('complete');
+  const [selectedMiningTarget, setSelectedMiningTarget] = useState('');
+  const miningTarget = ws.targets.length === 1 ? ws.targets[0] : ws.targets.includes(selectedMiningTarget) ? selectedMiningTarget : '';
   const [mineTasks, setMineTasks] = useState<string[]>(['association_rules', 'subgroups', 'manifold']);
   const [manifoldMethod, setManifoldMethod] = useState('pca');
   const [minSupport, setMinSupport] = useState(0.08);
@@ -1059,7 +1061,8 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
     setBusy(true);
     setErr(null);
     try {
-      const { state, ...result } = await apiPost<AdvancedMiningResponse>('/api/workbench/s02/advanced_mining', {});
+      const url = miningTarget ? `/api/workbench/s02/advanced_mining?target_col=${encodeURIComponent(miningTarget)}` : '/api/workbench/s02/advanced_mining';
+      const { state, ...result } = await apiPost<AdvancedMiningResponse>(url, {});
       onSync(state);
       setStudioResult('s02_advanced_mining', result);
     } catch (e: unknown) {
@@ -1075,6 +1078,7 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
       const res = await apiPost<MiningResponse>('/api/workbench/s02/mining', {
         mode: mineMode,
         tasks: mineTasks,
+        target: miningTarget || null,
         manifold_method: manifoldMethod,
         min_support: minSupport,
         min_confidence: minConf,
@@ -1297,6 +1301,14 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
               <span>Restored Data Mining Lab — Association Rules, Subgroups &amp; Manifold Projection</span>
               <ModeBar mode={mineMode} onChange={setMineMode} />
             </div>
+            {ws.targets.length > 1 && (
+              <label className="field">Target for this mining run
+                <select value={miningTarget} onChange={(event) => setSelectedMiningTarget(event.target.value)} disabled={busy}>
+                  <option value="">Choose one target</option>
+                  {ws.targets.map((target) => <option value={target} key={target}>{target}</option>)}
+                </select>
+              </label>
+            )}
             {mineMode === 'custom' && (
               <div className="row" style={{ gap: 14, marginBottom: 12 }}>
                 <label className="row" style={{ gap: 5 }}><input type="checkbox" checked={mineTasks.includes('association_rules')} onChange={() => toggleMineTask('association_rules')} /> Apriori Association Rules</label>
@@ -1326,10 +1338,10 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
               </label>
             </div>
             <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-              <button className="btn btn-primary" disabled={busy || !ws.has_dataset} onClick={runMining}>
+              <button className="btn btn-primary" disabled={busy || !ws.has_dataset || (ws.targets.length > 1 && !miningTarget && (mineMode !== 'custom' || mineTasks.includes('subgroups')))} onClick={runMining}>
                 {busy ? <span className="spinner" /> : null} Execute Data Mining Suite ({mineMode.toUpperCase()})
               </button>
-              <button className="btn btn-secondary" disabled={busy || !ws.has_dataset} onClick={runAdvancedMining}>
+              <button className="btn btn-secondary" disabled={busy || !ws.has_dataset || (ws.targets.length > 1 && !miningTarget)} onClick={runAdvancedMining}>
                 Run Advanced Mining (Beam + ARI + dCor)
               </button>
             </div>
@@ -1343,6 +1355,7 @@ export const Studio02Clustering: React.FC<StudioProps> = ({ ws, onSync, bumpGrid
 
           {mineRes && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+              {mineRes.target && <p>Mining target: {mineRes.target}</p>}
               {manifold?.error && <div className="alert alert-error">Manifold projection failed: {manifold.error}</div>}
               {manifold?.scatter && (
                 <div className="card">
@@ -1637,7 +1650,7 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  const columns = ws.columns.filter((column) => !ws.excluded_columns.includes(column));
+  const columns = ws.columns.filter((column) => !ws.excluded_columns.includes(column) && !ws.audit_only_columns?.includes(column));
   const selectedA = columns.includes(colA) ? colA : ws.numeric_columns.find((column) => columns.includes(column)) ?? columns[0] ?? '';
   const otherColumns = columns.filter((column) => column !== selectedA);
   const selectedB = otherColumns.includes(colB) ? colB : otherColumns[0] ?? '';
@@ -1685,6 +1698,7 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
           </button>
         </div>
       </div>
+      <LiveChartGenerator studioId="04" ws={ws} studioCache={studioCache} />
       {err && <div className="alert alert-error" role="alert">{err}</div>}
       {busy && <div role="status">Analyzing the current study data…</div>}
 
@@ -1775,7 +1789,7 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
         <div className="row" style={{ marginBottom: 12, gap: 10 }}>
           {hypMode === 'custom' && (
             <>
-              <label className="field">Statistical Test (17 Available)
+              <label className="field">Statistical Test
                 <select value={testType} onChange={(e) => setTestType(e.target.value)}>
                   <optgroup label="Normality & Goodness-of-Fit">
                     <option value="shapiro">Shapiro-Wilk Normality</option>

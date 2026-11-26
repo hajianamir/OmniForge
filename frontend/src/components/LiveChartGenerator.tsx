@@ -104,8 +104,10 @@ export const LiveChartGenerator: React.FC<LiveChartGeneratorProps> = ({
         if (!alive) return;
         setCatalog(Array.isArray(res?.charts) && Array.isArray(res?.columns?.all) && Array.isArray(res?.columns?.numeric) ? res : null);
       })
-      .catch(() => {
+      .catch((err: unknown) => {
         if (!alive) return;
+        setError(toErrorMessage(err));
+        setCatalog(null);
       });
     return () => {
       alive = false;
@@ -260,36 +262,15 @@ export const LiveChartGenerator: React.FC<LiveChartGeneratorProps> = ({
     }
   };
 
-  // Group dropdown items: Studio-Recommended first, then remaining categories
   const groupedOptions = useMemo(() => {
-    const items = catalog?.charts || [];
-    if (studioId === 'all' || studioId === '12') {
-      const byCat = new Map<string, LiveChartCatalogItem[]>();
-      for (const item of items) {
-        const list = byCat.get(item.category) || [];
-        list.push(item);
-        byCat.set(item.category, list);
-      }
-      return Array.from(byCat.entries()).map(([groupLabel, list]) => ({ groupLabel, list }));
-    }
-
-    const recommended = items.filter((it) => it.recommended_for_studio);
-    const others = items.filter((it) => !it.recommended_for_studio);
-    const groups: { groupLabel: string; list: LiveChartCatalogItem[] }[] = [];
-    if (recommended.length) {
-      groups.push({ groupLabel: `Recommended for Studio ${studioId}`, list: recommended });
-    }
     const byCat = new Map<string, LiveChartCatalogItem[]>();
-    for (const item of others) {
+    for (const item of catalog?.charts || []) {
       const list = byCat.get(item.category) || [];
       list.push(item);
       byCat.set(item.category, list);
     }
-    for (const [cat, list] of byCat.entries()) {
-      groups.push({ groupLabel: `More Professional Charts · ${cat}`, list });
-    }
-    return groups;
-  }, [catalog, studioId]);
+    return Array.from(byCat.entries()).map(([groupLabel, list]) => ({ groupLabel, list }));
+  }, [catalog]);
 
   const xColumns = useMemo(() => {
     const cols = catalog?.columns;
@@ -336,7 +317,7 @@ export const LiveChartGenerator: React.FC<LiveChartGeneratorProps> = ({
           </span>
         </span>
         <span className="badge badge-accent">
-          {readyCount}/{totalCount || 32} Live Charts Ready · Single-Chart On-Demand Engine
+          {catalog ? `${readyCount}/${totalCount} Live Charts Ready` : error ? 'Chart catalog unavailable' : 'Loading chart catalog'}
         </span>
       </div>
 

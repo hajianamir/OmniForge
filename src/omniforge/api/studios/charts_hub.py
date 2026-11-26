@@ -41,7 +41,10 @@ def charts_catalog(
     """Return the live on-demand professional chart catalog with dynamic workspace readiness."""
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
-    return get_live_chart_catalog(state, studio_id=studio_id)
+    try:
+        return get_live_chart_catalog(state, studio_id=studio_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/charts/generate")
