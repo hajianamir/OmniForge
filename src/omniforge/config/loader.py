@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import os
 import re
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,19 @@ from omniforge.core.logging import get_logger
 
 logger = get_logger(__name__)
 _PLATFORM_FIELDS = ("environment", "debug", "random_seed", "default_tenant_id")
+
+
+def load_packaged_domain_config(slug: str) -> dict[str, Any] | None:
+    """Read a built-in domain default, including from an installed wheel."""
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", slug):
+        raise ConfigurationError("Invalid domain name for a packaged configuration.")
+    resource = files(__package__).joinpath("domain_defaults", f"{slug}.yaml")
+    if not resource.is_file():
+        return None
+    content = yaml.safe_load(resource.read_text(encoding="utf-8"))
+    if not isinstance(content, dict):
+        raise ConfigurationError(f"The packaged configuration for '{slug}' must be a YAML mapping.")
+    return dict(content)
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -141,7 +155,7 @@ class ConfigLoader:
 
         Args:
             base_file: Optional path to base YAML (defaults to ``configs/default.yaml``).
-            domain: Optional domain name (loads ``configs/domains/{domain}.yaml``).
+            domain: Optional domain name (configured YAML overrides packaged defaults).
             extra_files: Optional list of additional overlay YAML paths.
             overrides: Optional Hydra-style ``key.subkey=value`` overrides.
 
@@ -165,10 +179,13 @@ class ConfigLoader:
             if domain_path.exists():
                 domain_cfg = self.load_yaml(domain_path)
             else:
-                raise ConfigurationError(
-                    f"Domain configuration file not found for domain '{domain}': {domain_path}",
-                    suggestions=["Run 'uap domains list' to view available domains."],
-                )
+                packaged = load_packaged_domain_config(slug)
+                if packaged is None:
+                    raise ConfigurationError(
+                        f"No configuration is available for domain '{slug}'.",
+                        suggestions=["Run 'omniforge domains list' to view available domains."],
+                    )
+                domain_cfg = _resolve_env_interpolation(packaged)
 
         if extra_files:
             for extra in extra_files:

@@ -141,3 +141,17 @@ def test_config_honors_environment_then_cli_and_validates_domain_slug(
     assert loader.compose(overrides=["platform.random_seed=32"]).random_seed == 32
     with pytest.raises(ConfigurationError, match="Domain names"):
         loader.compose(domain="invalid domain")
+
+
+def test_builtin_domain_defaults_and_override_precedence(tmp_path: Path) -> None:
+    from omniforge.domains import default_domain_registry
+
+    plugin = default_domain_registry.get("energy")
+    assert plugin.load_config(tmp_path)["domain"]["forecast_horizons"] == [24, 48, 168]
+    loader = ConfigLoader(tmp_path)
+    assert loader.compose(domain="energy").domain_overrides["domain"]["name"] == "energy"
+    root = tmp_path / "domains"
+    root.mkdir()
+    (root / "energy.yaml").write_text("domain:\n  name: custom\n", encoding="utf-8")
+    assert plugin.load_config(root) == {"domain": {"name": "custom"}}
+    assert loader.compose(domain="energy").domain_overrides == {"domain": {"name": "custom"}}

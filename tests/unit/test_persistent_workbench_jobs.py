@@ -264,3 +264,62 @@ def test_cancel_api_is_owner_scoped_and_running_jobs_are_not_falsely_cancelled(
     finally:
         release.set()
         manager.shutdown()
+
+
+def test_fastapi_lifespan_drains_workbench_jobs_and_releases_worker_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omniforge.api import main
+    from omniforge.api.jobs import _ConfiguredJobManager
+
+    db_path = tmp_path / "lifespan.db"
+    manager = BackgroundJobManager(max_workers=1, db_path=db_path)
+    configured = _ConfiguredJobManager()
+    configured._manager = manager
+    monkeypatch.setattr(main, "job_manager", configured)
+    owner = wb.current_job_owner_key(
+        Principal(subject="api_key_principal", roles=["admin"], tenant_id=get_settings().default_tenant_id),
+    )
+    monkeypatch.setattr(wb, "job_manager", configured)
+    release = threading.Event()
+    started = threading.Event()
+    draining = threading.Event()
+
+    def work() -> dict[str, bool]:
+        started.set()
+        assert release.wait(timeout=5)
+        return {"completed": True}
+
+    def release_when_draining() -> None:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            with manager._submission_lock:
+                if not manager._accepting_jobs:
+                    draining.set()
+                    break
+            time.sleep(0.01)
+        release.set()
+
+    responder = threading.Thread(target=release_when_draining)
+    try:
+        with TestClient(create_app(), headers={"X-API-Key": get_api_key()}) as outer:
+            submitted = configured.submit("test shutdown", work, owner_key=owner or "default")
+            assert started.wait(timeout=3)
+            with TestClient(create_app(), headers={"X-API-Key": get_api_key()}) as inner:
+                assert inner.get(f"/api/workbench/jobs/{submitted.job_id}").status_code == 200
+            with sqlite3.connect(db_path) as conn:
+                assert conn.execute("SELECT COUNT(*) FROM workbench_job_workers").fetchone() == (1,)
+            assert outer.get(f"/api/workbench/jobs/{submitted.job_id}").status_code == 200
+            responder.start()
+        responder.join(timeout=3)
+        assert draining.is_set()
+        assert configured._manager is None
+        with pytest.raises(JobQueueFullError, match="shutting down"):
+            manager.submit("late job", lambda: None)
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM workbench_job_workers").fetchone() == (0,)
+        persisted = manager.get(submitted.job_id, owner_key=owner)
+        assert persisted is not None and persisted.result == {"completed": True}
+    finally:
+        release.set()
+        manager.shutdown()

@@ -367,10 +367,10 @@ export const HANDBOOK_CHAPTERS_PART1: StudioChapter[] = [
   {
     studioId: '04',
     chapterNum: 'Chapter 04',
-    title: 'Automated EDA & Complete 17-Test Statistical Hypothesis Lab',
-    subtitle: 'Visual exploratory distributions, correlation heatmaps, and all 17 classical parametric & distribution-free non-parametric hypothesis tests.',
+    title: 'Automated EDA & Hypothesis Lab',
+    subtitle: 'Exploratory distributions, correlation heatmaps, and statistical hypothesis tests.',
     overview:
-      'Studio 04 pairs fast visual Exploratory Data Analysis (histograms, summary moments, correlation matrices, missingness charts, automated statistical insight cards) with a full 17-test scientific Hypothesis Testing Laboratory. Every hypothesis test evaluates a formal Null Hypothesis (H₀) against your data and computes a test statistic, exact or asymptotic p-value, effect size, and clear Reject / Fail-to-Reject decision at your chosen significance threshold α.',
+      'Studio 04 combines exploratory visualizations with tests matched to the sampling design. Evaluated battery tests report raw and Benjamini–Hochberg adjusted p-values. Tests with insufficient observations or undefined results have a recorded reason.',
     realWorldApplications: [
       'A/B product, marketing, or industrial process change testing (Welch t-test vs Mann-Whitney U).',
       'Before-vs-after calibration, maintenance, or medical intervention validation (Paired t-test vs Wilcoxon Signed-Rank).',
@@ -379,8 +379,8 @@ export const HANDBOOK_CHAPTERS_PART1: StudioChapter[] = [
     ],
     stepByStep: [
       'Section 1 (Automated EDA): Click "Run Automated EDA" to generate interactive distributions, correlation matrix heatmap, missingness bars, and automated insights.',
-      'Section 2 (17-Test Hypothesis Lab): Choose Complete (runs full multi-test battery across variables), Auto (smart target-guided tests), or Custom (select any exact test from all 17, pick Column A & Column B, and set α).',
-      'Read BOTH the p-value (statistical evidence against H₀) AND the effect size / group statistics (practical real-world magnitude).',
+      'Section 2 (Hypothesis Lab): Choose Complete for a broader battery, Auto for a smaller battery, or Custom for a specific method, columns and significance level.',
+      'Check the sampling assumptions and read the adjusted p-values for battery decisions. Review effect sizes or group statistics where the method reports them.',
     ],
     provenanceRule: 'Read-only on Active Data. Both Automated EDA and Hypothesis Lab results persist independently in cache and flow into Studio 12 Executive Reports.',
     methods: [
@@ -482,7 +482,7 @@ export const HANDBOOK_CHAPTERS_PART1: StudioChapter[] = [
       },
     ],
     decisionMatrix: {
-      title: 'Studio 04 Complete 17-Test Selector',
+      title: 'Studio 04 Test Selector',
       rows: [
         { application: 'Test normality of 1 numeric column', dataCondition: 'n <= 5,000 (or > 5,000)', recommended: 'Shapiro-Wilk (or D’Agostino K²)', alternative: 'Anderson-Darling (heavy tails)', rationale: 'Determines whether parametric or non-parametric workflow applies.' },
         { application: 'Compare 2 independent groups', dataCondition: 'Normal vs Skewed/Outliers', recommended: "Welch's t-Test (Normal)", alternative: 'Mann-Whitney U (Skewed)', rationale: 'Robust against unequal variance (Welch) or non-normality (Mann-Whitney).' },

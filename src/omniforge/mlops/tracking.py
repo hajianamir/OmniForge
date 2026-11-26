@@ -19,6 +19,7 @@ from omniforge.core.logging import get_logger
 from omniforge.core.utils import safe_json_default
 
 logger = get_logger(__name__)
+_RUN_COLUMNS = "run_id, experiment_name, run_name, status, started_at, ended_at, params_json, metrics_json, tags_json, artifacts_json"
 
 
 @contextmanager
@@ -99,6 +100,8 @@ class ExperimentTracker:
                     step INTEGER NOT NULL,
                     recorded_at TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_runs_experiment_started ON runs(experiment_name, started_at DESC);
                 """
             )
             conn.commit()
@@ -209,11 +212,15 @@ class ExperimentTracker:
         """Fetch a tracked run record by ID."""
         with _sqlite_conn(self.db_path) as conn:
             row = conn.execute(
-                "SELECT run_id, experiment_name, run_name, status, started_at, ended_at, params_json, metrics_json, tags_json, artifacts_json FROM runs WHERE run_id = ?",
+                f"SELECT {_RUN_COLUMNS} FROM runs WHERE run_id = ?",
                 (run_id,),
             ).fetchone()
         if row is None:
             raise MLOpsError(f"Experiment run '{run_id}' not found.")
+        return self._parse_run(row)
+
+    @staticmethod
+    def _parse_run(row: tuple[Any, ...]) -> RunRecord:
         return RunRecord(
             run_id=row[0],
             experiment_name=row[1],
@@ -232,14 +239,14 @@ class ExperimentTracker:
         with _sqlite_conn(self.db_path) as conn:
             if experiment_name:
                 rows = conn.execute(
-                    "SELECT run_id FROM runs WHERE experiment_name = ? ORDER BY started_at DESC LIMIT ?",
+                    f"SELECT {_RUN_COLUMNS} FROM runs WHERE experiment_name = ? ORDER BY started_at DESC LIMIT ?",
                     (experiment_name, limit),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT run_id FROM runs ORDER BY started_at DESC LIMIT ?", (limit,)
+                    f"SELECT {_RUN_COLUMNS} FROM runs ORDER BY started_at DESC LIMIT ?", (limit,)
                 ).fetchall()
-        return [self.get_run(r[0]) for r in rows]
+        return [self._parse_run(row) for row in rows]
 
     def _resolve_run(self, run_id: str | None) -> str:
         rid = run_id or self._active_run_id

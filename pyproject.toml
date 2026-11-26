@@ -216,7 +216,7 @@ media = "omniforge.domains.media:MediaDomainPlugin"
 package-dir = { "" = "src" }
 
 [tool.setuptools.package-data]
-omniforge = ["ui/static_app/*", "ui/static_app/assets/*"]
+omniforge = ["py.typed", "config/domain_defaults/*.yaml", "ui/static_app/*", "ui/static_app/assets/*"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

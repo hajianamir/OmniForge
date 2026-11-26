@@ -182,7 +182,7 @@ export const WORKFLOW_ROADMAP: WorkflowRoadmapStep[] = [
     requirement: 'MANDATORY',
     objective: 'Test distributional assumptions, detect multicollinearity (VIF), quantify tail risk (VaR/CVaR), and establish scientifically ranked mathematical baseline equations.',
     exactActions: [
-      'Configure significance level alpha (default 0.05), holdout ratio (default 0.20), and multiple-testing correction (Benjamini-Hochberg FDR or Bonferroni/Holm).',
+      'Configure significance level alpha (default 0.05), holdout ratio (default 0.20), and multiple-testing correction (Benjamini–Hochberg or Bonferroni).',
       'Run Universal Diagnostics in Complete or Auto mode.',
       'Inspect normality test verdicts (to decide Parametric vs Non-Parametric modeling), VIF > 10 warnings, and every ranked Baseline Equation Card (exact formula, coefficients, Lift vs Naive Floor, LaTeX & Python copy).',
     ],
@@ -191,14 +191,14 @@ export const WORKFLOW_ROADMAP: WorkflowRoadmapStep[] = [
   {
     step: 7,
     studioId: '04',
-    stageName: 'Automated EDA & 17-Test Hypothesis Testing Lab',
+    stageName: 'Automated EDA & Hypothesis Lab',
     requirement: 'RECOMMENDED',
-    objective: 'Visualize feature distributions and correlations and formally test domain hypotheses with exact parametric or non-parametric statistical tests.',
+    objective: 'Visualize distributions and correlations, and choose statistical tests that match the sampling design.',
     exactActions: [
       'Click "Run Automated EDA" to inspect histograms, skewness, correlation heatmaps, missingness bars, and automated statistical insights.',
-      'Use the 17-Test Hypothesis Lab in Complete mode (full battery), Auto mode (target-guided), or Custom mode (pick any exact test, columns, and alpha).',
+      'Use Complete for a broader battery, Auto for a smaller battery, or Custom to select a test, input columns, and alpha.',
     ],
-    expectedOutputs: 'Interactive EDA visualizations + formal hypothesis test statistics, p-values, effect sizes, and accept/reject decisions.',
+    expectedOutputs: 'EDA visualizations, test statistics, raw and adjusted battery p-values, and reasons for skipped tests.',
   },
   {
     step: 8,
@@ -208,7 +208,7 @@ export const WORKFLOW_ROADMAP: WorkflowRoadmapStep[] = [
     objective: 'Create nonlinear/skew-corrected/cyclical predictors when needed and prune noisy low-signal features using multi-method consensus.',
     exactActions: [
       'Preview or commit Yeo-Johnson skew corrections, pairwise interactions, polynomial terms, and datetime cyclical encodings (sin/cos).',
-      'Run 4-Method Consensus Feature Selection (Mutual Information + ANOVA F-Test + Random Forest Importance + L1 Lasso) to retain top-K predictors.',
+      'Preview consensus rankings and review the source predictors. Apply exclusions explicitly to change the predictors used in downstream studios.',
     ],
     expectedOutputs: 'Engineered features committed to Active Data (ENGINEERED provenance) and low-signal columns reversibly excluded.',
   },

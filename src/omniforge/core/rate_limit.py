@@ -21,12 +21,13 @@ share one budget.
 
 from __future__ import annotations
 
+import math
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from typing import Any, Protocol, TypedDict
 
-from omniforge.core.exceptions import DependencyMissingError
+from omniforge.core.exceptions import ConfigurationError, DependencyMissingError
 from omniforge.core.logging import get_logger
 
 try:  # optional dependency — only needed when backend=redis
@@ -70,7 +71,7 @@ class RateLimiter(Protocol):
 
 
 class InMemorySlidingWindowLimiter:
-    """Per-process sliding window kept in a dict of deques (the historical behavior)."""
+    """Bound tracked clients without resetting active windows at capacity."""
 
     def __init__(
         self,
@@ -84,27 +85,32 @@ class InMemorySlidingWindowLimiter:
         self.window_seconds = float(window_seconds)
         self._clock = clock or time.monotonic
         self._max_tracked_keys = int(max_tracked_keys)
-        self._hits: dict[str, deque[float]] = {}
+        if self._max_tracked_keys < 1 or not math.isfinite(self.window_seconds) or self.window_seconds <= 0:
+            raise ConfigurationError("Rate limiter window and tracked-key capacity must be positive and finite.")
+        self._hits: OrderedDict[str, deque[float]] = OrderedDict()
 
     async def hit(self, key: str) -> RateLimitDecision:
+        if self.max_requests <= 0:
+            return RateLimitDecision(allowed=True, retry_after=0, remaining=0)
         now = self._clock()
+        cutoff = now - self.window_seconds
         hits = self._hits.get(key)
         if hits is None:
+            while len(self._hits) >= self._max_tracked_keys:
+                oldest_key, oldest_hits = next(iter(self._hits.items()))
+                if oldest_hits[-1] > cutoff:
+                    retry_after = max(1, math.ceil(oldest_hits[-1] - cutoff))
+                    return RateLimitDecision(allowed=False, retry_after=retry_after, remaining=0)
+                del self._hits[oldest_key]
             hits = self._hits[key] = deque()
-        cutoff = now - self.window_seconds
-        while hits and hits[0] < cutoff:
+        while hits and hits[0] <= cutoff:
             hits.popleft()
         if len(hits) >= self.max_requests:
-            retry_after = int(self.window_seconds - (now - hits[0])) + 1
+            retry_after = max(1, math.ceil(hits[0] - cutoff))
             return RateLimitDecision(allowed=False, retry_after=retry_after, remaining=0)
         hits.append(now)
-        if len(self._hits) > self._max_tracked_keys:
-            self._sweep(cutoff)
+        self._hits.move_to_end(key)
         return RateLimitDecision(allowed=True, retry_after=0, remaining=self.max_requests - len(hits))
-
-    def _sweep(self, cutoff: float) -> None:
-        for stale in [k for k, dq in self._hits.items() if not dq or dq[-1] < cutoff]:
-            del self._hits[stale]
 
 
 class RedisSlidingWindowLimiter:
@@ -179,11 +185,16 @@ class ResilientRateLimiter:
             if not self._degraded_logged:
                 logger.error(
                     "rate_limiter_backend_degraded",
-                    error=str(exc),
+                    error_type=type(exc).__name__,
                     note="Redis rate-limit backend failing; serving per-process in-memory window until it recovers.",
                 )
                 self._degraded_logged = True
             return await self._fallback.hit(key)
+
+    async def aclose(self) -> None:
+        close_primary = getattr(self._primary, "aclose", None)
+        if close_primary is not None:
+            await close_primary()
 
 
 def build_rate_limiter(
@@ -226,7 +237,7 @@ def build_rate_limiter(
             )
             return ResilientRateLimiter(primary, memory)
         except Exception as exc:
-            logger.warning("rate_limiter_auto_redis_unavailable", error=str(exc))
+            logger.warning("rate_limiter_auto_redis_unavailable", error_type=type(exc).__name__)
             return memory
     if redis_url and _aioredis is None:
         logger.warning(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import re
 from abc import ABC, abstractmethod
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -13,6 +14,7 @@ import pandas as pd
 import yaml
 from pydantic import BaseModel, Field
 
+from omniforge.config.loader import load_packaged_domain_config
 from omniforge.core.exceptions import DomainPluginError
 from omniforge.core.logging import get_logger
 from omniforge.data.validation import ValidationRule
@@ -40,16 +42,23 @@ class BaseDomainPlugin(ABC):
     metadata: DomainMetadata
 
     def load_config(self, config_dir: str | Path = "configs/domains") -> dict[str, Any]:
-        """Load the domain's YAML configuration if present on disk."""
-        candidates = [
-            Path(config_dir) / f"{self.metadata.name}.yaml",
-            Path(__file__).resolve().parents[3] / "configs" / "domains" / f"{self.metadata.name}.yaml",
-        ]
-        for cand in candidates:
-            if cand.exists():
-                with cand.open("r", encoding="utf-8") as fh:
-                    return yaml.safe_load(fh) or {}
-        return {"domain": self.metadata.name}
+        """Use a local domain override first, then the installed built-in default."""
+        name = self.metadata.name
+        if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]*", name):
+            raise DomainPluginError("Domain names must use letters, digits, underscores, or hyphens.")
+        root = Path(config_dir).resolve()
+        override = (root / f"{name}.yaml").resolve()
+        if not override.is_relative_to(root):
+            raise DomainPluginError("Domain overrides must be inside the configured directory.")
+        if override.is_file():
+            content = yaml.safe_load(override.read_text(encoding="utf-8"))
+            if content is None:
+                return {}
+            if not isinstance(content, dict):
+                raise DomainPluginError("The domain override must be a YAML mapping.")
+            return dict(content)
+        packaged = load_packaged_domain_config(name.lower())
+        return packaged if packaged is not None else {"domain": name}
 
     @abstractmethod
     def engineer_domain_features(self, df: pd.DataFrame) -> pd.DataFrame:

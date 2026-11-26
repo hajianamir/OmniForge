@@ -147,3 +147,24 @@ def test_redis_missing_url_raises_dependency_missing() -> None:
 
     with pytest.raises(DependencyMissingError):
         RedisSlidingWindowLimiter("", max_requests=1)
+
+
+def test_cap_denies_new_clients_without_evicting_active_windows() -> None:
+    clock = _ManualClock()
+    limiter = InMemorySlidingWindowLimiter(
+        max_requests=2, max_tracked_keys=2, window_seconds=60, clock=clock,
+    )
+    assert _hit(limiter, "oldest")["allowed"]
+    clock.now += 1
+    assert _hit(limiter, "newer")["allowed"]
+    assert _hit(limiter, "newer")["remaining"] == 0
+    for index in range(1000):
+        assert _hit(limiter, f"other-{index}") == {"allowed": False, "retry_after": 59, "remaining": 0}
+    assert len(limiter._hits) == 2
+    assert not _hit(limiter, "newer")["allowed"]
+    clock.now += 59
+    assert _hit(limiter, "new-client")["allowed"]
+    assert len(limiter._hits) == 2
+    assert not _hit(limiter, "newer")["allowed"]
+    clock.now += 1
+    assert _hit(limiter, "newer")["allowed"]

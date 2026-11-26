@@ -163,7 +163,7 @@ print(omniforge.get_version_info())             # full metadata dict
 
 ## 4. Exact Step-by-Step End-to-End Workflow
 
-Follow this CRISP-DM sequence to track data lineage, compare models against baselines, and reserve data for final evaluation. Choose a split that matches real deployment, review feature availability at prediction time, and validate the model on representative held-out data before promotion.
+Use this iterative CRISP-DM workflow to track lineage, compare baselines, and reserve data for final evaluation. Revisit preparation and modeling when the evidence calls for it. Choose a split that matches deployment and verify feature availability at prediction time.
 
 | Step | Studio / Control | Requirement | Exact Action | Why & What Happens |
 |---:|---|---|---|---|
@@ -230,6 +230,8 @@ Row-independent formatting fixes can run before the split. Group repeated record
 **Modes.** Studio 01 `Auto` and `Complete` flag outliers for review. `Custom` exposes treatment rules. The SDK defaults to IQR detection and clipping, with a configurable action. The fitted cleaner screens predictors for outliers before applying imputation. An active temporal split supplies the time column and enables causal forward filling for time-based numeric imputation. Cleaning preserves selected outcomes, split key names, and rows reserved for the temporal gap. Reserved rows stay outside the training and holdout transforms.
 
 **Workflow.** Profile and validate the incoming data, use the health assessment to prioritize fixes, preview cleaning rules, and then re-profile and validate the result before committing. Use the deletion log, versioning, and exports to record the changes. Keep multicollinearity, skewness, and class imbalance in the statistical review. Compare reference and current cohorts for drift and track operational degradation in Studios 11 and 14. Studio 03 is diagnostic. Apply any independently justified domain features before Studio 05, using predictors available at scoring time.
+
+The dataset quality profile reports completeness, uniqueness, validity, consistency, reference accuracy, and timeliness. Reference accuracy requires observed matches against trusted values. Timeliness requires an evaluable timestamp. The score renormalizes the weights over evaluable dimensions and returns them as `effective_weights`. Rule conformance and statistical plausibility are reported separately where evaluated.
 
 **Provenance:** Updates Active Data while keeping Raw Data intact. Supports Undo, Revert to Raw, clean CSV/XLSX export.
 
@@ -336,6 +338,8 @@ The deep benchmark uses the active Split Lock or creates a separate holdout befo
 **Background AutoML jobs:** Set `async_job: true` on `POST /api/workbench/s06/automl`, then poll `GET /api/workbench/jobs/{job_id}` or list `GET /api/workbench/jobs`. Cancel via `POST /api/workbench/jobs/{job_id}/cancel`. Queued jobs cancel immediately; running AutoML jobs return 202 (`cancelling`) and stop at the next checkpoint before the model is published. A training step already in progress cannot be forcibly interrupted. Once publication begins, or for running jobs that do not opt into cooperative cancellation, the endpoint returns 409. A full queue returns 429 with `Retry-After`.
 
 Job status and JSON results are stored in SQLite (default `paths.workspace_dir/workbench_jobs.db`). Configure `OMNIFORGE_JOBS__MAX_WORKERS` (per process), `OMNIFORGE_JOBS__MAX_QUEUE_DEPTH` (shared waiting-job limit), `OMNIFORGE_JOBS__MAX_HISTORY` (terminal records), `OMNIFORGE_JOBS__WORKER_TIMEOUT_SECONDS`, and optionally `OMNIFORGE_JOBS__DB_PATH`. API workers must use the same settings and a shared filesystem with reliable SQLite locking. A vanished worker's queued/running jobs are marked failed after the lease expires; Python callables are **not** persisted or automatically resumed. Workspace datasets and active models remain process-local, so multi-worker workspace operations still require sticky routing or a separate shared workspace implementation. The separate `omniforge.mlops.job_queue.BackgroundJobQueue` helper remains in-memory.
+
+On graceful API shutdown the worker drains accepted work and then releases its SQLite lease. Set the deployment stop timeout to accommodate the remaining jobs. SDK queue owners can call `shutdown(wait=True, cancel_pending=True)` to cancel waiting tasks and join running threads. The SDK queue defaults to 128 waiting tasks and 128 terminal records. The in-memory API rate limiter also bounds tracked client keys at 10,000 per process. When all slots hold active windows, it returns HTTP 429 to new clients until a slot expires.
 
 **External Deployment Formula Kit:** After AutoML completes, OmniForge extracts governing mathematical relationships and exposes:
 - Standalone Python (`.py`) — zero-dependency scoring function
@@ -908,6 +912,8 @@ result = registry.invoke("pii_audit", {
 ---
 
 ## 11. Python SDK Reference — Core Patterns
+
+Built-in domain YAML and the SDK typing marker are included in the wheel and source distribution. `BaseDomainPlugin.load_config()` uses `configs/domains/<slug>.yaml` in the working directory or the supplied override directory first. `ConfigLoader` looks in the `domains` subdirectory of its configuration directory. Both use the packaged default when there is no local override.
 
 ### 11.1 Version Check
 ```python
