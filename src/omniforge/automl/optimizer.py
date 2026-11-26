@@ -56,9 +56,10 @@ class HyperparameterOptimizer:
     ) -> None:
         self.strategy = strategy.lower()
         self.acquisition = acquisition.lower()
-        self.direction = direction.lower()
-        if self.direction not in {"maximize", "minimize"}:
+        normalized_direction = direction.lower()
+        if normalized_direction not in {"maximize", "minimize"}:
             raise AutoMLError("HPO direction must be maximize or minimize.")
+        self.direction: Literal["maximize", "minimize"] = "maximize" if normalized_direction == "maximize" else "minimize"
         self.max_trials = max(2, int(max_trials))
         self.time_budget_seconds = float(time_budget_seconds)
         self.random_seed = random_seed
