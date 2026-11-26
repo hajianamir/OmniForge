@@ -52,7 +52,11 @@ def _builtin_step_handlers() -> dict[str, Callable[..., Any]]:
     ) -> Any:
         from omniforge.data.splitting import LeakageSafeSplitter, SplitConfig
 
+        if ctx.get("preprocessing_fit_scope") == "full_frame":
+            raise PipelineError("Split raw data before fitting cleaning or feature transforms.")
         df = _resolve_df(ctx, input_key)
+        if target_column is not None and target_column not in df.columns:
+            raise PipelineError("The configured split target does not exist in the input frame.")
         cfg = SplitConfig(
             strategy=strategy,  # type: ignore[arg-type]
             test_size=test_size,
@@ -68,31 +72,47 @@ def _builtin_step_handlers() -> dict[str, Callable[..., Any]]:
         )
         ctx.set("train_data", res.train_df)
         ctx.set("test_data", res.test_df)
-        if res.val_df is not None:
-            ctx.set("val_data", res.val_df)
+        ctx.set("val_data", res.val_df)
+        ctx.set("split_target", target_column)
+        ctx.set("split_config", cfg)
         ctx.set("split_result", res)
         return res.train_df
 
     def step_clean(ctx: PipelineContext, input_key: str = "raw_data", output_key: str = "clean_data", **kw: Any) -> Any:
         from omniforge.data.cleaning import CleaningConfig, DataCleaner
 
-        cleaner = DataCleaner(CleaningConfig(**kw))
         tr_df = ctx.get("train_data")
         te_df = ctx.get("test_data")
+        split_cfg = ctx.get("split_config")
+        target = ctx.get("split_target")
+        if target is not None:
+            kw["exclude_columns"] = list(dict.fromkeys([*(kw.get("exclude_columns") or []), target]))
+        if split_cfg is not None and split_cfg.time_col and ctx.get("split_result").strategy_used == "time_series":
+            kw["time_column"] = split_cfg.time_col
+            kw["causal_time_series"] = True
+            kw["exclude_columns"] = list(dict.fromkeys([*(kw.get("exclude_columns") or []), split_cfg.time_col]))
+        cleaner = DataCleaner(CleaningConfig(**kw))
         if isinstance(tr_df, pd.DataFrame) and isinstance(te_df, pd.DataFrame):
             tr_clean, report = cleaner.fit_transform(tr_df)
             te_clean, te_report = cleaner.transform(te_df)
+            va_df = ctx.get("val_data")
+            if isinstance(va_df, pd.DataFrame):
+                va_clean, va_report = cleaner.transform(va_df)
+                ctx.set("val_data", va_clean)
+                ctx.set("validation_cleaning_report", va_report)
             ctx.set("train_data", tr_clean)
             ctx.set("test_data", te_clean)
             ctx.set(output_key, tr_clean)
             ctx.set("cleaning_report", report)
             ctx.set("test_cleaning_report", te_report)
+            ctx.set("preprocessing_fit_scope", "train_only")
             return tr_clean
 
         df = _resolve_df(ctx, input_key)
         cleaned, report = cleaner.fit_transform(df)
         ctx.set(output_key, cleaned)
         ctx.set("cleaning_report", report)
+        ctx.set("preprocessing_fit_scope", "full_frame")
         return cleaned
 
     def step_quality(ctx: PipelineContext, input_key: str = "clean_data", **kw: Any) -> Any:
@@ -132,6 +152,10 @@ def _builtin_step_handlers() -> dict[str, Callable[..., Any]]:
         fe = FeatureEngineeringPipeline(FeatureConfig(**kw))
         tr_df = ctx.get("train_data")
         te_df = ctx.get("test_data")
+        split_target = ctx.get("split_target")
+        if target_column is not None and split_target is not None and target_column != split_target:
+            raise PipelineError("The feature target must match the declared split target.")
+        target_column = target_column or split_target
         if isinstance(tr_df, pd.DataFrame) and isinstance(te_df, pd.DataFrame):
             has_t = bool(target_column and target_column in tr_df.columns)
             y_tr = tr_df[target_column] if has_t else None
@@ -143,10 +167,18 @@ def _builtin_step_handlers() -> dict[str, Callable[..., Any]]:
                 tr_eng[target_column] = y_tr.to_numpy()  # type: ignore[union-attr]
             if target_column and target_column in te_df.columns:
                 te_eng[target_column] = te_df[target_column].to_numpy()
+            va_df = ctx.get("val_data")
+            if isinstance(va_df, pd.DataFrame):
+                va_features = va_df.drop(columns=[target_column]) if has_t else va_df
+                va_eng = fe.transform(va_features)
+                if has_t and target_column:
+                    va_eng[target_column] = va_df[target_column].to_numpy()
+                ctx.set("val_data", va_eng)
             ctx.set("train_data", tr_eng)
             ctx.set("test_data", te_eng)
             ctx.set(output_key, tr_eng)
             ctx.set("feature_pipeline", fe)
+            ctx.set("preprocessing_fit_scope", "train_only")
             return tr_eng
 
         df = _resolve_df(ctx, input_key)
@@ -157,6 +189,7 @@ def _builtin_step_handlers() -> dict[str, Callable[..., Any]]:
             X_eng[target_column] = y.values
         ctx.set(output_key, X_eng)
         ctx.set("feature_pipeline", fe)
+        ctx.set("preprocessing_fit_scope", "full_frame")
         return X_eng
 
     def _prepare_train_and_holdout(
@@ -166,6 +199,11 @@ def _builtin_step_handlers() -> dict[str, Callable[..., Any]]:
         *,
         fit_full_data: bool = False,
     ) -> pd.DataFrame:
+        preprocessing_scope = ctx.get("preprocessing_fit_scope")
+        if preprocessing_scope == "full_frame":
+            raise PipelineError("Predictive pipelines must split raw data before learned preprocessing.")
+        if preprocessing_scope == "train_only" and ctx.get("split_target") != target_column:
+            raise PipelineError("Declare the model target in the split step before fitting preprocessing.")
         tr_df = ctx.get("train_data")
         if isinstance(tr_df, pd.DataFrame) and target_column in tr_df.columns:
             return tr_df
@@ -191,7 +229,7 @@ def _builtin_step_handlers() -> dict[str, Callable[..., Any]]:
         from omniforge.models.registry import create_model
 
         fit_full = bool(kw.pop("fit_full_data", False))
-        df = _prepare_train_and_holdout(ctx, input_key, target_column, fit_full_data=fit_full)
+        df = _prepare_train_and_holdout(ctx, input_key, target_column, fit_full_data=fit_full).dropna(subset=[target_column])
         X = df.drop(columns=[target_column])
         y = df[target_column]
         model = create_model(model_name, task_type=TaskType(task_type), **kw)
@@ -208,10 +246,17 @@ def _builtin_step_handlers() -> dict[str, Callable[..., Any]]:
         from omniforge.automl.pipeline_search import AutoMLPipelineSearch
 
         fit_full = bool(kw.pop("fit_full_data", False))
-        df = _prepare_train_and_holdout(ctx, input_key, target_column, fit_full_data=fit_full)
+        df = _prepare_train_and_holdout(ctx, input_key, target_column, fit_full_data=fit_full).dropna(subset=[target_column])
         X = df.drop(columns=[target_column])
         y = df[target_column]
-        res = AutoMLPipelineSearch(**kw).fit(X, y)
+        te_df = ctx.get("test_data", ctx.get("_eval_holdout_data"))
+        holdout = None
+        if isinstance(te_df, pd.DataFrame) and target_column in te_df:
+            observed = te_df.dropna(subset=[target_column])
+            if observed.empty:
+                raise PipelineError("The independent holdout has no observed target values.")
+            holdout = (observed.drop(columns=[target_column]), observed[target_column])
+        res = AutoMLPipelineSearch(**kw).fit(X, y, holdout=holdout)
         ctx.set("automl_result", res)
         ctx.set("trained_model", res.best_model)
         return res
@@ -238,6 +283,9 @@ def _builtin_step_handlers() -> dict[str, Callable[..., Any]]:
         else:
             df = _resolve_df(ctx, input_key)
             ctx.set("evaluation_split", "in_sample")
+        df = df.dropna(subset=[target_column])
+        if df.empty:
+            raise PipelineError("Evaluation needs observed target values.")
         X = df.drop(columns=[target_column])
         y = df[target_column].to_numpy()
         preds = model.predict(X)

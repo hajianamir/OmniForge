@@ -316,6 +316,7 @@ class CopilotToolRegistry:
             dag = (
                 PipelineBuilder(name=pipeline_name)
                 .add_step("ingest", "ingest")
+                .add_step("split", "split", chain=True, config={"target_column": target_column})
                 .add_step("clean", "clean", chain=True)
                 .add_step("quality", "quality", chain=True)
                 .add_step("automl", "automl", chain=True, config={"target_column": target_column})

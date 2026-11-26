@@ -1549,16 +1549,16 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
                   horizontal
                   items={(report.hypothesis_ledger || [])
                     .slice(0, 12)
-                    .map((row) => {
-                      const rawP = Number(row.adjusted_p_value ?? row.p_value ?? 1);
-                      const safeP = Number.isFinite(rawP) && rawP > 0 ? Math.max(rawP, 1e-16) : 1;
+                    .flatMap((row) => {
+                      const rawP = row.adjusted_p_value;
+                      if (typeof rawP !== 'number' || !Number.isFinite(rawP)) return [];
+                      const safeP = Math.max(rawP, 1e-16);
                       const negLog = -Math.log10(safeP);
-                      const sig = rawP < alpha;
-                      return {
+                      return [{
                         label: `${String(row.variable || row.family || 'Test')} (${String(row.test_name || '')})`,
                         value: Number(negLog.toFixed(3)),
-                        color: sig ? '#f87171' : '#64748b',
-                      };
+                        color: row.decision === 'Reject H0' ? '#f87171' : '#64748b',
+                      }];
                     })}
                 />
               </div>
@@ -1833,22 +1833,23 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
           <div>
             <div className="kpi-grid">
               <div className="kpi-card"><div className="kpi-label">Tests Executed</div><div className="kpi-value">{hypRes.total_tests}</div></div>
-              <div className="kpi-card"><div className="kpi-label">Statistically Significant</div><div className="kpi-value">{hypRes.significant_tests}</div></div>
+              <div className="kpi-card"><div className="kpi-label">{hypRes.decision_policy ? 'Significant after BH adjustment' : 'Statistically Significant'}</div><div className="kpi-value">{hypRes.significant_tests}</div></div>
             </div>
+            {hypRes.decision_policy && <p>{hypRes.decision_policy}. The chart caps −log₁₀ values at 16 for display.</p>}
             {hypRes.battery.length > 0 && (
               <div style={{ marginBottom: 14 }}>
                 <BarChartSVG
-                  title="Hypothesis Battery Evidence (−log₁₀ p-value)"
+                  title={hypRes.decision_policy ? 'Hypothesis Battery (−log₁₀ adjusted p-value)' : 'Hypothesis Battery (−log₁₀ p-value)'}
                   horizontal
-                  items={hypRes.battery.slice(0, 14).map((row) => {
-                    const pVal = Number(row.p_value ?? 1);
-                    const safeP = Number.isFinite(pVal) ? Math.max(pVal, 1e-16) : 1;
-                    const sig = Boolean(row.significant ?? pVal < alpha);
-                    return {
-                      label: `${String(row.column ?? row.pair ?? row.variables ?? '')} · ${String(row.test_name ?? row.test ?? '')}`,
+                  items={hypRes.battery.slice(0, 14).flatMap((row) => {
+                    const pVal = hypRes.decision_policy ? row.p_value_fdr : row.p_value;
+                    if (typeof pVal !== 'number' || !Number.isFinite(pVal)) return [];
+                    const safeP = Math.max(pVal, 1e-16);
+                    return [{
+                      label: `${String(row.scope ?? row.column ?? row.pair ?? row.variables ?? '')} · ${String(row.test_name ?? row.test ?? '')}`,
                       value: Number((-Math.log10(safeP)).toFixed(3)),
-                      color: sig ? '#34d399' : '#64748b',
-                    };
+                      color: row.significant ? '#34d399' : '#64748b',
+                    }];
                   })}
                 />
               </div>
@@ -1867,7 +1868,7 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
               {hypRes.result.evaluable === false || hypRes.result.p_value == null ? (
                 <><strong>Not evaluable</strong> · {hypRes.result.interpretation}</>
               ) : (
-                <><strong>{hypRes.result.test_name}:</strong> statistic={hypRes.result.statistic == null ? 'unavailable' : Number(hypRes.result.statistic).toFixed(4)} · p-value={Number(hypRes.result.p_value).toExponential(3)} · <strong>{hypRes.result.significant ? 'SIGNIFICANT' : 'NOT SIGNIFICANT'}</strong> · {hypRes.result.interpretation}</>
+                <><strong>{hypRes.result.test_name}:</strong> statistic={hypRes.result.statistic == null ? 'unavailable' : Number(hypRes.result.statistic).toFixed(4)} · p-value={Number(hypRes.result.p_value).toExponential(3)} · <strong>{hypRes.result.p_value_scope === 'exploratory_selected_family' ? 'EXPLORATORY FITTED-NULL CHECK' : hypRes.result.significant ? 'SIGNIFICANT' : 'NOT SIGNIFICANT'}</strong> · {hypRes.result.interpretation}</>
               )}
             </div>
             {hypRes.result.extra_table && (
@@ -1990,6 +1991,9 @@ export const Studio05Features: React.FC<StudioProps> = ({ ws, onSync, bumpGrid, 
       {selRes?.rankings && (
         <div className="card">
           <div className="card-title">Feature Importance Ranking ({selRes.selected_features?.length || 0} selected · Mode: {String(selRes.mode || selMode).toUpperCase()})</div>
+          {selRes.selected_source_columns && (
+            <p>{selRes.committed ? 'Applied' : 'Preview'} · {selRes.fit_scope === 'train_only' ? 'Fitted on locked training rows' : 'Fitted on the full study'} · Source predictors {selRes.selected_source_columns.join(', ')}</p>
+          )}
           <BarChartSVG
             title="Feature Importance / Consensus Ranking"
             horizontal

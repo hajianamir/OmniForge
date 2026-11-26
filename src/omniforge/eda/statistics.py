@@ -36,14 +36,19 @@ class StatisticalAnalyzer:
         method: Literal["none", "bonferroni", "fdr_bh"] = "fdr_bh",
     ) -> list[float]:
         """Adjust a family of raw p-values for multiple hypothesis testing."""
-        m = len(p_values)
+        arr = np.asarray(p_values, dtype=float)
+        observed = np.isfinite(arr) & (arr >= 0.0) & (arr <= 1.0)
+        result = np.full(len(arr), np.nan)
+        arr = arr[observed]
+        m = len(arr)
         if m == 0:
-            return []
-        arr = np.clip(np.asarray(p_values, dtype=float), 0.0, 1.0)
+            return result.tolist()
         if method == "none":
-            return [round(float(p), 6) for p in arr]
+            result[observed] = arr
+            return result.tolist()
         if method == "bonferroni":
-            return [round(float(min(1.0, p * m)), 6) for p in arr]
+            result[observed] = np.minimum(1.0, arr * m)
+            return result.tolist()
         # Benjamini-Hochberg FDR step-up procedure
         order = np.argsort(arr)
         ranked = arr[order]
@@ -55,7 +60,8 @@ class StatisticalAnalyzer:
             adj[i] = min(1.0, running_min)
         restored = np.empty(m, dtype=float)
         restored[order] = adj
-        return [round(float(p), 6) for p in restored]
+        result[observed] = restored
+        return result.tolist()
 
     @staticmethod
     def normality_test(
@@ -166,7 +172,7 @@ class StatisticalAnalyzer:
             return HypothesisTestResult(
                 test_name="anderson_darling",
                 statistic=round(stat, 6),
-                p_value=round(p_val, 6),
+                p_value=p_val,
                 alpha=alpha,
                 reject_null=reject,
                 interpretation=(
@@ -181,7 +187,7 @@ class StatisticalAnalyzer:
         return HypothesisTestResult(
             test_name=name,
             statistic=round(float(stat), 6),
-            p_value=round(float(p_val), 6),
+            p_value=float(p_val),
             alpha=alpha,
             reject_null=reject,
             interpretation=(
@@ -233,7 +239,7 @@ class StatisticalAnalyzer:
         return HypothesisTestResult(
             test_name="one_sample_t_test",
             statistic=round(float(stat), 6),
-            p_value=round(float(p_val), 6),
+            p_value=float(p_val),
             alpha=alpha,
             reject_null=reject,
             effect_size=round(cohens_d, 4),
@@ -277,7 +283,7 @@ class StatisticalAnalyzer:
         return HypothesisTestResult(
             test_name="levene_variance_test",
             statistic=round(float(stat), 6),
-            p_value=round(float(p_val), 6),
+            p_value=float(p_val),
             alpha=alpha,
             reject_null=reject,
             interpretation=(
@@ -406,7 +412,7 @@ class StatisticalAnalyzer:
         return HypothesisTestResult(
             test_name=name,
             statistic=round(float(stat), 6),
-            p_value=round(float(p_val), 6),
+            p_value=float(p_val),
             alpha=alpha,
             reject_null=reject,
             effect_size=round(effect_val, 4),
@@ -479,7 +485,7 @@ class StatisticalAnalyzer:
         return HypothesisTestResult(
             test_name=name,
             statistic=round(float(stat), 6),
-            p_value=round(float(p_val), 6),
+            p_value=float(p_val),
             alpha=alpha,
             reject_null=reject,
             effect_size=round(eff, 4),
@@ -551,7 +557,7 @@ class StatisticalAnalyzer:
         return HypothesisTestResult(
             test_name=f"{method}_correlation",
             statistic=round(coef_f, 6),
-            p_value=round(p_f, 6),
+            p_value=p_f,
             alpha=alpha,
             reject_null=reject,
             effect_size=round(abs(coef_f), 4),
@@ -600,7 +606,7 @@ class StatisticalAnalyzer:
         return HypothesisTestResult(
             test_name=test_name,
             statistic=round(stat_out, 6),
-            p_value=round(float(p_val), 6),
+            p_value=float(p_val),
             alpha=alpha,
             reject_null=reject,
             effect_size=round(cramers_v, 4),
@@ -681,7 +687,7 @@ class StatisticalAnalyzer:
         return HypothesisTestResult(
             test_name="ljung_box_autocorrelation",
             statistic=round(q_stat, 6),
-            p_value=round(p_val, 6),
+            p_value=p_val,
             alpha=alpha,
             reject_null=reject,
             interpretation=(
@@ -721,7 +727,7 @@ class StatisticalAnalyzer:
             return HypothesisTestResult(
                 test_name="augmented_dickey_fuller",
                 statistic=round(float(adf_stat), 6),
-                p_value=round(float(p_val), 6),
+                p_value=float(p_val),
                 alpha=alpha,
                 reject_null=reject,
                 interpretation=(
@@ -828,7 +834,7 @@ class StatisticalAnalyzer:
         return HypothesisTestResult(
             test_name="augmented_dickey_fuller_mackinnon",
             statistic=round(best_t, 6),
-            p_value=round(p_mk, 6),
+            p_value=p_mk,
             alpha=alpha,
             reject_null=reject,
             interpretation=(
@@ -861,7 +867,7 @@ class StatisticalAnalyzer:
         return HypothesisTestResult(
             test_name="jarque_bera",
             statistic=round(float(stat), 6),
-            p_value=round(float(p_val), 6),
+            p_value=float(p_val),
             alpha=alpha,
             reject_null=reject,
             interpretation=(
@@ -916,7 +922,7 @@ class StatisticalAnalyzer:
         return HypothesisTestResult(
             test_name="anderson_darling",
             statistic=round(stat, 6),
-            p_value=round(p_val, 6),
+            p_value=p_val,
             alpha=alpha,
             reject_null=reject,
             interpretation=(
@@ -947,7 +953,7 @@ class StatisticalAnalyzer:
         return HypothesisTestResult(
             test_name="mcnemar_exact",
             statistic=round(stat, 6),
-            p_value=round(p_val, 6),
+            p_value=p_val,
             alpha=alpha,
             reject_null=reject,
             interpretation=(
@@ -969,7 +975,7 @@ class StatisticalAnalyzer:
         return HypothesisTestResult(
             test_name="fisher_exact",
             statistic=round(float(odds_ratio), 6) if np.isfinite(odds_ratio) else float("inf"),
-            p_value=round(float(p_val), 6),
+            p_value=float(p_val),
             alpha=alpha,
             reject_null=reject,
             interpretation=(

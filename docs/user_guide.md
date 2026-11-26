@@ -167,13 +167,13 @@ Follow this CRISP-DM sequence to track data lineage, compare models against base
 
 | Step | Studio / Control | Requirement | Exact Action | Why & What Happens |
 |---:|---|---|---|---|
-| **1** | **Studio 01 · Ingestion** | Mandatory | Load CSV, TSV, multi-sheet Excel (`.xlsx`), Parquet, JSON, SQL DB, MS Access (`.accdb`/`.mdb`), or a built-in benchmark domain dataset. | `InitialIntakeAuditor` executes immediately (health grade A–F, missingness, duplicates, outliers, constant/mixed-type columns, skewness, leakage warnings). |
+| **1** | **Studio 00 · Ingestion** | Mandatory | Load CSV, TSV, multi-sheet Excel (`.xlsx`), Parquet, JSON, SQL DB, MS Access (`.accdb`/`.mdb`), or a built-in benchmark domain dataset. | `InitialIntakeAuditor` executes immediately (health grade A–F, missingness, duplicates, outliers, constant/mixed-type columns, skewness, leakage warnings). |
 | **2** | **Topbar · Targets & Exclusions** | Mandatory | Confirm Target Column(s) in **Targets** and mask raw IDs / post-outcome leakage fields in **Exclusions**. | Reversibly scopes all 15 studios without modifying Raw Data. |
 | **3** | **Topbar · Split Lock** | **Recommended BEFORE Cleaning** | Click **Split Lock**, select Strategy (`Auto`, `Stratified`, `Random`, or `Chronological Time-Series`), Test Ratio (e.g., 20%), CV Folds, then click **Lock Train/Test Split**. | **Anti-Leakage Gold Standard**: Forces Studio 01 Cleaning and Studio 02 Clustering to fit statistics (medians, means, outlier fences, scalers, cluster centroids) strictly on Train and transform Test without leakage. |
 | **4** | **Studio 01 · Quality & Cleaning** | Mandatory | Run **Quality & Format Audit**, inspect **Dry-Run Preview**, pick `Auto` / `Complete` / `Custom` mode, click **Apply & Commit Cleaning**. | Updates Active Data (`RAW` → `CLEANED`), preserves Raw Data separately (with Undo & Revert to Raw), logs every deleted row/column to the Forensic Deleted-Records Audit Log. |
 | **5** | **Studio 02 · Clustering, Anomaly & Mining** | Recommended | Run Clustering, Anomaly Screening, and/or Data Mining in `PREVIEW` mode. Optionally **Remove Selected Corrupt Clusters / Anomalies** or **Attach `cluster_id` / `is_anomaly`**. | Isolates faulty operating regimes/outliers before modeling. Lights up Studio 02 green status LED (`CLEANED + CLUSTER-SCREENED`). |
-| **6** | **Studio 03 · Diagnostics, Baselines & Risk** | Mandatory | Set α (e.g., 0.05) and holdout ratio, run Diagnostics in `Complete`, `Auto`, or `Custom` mode. | Runs normality/association/VIF/VaR-CVaR diagnostics and ranks **both Parametric and Non-Parametric Analytical Baseline Equations** with explicit Lift over Naive Floor, LaTeX & Python copy. |
-| **7** | **Studio 04 · Automated EDA & Hypothesis Lab** | Recommended | Run Automated EDA (distributions, correlations, missingness, insights) and the 17-Test Hypothesis Lab (`Complete` / `Auto` / `Custom`). | Confirms distributional shape, group differences, and statistical significance before feature engineering and model selection. |
+| **6** | **Studio 03 · Diagnostics, Baselines & Risk** | Recommended | Run diagnostics and compare the inclusive baseline using the active Split Lock. Use the holdout ratio to form a diagnostic holdout when no lock is active. | Establishes a reference from the eligible study predictors before optional Studio 05 selection. |
+| **7** | **Studio 04 · Automated EDA & Hypothesis Lab** | Recommended | Run Automated EDA or the hypothesis battery. For a custom test, select a method matching the sampling design. | Reports evidence and skipped tests. Battery decisions use Benjamini–Hochberg adjusted p-values. A fitted-null test run on a family selected from the same sample is exploratory. |
 | **8** | **Studio 05 · Feature Engineering & Selection** | Conditional | Optionally generate skew-corrected, interaction, polynomial, or datetime cyclical features; run 4-Method Consensus Selection. | Adds engineered features (`ENGINEERED` provenance) and reversibly excludes low-signal noise columns. |
 | **9** | **Studio 06 · AutoML, Non-Parametric & Deep Learning** | Mandatory | Train Multi-Backend AutoML, 5 True Non-Parametric Analytical Models (closed-form formulas & GAM decompositions), and/or Paper-Grade Deep Learning architectures. | Benchmarks every model strictly against strong baselines, promotes Champion to Active Model, unlocks Studios 07, 11, 12, 14. |
 | **10** | **Studio 07 · Responsible AI** | Recommended | Run Global Permutation Importance, Local SHAP, Partial Dependence Plots (PDP), Fairness Audit, Model Card generation. | Verifies explainability, domain plausibility, and fairness compliance (Disparate Impact ≥ 0.80). |
@@ -186,7 +186,7 @@ Follow this CRISP-DM sequence to track data lineage, compare models against base
 
 **YES** for predictive modeling (AutoML, Non-Parametric Analytical Models, Deep Learning, Diagnostics Baselines, Supervisory Deployment). If numeric imputation (mean/median/KNN/MICE), outlier fences (IQR/Z-score/MAD), high-missing column thresholds, or scaling/clustering are computed on the entire dataset before splitting, test-set statistics leak into training and inflate validation accuracy.
 
-**Structural Exception / Pure BI Cleaning:** Purely row-independent formatting fixes (whitespace/HTML stripping, standardizing `"N/A"` tokens) and exact-duplicate deduplication across identical rows are safe either way. If you only need a cleaned spreadsheet export for external BI tools and will not train models, Split Lock is optional.
+Row-independent formatting fixes can run before the split. Group repeated records by entity before splitting when independence between entities matters. Split Lock is optional for exploratory cleanup and spreadsheet exports that will not feed predictive evaluation.
 
 ---
 
@@ -219,15 +219,17 @@ Follow this CRISP-DM sequence to track data lineage, compare models against base
 2. `standardize_missing_tokens` — `"N/A"`, `"NA"`, `"null"`, `""` → `NaN`
 3. `infer_and_cast_types` — Column type inference and casting
 4. `replace_nonfinite_with_nan` — `inf`, `-inf` → `NaN`
-5. `apply_domain_bounds` — Column min/max clamping
-6. `drop_high_missing_columns` — Drop columns above missing threshold (default 90%)
+5. `apply_domain_bounds` — Mark values outside explicit domain limits as missing
+6. `drop_high_missing_columns` — Drop columns above the configured missingness threshold
 7. `drop_exact_duplicates` — Remove fully duplicate rows
 8. `fuzzy_deduplicate` — Near-duplicate detection and removal
 9. `add_missing_indicators` — Add `_is_missing` flag columns
 10. `outliers` — Outlier detection (IQR, MAD, Z-score, Isolation Forest, LOF)
 11. `impute_missing` — Missing value imputation (median, mean, KNN, MICE)
 
-**Modes:** `Auto` (smart defaults), `Complete` (comprehensive pass), `Custom` (manual control of every imputer, outlier rule, string sanitizer, threshold).
+**Modes.** Studio 01 `Auto` and `Complete` flag outliers for review. `Custom` exposes treatment rules. The SDK defaults to IQR detection and clipping, with a configurable action. The fitted cleaner screens predictors for outliers before applying imputation. An active temporal split supplies the time column and enables causal forward filling for time-based numeric imputation. Cleaning preserves selected outcomes, split key names, and rows reserved for the temporal gap. Reserved rows stay outside the training and holdout transforms.
+
+**Workflow.** Profile and validate the incoming data, use the health assessment to prioritize fixes, preview cleaning rules, and then re-profile and validate the result before committing. Use the deletion log, versioning, and exports to record the changes. Keep multicollinearity, skewness, and class imbalance in the statistical review. Compare reference and current cohorts for drift and track operational degradation in Studios 11 and 14. Studio 03 is diagnostic. Apply any independently justified domain features before Studio 05, using predictors available at scoring time.
 
 **Provenance:** Updates Active Data while keeping Raw Data intact. Supports Undo, Revert to Raw, clean CSV/XLSX export.
 
@@ -263,34 +265,33 @@ Follow this CRISP-DM sequence to track data lineage, compare models against base
 **Diagnostics:** Normality (Shapiro-Wilk, D'Agostino K², Anderson-Darling, KS), correlation (Pearson, Spearman, Kendall), multicollinearity (VIF), financial/operational tail risk (VaR/CVaR).
 
 **Baseline Models (ranked with Lift over Naive Floor):**
-- Ridge Linear / Logistic (exact closed-form)
+- Ridge linear regression and logistic regression
 - All results include LaTeX and Python code for reproducibility
 
 **Thresholds:** `VIF > 10` indicates severe collinearity; `CVaR` measures expected tail loss beyond `VaR`.
 
 ---
 
-### Studio 04 — Automated EDA & 17-Test Hypothesis Lab
+### Studio 04 — Automated EDA & Hypothesis Lab
 
-**Purpose:** Visual distribution/correlation/missingness profiling plus 17 classical & non-parametric hypothesis tests.
+**Purpose:** Visual distribution, correlation, and missingness profiling with parametric and nonparametric hypothesis tests.
 
-**17 Statistical Tests:**
+**Test families:**
 | Test | Data Type | Non-Parametric Alternative |
 |---|---|---|
 | Shapiro-Wilk | 1 Numeric | D'Agostino K² |
 | D'Agostino K² | 1 Numeric | Anderson-Darling |
 | Anderson-Darling | 1 Numeric | KS Normality |
-| KS Normality | 1 Numeric | (already non-parametric) |
+| Lilliefors normality | 1 Numeric | — |
 | Welch's t-Test | Numeric × 2 Groups | Mann-Whitney U |
 | Paired t-Test | 2 Paired Numeric | Wilcoxon Signed-Rank |
-| 2-Sample KS Test | 2 Numeric / Groups | (already non-parametric) |
+| 2-Sample KS Test | Two independent numeric samples | — |
 | One-Way ANOVA | Numeric × 3+ Groups | Kruskal-Wallis H |
 | Levene / Fligner / Bartlett | Numeric × 2+ Groups | Fligner-Killeen |
 | Pearson r | 2 Numeric | Spearman ρ / Kendall τ |
 | Chi-Square χ² | 2 Categorical | Fisher's Exact Test |
-| Benjamini-Hochberg / Bonferroni / Holm | Multiple p-values | — |
 
-**Corrections:** BH-FDR for exploratory discovery; Bonferroni/Holm for strict confirmatory FWER. Always pair with effect size (Cohen's d, |r|).
+The Studio 04 battery shares observations across tests. Interpret its Benjamini–Hochberg adjusted results as exploratory when the dependence assumptions have not been established. Use a prespecified test family and check the sampling assumptions for confirmatory work. Studio 03 separately offers Bonferroni correction.
 
 ---
 
@@ -306,6 +307,8 @@ Follow this CRISP-DM sequence to track data lineage, compare models against base
 - Time-series lags & rolling windows
 
 **Selectors (8):** Variance, Correlation, Mutual Info, Chi2, ANOVA, Lasso, Tree, RFE + 4-Method Consensus.
+
+Studio 05 ranks features on the training partition when Split Lock is active. Preview shows encoded features and their source columns. Commit retains those source predictors in Active Data for Studio 06. Native `AutoMLPipelineSearch(select_k_features=...)` affects fold-local CV diagnostics for supported candidates. Use committed or explicitly supplied predictor columns to control production inputs.
 
 ---
 
@@ -325,6 +328,8 @@ Follow this CRISP-DM sequence to track data lineage, compare models against base
 | Isotonic Monotonic (PAVA) | Non-decreasing/non-increasing step | Guaranteed monotonic physics (dose-response, sensor calibration) |
 
 **3. Paper-Grade Deep Learning:** FT-Transformer, TabNet, ResNet-Tabular, MLP, 1D-CNN, GCN, GAT, GraphSAGE with loss curves & feature importances.
+
+The deep benchmark uses the active Split Lock or creates a separate holdout before fitting its input schema. Its row cap samples training and holdout separately. The response records the partition source, available and evaluated row counts, and the fitted predictor schema. Deep candidates and baselines are scored on the same holdout rows.
 
 **4. Single-Row & Batch CSV Scoring.** Models trained by Studio 06 retain a fitted input schema with the workspace. Both scoring endpoints accept the original columns, including categorical values and datetime-typed features, and apply the same input preparation and model-fitted encoding used in training. Blank or omitted inputs follow the model's missing-value handling; unknown categories follow the trained encoder's policy. Numeric-only workbench models retain fitted medians and category encodings. Invalid numeric/datetime values return a 422 error rather than silently becoming zero. Older saved workspaces without a fitted schema retain their legacy numeric scoring behavior until retrained.
 

@@ -413,13 +413,22 @@ class MultiLayerStackingAutoML:
 
         if is_clf:
             min_cls = int(pd.Series(y_tr_arr).value_counts().min())
+            if n_classes < 2 or min_cls < 2:
+                raise AutoMLError("Stacking requires at least two training observations in every class.")
             n_splits = max(2, min(self.cv_folds, min_cls))
             splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=self.random_seed)
-            splits = list(splitter.split(X_tr_mat, y_tr_arr))
+            splits = list(splitter.split(X_train, y_tr_arr))
         else:
             n_splits = max(2, min(self.cv_folds, len(X_tr_mat) // 5))
             splitter = KFold(n_splits=n_splits, shuffle=True, random_state=self.random_seed)
-            splits = list(splitter.split(X_tr_mat))
+            splits = list(splitter.split(X_train))
+
+        # Share each fitted fold transform across the base estimators in that fold.
+        fold_matrices = []
+        for tr_i, va_i in splits:
+            fold_train = X_train.iloc[tr_i]
+            fold_preprocessor = _build_preprocessor(fold_train)
+            fold_matrices.append((fold_preprocessor.fit_transform(fold_train), fold_preprocessor.transform(X_train.iloc[va_i])))
 
         # Layer 1 OOF + full fits
         l1_specs = self._layer1_specs(is_clf)
@@ -431,13 +440,13 @@ class MultiLayerStackingAutoML:
         for mname, proto in l1_specs.items():
             try:
                 oof = np.zeros((len(X_tr_mat), n_classes), dtype=float)
-                for tr_i, va_i in splits:
+                for (tr_i, va_i), (fold_train_mat, fold_val_mat) in zip(splits, fold_matrices, strict=True):
                     est_f = clone(proto)
-                    est_f.fit(X_tr_mat[tr_i], y_tr_arr[tr_i])
+                    est_f.fit(fold_train_mat, y_tr_arr[tr_i])
                     if is_clf and hasattr(est_f, "predict_proba"):
-                        oof[va_i] = est_f.predict_proba(X_tr_mat[va_i])
+                        oof[va_i] = est_f.predict_proba(fold_val_mat)
                     else:
-                        oof[va_i, 0] = est_f.predict(X_tr_mat[va_i])
+                        oof[va_i, 0] = est_f.predict(fold_val_mat)
                 full_est = clone(proto)
                 full_est.fit(X_tr_mat, y_tr_arr)
                 l1_fitted[mname] = full_est
@@ -700,14 +709,19 @@ class MetaFeatureWarmStartAutoML:
         mean_kurt = float(np.nanmean(np.abs(num_df.kurt(numeric_only=True)))) if num_df.shape[1] > 0 else 0.0
 
         # Landmarking score using fast depth-2 Decision Tree
-        pre = _build_preprocessor(X)
-        Xm = pre.fit_transform(X.head(min(n, 2000)))
+        landmark_rows = X.head(min(n, 2000))
         ym = np.asarray(y.head(min(n, 2000)))
+        lm_score = None
         try:
             stump = DecisionTreeClassifier(max_depth=2, random_state=42) if is_clf else DecisionTreeRegressor(max_depth=2, random_state=42)
-            lm_score = float(np.mean(cross_val_score(stump, Xm, ym, cv=2, scoring="f1_macro" if is_clf else "r2")))
-        except Exception:
-            lm_score = 0.0
+            pipeline = Pipeline([("pre", _build_preprocessor(landmark_rows)), ("stump", stump)])
+            measured = float(np.mean(cross_val_score(
+                pipeline, landmark_rows, ym, cv=2, scoring="f1_macro" if is_clf else "r2", error_score="raise",
+            )))
+            if np.isfinite(measured):
+                lm_score = measured
+        except ValueError as exc:
+            logger.debug("landmarking_score_unavailable", error_type=type(exc).__name__)
 
         meta: dict[str, float] = {
             "log_n_samples": round(float(np.log10(max(n, 1))), 4),
@@ -717,8 +731,9 @@ class MetaFeatureWarmStartAutoML:
             "missing_fraction": round(miss_frac, 4),
             "mean_abs_skewness": round(float(np.nan_to_num(mean_skew)), 4),
             "mean_abs_kurtosis": round(float(np.nan_to_num(mean_kurt)), 4),
-            "landmark_stump_score": round(lm_score, 4),
         }
+        if lm_score is not None:
+            meta["landmark_stump_score"] = lm_score
         if is_clf:
             vc = y.value_counts(normalize=True).to_numpy(dtype=float)
             meta["n_classes"] = float(len(vc))

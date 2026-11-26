@@ -146,3 +146,17 @@ class WorkbenchInputPreprocessor:
             raise ValueError("Input preprocessor has not been fitted.")
         result = self._transform(frame)
         return result.reindex(columns=self.output_columns)
+
+    def feature_sources(self) -> dict[str, str]:
+        """Map each fitted output feature to its original input column."""
+        if not self._fitted:
+            raise ValueError("Input preprocessor has not been fitted.")
+        sources = {}
+        for column in self.input_columns:
+            if self.mode == "raw" or self.column_types[column] != "categorical":
+                sources[column] = column
+            elif len(self.categories[column]) > 20:
+                sources[f"{column}_code"] = column
+            else:
+                sources.update({f"{column}_{value}": column for value in self.categories[column]})
+        return sources

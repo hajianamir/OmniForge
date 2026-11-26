@@ -103,6 +103,7 @@ def test_automl_hpo_nas_and_dag_pipeline(classification_df: pd.DataFrame) -> Non
     dag = (
         PipelineBuilder("integration_pipe")
         .add_step("quality", "quality")
+        .add_step("split", "split", chain=True, config={"target_column": "target"})
         .add_step("clean", "clean", chain=True)
         .add_step("automl", "automl", chain=True, config={"target_column": "target", "time_budget_seconds": 12.0})
         .add_step("evaluate", "evaluate", chain=True, config={"target_column": "target"})

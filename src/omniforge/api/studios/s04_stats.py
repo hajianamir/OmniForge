@@ -166,7 +166,7 @@ def _run_single_stat_test(
         return {
             "test_name": "Anderson-Darling Normality Test",
             "statistic": round(float(res_ad.statistic), 5),
-            "p_value": round(float(res_ad.p_value), 6),
+            "p_value": float(res_ad.p_value),
             "alpha": alpha,
             "significant": bool(res_ad.reject_null),
             "interpretation": res_ad.interpretation,
@@ -207,34 +207,26 @@ def _run_single_stat_test(
                 ]
             )
         fits: list[dict[str, Any]] = []
+        fitted_candidates: dict[str, tuple[Any, dict[str, float]]] = {}
         for dname, dist, fit_kw, k_params in candidates:
             try:
                 params = dist.fit(vals, **fit_kw)
                 logpdf = np.asarray(dist.logpdf(vals, *params), dtype=float)
                 if not np.all(np.isfinite(logpdf)):
-                    logpdf = np.clip(np.nan_to_num(logpdf, nan=-700.0, neginf=-700.0, posinf=700.0), -700.0, 700.0)
+                    continue
                 ll = float(np.sum(logpdf))
                 aic = 2.0 * k_params - 2.0 * ll
                 bic = k_params * float(np.log(n_obs)) - 2.0 * ll
-                ks_s, ks_p_raw = sp_stats.kstest(vals, dist.cdf, args=params)
-                # Use composite-hypothesis Lilliefors p-value for Normal instead of unadjusted KS after MLE
-                if dname == "Normal":
-                    lf_res = StatisticalAnalyzer.normality_test(
-                        pd.Series(vals), alpha=alpha, method="kolmogorov_smirnov"
-                    )
-                    gof_p = float(lf_res.p_value) if np.isfinite(lf_res.p_value) else float(ks_p_raw)
-                else:
-                    gof_p = float(ks_p_raw)
+                ks_s = float(sp_stats.ks_1samp(vals, dist.cdf, args=params).statistic)
+                fitted_candidates[dname] = (dist, {"loc": 0.0} if "floc" in fit_kw else {})
                 fits.append(
                     {
                         "distribution": dname,
                         "k_params": k_params,
-                        "log_likelihood": round(ll, 3),
-                        "aic": round(aic, 3),
-                        "bic": round(bic, 3),
-                        "ks_stat": round(float(ks_s), 5),
-                        "p_value": round(gof_p, 5),
-                        "good_fit": bool(gof_p >= alpha),
+                        "log_likelihood": ll,
+                        "aic": aic,
+                        "bic": bic,
+                        "ks_stat": ks_s,
                     }
                 )
             except Exception:
@@ -244,15 +236,28 @@ def _run_single_stat_test(
         if not fits:
             raise HTTPException(status_code=400, detail="None of the candidate distributions could be fitted.")
         best = fits[0]
+        dist, known_params = fitted_candidates[best["distribution"]]
+        draws = 399
+        gof = sp_stats.goodness_of_fit(
+            dist, vals, known_params=known_params or None, statistic="ks",
+            n_mc_samples=draws, rng=np.random.default_rng(42),
+        )
+        gof_p = float(gof.pvalue)
+        best.update(p_value=gof_p, bootstrap_ks_stat=float(gof.statistic))
         return {
             "test_name": f"Distribution Goodness-of-Fit ({col_a})",
-            "statistic": best["ks_stat"],
-            "p_value": best["p_value"],
+            "statistic": float(gof.statistic),
+            "p_value": gof_p,
             "alpha": alpha,
-            "significant": bool(best["p_value"] < alpha),
+            "significant": bool(gof_p < alpha),
+            "p_value_scope": "exploratory_selected_family",
+            "bootstrap_draws": draws,
+            "n_observations": n_obs,
             "interpretation": (
                 f"Best-fitting family by AIC is {best['distribution']} "
-                f"(AIC={best.get('aic', 0.0):.2f}, BIC={best.get('bic', 0.0):.2f}, KS={best['ks_stat']:.4f}, p={best['p_value']:.4g})."
+                f"(AIC={best['aic']:.2f}, BIC={best['bic']:.2f}). "
+                f"The fitted-null KS bootstrap gives p={gof_p:.4g} using {draws} draws. "
+                "Treat this result as exploratory because the same observations selected the family."
             ),
             "extra_table": fits,
         }
@@ -301,16 +306,22 @@ def _run_single_stat_test(
             "interpretation": f"Stat={stat:.4f}, p={pval:.4g} — {'heteroscedastic (unequal variances)' if pval < alpha else 'homoscedastic (equal variances)'}.",
         }
     if t in ("paired_t", "wilcoxon", "ks_2samp") and col_b and col_b in df.columns:
-        sub = df[[col_a, col_b]].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-        if len(sub) < 5:
-            raise HTTPException(status_code=400, detail="Need at least 5 paired numeric rows.")
-        a_v, b_v = sub[col_a].to_numpy(dtype=float), sub[col_b].to_numpy(dtype=float)
+        numeric = df[[col_a, col_b]].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+        if t == "ks_2samp":
+            a_v, b_v = (numeric[col].dropna().to_numpy(dtype=float) for col in (col_a, col_b))
+            if min(len(a_v), len(b_v)) < 5:
+                raise HTTPException(status_code=400, detail="Need at least 5 observed values in each independent sample.")
+        else:
+            paired = numeric.dropna()
+            if len(paired) < 5:
+                raise HTTPException(status_code=400, detail="Need at least 5 paired numeric rows.")
+            a_v, b_v = (paired[col].to_numpy(dtype=float) for col in (col_a, col_b))
         if t == "paired_t":
             stat, pval = sp_stats.ttest_rel(a_v, b_v)
             label = "Paired Student t-Test"
         elif t == "wilcoxon":
             diff = a_v - b_v
-            if np.allclose(diff, 0):
+            if np.all(diff == 0):
                 stat, pval = 0.0, 1.0
             else:
                 stat, pval = sp_stats.wilcoxon(diff)
@@ -324,6 +335,7 @@ def _run_single_stat_test(
             "p_value": float(pval),
             "alpha": alpha,
             "significant": bool(pval < alpha),
+            "sample_sizes": [len(a_v), len(b_v)],
             "interpretation": f"Stat={stat:.4f}, p={pval:.4g} ({'significant difference' if pval < alpha else 'no significant difference'}).",
         }
     if col_b and col_b in df.columns:
@@ -406,11 +418,11 @@ def s04_run_hypothesis(req: HypothesisReq, x_session_id: str | None = Header(def
                 return
             battery.append({**entry, **{k: v for k, v in result.items() if k != "extra_table"}})
 
-        tests_norm = ["shapiro", "dagostino", "anderson", "distribution_fit"] if mode == "complete" else ["shapiro", "distribution_fit"]
+        tests_norm = ["shapiro", "dagostino", "anderson"] if mode == "complete" else ["shapiro"]
         for nc in num_cols[:4]:
             for tt in tests_norm:
                 evaluate(tt, nc, None, nc)
-        corr_tests = ["pearson", "spearman", "kendall", "ks_2samp"] if mode == "complete" else ["spearman"]
+        corr_tests = ["pearson", "spearman", "kendall"] if mode == "complete" else ["spearman"]
         for i, col_a in enumerate(num_cols[:3]):
             for col_b in num_cols[i + 1 : 4]:
                 for tt in corr_tests:
@@ -424,8 +436,10 @@ def s04_run_hypothesis(req: HypothesisReq, x_session_id: str | None = Header(def
             evaluate("chi_square", cat_cols[0], cat_cols[1], f"{cat_cols[0]} x {cat_cols[1]}")
         adjusted = StatisticalAnalyzer.adjust_p_values([float(row["p_value"]) for row in battery])
         for row, p_adj in zip(battery, adjusted, strict=True):
+            row["significant_raw"] = row["significant"]
             row["p_value_fdr"] = p_adj
             row["significant_fdr"] = p_adj < req.alpha
+            row["significant"] = row["significant_fdr"]
         state["uap_hypothesis_battery"] = battery
         return wb_cache_and_respond(
             state,
@@ -435,6 +449,8 @@ def s04_run_hypothesis(req: HypothesisReq, x_session_id: str | None = Header(def
                 "mode": mode,
                 "total_tests": len(battery),
                 "significant_tests": sum(1 for r in battery if r.get("significant")),
+                "raw_significant_tests": sum(1 for r in battery if r.get("significant_raw")),
+                "decision_policy": "Benjamini–Hochberg across the evaluable battery",
                 "battery": battery,
                 "skipped": skipped,
                 "result": battery[0] if battery else None,

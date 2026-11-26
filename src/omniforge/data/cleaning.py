@@ -110,6 +110,8 @@ class CleaningReport(BaseModel):
     fuzzy_duplicates_removed: int = 0
     outliers_detected: dict[str, int] = Field(default_factory=dict)
     outlier_action_applied: str = "none"
+    effective_numeric_imputation: str | None = None
+    time_column: str | None = None
     removed_rows_count: int = 0
     removed_rows_by_reason: dict[str, int] = Field(default_factory=dict)
     removed_row_samples: list[dict[str, Any]] = Field(default_factory=list)
@@ -122,6 +124,7 @@ class _FittedCleanerState:
     dropped_cols: list[str] = field(default_factory=list)
     numeric_fill_values: dict[str, float] = field(default_factory=dict)
     causal_last_values: dict[str, float] = field(default_factory=dict)
+    causal_last_times: dict[str, Any] = field(default_factory=dict)
     categorical_fill_values: dict[str, Any] = field(default_factory=dict)
     frequent_categories: dict[str, set[str]] = field(default_factory=dict)
     knn_imputer: KNNImputer | None = None
@@ -177,7 +180,7 @@ class DataCleaner:
     def fit_transform(self, df: pd.DataFrame) -> tuple[pd.DataFrame, CleaningReport]:
         """Fit cleaning statistics on ``df`` and return cleaned data plus audit report."""
         self.fit(df)
-        return self.transform(df)
+        return self.transform(df, use_training_history=False)
 
     def fit_transform_split(
         self,
@@ -186,7 +189,7 @@ class DataCleaner:
     ) -> tuple[pd.DataFrame, pd.DataFrame, CleaningReport, CleaningReport]:
         """Leakage-safe cleaning: fit ALL statistical parameters on ``df_train`` only, then transform Train and Test."""
         self.fit(df_train)
-        clean_train, rep_train = self.transform(df_train)
+        clean_train, rep_train = self.transform(df_train, use_training_history=False)
         rem_tr = self.last_removed_rows_.copy()
         clean_test, rep_test = self.transform(df_test)
         rem_te = self.last_removed_rows_.copy()
@@ -223,7 +226,7 @@ class DataCleaner:
 
         # Canonical Stage 5: Apply explicit physical/domain bounds
         if self.config.domain_bounds:
-            work, _ = self.apply_domain_bounds(work, self.config.domain_bounds)
+            work, _ = self.apply_domain_bounds(work, {col: bounds for col, bounds in self.config.domain_bounds.items() if col not in excluded})
 
         # Canonical Stage 6: Drop columns exceeding missing-value threshold BEFORE row deduplication
         if self.config.drop_high_missing_cols and len(work) > 0:
@@ -353,15 +356,16 @@ class DataCleaner:
                 work = work.drop(columns=outlier_flag_cols, errors="ignore")
 
         # Canonical Stage 11: Fit causal anchors & univariate/multivariate imputers on post-outlier Train data
-        ts_work = (
-            work.sort_values(self.config.time_column, kind="mergesort")
-            if (self.config.time_column and self.config.time_column in work.columns)
-            else work
-        )
-        for c in num_cols:
-            valid_c = ts_work[c].dropna()
-            if len(valid_c) > 0:
-                self._state.causal_last_values[str(c)] = float(valid_c.iloc[-1])
+        time = self._time_values(work)
+        if time is not None and self.config.causal_time_series:
+            for col in num_cols:
+                observed = time.notna().to_numpy() & work[col].notna().to_numpy()
+                if observed.any():
+                    positions = np.flatnonzero(observed)
+                    last = int(time.iloc[positions].reset_index(drop=True).argsort(kind="stable").iloc[-1])
+                    pos = int(positions[last])
+                    self._state.causal_last_values[str(col)] = float(work[col].iloc[pos])
+                    self._state.causal_last_times[str(col)] = time.iloc[pos]
 
         # Always store fallback per-column numeric fill values (needed for leading NaNs in causal ffill too)
         for col in num_cols:
@@ -427,7 +431,7 @@ class DataCleaner:
         self._is_fitted = True
         return self
 
-    def transform(self, df: pd.DataFrame) -> tuple[pd.DataFrame, CleaningReport]:
+    def transform(self, df: pd.DataFrame, *, use_training_history: bool = True) -> tuple[pd.DataFrame, CleaningReport]:
         """Apply fitted cleaning rules to ``df`` and return cleaned DataFrame and audit report."""
         if not self._is_fitted:
             raise RuntimeError(
@@ -493,7 +497,7 @@ class DataCleaner:
 
         # Canonical Stage 5: Apply explicit physical/domain bounds
         if self.config.domain_bounds:
-            work, domain_invalids = self.apply_domain_bounds(work, self.config.domain_bounds)
+            work, domain_invalids = self.apply_domain_bounds(work, {col: bounds for col, bounds in self.config.domain_bounds.items() if col not in excluded})
             if domain_invalids:
                 steps.append(f"apply_domain_bounds:{sum(domain_invalids.values())}_coerced_to_nan")
 
@@ -574,7 +578,7 @@ class DataCleaner:
 
         # Canonical Stage 11: Impute remaining missing values using post-outlier Train statistics
         imputed_counts: dict[str, int] = {}
-        work, imputed_counts = self._impute_missing(work, excluded)
+        work, imputed_counts = self._impute_missing(work, excluded, use_training_history=use_training_history)
         if imputed_counts:
             steps.append("impute_missing")
 
@@ -609,6 +613,12 @@ class DataCleaner:
             fuzzy_duplicates_removed=fuzzy_dups_removed,
             outliers_detected=outliers_detected,
             outlier_action_applied=self.config.outlier_action,
+            effective_numeric_imputation=(
+                "causal_ffill"
+                if self.config.causal_time_series and self.config.numeric_imputation in {"ffill", "bfill", "interpolate"}
+                else self.config.numeric_imputation
+            ),
+            time_column=self.config.time_column,
             removed_rows_count=int(len(self.last_removed_rows_)),
             removed_rows_by_reason=removed_by_reason,
             removed_row_samples=removed_samples,
@@ -823,8 +833,17 @@ class DataCleaner:
                             df.loc[mask, c] = med
         return df, detected, flag_cols, removed_df, removed_pos, removed_reasons
 
+    def _time_values(self, df: pd.DataFrame) -> pd.Series | None:
+        column = self.config.time_column
+        if not column or column not in df:
+            return None
+        values = df[column]
+        if pd.api.types.is_numeric_dtype(values):
+            return values.replace([np.inf, -np.inf], np.nan)
+        return pd.to_datetime(values, errors="coerce", utc=True, format="mixed")
+
     def _impute_missing(
-        self, df: pd.DataFrame, excluded: set[str]
+        self, df: pd.DataFrame, excluded: set[str], *, use_training_history: bool,
     ) -> tuple[pd.DataFrame, dict[str, int]]:
         imputed: dict[str, int] = {}
 
@@ -866,34 +885,41 @@ class DataCleaner:
                         df.loc[na_mask, c] = rf.predict(mf_in.loc[na_mask, pred_cols])
                         imputed[c] = int(na_mask.sum())
         elif self.config.numeric_imputation in ("ffill", "bfill", "interpolate"):
-            # Sort chronologically if time_column provided, restore index ordering afterwards
-            orig_index = df.index
-            was_sorted = False
-            if self.config.time_column and self.config.time_column in df.columns:
-                df = df.sort_values(self.config.time_column, kind="mergesort")
-                was_sorted = True
+            time = self._time_values(df)
+            if self.config.time_column and time is None:
+                raise DataCleaningError("The configured time column is missing.")
+            order = time.reset_index(drop=True).sort_values(kind="stable").index.to_numpy() if time is not None else np.arange(len(df))
+            ordered_time = time.iloc[order].reset_index(drop=True) if time is not None else None
             for col in df.select_dtypes(include=[np.number]).columns:
-                if col in excluded:
+                if col in excluded or col == self.config.time_column:
                     continue
-                nulls = int(df[col].isna().sum())
+                values = df[col].iloc[order].reset_index(drop=True)
+                nulls = int(values.isna().sum())
                 if nulls == 0:
                     continue
-                fallback = self._state.causal_last_values.get(
-                    str(col),
-                    self._state.numeric_fill_values.get(str(col), self.config.constant_fill_numeric),
-                )
+                fallback = self._state.numeric_fill_values.get(str(col), self.config.constant_fill_numeric)
                 if self.config.causal_time_series:
-                    # Strictly causal past-only forward-fill anchored on Train's last valid value: NEVER peek into t+1
-                    df[col] = df[col].ffill().fillna(fallback)
+                    fallback = self.config.constant_fill_numeric
+                    if ordered_time is None:
+                        filled = values.ffill()
+                    else:
+                        valid_time = ordered_time.notna()
+                        prior = values.where(valid_time).ffill().shift()
+                        if use_training_history and str(col) in self._state.causal_last_times:
+                            anchor_time = self._state.causal_last_times[str(col)]
+                            anchor_value = self._state.causal_last_values[str(col)]
+                            prior_time = ordered_time.where(values.notna()).ffill().shift()
+                            prefer_anchor = ordered_time.gt(anchor_time) & (prior_time.isna() | prior_time.lt(anchor_time))
+                            prior = prior.mask(prefer_anchor, anchor_value)
+                        filled = values.fillna(prior.where(valid_time))
                 elif self.config.numeric_imputation == "ffill":
-                    df[col] = df[col].ffill().fillna(fallback)
+                    filled = values.ffill()
                 elif self.config.numeric_imputation == "bfill":
-                    df[col] = df[col].bfill().fillna(fallback)
+                    filled = values.bfill()
                 else:
-                    df[col] = df[col].interpolate(method="linear").ffill().fillna(fallback)
+                    filled = values.interpolate(method="linear").ffill()
+                df[col] = filled.fillna(fallback).iloc[np.argsort(order)].to_numpy()
                 imputed[str(col)] = nulls
-            if was_sorted:
-                df = df.loc[orig_index]
         elif self.config.numeric_imputation != "none":
             for col, val in self._state.numeric_fill_values.items():
                 if col in df.columns and col not in excluded:
@@ -918,7 +944,7 @@ class DataCleaner:
         # per-column fill value (median by default) so missing_after is always 0.
         if self.config.numeric_imputation != "none":
             for col in df.select_dtypes(include=[np.number]).columns:
-                if col in excluded:
+                if col in excluded or col == self.config.time_column:
                     continue
                 nulls = int(df[col].isna().sum())
                 if nulls > 0:

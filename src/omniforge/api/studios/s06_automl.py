@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
+from sklearn.model_selection import train_test_split
 
 from omniforge.api.auth import require_permission
 from omniforge.api.jobs import JobCancellationToken, JobQueueFullError
@@ -370,6 +371,7 @@ def s06_run_nonparametric_analytical(
         tgt_map[m_name] = {
             "model": m_obj,
             "feature_cols": feat_cols,
+            "input_preprocessor": input_preprocessor,
             "metrics": {
                 str(row_m.get("primary_metric", "score")): row_m.get("primary_score", 0.0),
                 "lift_vs_parametric": row_m.get("lift_vs_parametric", 0.0),
@@ -407,20 +409,59 @@ def s06_run_deep_benchmark(req: DeepBenchReq, x_session_id: str | None = Header(
     """Benchmark Paper-Grade Deep Learning Architectures (FT-Transformer, TabNet, ResNet-Tabular, MLP, 1D-CNN, GNN) vs. Baselines."""
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
-    df = _wb().get_analysis_dataframe(state, _wb()._require_df(state))
-    targets = _wb().get_selected_targets(state, df)
+    active_df = _wb()._require_df(state)
+    df = _wb().get_analysis_dataframe(state, active_df)
+    targets = _wb().get_selected_targets(state, active_df)
     target, columns = _modeling_scope(df, targets, req.target)
-    X_full, y_full, task = _wb()._prepare_xy(df.loc[:, columns], target)
-    if len(X_full) < 6:
-        raise HTTPException(status_code=400, detail="Deep learning benchmark requires at least 6 rows.")
-    if len(X_full) > req.max_rows:
-        idx = np.random.default_rng(42).choice(len(X_full), size=req.max_rows, replace=False)
-        X_full = X_full.iloc[idx].reset_index(drop=True)
-        y_full = y_full.iloc[idx].reset_index(drop=True)
-    split = min(len(X_full) - 2, max(2, int(len(X_full) * 0.8)))
-    X_tr, X_te = X_full.iloc[:split], X_full.iloc[split:]
-    y_tr, y_te = y_full.iloc[:split], y_full.iloc[split:]
+    train, test, lock = _wb().get_active_split_frames(state, active_df)
+    if lock:
+        keys = {lock.get(key) for key in ("time_col", "group_col", "row_id_col")}
+        columns = [col for col in columns if col not in keys or col == target]
+    train = train.loc[:, columns].dropna(subset=[target])
+    split_strategy: str | None
+    if test is None:
+        if len(train) < 12:
+            raise HTTPException(status_code=400, detail="The deep benchmark needs at least 12 observed rows for a holdout.")
+        test_rows = min(len(train) - 10, max(2, len(train) // 5))
+        task = _wb()._infer_task(train[target])
+        counts = train[target].value_counts()
+        can_stratify = task != _wb().TaskType.REGRESSION and counts.min() >= 2 and len(counts) <= test_rows
+        train, test = train_test_split(
+            train, test_size=test_rows, random_state=42, stratify=train[target] if can_stratify else None,
+        )
+        split_source = "benchmark_holdout"
+        split_strategy = "stratified" if can_stratify else "random"
+    else:
+        test = test.loc[:, columns].dropna(subset=[target])
+        split_source = "split_lock"
+        split_strategy = lock.get("strategy") if lock else None
+    if len(train) < 10 or len(test) < 2:
+        raise HTTPException(status_code=400, detail="The deep benchmark needs 10 observed training rows and 2 held-out rows.")
+
+    training_rows, heldout_rows = len(train), len(test)
+    task = _wb()._infer_task(train[target])
     is_clf = task in (_wb().TaskType.BINARY_CLASSIFICATION, _wb().TaskType.MULTICLASS_CLASSIFICATION)
+    if training_rows + heldout_rows > req.max_rows:
+        train_limit = min(training_rows, max(10, min(req.max_rows - 2, req.max_rows * training_rows // (training_rows + heldout_rows))))
+        test_limit = min(heldout_rows, req.max_rows - train_limit)
+        if train_limit < training_rows:
+            positions = np.arange(training_rows)
+            counts = train[target].value_counts()
+            stratify = train[target] if is_clf and counts.min() >= 2 and len(counts) <= min(train_limit, training_rows - train_limit) else None
+            kept, _ = train_test_split(positions, train_size=train_limit, random_state=42, stratify=stratify)
+            train = train.iloc[np.sort(kept)]
+        if test_limit < heldout_rows:
+            kept = np.random.default_rng(42).choice(heldout_rows, size=test_limit, replace=False)
+            test = test.iloc[np.sort(kept)]
+    if is_clf and (train[target].nunique() < 2 or not test[target].isin(train[target].unique()).all()):
+        raise HTTPException(status_code=400, detail="Every holdout class must be represented in the deep benchmark training rows.")
+
+    X_tr, y_tr, _inferred_task, preprocessor = _wb()._prepare_xy_fitted(train, target)
+    try:
+        X_te = preprocessor.transform(test.drop(columns=[target]))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="The holdout predictors do not match the training schema.") from exc
+    y_te = test[target]
 
     base_suite = BaselineBenchmarkSuite()
     base_res = base_suite.run_classification(X_tr, y_tr, X_te, y_te) if is_clf else base_suite.run_regression(X_tr, y_tr, X_te, y_te)
@@ -461,6 +502,7 @@ def s06_run_deep_benchmark(req: DeepBenchReq, x_session_id: str | None = Header(
                 "model": m,
                 "name": m.name,
                 "feature_cols": list(X_tr.columns),
+                "input_preprocessor": preprocessor,
                 "metrics": {"f1_weighted" if is_clf else "r2": round(sc, 5), "elapsed_sec": elapsed},
                 "target": target,
             }
@@ -497,6 +539,12 @@ def s06_run_deep_benchmark(req: DeepBenchReq, x_session_id: str | None = Header(
             "target": target,
             "metric": "f1_weighted" if is_clf else "r2",
             "results": rows,
+            "evaluation": {
+                "source": split_source, "strategy": split_strategy,
+                "n_train": len(X_tr), "n_test": len(X_te),
+                "available_train_rows": training_rows, "available_test_rows": heldout_rows,
+                "input_columns": preprocessor.input_columns, "encoded_columns": preprocessor.output_columns,
+            },
             "feature_importances": feature_importances,
         },
     )
