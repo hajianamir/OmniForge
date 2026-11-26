@@ -99,7 +99,12 @@ class _ChampionEstimator(BaseEstimator):
 
 
 class AutoMLPipelineSearch:
-    """End-to-end leakage-safe AutoML engine supporting Stratified, Group, and TimeSeriesSplit CV with sklearn Pipelines."""
+    """AutoML search with Stratified, Group, and TimeSeriesSplit CV.
+
+    ``select_k_features`` applies only to fold-local CV diagnostics for
+    supported candidates. Production candidate fits, refits, and predictions
+    use the provided predictor columns.
+    """
 
     def __init__(
         self,
@@ -479,6 +484,8 @@ class AutoMLPipelineSearch:
                             row_entry["cv_mean"] = cv_res["test_mean"]
                             row_entry["cv_std"] = cv_res["test_std"]
                             row_entry["overfit_gap"] = cv_res["overfit_gap"]
+                            if self.select_k_features is not None:
+                                row_entry["cv_select_k_features_requested"] = self.select_k_features
                             cv_summary.append(
                                 {
                                     "model": alg,
@@ -489,6 +496,7 @@ class AutoMLPipelineSearch:
                                     "cv_std": cv_res["test_std"],
                                     "train_mean": cv_res["train_mean"],
                                     "overfit_gap": cv_res["overfit_gap"],
+                                    "cv_select_k_features_requested": self.select_k_features,
                                 }
                             )
                         except Exception as cv_exc:

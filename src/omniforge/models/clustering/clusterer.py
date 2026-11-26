@@ -129,6 +129,7 @@ class ClusteringEngine(BaseOmniForgeModel):
         self._encoded_cols_: list[str] = []
         self._col_medians_: dict[str, float] = {}
         self._array_medians_: np.ndarray | None = None
+        self._profile_input_columns_: list[str] = []
 
     def _make_scaler(self) -> Any:
         if self.scaler_type == "standard":
@@ -141,35 +142,40 @@ class ClusteringEngine(BaseOmniForgeModel):
 
     def _prepare_matrix(self, X: pd.DataFrame | np.ndarray, *, fit_scaler: bool) -> np.ndarray:
         if isinstance(X, pd.DataFrame):
-            work = X.copy()
-            # Encode categorical columns safely and impute numeric medians
-            num_cols = list(work.select_dtypes(include=[np.number]).columns)
+            X = X.rename(columns=str)
+            if not X.columns.is_unique:
+                raise ModelTrainingError("Clustering feature names must be unique after normalization.")
+            if fit_scaler:
+                self._profile_input_columns_ = list(X.columns)
+                self._col_medians_ = {}
+                num_cols = list(X.select_dtypes(include=[np.number]).columns)
+            else:
+                num_cols = list(self._col_medians_)
+            work = X.reindex(columns=self._profile_input_columns_).copy()
             cat_cols = [c for c in work.columns if c not in num_cols]
             for c in num_cols:
-                col_vals = pd.to_numeric(work[c], errors="coerce")
+                col_vals = pd.to_numeric(work[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
                 if fit_scaler:
                     med = float(col_vals.median()) if col_vals.notna().any() else 0.0
                     self._col_medians_[str(c)] = med
                 else:
-                    med = self._col_medians_.get(str(c), float(col_vals.median()) if col_vals.notna().any() else 0.0)
+                    med = self._col_medians_[str(c)]
                 work[c] = col_vals.fillna(med)
             if cat_cols:
                 for c in cat_cols:
-                    work[c] = work[c].fillna("missing").astype(str)
+                    work[c] = work[c].astype("string").fillna("missing")
                 work = pd.get_dummies(work, columns=cat_cols, drop_first=False, dtype=float)
             if fit_scaler:
                 self._encoded_cols_ = list(work.columns)
             elif self._encoded_cols_:
-                for c in self._encoded_cols_:
-                    if c not in work.columns:
-                        work[c] = 0.0
-                work = work[self._encoded_cols_]
+                work = work.reindex(columns=self._encoded_cols_, fill_value=0.0)
             arr = work.to_numpy(dtype=float)
         else:
             arr = np.asarray(X, dtype=float)
             if arr.ndim == 1:
                 arr = arr.reshape(-1, 1)
             if fit_scaler:
+                self._profile_input_columns_ = []
                 with np.errstate(all="ignore"):
                     col_med = np.nanmedian(arr, axis=0)
                 col_med = np.where(np.isnan(col_med), 0.0, col_med).astype(float)
@@ -279,7 +285,15 @@ class ClusteringEngine(BaseOmniForgeModel):
 
     def _predict(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
         _ = kwargs
-        X_s = self._prepare_matrix(X, fit_scaler=False)
+        return self._predict_scaled(self._prepare_matrix(X, fit_scaler=False))
+
+    def predict(self, X: pd.DataFrame | np.ndarray, **kwargs: Any) -> np.ndarray:
+        if isinstance(X, pd.DataFrame) and getattr(self, "_profile_input_columns_", []):
+            self._check_is_fitted()
+            return self._predict_scaled(self._prepare_matrix(X, fit_scaler=False))
+        return super().predict(X, **kwargs)
+
+    def _predict_scaled(self, X_s: np.ndarray) -> np.ndarray:
         if hasattr(self._estimator, "predict"):
             return np.asarray(self._estimator.predict(X_s), dtype=int)
         # Density-aware core-point inductive assignment for DBSCAN / OPTICS (labels out-of-radius points -1)
@@ -326,12 +340,14 @@ class ClusteringEngine(BaseOmniForgeModel):
             k_min=k_min,
             k_max=k_max,
         )
-        cols = train_res.feature_columns
-        test_labels = np.asarray(self.predict(df_test[cols]), dtype=int)
+        test_labels = np.asarray(self.predict(df_test), dtype=int)
         return train_res, test_labels
 
     def predict_proba_clusters(self, X: pd.DataFrame | np.ndarray) -> np.ndarray | None:
         """Return soft cluster membership probabilities (exact for GMM, softmax distance for centroid models)."""
+        self._check_is_fitted()
+        if not getattr(self, "_profile_input_columns_", []):
+            X, _ = self._prepare_X(X, fitting=False)
         X_s = self._prepare_matrix(X, fit_scaler=False)
         if hasattr(self._estimator, "predict_proba"):
             return np.asarray(self._estimator.predict_proba(X_s), dtype=float)
@@ -746,15 +762,16 @@ class ClusteringEngine(BaseOmniForgeModel):
 
     @staticmethod
     def hopkins_statistic(df: pd.DataFrame, *, sample_size: int = 50, random_state: int = 42) -> dict[str, Any]:
-        """Compute Hopkins Statistic (H in [0, 1]) to assess clustering tendency vs uniform randomness."""
+        """Compute the dimension-powered Hopkins statistic in the standardized bounding box."""
         from sklearn.neighbors import NearestNeighbors
         from sklearn.preprocessing import StandardScaler
 
         num = df.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan).dropna()
+        num = num.loc[:, num.nunique() > 1]
         n, d = num.shape
         if n < 20 or d < 1:
-            return {"evaluable": False, "hopkins": 0.5, "tendency": "insufficient_data"}
-        m = min(sample_size, max(5, n // 5))
+            return {"evaluable": False, "hopkins": None, "tendency": "insufficient_data"}
+        m = max(1, min(sample_size, max(5, n // 5)))
         X = StandardScaler().fit_transform(num.to_numpy(dtype=float))
         rng = np.random.default_rng(random_state)
         sample_idx = rng.choice(n, size=m, replace=False)
@@ -766,11 +783,17 @@ class ClusteringEngine(BaseOmniForgeModel):
         nbrs = NearestNeighbors(n_neighbors=2).fit(X)
         u_dist, _ = nbrs.kneighbors(U, n_neighbors=1)
         w_dist, _ = nbrs.kneighbors(X_sample, n_neighbors=2)
-        u_sum = float(np.sum(u_dist[:, 0]))
-        w_sum = float(np.sum(w_dist[:, 1]))
-        h = u_sum / (u_sum + w_sum) if (u_sum + w_sum) > 1e-12 else 0.5
+        distance_scale = max(float(u_dist.max()), float(w_dist.max()))
+        if distance_scale == 0.0:
+            return {"evaluable": False, "hopkins": None, "tendency": "degenerate_distances"}
+        u_sum = float(np.sum((u_dist[:, 0] / distance_scale) ** d))
+        w_sum = float(np.sum((w_dist[:, 1] / distance_scale) ** d))
+        h = u_sum / (u_sum + w_sum)
         tendency = "strong_clusters" if h >= 0.75 else ("moderate_clusters" if h >= 0.6 else "uniform_or_random")
-        return {"evaluable": True, "hopkins": round(float(h), 4), "tendency": tendency, "sample_size": int(m)}
+        return {
+            "evaluable": True, "hopkins": h, "tendency": tendency,
+            "sample_size": int(m), "distance_power": d,
+        }
 
 
 

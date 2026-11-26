@@ -28,8 +28,6 @@ class EnergyDomainPlugin(BaseDomainPlugin):
         if "temperature_c" in out.columns:
             out["cooling_degree_days"] = np.maximum(out["temperature_c"] - 18.0, 0.0)
             out["heating_degree_days"] = np.maximum(18.0 - out["temperature_c"], 0.0)
-        if {"solar_mw", "wind_mw", "load_mw"}.issubset(out.columns):
-            out["net_load_mw"] = out["load_mw"] - (out["solar_mw"] + out["wind_mw"])
         return out
 
     def compute_domain_kpis(self, df: pd.DataFrame, *, predictions: np.ndarray | None = None) -> dict[str, float]:
@@ -40,6 +38,8 @@ class EnergyDomainPlugin(BaseDomainPlugin):
             kpis["peak_demand_mw"] = round(peak, 3)
             kpis["load_factor"] = round(avg / max(peak, 1e-9), 4)
         if {"solar_mw", "wind_mw", "load_mw"}.issubset(df.columns):
+            net_load = df["load_mw"] - df["solar_mw"] - df["wind_mw"]
+            kpis["mean_net_load_mw"] = float(net_load.mean())
             ren = float((df["solar_mw"] + df["wind_mw"]).sum())
             tot = float(df["load_mw"].sum())
             kpis["renewable_penetration_pct"] = round(100.0 * ren / max(tot, 1e-9), 2)

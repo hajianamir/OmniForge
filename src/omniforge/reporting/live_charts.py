@@ -1517,30 +1517,25 @@ def _build_feature_correlation_forest(
     rows_out: list[dict[str, Any]] = []
     y_ser = num_df[ref_col]
     for c in others[:16]:
-        pair = pd.concat([num_df[c], y_ser], axis=1).dropna()
+        pair = pd.concat([num_df[c], y_ser], axis=1).replace([np.inf, -np.inf], np.nan).dropna()
         n = len(pair)
         if n < 5:
             continue
         x_arr = pair.iloc[:, 0].to_numpy(dtype=float)
         y_arr = pair.iloc[:, 1].to_numpy(dtype=float)
-        if np.std(x_arr) <= 1e-12 or np.std(y_arr) <= 1e-12:
+        if np.all(x_arr == x_arr[0]) or np.all(y_arr == y_arr[0]):
             continue
-        r_val, p_val = stats.pearsonr(x_arr, y_arr)
-        r_clamped = max(-0.9999, min(0.9999, float(r_val)))
-        if n > 3:
-            z = math.atanh(r_clamped)
-            se = 1.0 / math.sqrt(n - 3)
-            ci_lo = math.tanh(z - 1.96 * se)
-            ci_hi = math.tanh(z + 1.96 * se)
-        else:
-            ci_lo, ci_hi = r_clamped, r_clamped
+        result = stats.pearsonr(x_arr, y_arr)
+        interval = result.confidence_interval(confidence_level=0.95)
+        if not np.isfinite([result.statistic, result.pvalue, interval.low, interval.high]).all():
+            continue
         rows_out.append(
             {
                 "label": disp_fn(c),
-                "estimate": round(r_clamped, 4),
-                "ci_low": round(ci_lo, 4),
-                "ci_high": round(ci_hi, 4),
-                "p_value": round(float(p_val), 6),
+                "estimate": float(result.statistic),
+                "ci_low": float(interval.low),
+                "ci_high": float(interval.high),
+                "p_value": float(result.pvalue),
                 "n": n,
             }
         )
@@ -1552,11 +1547,11 @@ def _build_feature_correlation_forest(
     sig_cnt = sum(1 for r in rows_out if r["p_value"] < 0.05)
     return {
         "title": f"Feature Correlation Forest Plot vs. {disp_fn(ref_col)}",
-        "subtitle": f"Pearson r with exact Fisher z-transform 95% confidence intervals ({sig_cnt}/{len(rows_out)} significant at α=0.05)",
+        "subtitle": "Approximate Fisher-z 95% intervals assume independent pairs and bivariate normality. P-values are unadjusted and exploratory.",
         "kpis": {
             "Reference Variable": disp_fn(ref_col),
             "Features Tested": len(rows_out),
-            "Significant (p<0.05)": sig_cnt,
+            "Unadjusted p<0.05": sig_cnt,
             "Strongest |r|": round(abs(rows_out[0]["estimate"]), 4),
         },
         "data": {"rows": rows_out, "reference_value": 0.0, "x_label": f"Pearson Correlation r with {disp_fn(ref_col)}"},

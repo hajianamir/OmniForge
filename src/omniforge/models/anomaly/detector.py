@@ -12,6 +12,7 @@ from sklearn.neighbors import LocalOutlierFactor
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import OneClassSVM
 
+from omniforge.core.exceptions import ModelTrainingError
 from omniforge.core.performance import parallel_n_jobs
 from omniforge.core.types import TaskType
 from omniforge.models.base import BaseOmniForgeModel
@@ -29,6 +30,9 @@ class AnomalyDetector(BaseOmniForgeModel):
         contamination: float = 0.05,
         **kwargs: Any,
     ) -> None:
+        method = method.strip().lower()
+        if method not in {"isolation_forest", "lof", "ocsvm", "pca_recon", "mad", "zscore", "ensemble"}:
+            raise ModelTrainingError("Unsupported anomaly detection method.")
         super().__init__(
             name=f"Anomaly_{method}",
             task_type=TaskType.ANOMALY_DETECTION,

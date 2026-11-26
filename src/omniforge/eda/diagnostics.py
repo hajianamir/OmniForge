@@ -68,6 +68,7 @@ class UniversalDiagnosticsReport:
     baseline_benchmarks: dict[str, dict[str, dict[str, float]]] = field(default_factory=dict)
     baseline_equations: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     baseline_feature_cols: dict[str, list[str]] = field(default_factory=dict)
+    baseline_split: dict[str, dict[str, Any]] = field(default_factory=dict)
     risk_assessment: dict[str, Any] | None = None
     recommendations: list[str] = field(default_factory=list)
 
@@ -137,7 +138,10 @@ class UniversalDiagnosticsSuite:
 
     @staticmethod
     def _is_classification_series(series: pd.Series) -> bool:
-        return (not pd.api.types.is_numeric_dtype(series)) or int(series.nunique(dropna=True)) <= 15
+        if not pd.api.types.is_numeric_dtype(series):
+            return True
+        observed = series.dropna().drop_duplicates().to_numpy(dtype=float)
+        return bool(len(observed) <= 15 and np.all(np.isfinite(observed)) and np.all(observed == np.trunc(observed)))
 
     @staticmethod
     def _bootstrap_mean_ci(
@@ -188,6 +192,7 @@ class UniversalDiagnosticsSuite:
         target_cols: list[str] | None = None,
         selected_modules: list[str] | None = None,
         criteria: StatisticalCriteriaConfig | None = None,
+        baseline_partitions: tuple[pd.DataFrame, pd.DataFrame] | None = None,
     ) -> UniversalDiagnosticsReport:
         """Execute user-selected statistical tests, baseline benchmarks, and risk audits with exact criteria."""
         cfg = criteria or StatisticalCriteriaConfig()
@@ -401,9 +406,13 @@ class UniversalDiagnosticsSuite:
             raw_ps = [float(r["p_value"]) for r in raw_ledger]
             adj_ps = StatisticalAnalyzer.adjust_p_values(raw_ps, method=cfg.multiple_testing_correction)
             for row, adj_p in zip(raw_ledger, adj_ps, strict=False):
-                row["adjusted_p_value"] = adj_p
-                eff_p = adj_p if cfg.multiple_testing_correction != "none" else float(row["p_value"])
-                row["decision"] = "Reject H0" if eff_p < cfg.alpha else "Fail to Reject H0"
+                evaluable = bool(np.isfinite(adj_p))
+                row["adjusted_p_value"] = adj_p if evaluable else None
+                if not evaluable:
+                    row["p_value"] = None
+                    row["decision"] = "Not evaluable"
+                else:
+                    row["decision"] = "Reject H0" if adj_p < cfg.alpha else "Fail to Reject H0"
             report.hypothesis_ledger = raw_ledger
 
         # 8. Quantitative Baseline Benchmarks + Explicit Mathematical Baseline Equations (per selected target)
@@ -414,42 +423,39 @@ class UniversalDiagnosticsSuite:
             pred_cols = [c for c in df.columns if c not in targets]
             if pred_cols:
                 for t_col in targets:
-                    work = df.dropna(subset=[t_col]).copy()
-                    if len(work) < 12:
+                    if baseline_partitions is None:
+                        work = df.dropna(subset=[t_col]).copy()
+                        if len(work) < 12:
+                            continue
+                        target = work[t_col]
+                        strat = target if self._is_classification_series(target) and int(target.value_counts().min()) >= 2 else None
+                        try:
+                            train_positions, test_positions = train_test_split(
+                                np.arange(len(work)), test_size=cfg.holdout_ratio, random_state=42, stratify=strat,
+                            )
+                        except ValueError:
+                            report.recommendations.append(f"Skipped baseline for '{t_col}': cannot form an evaluable holdout.")
+                            continue
+                        train, test = work.iloc[train_positions], work.iloc[test_positions]
+                        partition_source = "diagnostics_holdout"
+                    else:
+                        train, test = (part.dropna(subset=[t_col]) for part in baseline_partitions)
+                        partition_source = "split_lock"
+                    if len(train) < 2 or len(test) < 2:
+                        report.recommendations.append(f"Skipped baseline for '{t_col}': too few observed targets in the fixed partitions.")
                         continue
-                    y = work[t_col]
-                    is_clf = self._is_classification_series(y)
-                    strat = y if (is_clf and int(y.value_counts().min()) >= 2) else None
-                    # Split raw DataFrame FIRST to eliminate pre-split encoding/imputation leakage
-                    tr_idx, val_idx = train_test_split(
-                        work.index, test_size=cfg.holdout_ratio, random_state=42, stratify=strat
-                    )
-                    raw_X_tr = work.loc[tr_idx, pred_cols].copy()
-                    raw_X_val = work.loc[val_idx, pred_cols].copy()
-                    y_tr = work.loc[tr_idx, t_col]
-                    y_val = work.loc[val_idx, t_col]
+                    y_tr, y_val = train[t_col], test[t_col]
+                    is_clf = self._is_classification_series(y_tr)
+                    from omniforge.features.inference import WorkbenchInputPreprocessor
 
-                    # Convert datetime/timedelta columns to numeric epoch seconds before one-hot encoding
-                    for dt_col in list(raw_X_tr.columns):
-                        if pd.api.types.is_datetime64_any_dtype(raw_X_tr[dt_col]) or pd.api.types.is_timedelta64_dtype(raw_X_tr[dt_col]):
-                            raw_X_tr[dt_col] = pd.to_numeric(raw_X_tr[dt_col], errors="coerce").astype(float) / 1e9
-                            raw_X_val[dt_col] = pd.to_numeric(raw_X_val[dt_col], errors="coerce").astype(float) / 1e9
-
-                    # Fit one-hot schema & median imputation STRICTLY on training partition
-                    X_tr = pd.get_dummies(raw_X_tr, drop_first=False, dtype=float)
-                    X_val = pd.get_dummies(raw_X_val, drop_first=False, dtype=float).reindex(
-                        columns=X_tr.columns, fill_value=0.0
-                    )
-                    for col in X_tr.columns:
-                        X_tr[col] = pd.to_numeric(X_tr[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
-                        X_val[col] = pd.to_numeric(X_val[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
-                        tr_med = float(X_tr[col].median()) if X_tr[col].notna().any() else 0.0
-                        if not np.isfinite(tr_med):
-                            tr_med = 0.0
-                        if X_tr[col].isna().any():
-                            X_tr[col] = X_tr[col].fillna(tr_med)
-                        if X_val[col].isna().any():
-                            X_val[col] = X_val[col].fillna(tr_med)
+                    preprocessor = WorkbenchInputPreprocessor(mode="numeric").fit(train[pred_cols])
+                    X_tr = preprocessor.transform(train[pred_cols])
+                    X_val = preprocessor.transform(test[pred_cols])
+                    report.baseline_split[t_col] = {
+                        "source": partition_source,
+                        "training_rows": len(train),
+                        "holdout_rows": len(test),
+                    }
 
                     if is_clf and int(pd.Series(y_tr).nunique(dropna=True)) < 2:
                         report.recommendations.append(
@@ -472,9 +478,8 @@ class UniversalDiagnosticsSuite:
                         )
                     report.baseline_benchmarks[t_col] = bl_metrics
                     report.baseline_feature_cols[t_col] = list(pred_cols)
-                    # Also fit clean raw-schema baselines via BaseOmniForgeModel._prepare_X so future scoring works directly on raw inputs
+                    # Preserve the exact scored models and the fitted raw-input schema.
                     raw_models: dict[str, Any] = {}
-                    raw_y_tr = y_tr
                     primary_metric = "f1_weighted" if is_clf else "r2"
                     higher_is_better = True
                     criterion_label = (
@@ -536,7 +541,7 @@ class UniversalDiagnosticsSuite:
                             acc_status = "REJECTED — BELOW NAIVE FLOOR"
 
                         reasons: list[str] = [
-                            f"Ranked #{rank_num} of {len(ranked_names)} candidates on strict {int(cfg.holdout_ratio * 100)}% holdout partition (zero leakage).",
+                            f"Ranked #{rank_num} of {len(ranked_names)} candidates on {len(test)} held-out rows ({partition_source}).",
                             f"Primary Criterion ({criterion_label}): {primary_metric.upper()} = {p_score:.4f}"
                             + (f" | RMSE = {float(m_scores.get('rmse', 0.0)):.4f}, MAE = {float(m_scores.get('mae', 0.0)):.4f}" if not is_clf else f" | Accuracy = {float(m_scores.get('accuracy', 0.0)):.4f}"),
                         ]
@@ -546,7 +551,7 @@ class UniversalDiagnosticsSuite:
                             )
                         elif lift_abs > 0:
                             pct_txt = f" ({lift_pct:+.1f}%)" if lift_pct is not None else ""
-                            reasons.append(f"Beats Naive Floor ({naive_floor:.4f}) by +{lift_abs:.4f}{pct_txt}, confirming genuine predictive signal.")
+                            reasons.append(f"Beats Naive Floor ({naive_floor:.4f}) by +{lift_abs:.4f}{pct_txt}, on this holdout.")
                         else:
                             reasons.append(f"Did not beat Naive Floor ({naive_floor:.4f}); flagged for review or non-linear modeling in Studio 06.")
 
@@ -612,37 +617,35 @@ class UniversalDiagnosticsSuite:
                         )
                         enriched_eqs.append(eq_d)
 
-                        try:
-                            clone_kwargs = dict(bl_m.hyperparameters)
-                            if type(bl_m).__name__ in {
-                                "PenalizedSplineGAMModel",
-                                "NadarayaWatsonKernelModel",
-                                "DistanceWeightedKNNModel",
-                            }:
-                                clone_kwargs["task_type"] = bl_m.task_type
-                            clone_m = type(bl_m)(**clone_kwargs)
-                            clone_m.fit(raw_X_tr, raw_y_tr)
-                            raw_models[bl_name] = {
-                                "model": clone_m,
-                                "feature_cols": list(pred_cols),
-                                "metrics": eq_d["metrics"],
-                            }
-                        except Exception:
-                            raw_models[bl_name] = {
-                                "model": bl_m,
-                                "feature_cols": list(X_tr.columns),
-                                "metrics": eq_d["metrics"],
-                            }
+                        raw_models[bl_name] = {
+                            "model": bl_m,
+                            "feature_cols": list(X_tr.columns),
+                            "input_preprocessor": preprocessor,
+                            "metrics": eq_d["metrics"],
+                        }
                     report.baseline_equations[t_col] = enriched_eqs
                     self.last_baseline_models_[t_col] = raw_models
             elif len(df) >= 20:
-                # Forecasting baseline when target is standalone series
+                # Forecasting baselines use chronological partitions for standalone series.
                 for t_col in targets:
                     if pd.api.types.is_numeric_dtype(df[t_col]):
-                        vals = df[t_col].dropna().to_numpy(dtype=float)
-                        split_i = max(10, int(len(vals) * (1.0 - cfg.holdout_ratio)))
+                        if baseline_partitions is None:
+                            vals = df[t_col].dropna().to_numpy(dtype=float)
+                            split_i = max(10, int(len(vals) * (1.0 - cfg.holdout_ratio)))
+                            train_vals, test_vals = vals[:split_i], vals[split_i:]
+                            source = "diagnostics_chronological_holdout"
+                        else:
+                            train_vals, test_vals = (
+                                part[t_col].dropna().to_numpy(dtype=float) for part in baseline_partitions
+                            )
+                            source = "split_lock"
+                        if len(train_vals) < 10 or len(test_vals) < 2:
+                            continue
+                        report.baseline_split[t_col] = {
+                            "source": source, "training_rows": len(train_vals), "holdout_rows": len(test_vals),
+                        }
                         fc_metrics, fc_models = BaselineBenchmarkSuite.run_forecasting_detailed(
-                            vals[:split_i], vals[split_i:]
+                            train_vals, test_vals
                         )
                         report.baseline_benchmarks[t_col] = fc_metrics
                         self.last_baseline_models_[t_col] = fc_models

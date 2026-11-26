@@ -23,12 +23,7 @@ class RealEstateDomainPlugin(BaseDomainPlugin):
     )
 
     def engineer_domain_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        out = df.copy()
-        if {"annual_rent", "sale_price"}.issubset(out.columns):
-            out["gross_rent_yield_pct"] = 100.0 * out["annual_rent"] / np.maximum(out["sale_price"], 1.0)
-        if {"sale_price", "area_sqm"}.issubset(out.columns):
-            out["price_per_sqm"] = out["sale_price"] / np.maximum(out["area_sqm"], 1.0)
-        return out
+        return df.copy()
 
     def compute_domain_kpis(self, df: pd.DataFrame, *, predictions: np.ndarray | None = None) -> dict[str, float]:
         kpis: dict[str, float] = {}

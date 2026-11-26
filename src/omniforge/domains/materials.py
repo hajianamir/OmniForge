@@ -23,10 +23,7 @@ class MaterialsDomainPlugin(BaseDomainPlugin):
     )
 
     def engineer_domain_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        out = df.copy()
-        if {"tensile_strength_mpa", "density_g_cm3"}.issubset(out.columns):
-            out["specific_strength"] = out["tensile_strength_mpa"] / np.maximum(out["density_g_cm3"], 0.1)
-        return out
+        return df.copy()
 
     def compute_domain_kpis(self, df: pd.DataFrame, *, predictions: np.ndarray | None = None) -> dict[str, float]:
         kpis: dict[str, float] = {}

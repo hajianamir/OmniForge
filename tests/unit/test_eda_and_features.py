@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from omniforge.data.cleaning import DataCleaner
 from omniforge.eda.automated_eda import AutomatedEDA
@@ -51,7 +52,7 @@ def test_universal_diagnostics_criteria_baselines_and_risk(classification_df: pd
     lb = StatisticalAnalyzer.ljung_box_autocorrelation_test(cleaned["feature_0"], alpha=0.05)
     assert lb.test_name == "ljung_box_autocorrelation"
     adj_bonf = StatisticalAnalyzer.adjust_p_values([0.01, 0.04, 0.20], method="bonferroni")
-    assert adj_bonf == [0.03, 0.12, 0.6]
+    assert adj_bonf == pytest.approx([0.03, 0.12, 0.6])
     adj_fdr = StatisticalAnalyzer.adjust_p_values([0.01, 0.04, 0.20], method="fdr_bh")
     assert adj_fdr[0] <= adj_fdr[1] <= adj_fdr[2]
 

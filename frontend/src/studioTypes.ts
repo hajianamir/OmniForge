@@ -250,6 +250,7 @@ export interface HypothesisResponse extends StateEnvelope {
   skipped?: JsonRow[];
   total_tests?: number;
   significant_tests?: number;
+  decision_policy?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +270,9 @@ export interface FeatureRanking extends JsonRow {
 }
 
 export interface SelectionResponse extends StateEnvelope {
+  selected_source_columns?: string[];
+  fit_scope?: 'train_only' | 'full_frame';
+  committed?: boolean;
   mode?: string;
   rankings?: FeatureRanking[];
   selected_features?: string[];

@@ -12,8 +12,10 @@ from scipy import ndimage
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import cross_val_score
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from omniforge.core.exceptions import ModelTrainingError
 from omniforge.core.logging import get_logger
 from omniforge.core.utils import is_package_available
 from omniforge.models.computer_vision.vision import ComputerVisionEngine
@@ -394,27 +396,42 @@ class VisionFoundationHub:
         labels: list[Any],
         *,
         backbone: str = "resnet18",
+        pretrained: bool = True,
     ) -> dict[str, Any]:
         """Extract foundation/pyramid embeddings for a batch of images and train an L2 linear probe classifier."""
+        if not images or len(images) != len(labels):
+            raise ModelTrainingError(
+                "Transfer training requires one label per image and at least one image.",
+                suggestions=["Provide equal-length lists of training images and class labels."],
+            )
         embs = []
-        used_backend = "native_spatial_pyramid"
+        backends: set[str] = set()
         for img in images:
-            res = self.extract_foundation_embedding(img, backbone=backbone, pretrained=False)
-            used_backend = str(res["backend"])
+            res = self.extract_foundation_embedding(img, backbone=backbone, pretrained=pretrained)
+            backends.add(str(res["backend"]))
             embs.append(res["embedding"])
+        if len(backends) != 1:
+            raise ModelTrainingError(
+                "Every training image must use the same embedding backend.",
+                suggestions=["Check that the requested backbone supports every training image."],
+            )
         X = np.vstack(embs)
         y = np.asarray(labels)
-        X_s = self._linear_probe_scaler.fit_transform(X)
-        clf = LogisticRegression(max_iter=500, random_state=self.random_seed)
+        pipeline = Pipeline([
+            ("scaler", StandardScaler()),
+            ("classifier", LogisticRegression(max_iter=500, random_state=self.random_seed)),
+        ])
         cv_acc = None
         if len(y) >= 6 and len(np.unique(y)) >= 2:
             min_cls = int(np.min([np.sum(y == c) for c in np.unique(y)]))
             if min_cls >= 2:
-                cv_acc = round(float(np.mean(cross_val_score(clf, X_s, y, cv=min(3, min_cls)))), 4)
-        clf.fit(X_s, y)
-        self._linear_probe_clf = clf
+                cv_acc = float(np.mean(cross_val_score(pipeline, X, y, cv=min(3, min_cls), error_score="raise")))
+        pipeline.fit(X, y)
+        self._linear_probe_scaler = pipeline.named_steps["scaler"]
+        self._linear_probe_clf = pipeline.named_steps["classifier"]
         return {
-            "backend": used_backend,
+            "backend": next(iter(backends)),
+            "pretrained_requested": pretrained,
             "n_samples": len(y),
             "embedding_dim": int(X.shape[1]),
             "classes": [str(c) for c in np.unique(y)],

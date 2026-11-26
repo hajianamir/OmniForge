@@ -539,3 +539,92 @@ def test_small_eda_and_hypothesis_keep_exclusions_after_cleaning() -> None:
     assert rerun.status_code == 200, rerun.text
     assert rerun.json()["state"]["excluded_columns"] == ["skip_me"]
     assert "skip_me" not in [row["column"] for row in rerun.json()["missing_bars"]]
+
+
+def test_studio03_benchmarks_use_the_same_locked_cohort_and_studio05_preview_is_nonmutating() -> None:
+    client, headers = _client()
+    _upload(client, headers)
+    lock = client.post("/api/workbench/split-lock", headers=headers, json={"strategy": "random", "test_size": 0.25})
+    assert lock.status_code == 200, lock.text
+    diagnostics = client.post(
+        "/api/workbench/s03/run", headers=headers,
+        json={"mode": "custom", "selected_modules": ["baseline_benchmark"], "holdout_ratio": 0.4},
+    )
+    assert diagnostics.status_code == 200, diagnostics.text
+    report = diagnostics.json()["report"]
+    assert report["baseline_split"]["target"] == {"source": "split_lock", "training_rows": 60, "holdout_rows": 20}
+    assert report["baseline_feature_cols"]["target"] == ["alpha", "beta", "constant"]
+    selection = {"mode": "custom", "method": "f_test", "top_k": 1, "target": "target"}
+    preview = client.post("/api/workbench/s05/select", headers=headers, json=selection)
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["fit_scope"] == "train_only"
+    assert preview.json()["selected_source_columns"] == ["alpha"]
+    assert preview.json()["committed"] is False
+    assert preview.json()["state"]["columns"] == ["alpha", "beta", "constant", "target"]
+    committed = client.post("/api/workbench/s05/select", headers=headers, json={**selection, "commit": True})
+    assert committed.status_code == 200, committed.text
+    assert committed.json()["committed"] is True
+    assert committed.json()["state"]["columns"] == ["alpha", "target"]
+    assert committed.json()["state"]["split_lock"]["active"] is True
+
+
+def test_studio04_battery_returns_finite_adjusted_results_on_larger_fixture() -> None:
+    import time
+
+    import numpy as np
+    from statsmodels.stats.multitest import multipletests
+
+    client, headers = _client()
+    rng = np.random.default_rng(41)
+    n = 12_000
+    fixture = pd.DataFrame({
+        "normal": rng.standard_normal(n), "lognormal": rng.lognormal(size=n),
+        "uniform": rng.uniform(size=n), "poisson": rng.poisson(lam=7, size=n),
+        "group": rng.choice(["left", "right", "middle"], size=n),
+    })
+    uploaded = client.post(
+        "/api/workbench/s01/upload", headers=headers,
+        files={"file": ("synthetic-battery.csv", io.BytesIO(fixture.to_csv(index=False).encode()), "text/csv")},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    start = time.perf_counter()
+    response = client.post("/api/workbench/s04/hypothesis", headers=headers, json={"mode": "complete"})
+    elapsed = time.perf_counter() - start
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    battery = payload["battery"]
+    assert payload["total_tests"] == len(battery) > 10
+    rejected, adjusted, _, _ = multipletests([row["p_value"] for row in battery], method="fdr_bh")
+    np.testing.assert_allclose([row["p_value_fdr"] for row in battery], adjusted)
+    assert payload["significant_tests"] == int(rejected.sum())
+    print(f"Studio 04 complete battery: {n:,} rows, {len(battery)} tests, API round trip {elapsed:.3f}s")
+
+
+def test_studio01_preserves_temporal_gap_rows_and_split_keys_on_cleaning() -> None:
+    client, headers = _client()
+    n = 35
+    source = pd.DataFrame({
+        "Event Time": pd.date_range("2022-01-01", periods=n, freq="D"),
+        "sensor reading": [float(i) if i % 3 else None for i in range(n)],
+        "target": [float(i) for i in range(n)],
+    })
+    upload = client.post("/api/workbench/s01/upload", headers=headers, files={
+        "file": ("temporal.csv", source.to_csv(index=False).encode(), "text/csv"),
+    })
+    assert upload.status_code == 200, upload.text
+    lock = client.post("/api/workbench/split-lock", headers=headers, json={
+        "strategy": "time_series", "time_col": "Event Time", "target_col": "target", "test_size": 0.2, "gap": 3,
+    })
+    assert lock.status_code == 200, lock.text
+    assert lock.json()["state"]["split_lock"]["active"]
+    cleaned = client.post("/api/workbench/s01/clean", headers=headers, json={
+        "mode": "custom", "impute_numeric": "bfill", "drop_duplicates": False,
+        "standardize_column_names": True,
+    })
+    assert cleaned.status_code == 200, cleaned.text
+    body = cleaned.json()
+    assert body["rows_removed"] == 0
+    assert body["cleaning_report"]["rows_reserved_by_split"] == 3
+    assert body["cleaning_report"]["effective_numeric_imputation"] == "causal_ffill"
+    assert body["state"]["split_lock"]["active"]
+    assert body["state"]["columns"] == ["Event Time", "sensor_reading", "target", "sensor_reading_is_outlier"]

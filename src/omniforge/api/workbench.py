@@ -1000,6 +1000,16 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
     state = get_session_state(sid)
     df = _require_df(state)
     before_cols = list(df.columns)
+    work_in = df.copy()
+    train_df, test_df, lock = get_active_split_frames(state, work_in)
+    locked_time = lock.get("time_col") if lock and lock.get("strategy") == "time_series" else None
+    lock_columns = {
+        lock[key] for key in ("time_col", "group_col", "row_id_col", "target_col") if isinstance(lock.get(key), str)
+    } if lock else set()
+    protected_columns = list(dict.fromkeys([
+        *get_excluded_columns(state, df), *get_selected_targets(state, df),
+        *sorted(lock_columns),
+    ]))
 
     mode = req.mode.lower()
     if mode == "auto":
@@ -1018,7 +1028,7 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
             outlier_method=str(preset.get("outlier_method", "iqr")),
             outlier_action="flag",
             outlier_threshold=float(preset.get("outlier_threshold", 1.5)),
-            exclude_columns=list(dict.fromkeys([*get_excluded_columns(state, df), *get_selected_targets(state, df)])),
+            exclude_columns=protected_columns,
         )
         drop_const = bool(preset.get("drop_constant_columns", True))
         std_col_names = False
@@ -1038,14 +1048,11 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
             outlier_method="iqr",
             outlier_action="flag",
             outlier_threshold=1.5,
-            exclude_columns=list(dict.fromkeys([*get_excluded_columns(state, df), *get_selected_targets(state, df)])),
+            exclude_columns=protected_columns,
         )
         drop_const = True
         std_col_names = False
     else:
-        _lock_raw = state.get("uap_split_lock")
-        lock_cfg: dict[str, Any] = _lock_raw if isinstance(_lock_raw, dict) else {}
-        has_time_lock = bool(lock_cfg.get("active")) and bool(lock_cfg.get("time_col"))
         cfg = CleaningConfig(
             standardize_missing_tokens=req.standardize_missing_tokens,
             clean_strings=req.clean_strings,
@@ -1064,22 +1071,24 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
             outlier_action=req.handle_outliers,
             outlier_threshold=req.outlier_threshold,
             contamination=req.contamination,
-            causal_time_series=has_time_lock,
-            time_column=lock_cfg.get("time_col") if has_time_lock else None,
-            exclude_columns=list(dict.fromkeys([*get_excluded_columns(state, df), *get_selected_targets(state, df)])),
+            exclude_columns=protected_columns,
         )
         drop_const = req.drop_constant_columns
         std_col_names = req.standardize_column_names
 
-    work_in = df.copy()
+    cfg.causal_time_series = bool(locked_time)
+    cfg.time_column = locked_time
     cleaner = DataCleaner(cfg)
-    train_df, test_df, lock = get_active_split_frames(state, work_in)
     split_safe_used = False
     if test_df is not None and lock is not None:
         split_safe_used = True
         cleaned_tr, cleaned_te, rep_tr, rep_te = cleaner.fit_transform_split(train_df, test_df)
         cleaned = recombine_split_frames(cleaned_tr, cleaned_te, work_in.index)
+        reserved = work_in.loc[~work_in.index.isin(train_df.index.union(test_df.index))]
+        if not reserved.empty:
+            cleaned = recombine_split_frames(cleaned, reserved.reindex(columns=cleaned.columns), work_in.index)
         rep_dict = rep_tr.model_dump()
+        rep_dict["rows_reserved_by_split"] = len(reserved)
         rep_dict["exact_duplicates_removed"] = int(rep_tr.exact_duplicates_removed + rep_te.exact_duplicates_removed)
         rep_dict["fuzzy_duplicates_removed"] = int(rep_tr.fuzzy_duplicates_removed + rep_te.fuzzy_duplicates_removed)
         rep_dict["removed_rows_count"] = int(rep_tr.removed_rows_count + rep_te.removed_rows_count)
@@ -1105,7 +1114,7 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
 
     dropped_const_cols: list[str] = []
     if drop_const:
-        excl_set = set(get_excluded_columns(state, cleaned)) | set(get_selected_targets(state, cleaned))
+        excl_set = set(protected_columns)
         if cfg.outlier_action == "flag":
             excl_set.update(
                 col for col in cleaned.columns
@@ -1129,9 +1138,12 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
     if std_col_names:
         import re as _re
 
-        seen_names: set[str] = set()
+        seen_names = set(lock_columns)
         new_names: list[str] = []
         for i, c in enumerate(cleaned.columns):
+            if c in lock_columns:
+                new_names.append(c)
+                continue
             base = _re.sub(r"[^a-zA-Z0-9]+", "_", str(c).strip()).strip("_").lower() or f"col_{i}"
             cand = base
             suffix = 2
@@ -1433,6 +1445,16 @@ def _prepare_numeric_feature_frame(
     return work, encoded_cols
 
 
+def _study_predictor_columns(
+    df: pd.DataFrame, excluded: set[str], requested: list[str] | None,
+) -> list[str]:
+    candidates = requested if requested else list(df.columns)
+    return [
+        col for col in dict.fromkeys(candidates)
+        if col in df.columns and col not in excluded and df[col].notna().any()
+    ]
+
+
 @router.post("/s02/clustering")
 def s02_run_clustering(req: ClusterReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _sid(x_session_id)
@@ -1440,15 +1462,16 @@ def s02_run_clustering(req: ClusterReq, x_session_id: str | None = Header(defaul
     raw_analysis_df = get_analysis_dataframe(state, _require_df(state))
     targets = set(get_selected_targets(state, raw_analysis_df))
     helper_cols = {"cluster_id", "is_anomaly", "anomaly_score"} | targets
-    df, num_cols = _prepare_numeric_feature_frame(raw_analysis_df, helper_cols, req.features, min_cols=2)
-    if len(num_cols) < 2 and targets:
-        # Fall back to including target columns only when fewer than 2 non-target columns exist
-        df, num_cols = _prepare_numeric_feature_frame(
-            raw_analysis_df, {"cluster_id", "is_anomaly", "anomaly_score"}, req.features, min_cols=2
-        )
-    if len(num_cols) < 2:
-        raise HTTPException(status_code=400, detail="Clustering requires at least 2 usable columns.")
-    train_df, test_df, _ = get_active_split_frames(state, df)
+    df = raw_analysis_df
+    train_df, test_df, lock = get_active_split_frames(state, _require_df(state))
+    train_df = train_df.loc[:, df.columns]
+    if test_df is not None:
+        test_df = test_df.loc[:, df.columns]
+    if lock:
+        helper_cols.update(c for c in (lock.get("row_id_col"), lock.get("group_col"), lock.get("time_col")) if isinstance(c, str))
+    num_cols = _study_predictor_columns(train_df, helper_cols, req.features)
+    if not num_cols:
+        raise HTTPException(status_code=400, detail="Clustering requires an observed predictor in the current study.")
 
     mode = req.mode.lower()
     if mode == "complete":
@@ -1716,21 +1739,30 @@ def s02_run_anomaly(req: AnomalyReq, x_session_id: str | None = Header(default="
     state = get_session_state(sid)
     raw_audit_df = get_audit_anomaly_dataframe(state, _require_df(state))
     helper_cols = {"cluster_id", "is_anomaly", "anomaly_score"} | set(get_selected_targets(state, raw_audit_df))
-    df, num_cols = _prepare_numeric_feature_frame(raw_audit_df, helper_cols, req.features, min_cols=2)
-    if not num_cols:
-        df, num_cols = _prepare_numeric_feature_frame(
-            raw_audit_df, {"cluster_id", "is_anomaly", "anomaly_score"}, req.features, min_cols=1
-        )
-    if not num_cols:
-        raise HTTPException(status_code=400, detail="Anomaly detection requires at least 1 usable column.")
-
-    train_df, _test_df, _lock = get_active_split_frames(state, df)
-    fit_source = train_df if isinstance(train_df, pd.DataFrame) and not train_df.empty else df
-    X_fit_raw = fit_source[num_cols].replace([np.inf, -np.inf], np.nan)
-    fit_medians = X_fit_raw.median(numeric_only=True).fillna(0.0)
-    X_fit = X_fit_raw.fillna(fit_medians)
-
-    X_num = df[num_cols].replace([np.inf, -np.inf], np.nan).fillna(fit_medians)
+    train_df, _test_df, lock = get_active_split_frames(state, _require_df(state))
+    if lock:
+        helper_cols.update(c for c in (lock.get("row_id_col"), lock.get("group_col"), lock.get("time_col")) if isinstance(c, str))
+        row_id = lock.get("row_id_col")
+        if isinstance(row_id, str) and row_id in raw_audit_df and raw_audit_df[row_id].is_unique:
+            train_df = raw_audit_df.loc[raw_audit_df[row_id].isin(train_df[row_id])]
+        elif raw_audit_df.index.is_unique and train_df.index.is_unique and train_df.index.isin(raw_audit_df.index).all():
+            train_df = raw_audit_df.loc[train_df.index]
+        else:
+            raise HTTPException(status_code=400, detail="The raw audit data cannot be aligned with the locked training rows.")
+    else:
+        train_df = raw_audit_df
+    if train_df.empty:
+        raise HTTPException(status_code=400, detail="Anomaly detection requires a non-empty training partition.")
+    candidate_cols = _study_predictor_columns(train_df, helper_cols, req.features)
+    if not candidate_cols:
+        raise HTTPException(status_code=400, detail="Anomaly detection requires at least one observed predictor.")
+    try:
+        preprocessor = WorkbenchInputPreprocessor(mode="numeric").fit(train_df.loc[:, candidate_cols])
+        X_fit = preprocessor.transform(train_df.loc[:, candidate_cols])
+        X_num = preprocessor.transform(raw_audit_df.loc[:, candidate_cols])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="The anomaly predictor schema could not be fitted.") from exc
+    num_cols = list(X_num.columns)
 
     mode = req.mode.lower()
     if mode == "complete":
@@ -1766,9 +1798,11 @@ def s02_run_anomaly(req: AnomalyReq, x_session_id: str | None = Header(default="
                 selected_scores = scores
                 chosen_method = m_name
         except Exception as exc:
-            detector_comparison.append({"detector": m_name, "n_anomalies": 0, "anomaly_rate_pct": 0.0, "error": str(exc)[:100]})
+            logger.warning("anomaly_detector_failed", method=m_name, error_type=type(exc).__name__)
+            detector_comparison.append({"detector": m_name, "error": "The detector could not be fitted or the method is unsupported."})
 
-    assert selected_flags is not None and selected_scores is not None
+    if selected_flags is None or selected_scores is None:
+        raise HTTPException(status_code=400, detail="None of the requested anomaly detectors could evaluate this data.")
     preview = raw_audit_df.copy()
     preview["is_anomaly"] = selected_flags
     preview["anomaly_score"] = selected_scores

@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, HTTPException
 
 from omniforge.api.auth import authorize_principal, require_permission
 from omniforge.api.studios.schemas import DAGRunReq, wb_cache_and_respond
@@ -14,6 +14,7 @@ from omniforge.automl.backends import AutoMLBackendHub
 from omniforge.core.performance import compute_df_fingerprint
 from omniforge.core.types import Principal
 from omniforge.data.cleaning import CleaningConfig
+from omniforge.data.splitting import LeakageSafeSplitter, SplitConfig
 from omniforge.features.engineering import FeatureConfig, FeatureEngineeringPipeline
 from omniforge.pipelines.builder import PipelineBuilder
 from omniforge.pipelines.executor import PipelineExecutor
@@ -27,7 +28,9 @@ def _wb() -> Any:
     return wb
 
 
-def _initial_split_frames(state: dict[str, Any], active_df: pd.DataFrame, df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _initial_split_frames(
+    state: dict[str, Any], active_df: pd.DataFrame, df: pd.DataFrame, target: str | None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Extract active Split-Lock train/test frames or deterministic 80/20 holdout frames for leak-free DAG execution."""
     train_df, test_df, _ = _wb().get_active_split_frames(state, active_df)
     if test_df is not None:
@@ -35,8 +38,8 @@ def _initial_split_frames(state: dict[str, Any], active_df: pd.DataFrame, df: pd
     n = len(df)
     if n < 5:
         return df.copy(), pd.DataFrame(columns=df.columns)
-    cut = max(2, int(round(0.8 * n)))
-    return df.iloc[:cut].reset_index(drop=True), df.iloc[cut:].reset_index(drop=True)
+    result = LeakageSafeSplitter(SplitConfig(test_size=0.2)).split(df, target_col=target)
+    return result.train_df, result.test_df
 
 
 @router.post("/s10/run")
@@ -56,7 +59,11 @@ def s10_run_dag(
     if target is not None and ("features" in req.stages or "automl" in req.stages):
         df = df.drop(columns=[col for col in targets if col != target])
 
-    init_train, init_test = _initial_split_frames(state, active_df, df)
+    init_train, init_test = _initial_split_frames(state, active_df, df, target)
+    if "automl" in req.stages and init_test.empty:
+        raise HTTPException(status_code=400, detail="Predictive pipelines require a separate holdout partition.")
+    locked_split = state.get("uap_split_lock") or {}
+    locked_time = locked_split.get("time_col") if locked_split.get("active") and locked_split.get("strategy") == "time_series" else None
 
     builder = PipelineBuilder(name="OmniForge_DAG_Workflow")
     prev: str | None = None
@@ -81,9 +88,19 @@ def s10_run_dag(
             def _step_clean(ctx: Any) -> dict[str, Any]:
                 tr_in: pd.DataFrame = ctx.get("train_df")
                 te_in: pd.DataFrame = ctx.get("test_df")
-                cleaner = _wb().DataCleaner(CleaningConfig(outlier_action="flag"))
+                clock_added = bool(locked_time and locked_time not in tr_in.columns)
+                if clock_added and isinstance(locked_time, str):
+                    tr_in = tr_in.assign(**{locked_time: active_df.loc[tr_in.index, locked_time]})
+                    te_in = te_in.assign(**{locked_time: active_df.loc[te_in.index, locked_time]})
+                cleaner = _wb().DataCleaner(CleaningConfig(
+                    outlier_action="flag", time_column=locked_time, causal_time_series=bool(locked_time),
+                    exclude_columns=list(dict.fromkeys(col for col in (target, locked_time) if col is not None)),
+                ))
                 if len(te_in) > 0:
                     clean_tr, clean_te, _, _ = cleaner.fit_transform_split(tr_in, te_in)
+                    if clock_added:
+                        clean_tr = clean_tr.drop(columns=[locked_time])
+                        clean_te = clean_te.drop(columns=[locked_time])
                     combined = pd.concat([clean_tr, clean_te], ignore_index=True)
                     ctx.set("train_df", clean_tr)
                     ctx.set("test_df", clean_te)
@@ -95,7 +112,8 @@ def s10_run_dag(
                     "rows_after": int(len(combined)),
                     "train_rows": int(len(ctx.get("train_df"))),
                     "test_rows": int(len(ctx.get("test_df"))),
-                    "leakage_safe_split_fit": True,
+                    "leakage_safe_split_fit": not te_in.empty,
+                    "fit_scope": "train_only" if not te_in.empty else "full_frame",
                     "output_fingerprint": compute_df_fingerprint(combined),
                 }
 

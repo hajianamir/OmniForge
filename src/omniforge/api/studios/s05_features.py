@@ -117,22 +117,27 @@ def s05_select_features(
         authorize_principal(principal, "data:write")
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
-    df = _wb().get_analysis_dataframe(state, _wb()._require_df(state))
+    full_df = _wb()._require_df(state)
+    df = _wb().get_analysis_dataframe(state, full_df)
     targets = _wb().get_selected_targets(state, df)
     target = req.target if (req.target and req.target in df.columns) else (targets[0] if targets else None)
     if not target:
         raise HTTPException(status_code=400, detail="Select a target column before running Feature Selection.")
-    X, y, task = _wb()._prepare_xy(df, target)
-    train_df, _test_df, _lock = _wb().get_active_split_frames(state, df)
-    if isinstance(train_df, pd.DataFrame) and not train_df.empty and target in train_df.columns:
-        X_fit, y_fit, _ = _wb()._prepare_xy(train_df, target)
-    else:
-        X_fit, y_fit = X, y
+    train_df, _test_df, lock = _wb().get_active_split_frames(state, full_df)
+    train_df = train_df.loc[:, df.columns]
+    protected = set(targets) | {target}
+    if isinstance(lock, dict) and lock.get("active"):
+        protected.update(lock[key] for key in ("time_col", "group_col", "row_id_col") if isinstance(lock.get(key), str))
+    dropped_from_inputs = [c for c in protected - {target} if c in train_df.columns]
+    try:
+        X_fit, y_fit, task, preprocessor = _wb()._prepare_xy_fitted(train_df.drop(columns=dropped_from_inputs), target)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="The feature selection input schema could not be fitted.") from exc
     task_str = "classification" if task in (_wb().TaskType.BINARY_CLASSIFICATION, _wb().TaskType.MULTICLASS_CLASSIFICATION) else "regression"
     mode = req.mode.lower()
     methods = ["mutual_info", "f_test", "importance", "l1"] if mode in ("complete", "auto") else [req.method]
 
-    consensus: dict[str, list[float]] = {c: [] for c in X.columns}
+    consensus: dict[str, list[float]] = {c: [] for c in X_fit.columns}
     method_breakdown: list[dict[str, Any]] = []
     selected: list[str] = []
     scores: dict[str, float] = {}
@@ -174,17 +179,10 @@ def s05_select_features(
         key=lambda r: float(str(r["score"])),
         reverse=True,
     )
-    if req.commit and selected:
-        full_df = _wb()._require_df(state)
-        target_set = set(targets) | {target}
-        selected_set = set(selected)
-        keep_raw = [
-            c
-            for c in full_df.columns
-            if c in selected_set
-            or c in target_set
-            or any(sel.startswith(f"{c}_") for sel in selected_set)
-        ]
+    sources = preprocessor.feature_sources()
+    selected_raw = list(dict.fromkeys(sources[feature] for feature in selected))
+    if req.commit and selected_raw:
+        keep_raw = protected | set(selected_raw)
         dropped = [c for c in full_df.columns if c not in keep_raw]
         if dropped:
             _wb().set_excluded_columns(
@@ -200,7 +198,7 @@ def s05_select_features(
                 count=len(dropped),
                 total_before=full_df.shape[1],
                 criterion_rule=f"mode={mode}, method={req.method}, top_k={req.top_k}",
-                reason=f"Feature selection kept top {len(selected)} highest-signal predictors.",
+                reason=f"Feature selection kept {len(selected_raw)} source predictors for {len(selected)} ranked features.",
                 sample_identifiers=dropped[:10],
             )
             # Only mutate the dataset when columns actually change; a no-op
@@ -227,6 +225,9 @@ def s05_select_features(
             "mode": mode,
             "method_breakdown": method_breakdown,
             "selected_features": selected,
+            "selected_source_columns": selected_raw,
+            "fit_scope": "train_only" if isinstance(lock, dict) and lock.get("active") else "full_frame",
+            "committed": req.commit,
             "rankings": ranked,
         },
     )
