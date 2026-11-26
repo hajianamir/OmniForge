@@ -259,3 +259,31 @@ def test_score_only_report_labels_compliance_unavailable() -> None:
     assert "compliance unavailable" in section["body"]
     assert "100.00% compliance" not in section["body"]
     assert "Unevaluable records: 30" in section["body"]
+
+
+def test_integer_valued_regression_remains_regression_after_workspace_restore() -> None:
+    from omniforge.reporting.live_charts import generate_live_chart
+    from omniforge.ui.state import export_workspace_project_bytes, restore_workspace_project_bytes
+
+    X = pd.DataFrame({"input": np.arange(20, dtype=float)})
+    y = pd.Series(np.square(X["input"]), name="outcome")
+    study = X.assign(outcome=y)
+    state: dict = {}
+    load_new_dataset(state, study, "counts", "test fixture", default_target="outcome")
+    state.update({
+        "uap_active_model": Ridge().fit(X.iloc[:14], y.iloc[:14]),
+        "uap_active_model_target": "outcome", "uap_active_feature_cols": ["input"],
+        "uap_active_X_test": X.iloc[14:], "uap_active_y_test": y.iloc[14:],
+    })
+    record_active_holdout(state)
+    original = generate_live_chart(state, chart_id="model_champion_gauge")
+    assert "R²" in original["subtitle"]
+    archive, _ = export_workspace_project_bytes(state)
+    restored: dict = {}
+    restore_workspace_project_bytes(restored, archive)
+    assert restored["uap_active_holdout_model"] is restored["uap_active_model"]
+    after = generate_live_chart(restored, chart_id="model_champion_gauge")
+    assert "Held-Out Evaluation Set (n=6)" in after["subtitle"]
+    assert after["data"] == original["data"]
+    monitored = SupervisoryPredictionMonitor().evaluate_incoming(restored, study.iloc[14:], model_id="active_champion")
+    assert monitored["kpis"]["task_mode"] == "regression"

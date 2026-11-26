@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from sklearn.base import get_tags
 from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, r2_score, root_mean_squared_error
 
 from omniforge.core.exceptions import EvaluationError
@@ -182,6 +183,8 @@ class SupervisoryPredictionMonitor:
         if declared in (TaskType.REGRESSION, TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
             return TaskType(declared)
         kind = getattr(estimator, "_estimator_type", None)
+        if kind is None and hasattr(estimator, "__sklearn_tags__"):
+            kind = get_tags(estimator).estimator_type
         classes = getattr(estimator, "classes_", None)
         if kind == "regressor":
             return TaskType.REGRESSION
