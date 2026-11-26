@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import math
 import tempfile
 from pathlib import Path
 from typing import Any, cast
@@ -220,11 +221,20 @@ def _compile_report_payload(state: dict[str, Any], req: ReportCompileReq) -> dic
         kpis = sr.get("kpis") or {}
         alarms = sr.get("alarms") or []
         fp_title = "Live Prediction, Reality-vs-Baseline Comparison & Tolerance Alarm Audit"
+
+        def percent(value: Any) -> str:
+            return f"{value:.2f}%" if isinstance(value, (int, float)) and math.isfinite(value) else "unavailable"
+
+        model_label = kpis.get("model_label") or "Selected Model"
+        baseline_label = kpis.get("baseline_label")
+        baseline_text = f" compared with '{baseline_label}'" if baseline_label else ""
+        compliance_text = percent(kpis.get("compliance_rate_pct"))
+        breach_text = percent(kpis.get("breach_rate_pct"))
         fp_body = (
-            f"Supervisory evaluation of model '{kpis.get('model_label', 'Selected Model')}' vs baseline '{kpis.get('baseline_label', 'Baseline')}' "
-            f"across {kpis.get('n_records', 0)} live observations resulted in status {sr.get('system_status')} "
-            f"with {kpis.get('breach_count', 0)} tolerance breaches ({kpis.get('breach_rate_pct', 0):.2f}%) "
-            f"and {kpis.get('compliance_rate_pct', 100):.2f}% compliance."
+            f"Supervisory evaluation of '{model_label}'{baseline_text} covered {kpis.get('n_records', 0)} "
+            f"records. Status {sr.get('system_status', 'unavailable')}, tolerance breaches "
+            f"{kpis.get('breach_count', 0)} (rate {breach_text}), compliance {compliance_text}. "
+            f"Unevaluable records: {kpis.get('unavailable_count', 0)}."
         )
         sections.append(
             {
@@ -236,8 +246,8 @@ def _compile_report_payload(state: dict[str, Any], req: ReportCompileReq) -> dic
                 "narrative": fp_body,
                 "bullets": [
                     f"System Status: {sr.get('system_status')}",
-                    f"Critical Breaches: {kpis.get('breach_count', 0)} | Warnings: {kpis.get('warning_count', 0)} | Compliance: {kpis.get('compliance_rate_pct', 100):.1f}%",
-                    f"Model MAE: {kpis.get('mae', 'N/A')} | MAPE: {kpis.get('mape_pct', 'N/A')}% | Baseline MAE: {kpis.get('baseline_mae', 'N/A')}",
+                    f"Critical Breaches: {kpis.get('breach_count', 0)} | Warnings: {kpis.get('warning_count', 0)} | Compliance: {compliance_text}",
+                    f"Model MAE: {kpis.get('mae', 'N/A')} | MAPE: {percent(kpis.get('mape_pct'))} | Baseline MAE: {kpis.get('baseline_mae', 'N/A')}",
                 ],
             }
         )

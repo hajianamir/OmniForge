@@ -12,6 +12,7 @@ import pandas as pd
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Response, UploadFile
 
 from omniforge.api.auth import require_permission
+from omniforge.api.studios.root_cause import analyze_study_cohorts
 from omniforge.api.studios.schemas import (
     RootCauseReq,
     SupervisoryAccessReq,
@@ -24,11 +25,11 @@ from omniforge.api.studios.schemas import (
 from omniforge.core.types import TaskType
 from omniforge.core.utils import sanitize_spreadsheet_frame, to_json_object
 from omniforge.features.inference import WorkbenchInputPreprocessor
-from omniforge.mlops.root_cause import DriftRootCauseAnalyzer
 from omniforge.mlops.supervisory_monitor import SupervisoryPredictionMonitor
 from omniforge.models.deep import FTTransformerModel, MLPModel, ResNetTabularModel, TabNetModel
 from omniforge.models.nonparametric import NadarayaWatsonKernelModel, PenalizedSplineGAMModel
 from omniforge.ui.state import (
+    clear_supervisory_evaluation,
     get_analysis_dataframe,
     get_selected_targets,
     get_session_state,
@@ -74,15 +75,7 @@ def s14_get_model_equations(
     catalog = SupervisoryPredictionMonitor.catalog_available_models(state)
     if not catalog:
         return to_json_object({"champion_equation": None, "baseline_equation": None})
-    primary_entry = next((m for m in catalog if m["model_id"] == model_id), catalog[0])
-    baseline_entry = None
-    if baseline_model_id:
-        baseline_entry = next((m for m in catalog if m["model_id"] == baseline_model_id), None)
-    if baseline_entry is None:
-        baseline_entry = next(
-            (m for m in catalog if m["family"] == "Baseline" and m["model_id"] != primary_entry["model_id"]),
-            next((m for m in catalog if m["family"] == "Baseline"), None),
-        )
+    primary_entry, baseline_entry = SupervisoryPredictionMonitor.model_pair(catalog, model_id, baseline_model_id)
     ref_df = state.get("uap_df") if isinstance(state.get("uap_df"), pd.DataFrame) else None
     champ_eq = SupervisoryPredictionMonitor.extract_model_equation(primary_entry, ref_df=ref_df)
     base_eq = SupervisoryPredictionMonitor.extract_model_equation(baseline_entry, ref_df=ref_df)
@@ -103,33 +96,53 @@ def s14_quick_train(req: SupervisoryQuickTrainReq, x_session_id: str | None = He
     state = get_session_state(sid)
     active_df = _wb()._require_df(state)
     df = get_analysis_dataframe(state, active_df)
-    targets = get_selected_targets(state, df)
-    target = req.target if (req.target and req.target in df.columns) else (targets[0] if targets else None)
-    if not target:
-        raise HTTPException(status_code=400, detail="Select a target column first before training a supervisory model.")
+    targets = get_selected_targets(state, active_df)
+    scope_lock = state.get("uap_split_lock")
+    scope_targets = tuple(targets)
+    scope_exclusions = tuple(_wb().get_excluded_columns(state, active_df))
+    target = req.target if req.target is not None else (targets[0] if len(targets) == 1 else None)
+    if target is None or target not in df.columns:
+        raise HTTPException(status_code=400, detail="Select one target from the active study before training.")
     train_df, test_df, lock = _wb().get_active_split_frames(state, active_df)
     train_df = train_df.loc[:, df.columns].dropna(subset=[target])
+    excluded = {*targets, target}
+    if lock:
+        excluded.update(col for key in ("row_id_col", "group_col", "time_col") if isinstance(col := lock.get(key), str))
+    if len(train_df) < 4 or (test_df is None and len(train_df) < 6):
+        raise HTTPException(status_code=400, detail="Supervisory quick-train requires four training rows and two test rows.")
+    task = _wb()._infer_task(train_df[target])
+    is_clf = task in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION)
+    split_source = "split_lock"
     if test_df is None:
-        split = min(len(train_df) - 2, int(len(train_df) * 0.8))
-        train_df, test_df = train_df.iloc[:split], train_df.iloc[split:]
+        from sklearn.model_selection import train_test_split
+
+        test_size = max(2, len(train_df) - int(len(train_df) * 0.8))
+        if is_clf:
+            test_size = max(test_size, int(train_df[target].nunique()))
+        try:
+            train_df, test_df = train_test_split(
+                train_df, test_size=test_size, random_state=42, stratify=train_df[target] if is_clf else None,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="The observed classes cannot support a stratified holdout.") from exc
+        split_source = "stratified_split" if is_clf else "random_split"
     else:
         test_df = test_df.loc[:, df.columns].dropna(subset=[target])
-    if len(train_df) < 4 or len(test_df) < 2 or df.shape[1] < 2:
-        raise HTTPException(status_code=400, detail="Supervisory quick-train requires four training rows, two test rows, and a predictor.")
+    if len(train_df) < 4 or len(test_df) < 2:
+        raise HTTPException(status_code=400, detail="Supervisory quick-train requires four training rows and two test rows.")
     y_tr, y_te = train_df[target], test_df[target]
-    task = _wb()._infer_task(y_tr)
-    is_clf = task in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION)
-    if is_clf and y_tr.nunique() < 2:
-        raise HTTPException(status_code=400, detail="Supervisory training requires at least two observed classes.")
+    if is_clf and (y_tr.nunique() < 2 or not y_te.isin(y_tr.unique()).all()):
+        raise HTTPException(status_code=400, detail="The training partition must contain all classes evaluated on the test partition.")
+    predictors = _wb()._study_predictor_columns(train_df, excluded, None)
+    if not predictors:
+        raise HTTPException(status_code=400, detail="No observed predictor columns remain in the active study.")
     try:
-        raw_train = train_df.drop(columns=[target])
+        raw_train = train_df.loc[:, predictors]
         input_preprocessor = WorkbenchInputPreprocessor(mode="numeric").fit(raw_train)
         X_tr = input_preprocessor.transform(raw_train)
-        X_te = input_preprocessor.transform(test_df.drop(columns=[target]))
+        X_te = input_preprocessor.transform(test_df.loc[:, predictors])
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if not len(X_tr.columns):
-        raise HTTPException(status_code=400, detail="No usable predictor columns remain after excluding target.")
+        raise HTTPException(status_code=400, detail="The selected predictor columns could not be prepared.") from exc
 
     from sklearn.ensemble import (
         GradientBoostingClassifier,
@@ -188,6 +201,13 @@ def s14_quick_train(req: SupervisoryQuickTrainReq, x_session_id: str | None = He
     score = float(f1_score(y_te, preds, average="weighted", zero_division=0)) if is_clf else float(r2_score(y_te, preds))
     metric_name = "f1_weighted" if is_clf else "r2"
 
+    if (
+        state.get("uap_df") is not active_df or state.get("uap_split_lock") is not scope_lock
+        or tuple(get_selected_targets(state, active_df)) != scope_targets
+        or tuple(_wb().get_excluded_columns(state, active_df)) != scope_exclusions
+    ):
+        raise HTTPException(status_code=409, detail="The workspace changed during training. Start a new quick-train run.")
+    clear_supervisory_evaluation(state)
     if family == "Deep Learning":
         _dl_raw = state.get("uap_dl_models")
         dl_dict: dict[str, Any] = dict(_dl_raw) if isinstance(_dl_raw, dict) else {}
@@ -198,6 +218,7 @@ def s14_quick_train(req: SupervisoryQuickTrainReq, x_session_id: str | None = He
             "metrics": {metric_name: round(score, 4)},
             "target": target,
             "input_preprocessor": input_preprocessor,
+            "evaluation_holdout": (X_te, y_te),
         }
         state["uap_dl_models"] = dl_dict
     elif family == "Baseline":
@@ -210,6 +231,7 @@ def s14_quick_train(req: SupervisoryQuickTrainReq, x_session_id: str | None = He
             "feature_cols": list(X_tr.columns),
             "metrics": {metric_name: round(score, 4)},
             "input_preprocessor": input_preprocessor,
+            "evaluation_holdout": (X_te, y_te),
         }
         bl_all[target] = t_bl
         state["uap_baseline_models"] = bl_all
@@ -232,7 +254,7 @@ def s14_quick_train(req: SupervisoryQuickTrainReq, x_session_id: str | None = He
             "family": family,
             "metric": metric_name,
             "score": round(score, 4),
-            "evaluation": {"partition": "test", "source": "split_lock" if lock else "ordered_split",
+            "evaluation": {"partition": "test", "source": split_source,
                            "n_train": len(X_tr), "n_test": len(X_te)},
             "models": models_clean,
             "state": _wb()._state_summary(state, sid),
@@ -246,7 +268,7 @@ def _run_supervisory_eval(
     incoming_df: pd.DataFrame,
     source_label: str,
     *,
-    model_id: str,
+    model_id: str | None,
     baseline_model_id: str | None,
     actual_col: str | None,
     id_col: str | None,
@@ -262,15 +284,12 @@ def _run_supervisory_eval(
     ref_df = state.get("uap_df")
     if not isinstance(ref_df, pd.DataFrame) or ref_df.empty:
         raise HTTPException(status_code=400, detail="Load a training/reference dataset in Studio 01 first.")
-    targets = get_selected_targets(state, ref_df)
-    target_col = targets[0] if targets else None
-    actual_use = actual_col or (target_col if (target_col and target_col in incoming_df.columns) else None)
     eval_res = SupervisoryPredictionMonitor().evaluate_incoming(
         state=state,
         incoming_df=incoming_df,
         model_id=model_id,
         baseline_model_id=baseline_model_id,
-        actual_col=actual_use,
+        actual_col=actual_col,
         id_col=id_col,
         source_label=source_label,
         max_pct_error=max_pct_error,
@@ -304,7 +323,7 @@ def _run_supervisory_eval(
 async def s14_evaluate_file(
     file: UploadFile = File(...),
     sheet_name: str | None = Form(default=None),
-    model_id: str = Form(default="active_champion"),
+    model_id: str | None = Form(default=None),
     baseline_model_id: str | None = Form(default=None),
     actual_col: str | None = Form(default=None),
     id_col: str | None = Form(default=None),
@@ -393,14 +412,20 @@ def s14_evaluate_access(req: SupervisoryAccessReq, x_session_id: str | None = He
     )
 
 
-@router.post("/s14/evaluate-demo-batch")
+@router.post("/s14/evaluate-demo-batch", dependencies=[Depends(require_permission("mlops:write"))])
 def s14_evaluate_demo_batch(req: SupervisoryDemoReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     """Generate a realistic live operational batch from the active dataset with optional injected process faults so engineers can immediately test tolerance alarms."""
     sid = _wb()._sid(x_session_id)
     state = get_session_state(sid)
     df = get_analysis_dataframe(state, _wb()._require_df(state))
-    targets = get_selected_targets(state, df)
-    target_col = req.actual_col or (targets[0] if targets else None)
+    catalog = SupervisoryPredictionMonitor.catalog_available_models(state)
+    model = next((entry for entry in catalog if req.model_id is None or entry["model_id"] == req.model_id), None)
+    if model is None:
+        raise HTTPException(status_code=400, detail="Select an available model before running a simulation.")
+    target_col = req.actual_col or model["target"]
+    selected_targets = set(get_selected_targets(state, df))
+    if target_col not in df.columns or (target_col != model["target"] and target_col in selected_targets):
+        raise HTTPException(status_code=400, detail="The simulation outcome does not match the selected model.")
 
     rng = np.random.default_rng(2026)
     n_take = min(req.n_rows, len(df))
@@ -409,7 +434,7 @@ def s14_evaluate_demo_batch(req: SupervisoryDemoReq, x_session_id: str | None = 
     # Add light operational measurement noise + explicit process fault excursions on inject_fault_pct% of rows
     num_cols = list(batch.select_dtypes(include=[np.number]).columns)
     for col in num_cols:
-        if col == target_col:
+        if col == target_col or col in selected_targets:
             continue
         std = float(batch[col].std())
         if math.isfinite(std) and std > 0 and req.noise_scale > 0:
@@ -451,16 +476,14 @@ def s14_evaluate_demo_batch(req: SupervisoryDemoReq, x_session_id: str | None = 
     )
 
 
-@router.post("/s14/evaluate-single")
+@router.post("/s14/evaluate-single", dependencies=[Depends(require_permission("mlops:write"))])
 def s14_evaluate_single(req: SupervisorySingleReq, x_session_id: str | None = Header(default="default")) -> dict[str, Any]:
     sid = _wb()._sid(x_session_id)
     state = get_session_state(sid)
     rec = dict(req.record)
     actual_col = req.actual_col
     if req.actual_value is not None:
-        df = state.get("uap_df")
-        targets = get_selected_targets(state, df) if isinstance(df, pd.DataFrame) else []
-        actual_col = actual_col or (targets[0] if targets else "__actual__")
+        actual_col = actual_col or "__actual__"
         rec[actual_col] = req.actual_value
     incoming = pd.DataFrame([rec])
     return _run_supervisory_eval(
@@ -483,38 +506,17 @@ def s14_evaluate_single(req: SupervisorySingleReq, x_session_id: str | None = He
     )
 
 
-@router.post("/s14/root-cause")
+@router.post("/s14/root-cause", dependencies=[Depends(require_permission("mlops:read"))])
 def s14_root_cause(
     req: RootCauseReq, x_session_id: str | None = Header(default="default")
 ) -> dict[str, Any]:
     """C5 causal drift root-cause attribution in the Supervisory studio (live telemetry vs reference)."""
     sid = _wb()._sid(x_session_id)
     state = get_session_state(sid)
-    df = get_analysis_dataframe(state, _wb()._require_df(state))
-    num_df = df.select_dtypes(include=[np.number]).dropna()
-    if len(num_df) < 20:
-        raise HTTPException(status_code=400, detail="Root-cause analysis requires at least 20 numeric rows.")
-    cut = max(5, min(len(num_df) - 5, int(len(num_df) * 0.5)))
-    ref_df = num_df.iloc[:cut]
-    cur_df = num_df.iloc[cut:]
-    model = state.get("uap_active_model")
-    feat_cols = list(state.get("uap_active_feature_cols") or num_df.columns)
-    analyzer = DriftRootCauseAnalyzer(
-        psi_warning=req.psi_warning,
-        psi_critical=req.psi_critical,
-        max_cond_set_size=req.max_cond_set_size,
-    )
-    report = analyzer.analyze(
-        ref_df, cur_df, model=model, feature_cols=feat_cols,
-        target_col=req.target_col, time_col=req.time_col,
-    )
-    payload = wb_cache_and_respond(
-        state, sid, "s14_root_cause", {"root_cause_report": report.model_dump()}
-    )
-    return payload
+    return wb_cache_and_respond(state, sid, "s14_root_cause", analyze_study_cohorts(state, req))
 
 
-@router.get("/s14/export/{fmt}")
+@router.get("/s14/export/{fmt}", dependencies=[Depends(require_permission("report:generate"))])
 def s14_export_results(fmt: str, x_session_id: str | None = Header(default="default")) -> Response:
     state = get_session_state(_wb()._sid(x_session_id))
     res_df = state.get("uap_supervisory_scored_df")

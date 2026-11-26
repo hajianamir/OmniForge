@@ -184,3 +184,32 @@ test('mining selects each outcome explicitly and live charts follow studio scope
   await page.locator('[data-studio="12"]').click();
   await expect(picker.locator('option[value="classifier_roc_curve"]')).toHaveCount(1);
 });
+
+test('supervisory quick-train selects an outcome and score-only shows unavailable compliance', async ({ page }) => {
+  await page.addInitScript((key) => localStorage.setItem('omniforge_api_key', key), apiKey!);
+  await page.goto('/');
+  const rows = ['measurement,category,outcome_a,outcome_b'];
+  for (let i = 0; i < 60; i++) rows.push(`${i},${i % 2 === 0 ? 'left' : 'right'},${i % 2},${i * 3 + i % 7}`);
+  await page.locator('input[accept=".csv,.tsv,.xlsx,.xls,.xlsm,.parquet,.json"]').setInputFiles({
+    name: 'supervisory-study.csv', mimeType: 'text/csv', buffer: Buffer.from(rows.join('\n')),
+  });
+  await expect(page.getByText(/Ingested 'supervisory-study.csv'/)).toBeVisible();
+  await page.getByRole('button', { name: 'Targets (1)' }).click();
+  await page.locator('.modal-panel').getByRole('button', { name: 'outcome_a', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Targets (2)' })).toBeVisible();
+  await page.locator('.modal-backdrop').click({ position: { x: 5, y: 5 } });
+  await page.locator('[data-studio="14"]').click();
+  const train = page.getByRole('button', { name: /Quick-Train & Select Model/ });
+  await expect(train).toBeDisabled();
+  await page.getByLabel('Training outcome').selectOption('outcome_b');
+  await train.click();
+  await expect(page.getByText(/Trained 'Linear Baseline/)).toBeVisible();
+  await page.getByRole('button', { name: 'Single Reading Probe' }).click();
+  await page.getByLabel('measurement', { exact: true }).fill('35');
+  await page.getByLabel('category', { exact: true }).fill('left');
+  await expect(page.getByLabel('Measured Actual (outcome_b)')).toBeVisible();
+  await page.getByRole('button', { name: 'Evaluate Single Live Reading' }).click();
+  await expect(page.getByText('SYSTEM STATUS: UNAVAILABLE', { exact: true })).toBeVisible();
+  await expect(page.getByText('Compliance: Unavailable', { exact: true })).toBeVisible();
+  await expect(page.getByText('Unevaluable: 1', { exact: true })).toBeVisible();
+});

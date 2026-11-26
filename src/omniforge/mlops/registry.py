@@ -185,6 +185,15 @@ class ModelRegistry:
                 return
             with _sqlite_conn(source_uri, uri=True) as source:
                 source.row_factory = sqlite3.Row
+                tables = {row[0] for row in source.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+                )}
+                if not tables:
+                    # The physical file may have been initialized before its schema was created.
+                    # Leave it eligible for a later import once it contains registry data.
+                    return
+                if "model_versions" not in tables:
+                    raise MLOpsError("The legacy registry is missing its model version table.")
                 old_rows = source.execute("SELECT * FROM model_versions").fetchall()
             for row in old_rows:
                 current = conn.execute(

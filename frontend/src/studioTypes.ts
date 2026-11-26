@@ -655,6 +655,9 @@ export interface ChatResponse {
 // ---------------------------------------------------------------------------
 
 export interface SupervisoryModelInfo extends JsonRow {
+  task_type?: string | null;
+  input_columns?: string[];
+  input_types?: Record<string, string>;
   model_id: string;
   label: string;
   family?: string;
@@ -671,12 +674,15 @@ export interface SupervisoryKPIs extends JsonRow {
   mape_pct?: number;
   breach_count?: number;
   warning_count?: number;
+  unavailable_count?: number;
+  compliance_rate_pct?: number | null;
   model_vs_baseline_lift_pct?: number;
   mae_improvement_vs_baseline_pct?: number;
 }
 
 export interface TrendPoint {
   label?: string;
+  threshold?: number;
   actual?: number | null;
   predicted?: number | null;
   baseline?: number | null;
@@ -775,6 +781,7 @@ export interface SupervisoryEvaluation {
   trend_series?: TrendPoint[];
   spc_points?: SPCPoint[];
   spc_limits?: SPCLimits | null;
+  spc_unavailable_reason?: string | null;
   ratio_points?: JsonRow[];
   telemetry_rows?: JsonRow[];
   history?: JsonRow[];

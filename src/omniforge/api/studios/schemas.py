@@ -310,7 +310,7 @@ class SupervisoryQuickTrainReq(BaseModel):
 
 
 class SupervisoryTolBase(BaseModel):
-    model_id: str = "active_champion"
+    model_id: str | None = None
     baseline_model_id: str | None = None
     actual_col: str | None = None
     id_col: str | None = None

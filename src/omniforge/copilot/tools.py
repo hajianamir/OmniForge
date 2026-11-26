@@ -106,9 +106,8 @@ class CopilotToolRegistry:
             raise
         except Exception as exc:
             raise CopilotError(
-                f"Copilot tool '{tool_name}' execution failed: {exc}",
-                context={"tool": tool_name, "arguments": arguments or {}},
-                cause=exc,
+                f"Copilot tool '{tool_name}' could not complete the request.",
+                context={"tool": tool_name},
             ) from exc
 
     def _register_platform_tools(self) -> None:
@@ -144,6 +143,7 @@ class CopilotToolRegistry:
         ) -> dict[str, Any]:
             from omniforge.data.synthetic import SyntheticDataGenerator
 
+            _authorize_if_http_principal("data:write")
             gen = SyntheticDataGenerator()
             if task == "regression":
                 df = gen.generate_regression_dataset(n_samples=n_samples)
@@ -465,6 +465,7 @@ class CopilotToolRegistry:
             """Enforce leakage-safe Split Lock (train/test integrity)."""
             from omniforge.core.contracts import LeakageGuard
 
+            _authorize_if_http_principal("data:write")
             _, df = self.memory.get_dataset(dataset_name)
             # Deterministic holdout split
             n = len(df)

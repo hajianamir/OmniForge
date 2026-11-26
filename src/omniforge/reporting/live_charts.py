@@ -56,6 +56,10 @@ PALETTE: tuple[str, ...] = (
 )
 
 
+class LiveChartUnavailable(ValueError):
+    """A user-facing chart prerequisite or supported validation failure."""
+
+
 @dataclass(frozen=True)
 class LiveChartSpec:
     """Declarative specification for an on-demand live chart."""
@@ -89,7 +93,7 @@ LIVE_CHART_SPECS: tuple[LiveChartSpec, ...] = (
         chart_type="gauge",
         title="Champion Model Primary Score Gauge",
         category="Model Evaluation & Diagnostics",
-        description="Radial score dial for the active trained model vs. baseline benchmark threshold.",
+        description="Radial score dial for the selected trained model on the displayed evaluation cohort.",
         studios=("03", "06", "07", "11", "12", "14"),
         requirement="model_any",
     ),
@@ -526,69 +530,77 @@ class _ResolvedModelEval:
     probability_error: str | None = None
 
 
-def _resolve_model_eval(state: dict[str, Any], df: pd.DataFrame) -> _ResolvedModelEval | None:
-    """Resolve the active trained model and evaluate it on the locked holdout or active test frame."""
+def _resolve_model_eval(
+    state: dict[str, Any], df: pd.DataFrame, *, unavailable: list[str] | None = None,
+) -> _ResolvedModelEval | None:
+    """Evaluate with the model's fitted schema and the recorded outcome."""
+
+    def explain(reason: str) -> None:
+        if unavailable is not None:
+            unavailable.append(reason)
+
     catalog = SupervisoryPredictionMonitor.catalog_available_models(state)
     if not catalog:
         return None
     entry = catalog[0]
     est = entry["_estimator"]
     model_name = str(entry.get("label") or entry.get("model_id") or "Trained Model")
-    targets = get_selected_targets(state, df)
-    target_col = str(entry.get("target") or (targets[0] if targets else ""))
-    if target_col not in df.columns and targets:
-        target_col = targets[0]
+    target_col = str(entry.get("target") or "")
+    if target_col not in df.columns:
+        explain("The trained model's outcome is absent from the active study.")
+        return None
 
-    X_test_saved = state.get("uap_active_X_test")
-    y_test_saved = state.get("uap_active_y_test")
-    preprocessor = state.get("uap_active_input_preprocessor")
-
-    # Prefer exact saved X_test / y_test when evaluating active_champion
-    if (
-        entry["model_id"] == "active_champion"
-        and isinstance(X_test_saved, pd.DataFrame)
-        and isinstance(y_test_saved, pd.Series)
-        and not X_test_saved.empty
-        and len(X_test_saved) == len(y_test_saved)
-    ):
-        X_eval = X_test_saved.copy()
-        y_eval = y_test_saved.copy()
+    recorded = SupervisoryPredictionMonitor._evaluation_holdout(state, entry)
+    if recorded is not None:
+        X_eval, y_eval = recorded
         eval_scope = f"Held-Out Evaluation Set (n={len(X_eval):,})"
     else:
-        if not target_col or target_col not in df.columns:
+        if entry["model_id"] == "active_champion" and state.get("uap_active_holdout_fingerprint"):
+            explain("The saved holdout no longer matches the recorded model inputs and outcome.")
             return None
-        _train_df, test_df, lock = get_active_split_frames(state, df)
-        if test_df is not None and not test_df.empty and lock is not None and target_col in test_df.columns:
-            eval_df = test_df.dropna(subset=[target_col]).copy()
-            eval_scope = f"Locked Test Split (n={len(eval_df):,})"
+        try:
+            _train_df, test_df, lock = get_active_split_frames(state, df)
+        except ValueError:
+            explain("The current split cannot be verified for chart scoring.")
+            return None
+        if test_df is not None and lock is not None:
+            eval_df = test_df.dropna(subset=[target_col])
+            eval_scope = f"Current Locked Partition (n={len(eval_df):,})"
         else:
-            clean_df = df.dropna(subset=[target_col]).copy()
+            clean_df = df.dropna(subset=[target_col])
             cut = max(2, int(len(clean_df) * 0.75))
             eval_df = clean_df.iloc[cut:] if len(clean_df) - cut >= 8 else clean_df
-            eval_scope = f"Evaluation Slice (n={len(eval_df):,})"
+            eval_scope = f"Evaluation Slice (n={len(eval_df):,}; holdout status unverified)"
         if eval_df.empty:
+            explain("The evaluation rows contain no observed values of the model's outcome.")
             return None
         y_eval = eval_df[target_col]
-        raw_X = eval_df.drop(columns=[target_col], errors="ignore")
-        feat_cols = [str(c) for c in (entry.get("feature_cols") or [])]
-        if entry["model_id"] == "active_champion" and preprocessor is not None and hasattr(preprocessor, "transform"):
-            try:
-                X_eval = preprocessor.transform(raw_X)
-            except Exception:
-                X_eval = SupervisoryPredictionMonitor._align_features(raw_X, feat_cols, ref_df=df)
-        else:
-            X_eval = SupervisoryPredictionMonitor._align_features(raw_X, feat_cols, ref_df=df)
+        raw_X = eval_df.drop(columns=[target_col])
+        features = getattr(est, "feature_names_in_", None)
+        legacy_X = state.get("uap_active_X_test") if entry["model_id"] == "active_champion" else None
+        if features is None and isinstance(legacy_X, pd.DataFrame):
+            features = legacy_X.columns
+        try:
+            X_eval = SupervisoryPredictionMonitor._model_input(
+                raw_X, entry, None, list(features) if features is not None else None, strict=True,
+            )
+        except (ValueError, TypeError):
+            explain("The fitted model input schema could not be applied to these evaluation rows.")
+            return None
 
     try:
         y_pred = np.asarray(est.predict(X_eval))
     except Exception:
-        try:
-            X_np = X_eval.select_dtypes(include=[np.number]).fillna(0.0)
-            y_pred = np.asarray(est.predict(X_np))
-        except Exception:
-            return None
+        explain("The fitted model could not score these evaluation rows.")
+        return None
 
-    task = _infer_task_type(y_eval)
+    task = SupervisoryPredictionMonitor._model_task(est) or _infer_task_type(y_eval)
+    valid = y_pred.shape == (len(X_eval),) and pd.notna(y_pred).all()
+    if valid and task == TaskType.REGRESSION:
+        valid = np.isfinite(pd.to_numeric(y_pred, errors="coerce")).all()
+    if not valid:
+        explain("The model emitted missing or invalid predictions for these evaluation rows.")
+        return None
     raw_classes = getattr(est, "classes_", None)
     classes: list[Any] = list(raw_classes) if raw_classes is not None else []
     y_proba: np.ndarray | None = None
@@ -654,6 +666,7 @@ def _spec_readiness(
     state: dict[str, Any],
     has_df: bool,
     model_eval: _ResolvedModelEval | None,
+    model_error: str | None = None,
 ) -> tuple[bool, str | None]:
     if not has_df:
         return False, "Ingest or load a dataset in Studio 00 / 01 first."
@@ -667,15 +680,21 @@ def _spec_readiness(
     if spec.requirement == "supervisory":
         sup = state.get("uap_supervisory_result")
         if isinstance(sup, dict) and sup.get("kpis"):
+            if spec.id == "supervisory_compliance_gauge" and not math.isfinite(
+                _finite_float(sup["kpis"].get("compliance_rate_pct"), math.nan)
+            ):
+                return False, "Tolerance compliance is unavailable without evaluated observations."
             return True, None
         return False, "Run a Supervisory Evaluation batch or simulation in Studio 14 first."
     if spec.requirement == "model_any":
-        if model_eval is not None or isinstance(state.get("uap_supervisory_result"), dict):
+        if model_eval is not None or (
+            spec.id != "model_champion_gauge" and isinstance(state.get("uap_supervisory_result"), dict)
+        ):
             return True, None
-        return False, "Train a model in Studio 03 (Diagnostics), Studio 06 (AutoML / DL), or Studio 14 first."
+        return False, model_error or "Train a model in Studio 03 (Diagnostics), Studio 06 (AutoML / DL), or Studio 14 first."
     if spec.requirement == "model_clf":
         if model_eval is None:
-            return False, "Train a classification model in Studio 03, Studio 06, or Studio 14 first."
+            return False, model_error or "Train a classification model in Studio 03, Studio 06, or Studio 14 first."
         if model_eval.task_type not in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
             return (
                 False,
@@ -693,7 +712,7 @@ def _spec_readiness(
 def _chart_studio(studio_id: str) -> str:
     studio = (studio_id or "all").strip().lower().removeprefix("s")
     if studio not in {"all", *(f"{index:02d}" for index in range(15))}:
-        raise ValueError("Choose a studio from 00 through 14 or the all-studio chart gallery.")
+        raise LiveChartUnavailable("Choose a studio from 00 through 14 or the all-studio chart gallery.")
     return studio
 
 
@@ -714,7 +733,8 @@ def get_live_chart_catalog(state: dict[str, Any], studio_id: str = "all") -> dic
         t_enum = _infer_task_type(df[primary_target])
         task_str = "regression" if t_enum == TaskType.REGRESSION else "classification"
 
-    model_eval = _resolve_model_eval(state, df) if has_df else None
+    unavailable: list[str] = []
+    model_eval = _resolve_model_eval(state, df, unavailable=unavailable) if has_df else None
 
     studio_norm = _chart_studio(studio_id)
     charts_out: list[dict[str, Any]] = []
@@ -722,7 +742,7 @@ def get_live_chart_catalog(state: dict[str, Any], studio_id: str = "all") -> dic
         in_studio = studio_norm == "all" or studio_norm in spec.studios
         if not in_studio and studio_norm != "12":
             continue
-        ready, reason = _spec_readiness(spec, state, has_df, model_eval)
+        ready, reason = _spec_readiness(spec, state, has_df, model_eval, next(iter(unavailable), None))
         charts_out.append(
             {
                 "id": spec.id,
@@ -780,23 +800,24 @@ def generate_live_chart(
     """Compute ONLY the single requested ``chart_id`` from live workspace data & model state."""
     spec = _SPEC_BY_ID.get(chart_id)
     if spec is None:
-        raise ValueError(f"Unknown chart_id {chart_id!r}. Valid IDs: {sorted(_SPEC_BY_ID)}")
+        raise LiveChartUnavailable(f"Unknown chart_id {chart_id!r}. Valid IDs: {sorted(_SPEC_BY_ID)}")
     studio_id = _chart_studio(studio_id)
     if studio_id not in ("all", "12") and studio_id not in spec.studios:
-        raise ValueError("The requested chart is outside this studio's chart catalog.")
+        raise LiveChartUnavailable("The requested chart is outside this studio's chart catalog.")
 
     raw_active = state.get("uap_df")
     if not isinstance(raw_active, pd.DataFrame) or raw_active.empty:
-        raise ValueError("No active dataset loaded. Ingest a dataset in Studio 00 / 01 first.")
+        raise LiveChartUnavailable("No active dataset loaded. Ingest a dataset in Studio 00 / 01 first.")
 
     df = get_analysis_dataframe(state, raw_active)
     if df.empty:
-        raise ValueError("Active analysis DataFrame is empty after exclusions.")
+        raise LiveChartUnavailable("Active analysis DataFrame is empty after exclusions.")
 
-    model_eval = _resolve_model_eval(state, df) if spec.requirement in ("model_any", "model_clf") else None
-    ready, reason = _spec_readiness(spec, state, True, model_eval)
+    unavailable: list[str] = []
+    model_eval = _resolve_model_eval(state, df, unavailable=unavailable) if spec.requirement in ("model_any", "model_clf") else None
+    ready, reason = _spec_readiness(spec, state, True, model_eval, next(iter(unavailable), None))
     if not ready:
-        raise ValueError(reason or f"Chart '{spec.title}' is not ready in the current workspace state.")
+        raise LiveChartUnavailable(reason or f"Chart '{spec.title}' is not ready in the current workspace state.")
 
     prov = _provenance_banner(state, df)
     targets = get_selected_targets(state, df)
@@ -815,7 +836,7 @@ def generate_live_chart(
             return primary_target
         if num_cols:
             return num_cols[0]
-        raise ValueError("At least one numeric or encodable column is required for this chart.")
+        raise LiveChartUnavailable("At least one numeric or encodable column is required for this chart.")
 
     def _pick_num_y(exclude_col: str | None = None) -> str:
         if feature_y and feature_y in num_df.columns and feature_y != exclude_col:
@@ -834,7 +855,7 @@ def generate_live_chart(
     if chart_id == "dataset_readiness_gauge":
         payload = _build_dataset_readiness_gauge(state, df)
     elif chart_id == "model_champion_gauge":
-        payload = _build_model_champion_gauge(state, model_eval)
+        payload = _build_model_champion_gauge(model_eval)
     elif chart_id == "supervisory_compliance_gauge":
         payload = _build_supervisory_compliance_gauge(state)
     elif chart_id == "quality_6d_radar":
@@ -906,7 +927,7 @@ def generate_live_chart(
     elif chart_id == "bland_altman_agreement":
         payload = _build_bland_altman_agreement(state, model_eval)
     elif chart_id == "cusum_sequential_control":
-        col_x = _pick_num_x(prefer_non_target=False)
+        col_x = _pick_num_x(prefer_non_target=False) if studio_id != "14" else ""
         payload = _build_cusum_sequential_control(state, num_df, col_x, _disp(col_x), studio_id)
     elif chart_id == "lorenz_gini_curve":
         col_x = _pick_num_x(prefer_non_target=False)
@@ -925,7 +946,7 @@ def generate_live_chart(
     elif chart_id == "stacked_composition_bar":
         payload = _build_stacked_composition_bar(df, feature_x, group_col, primary_target)
     else:
-        raise ValueError(f"Unhandled chart_id {chart_id!r}")
+        raise LiveChartUnavailable(f"Unhandled chart_id {chart_id!r}")
 
     return to_json_object(
         {
@@ -987,52 +1008,43 @@ def _build_dataset_readiness_gauge(state: dict[str, Any], df: pd.DataFrame) -> d
     }
 
 
-def _build_model_champion_gauge(state: dict[str, Any], model_eval: _ResolvedModelEval | None) -> dict[str, Any]:
-    metrics = state.get("uap_active_model_metrics") or {}
-    if model_eval is not None:
-        if model_eval.task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
-            acc = float(accuracy_score(model_eval.y_true.astype(str), pd.Series(model_eval.y_pred).astype(str)))
-            f1 = float(f1_score(model_eval.y_true.astype(str), pd.Series(model_eval.y_pred).astype(str), average="macro", zero_division=0))
-            val = round(f1 * 100.0, 2)
-            metric_name = "Macro-F1 (%)"
-            base_val = round(float(metrics.get("baseline_score", max(0.35, f1 - 0.08))) * 100.0, 2)
-            extra_kpi = {"Accuracy (%)": round(acc * 100.0, 2)}
-        else:
-            y_t = pd.to_numeric(model_eval.y_true, errors="coerce").fillna(0.0).to_numpy(dtype=float)
-            y_p = np.asarray(model_eval.y_pred, dtype=float)
-            r2 = float(r2_score(y_t, y_p))
-            val = round(max(0.0, min(100.0, r2 * 100.0)), 2)
-            metric_name = "Explained Variance R² (%)"
-            base_raw = _finite_float(metrics.get("baseline_score"), max(0.0, r2 - 0.1))
-            base_val = round(max(0.0, min(100.0, base_raw * 100.0)), 2)
-            extra_kpi = {"Raw R²": round(r2, 4), "RMSE": round(float(root_mean_squared_error(y_t, y_p)), 4)}
-        m_label = model_eval.model_name
+def _build_model_champion_gauge(model_eval: _ResolvedModelEval | None) -> dict[str, Any]:
+    if model_eval is None:
+        raise LiveChartUnavailable("A model and evaluable outcome cohort are required for the score gauge.")
+    if model_eval.task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
+        y_true = model_eval.y_true
+        y_pred = model_eval.y_pred
+        acc = float(accuracy_score(y_true, y_pred))
+        score = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+        metric_name = "Macro-F1 (%)"
+        extra_kpi = {"Accuracy (%)": round(acc * 100.0, 2)}
     else:
-        sup = state.get("uap_supervisory_result") or {}
-        kpis = sup.get("kpis") or {}
-        val = round(max(0.0, 100.0 - _finite_float(kpis.get("mape_pct"), 10.0)), 2)
-        metric_name = "100 - MAPE (%)"
-        base_val = 85.0
-        m_label = str(kpis.get("model_label") or "Supervisory Model")
-        extra_kpi = {}
-
+        y_true = pd.to_numeric(model_eval.y_true, errors="coerce").to_numpy(dtype=float)
+        y_pred = np.asarray(model_eval.y_pred, dtype=float)
+        finite = np.isfinite(y_true) & np.isfinite(y_pred)
+        if finite.sum() < 2 or np.ptp(y_true[finite]) == 0:
+            raise LiveChartUnavailable("R² requires at least two finite observations and a nonconstant outcome.")
+        score = float(r2_score(y_true[finite], y_pred[finite], force_finite=False))
+        metric_name = "R² (%)"
+        extra_kpi = {"RMSE": round(float(root_mean_squared_error(y_true[finite], y_pred[finite])), 4)}
+    if not math.isfinite(score):
+        raise LiveChartUnavailable("The model score is undefined on the evaluation cohort.")
+    val = round(score * 100.0, 2)
+    label = model_eval.model_name
     return {
-        "title": f"Champion Model Score Gauge — {m_label}",
-        "subtitle": f"{metric_name} = {val:.2f}% (Baseline reference: {base_val:.2f}%)",
-        "kpis": {metric_name: val, "Baseline Reference (%)": base_val, **extra_kpi},
+        "title": f"Champion Model Score Gauge — {label}",
+        "subtitle": f"{metric_name} = {val:.2f}% · {model_eval.eval_scope}",
+        "kpis": {metric_name: val, **extra_kpi},
         "data": {
             "value": val,
-            "min": 0.0,
+            "min": min(0.0, val),
             "max": 100.0,
             "unit": "%",
-            "status_label": m_label[:28],
-            "thresholds": [
-                {"value": max(5.0, min(95.0, base_val)), "label": f"Baseline ({base_val:.1f}%)", "color": "#a78bfa"},
-                {"value": 85.0, "label": "High Bar (85%)", "color": "#34d399"},
-            ],
+            "status_label": label[:28],
+            "thresholds": [],
         },
-        "table_columns": ["Model", "Metric", "Score_Pct", "Baseline_Pct"],
-        "table_rows": [[m_label, metric_name, val, base_val]],
+        "table_columns": ["Model", "Metric", "Score_Pct", "Evaluation_Scope"],
+        "table_rows": [[label, metric_name, val, model_eval.eval_scope]],
     }
 
 
@@ -1042,7 +1054,9 @@ def _build_supervisory_compliance_gauge(state: dict[str, Any]) -> dict[str, Any]
     breaches = int(kpis.get("breach_count", 0) or 0)
     warnings = int(kpis.get("warning_count", 0) or 0)
     n_rec = int(kpis.get("n_records", len(sup.get("trend_series") or [])) or 1)
-    comp = _finite_float(kpis.get("compliance_rate_pct"), 100.0 * (1.0 - breaches / max(1, n_rec)))
+    comp = _finite_float(kpis.get("compliance_rate_pct"), math.nan)
+    if not math.isfinite(comp):
+        raise LiveChartUnavailable("Tolerance compliance is unavailable without evaluated observations.")
     comp = round(max(0.0, min(100.0, comp)), 2)
     status = str(sup.get("system_status") or "NORMAL")
     return {
@@ -1081,7 +1095,7 @@ def _build_quality_6d_radar(state: dict[str, Any], df: pd.DataFrame) -> dict[str
         if all(axis in raw_scores for axis in axes):
             dims_raw = raw_scores
     if not axes:
-        raise ValueError("No quality dimensions could be evaluated for this dataset.")
+        raise LiveChartUnavailable("No quality dimensions could be evaluated for this dataset.")
     series: list[dict[str, Any]] = [
         {"name": "Active Dataset", "values": [dims_act[a] for a in axes], "color": "#38bdf8"},
     ]
@@ -1126,7 +1140,7 @@ def _build_group_centroid_radar(
     if len(feat_candidates) < 3:
         feat_candidates = list(num_df.columns[:7])
     if len(feat_candidates) < 3:
-        raise ValueError("Radar profile requires at least 3 numeric/encodable features.")
+        raise LiveChartUnavailable("Radar profile requires at least 3 numeric/encodable features.")
 
     # Normalize each feature to [0, 100] across the dataset so group centroids compare cleanly
     sub = num_df[feat_candidates].copy()
@@ -1171,7 +1185,7 @@ def _build_group_centroid_radar(
 
 def _build_model_multimetric_radar(model_eval: _ResolvedModelEval | None) -> dict[str, Any]:
     if model_eval is None:
-        raise ValueError("Train a model first to generate the Model Multi-Metric Evaluation Radar.")
+        raise LiveChartUnavailable("Train a model first to generate the Model Multi-Metric Evaluation Radar.")
 
     if model_eval.task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
         y_t = model_eval.y_true.astype(str)
@@ -1321,7 +1335,7 @@ def _build_portfolio_allocation_donut(state: dict[str, Any]) -> dict[str, Any]:
         pairs = []
     pos_pairs = [(k, abs(v)) for k, v in pairs if abs(v) > 1e-6]
     if not pos_pairs:
-        raise ValueError("Optimization result contains no non-zero allocation weights.")
+        raise LiveChartUnavailable("Optimization result contains no non-zero allocation weights.")
     pos_pairs.sort(key=lambda kv: kv[1], reverse=True)
     total = sum(v for _, v in pos_pairs) or 1.0
     slices = [
@@ -1484,7 +1498,7 @@ def _build_model_attribution_waterfall(state: dict[str, Any], model_eval: _Resol
         scope_desc = "Studio 14 Supervisory Root-Cause Attribution"
 
     if not contributions:
-        raise ValueError("Unable to extract local feature attributions; train a model in Studio 06 first.")
+        raise LiveChartUnavailable("Unable to extract local feature attributions; train a model in Studio 06 first.")
 
     contributions.sort(key=lambda kv: abs(kv[1]), reverse=True)
     top = contributions[:8]
@@ -1524,7 +1538,7 @@ def _build_feature_correlation_forest(
 ) -> dict[str, Any]:
     others = [c for c in num_df.columns if c != ref_col]
     if not others:
-        raise ValueError("Correlation Forest Plot requires at least 2 numeric/encodable columns.")
+        raise LiveChartUnavailable("Correlation Forest Plot requires at least 2 numeric/encodable columns.")
 
     rows_out: list[dict[str, Any]] = []
     y_ser = num_df[ref_col]
@@ -1553,7 +1567,7 @@ def _build_feature_correlation_forest(
         )
 
     if not rows_out:
-        raise ValueError(f"No non-constant paired variables available to correlate against '{ref_col}'.")
+        raise LiveChartUnavailable(f"No non-constant paired variables available to correlate against '{ref_col}'.")
 
     rows_out.sort(key=lambda r: abs(r["estimate"]), reverse=True)
     sig_cnt = sum(1 for r in rows_out if r["p_value"] < 0.05)
@@ -1579,7 +1593,7 @@ def _build_standardized_effect_forest(
 ) -> dict[str, Any]:
     predictors = [c for c in num_df.columns if c != ref_col][:14]
     if not predictors:
-        raise ValueError("Standardized Multivariate Effect Forest Plot requires at least 2 numeric/encodable columns.")
+        raise LiveChartUnavailable("Standardized Multivariate Effect Forest Plot requires at least 2 numeric/encodable columns.")
 
     work = num_df[[*predictors, ref_col]].dropna()
     if len(work) < 8:
@@ -1588,14 +1602,14 @@ def _build_standardized_effect_forest(
             work[c] = work[c].fillna(work[c].median())
         work = work.dropna()
     if len(work) < 6:
-        raise ValueError("At least 6 observations are required to estimate multivariate 95% confidence intervals.")
+        raise LiveChartUnavailable("At least 6 observations are required to estimate multivariate 95% confidence intervals.")
 
     X_raw = work[predictors].to_numpy(dtype=float)
     y_raw = work[ref_col].to_numpy(dtype=float)
     x_std = np.std(X_raw, axis=0)
     keep_mask = x_std > 1e-12
     if not np.any(keep_mask):
-        raise ValueError("All predictor columns have zero variance.")
+        raise LiveChartUnavailable("All predictor columns have zero variance.")
 
     kept_cols = [predictors[i] for i in range(len(predictors)) if keep_mask[i]]
     X = (X_raw[:, keep_mask] - np.mean(X_raw[:, keep_mask], axis=0)) / x_std[keep_mask]
@@ -1708,7 +1722,7 @@ def _build_missing_variance_pareto(df: pd.DataFrame, num_df: pd.DataFrame) -> di
 
 def _build_pca_eigenvalue_pareto(num_df: pd.DataFrame) -> dict[str, Any]:
     if num_df.shape[1] < 2 or len(num_df) < 4:
-        raise ValueError("PCA Eigenvalue Pareto requires at least 2 numeric/encodable columns and 4 rows.")
+        raise LiveChartUnavailable("PCA Eigenvalue Pareto requires at least 2 numeric/encodable columns and 4 rows.")
     work = num_df.copy()
     for c in work.columns:
         med = work[c].median()
@@ -1717,7 +1731,7 @@ def _build_pca_eigenvalue_pareto(num_df: pd.DataFrame) -> dict[str, Any]:
     stds = np.std(X, axis=0)
     keep = stds > 1e-12
     if int(np.sum(keep)) < 2:
-        raise ValueError("At least 2 non-constant columns are required for PCA decomposition.")
+        raise LiveChartUnavailable("At least 2 non-constant columns are required for PCA decomposition.")
     X_std = (X[:, keep] - np.mean(X[:, keep], axis=0)) / stds[keep]
     _u, s_vals, _vt = np.linalg.svd(X_std, full_matrices=False)
     eig = (s_vals**2) / max(1, len(X_std) - 1)
@@ -1793,7 +1807,7 @@ def _build_feature_importance_pareto(
     if not pairs:
         tgt = primary_target if (primary_target and primary_target in num_df.columns) else (num_df.columns[-1] if len(num_df.columns) else None)
         if tgt is None or num_df.shape[1] < 2:
-            raise ValueError("At least 2 columns are required to compute feature importance.")
+            raise LiveChartUnavailable("At least 2 columns are required to compute feature importance.")
         y_s = num_df[tgt]
         for c in num_df.columns:
             if c == tgt:
@@ -1806,7 +1820,7 @@ def _build_feature_importance_pareto(
 
     pairs = [(k, v) for k, v in pairs if v > 0]
     if not pairs:
-        raise ValueError("No positive feature importance scores available.")
+        raise LiveChartUnavailable("No positive feature importance scores available.")
     pairs.sort(key=lambda kv: kv[1], reverse=True)
     top = pairs[:14]
     total = sum(v for _, v in top) or 1.0
@@ -1895,7 +1909,7 @@ def _build_empirical_ecdf_ks(
     if not raw_groups:
         full_arr = ser.dropna().to_numpy(dtype=float)
         if len(full_arr) < 2:
-            raise ValueError(f"Column '{col_x}' has fewer than 2 finite values.")
+            raise LiveChartUnavailable(f"Column '{col_x}' has fewer than 2 finite values.")
         raw_groups = [(disp_x, full_arr)]
 
     if len(raw_groups) >= 2:
@@ -1996,7 +2010,7 @@ def _build_stratified_violin_box(
     if not samples:
         arr = num_df[col_x].dropna().to_numpy(dtype=float)
         if len(arr) < 3:
-            raise ValueError("Violin & Boxplot requires at least 3 finite observations.")
+            raise LiveChartUnavailable("Violin & Boxplot requires at least 3 finite observations.")
         samples = [(disp_x, arr)]
         y_label = disp_x
         title_str = f"Violin & Tukey Box-Whisker — {disp_x}"
@@ -2067,7 +2081,7 @@ def _build_stratified_violin_box(
 def _build_normality_qq_plot(ser: pd.Series, disp_x: str) -> dict[str, Any]:
     arr = pd.to_numeric(ser, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna().to_numpy(dtype=float)
     if len(arr) < 5:
-        raise ValueError(f"Q-Q Plot requires at least 5 finite observations in '{disp_x}'.")
+        raise LiveChartUnavailable(f"Q-Q Plot requires at least 5 finite observations in '{disp_x}'.")
 
     arr_sorted = np.sort(arr)
     n = len(arr_sorted)
@@ -2148,7 +2162,7 @@ def _build_bivariate_regression_ci(
     pair = pair.dropna(subset=["x", "y"])
     n = len(pair)
     if n < 4:
-        raise ValueError(f"At least 4 paired finite rows are required between '{col_x}' and '{col_y}'.")
+        raise LiveChartUnavailable(f"At least 4 paired finite rows are required between '{col_x}' and '{col_y}'.")
 
     x_arr = pair["x"].to_numpy(dtype=float)
     y_arr = pair["y"].to_numpy(dtype=float)
@@ -2248,7 +2262,7 @@ def _extract_binary_clf_scores(
         label = classes[1]
         scores = model_eval.decision_scores
     else:
-        raise ValueError(model_eval.probability_error or "The estimator does not provide valid scores for this chart.")
+        raise LiveChartUnavailable(model_eval.probability_error or "The estimator does not provide valid scores for this chart.")
     y_bin = (model_eval.y_true == label).to_numpy(dtype=int)
     return y_bin, np.asarray(scores, dtype=float), str(label)
 
@@ -2256,7 +2270,7 @@ def _extract_binary_clf_scores(
 def _build_classifier_roc_curve(model_eval: _ResolvedModelEval) -> dict[str, Any]:
     y_bin, scores, pos_cls = _extract_binary_clf_scores(model_eval)
     if len(np.unique(y_bin)) < 2:
-        raise ValueError("Evaluation split contains only a single target class; ROC curve requires both positive and negative examples.")
+        raise LiveChartUnavailable("Evaluation split contains only a single target class; ROC curve requires both positive and negative examples.")
 
     fpr, tpr, thresholds = roc_curve(y_bin, scores)
     auc_val = float(roc_auc_score(y_bin, scores))
@@ -2299,7 +2313,7 @@ def _build_classifier_roc_curve(model_eval: _ResolvedModelEval) -> dict[str, Any
 def _build_classifier_pr_curve(model_eval: _ResolvedModelEval) -> dict[str, Any]:
     y_bin, scores, pos_cls = _extract_binary_clf_scores(model_eval)
     if len(np.unique(y_bin)) < 2:
-        raise ValueError("Evaluation split contains only a single target class; PR curve requires both classes.")
+        raise LiveChartUnavailable("Evaluation split contains only a single target class; PR curve requires both classes.")
 
     precision, recall, thresholds = precision_recall_curve(y_bin, scores)
     ap_val = float(average_precision_score(y_bin, scores))
@@ -2344,7 +2358,7 @@ def _build_classifier_pr_curve(model_eval: _ResolvedModelEval) -> dict[str, Any]
 def _build_classifier_calibration(model_eval: _ResolvedModelEval) -> dict[str, Any]:
     y_bin, scores, pos_cls = _extract_binary_clf_scores(model_eval, require_probabilities=True)
     if len(np.unique(y_bin)) < 2:
-        raise ValueError("Calibration reliability diagram requires both positive and negative outcomes.")
+        raise LiveChartUnavailable("Calibration reliability diagram requires both positive and negative outcomes.")
 
     scores_c = np.clip(scores, 0.0, 1.0)
     brier = float(brier_score_loss(y_bin, scores_c))
@@ -2446,7 +2460,7 @@ def _build_classifier_gain_lift(model_eval: _ResolvedModelEval) -> dict[str, Any
     total_pos = int(np.sum(y_bin))
     n = len(y_bin)
     if total_pos <= 0 or n < 4:
-        raise ValueError("Cumulative Gains & Lift curve requires at least 1 positive instance in the evaluation set.")
+        raise LiveChartUnavailable("Cumulative Gains & Lift curve requires at least 1 positive instance in the evaluation set.")
 
     order = np.argsort(-scores)
     y_sorted = y_bin[order]
@@ -2494,7 +2508,10 @@ def _build_classifier_gain_lift(model_eval: _ResolvedModelEval) -> dict[str, Any
 def _extract_actual_and_pred_numeric(state: dict[str, Any], model_eval: _ResolvedModelEval | None) -> tuple[np.ndarray, np.ndarray, str]:
     """Extract numeric ``(actual, predicted, label)`` from supervisory evaluation or active model."""
     sup = state.get("uap_supervisory_result")
-    if isinstance(sup, dict) and sup.get("trend_series"):
+    if (
+        isinstance(sup, dict) and sup.get("trend_series")
+        and (sup.get("kpis") or {}).get("task_mode") == "regression"
+    ):
         acts: list[float] = []
         preds: list[float] = []
         for pt in sup["trend_series"]:
@@ -2509,7 +2526,7 @@ def _extract_actual_and_pred_numeric(state: dict[str, Any], model_eval: _Resolve
             return np.asarray(acts, dtype=float), np.asarray(preds, dtype=float), lbl
 
     if model_eval is None:
-        raise ValueError("Train a model or run Studio 14 Supervisory Evaluation first.")
+        raise LiveChartUnavailable("Train a model or run Studio 14 Supervisory Evaluation first.")
 
     if model_eval.task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
         y_bin, scores, pos_cls = _extract_binary_clf_scores(model_eval, require_probabilities=True)
@@ -2519,7 +2536,7 @@ def _extract_actual_and_pred_numeric(state: dict[str, Any], model_eval: _Resolve
     y_p = np.asarray(model_eval.y_pred, dtype=float)
     mask = np.isfinite(y_a) & np.isfinite(y_p)
     if int(np.sum(mask)) < 4:
-        raise ValueError("At least 4 finite actual/predicted pairs are required.")
+        raise LiveChartUnavailable("At least 4 finite actual/predicted pairs are required.")
     return y_a[mask], y_p[mask], model_eval.model_name
 
 
@@ -2621,24 +2638,38 @@ def _build_cusum_sequential_control(
     disp_x: str,
     studio_id: str,
 ) -> dict[str, Any]:
-    sup = state.get("uap_supervisory_result")
-    if studio_id == "14" and isinstance(sup, dict) and sup.get("spc_points"):
-        raw_r = [_finite_float(p.get("residual"), math.nan) for p in sup["spc_points"] if isinstance(p, dict)]
-        arr = np.asarray([v for v in raw_r if math.isfinite(v)], dtype=float)
-        src_name = "Studio 14 Supervisory Residuals"
+    if studio_id == "14":
+        sup = state.get("uap_supervisory_result") or {}
+        limits = sup.get("spc_limits") or {}
+        mu0 = _finite_float(limits.get("center"), math.nan)
+        sigma0 = _finite_float(limits.get("sigma"), math.nan)
+        if not math.isfinite(mu0) or not math.isfinite(sigma0) or sigma0 <= 0:
+            raise LiveChartUnavailable("Supervisory CUSUM requires a verified held-out residual reference.")
+        residual_sequence = state.get("uap_supervisory_residual_sequence")
+        if isinstance(residual_sequence, np.ndarray) and residual_sequence.ndim == 1:
+            arr = residual_sequence
+        else:
+            points = sup.get("spc_points") or []
+            arr = np.asarray([_finite_float(p.get("residual"), math.nan) for p in points], dtype=float)
+        if len(arr) != (sup.get("kpis") or {}).get("n_records"):
+            raise LiveChartUnavailable("Supervisory CUSUM requires the full, ordered residual sequence.")
+        if not np.isfinite(arr).all():
+            raise LiveChartUnavailable("Supervisory CUSUM requires a complete sequential residual series.")
+        src_name = "Studio 14 residuals · held-out reference"
     else:
         arr = num_df[col_x].dropna().to_numpy(dtype=float)
-        src_name = disp_x
+        src_name = f"{disp_x} · retrospective reference"
+        if len(arr) < 6:
+            raise LiveChartUnavailable("Retrospective CUSUM needs at least five reference rows and one subsequent row.")
+        ref_n = max(5, len(arr) // 2)
+        mu0 = float(np.mean(arr[:ref_n]))
+        sigma0 = float(np.std(arr[:ref_n], ddof=1))
+        arr = arr[ref_n:]
+        if not math.isfinite(sigma0) or sigma0 <= 0:
+            raise LiveChartUnavailable("The retrospective reference has no estimable variation.")
 
-    if len(arr) < 5:
-        raise ValueError(f"CUSUM chart requires at least 5 finite sequential observations in '{src_name}'.")
-
-    # Reference baseline mean & SD estimated from baseline Phase-I window (first half, min 5)
-    ref_n = max(5, len(arr) // 2)
-    mu0 = float(np.mean(arr[:ref_n]))
-    sigma0 = float(np.std(arr[:ref_n], ddof=1))
-    if sigma0 <= 1e-12:
-        sigma0 = float(np.std(arr, ddof=1)) or 1.0
+    if not len(arr):
+        raise LiveChartUnavailable("No sequential observations are available for CUSUM.")
 
     z = (arr - mu0) / sigma0
     k_slack = 0.5
@@ -2670,7 +2701,7 @@ def _build_cusum_sequential_control(
     return {
         "title": f"Tabular CUSUM (C+ / C-) Drift Control Chart — {src_name}",
         "subtitle": f"Slack k = {k_slack}σ, Decision Interval H = ±{h_limit}σ · {n_alarms} alarm points"
-        + (f" (First shift at t = {first_alarm})" if first_alarm else " (In statistical control)"),
+        + (f" (First threshold crossing at t = {first_alarm})" if first_alarm else " (No threshold crossings)"),
         "kpis": {
             "Baseline Mean μ₀": round(mu0, 4),
             "Baseline SD σ₀": round(sigma0, 4),
@@ -2687,7 +2718,7 @@ def _build_cusum_sequential_control(
 def _build_lorenz_gini_curve(ser: pd.Series, disp_x: str) -> dict[str, Any]:
     arr = pd.to_numeric(ser, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna().to_numpy(dtype=float)
     if len(arr) < 3:
-        raise ValueError(f"Lorenz Curve requires at least 3 finite observations in '{disp_x}'.")
+        raise LiveChartUnavailable(f"Lorenz Curve requires at least 3 finite observations in '{disp_x}'.")
 
     min_v = float(np.min(arr))
     shifted = arr - min_v if min_v < 0 else arr.copy()
@@ -2734,7 +2765,7 @@ def _build_multivariate_parallel_coords(
 ) -> dict[str, Any]:
     cols = list(num_df.columns[:7])
     if len(cols) < 3:
-        raise ValueError("Parallel Coordinates requires at least 3 numeric/encodable columns.")
+        raise LiveChartUnavailable("Parallel Coordinates requires at least 3 numeric/encodable columns.")
 
     g_col = (
         group_col
@@ -2833,7 +2864,7 @@ def _build_ridgeline_kde_joyplot(
         title = "Multi-Feature Standardized Ridgeline KDE Plot"
 
     if not raw_ridges:
-        raise ValueError("Ridgeline KDE requires at least 3 finite observations.")
+        raise LiveChartUnavailable("Ridgeline KDE requires at least 3 finite observations.")
 
     all_v = np.concatenate([a for _, a in raw_ridges])
     lo, hi = float(np.percentile(all_v, 1)), float(np.percentile(all_v, 99))
@@ -2878,7 +2909,7 @@ def _build_alluvial_sankey_flow(
 ) -> dict[str, Any]:
     cols = [str(c) for c in df.columns]
     if len(cols) < 2:
-        raise ValueError("Alluvial / Sankey Flow requires at least 2 columns.")
+        raise LiveChartUnavailable("Alluvial / Sankey Flow requires at least 2 columns.")
     cat_cols = [str(c) for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
     col_src = feature_x if (feature_x and feature_x in df.columns) else (cat_cols[0] if cat_cols else cols[0])
     col_dst = (
@@ -2984,7 +3015,7 @@ def _build_data_lifecycle_funnel(state: dict[str, Any], raw_active: pd.DataFrame
 def _build_correlation_heatmap_svg(num_df: pd.DataFrame) -> dict[str, Any]:
     cols = [c for c in num_df.columns if num_df[c].nunique(dropna=True) > 1][:12]
     if len(cols) < 2:
-        raise ValueError("Correlation Heatmap requires at least 2 non-constant columns.")
+        raise LiveChartUnavailable("Correlation Heatmap requires at least 2 non-constant columns.")
     corr = num_df[cols].corr(method="pearson")
     mat_vals: list[list[float | None]] = []
     table_rows: list[list[Any]] = []
@@ -3022,7 +3053,7 @@ def _build_stacked_composition_bar(
 ) -> dict[str, Any]:
     cols = [str(c) for c in df.columns]
     if len(cols) < 2:
-        raise ValueError("Stacked Composition Bar Chart requires at least 2 columns.")
+        raise LiveChartUnavailable("Stacked Composition Bar Chart requires at least 2 columns.")
     cat_cols = [str(c) for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
     col_x = feature_x if (feature_x and feature_x in df.columns) else (cat_cols[0] if cat_cols else cols[0])
     col_g = (

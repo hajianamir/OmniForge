@@ -660,7 +660,7 @@ def reset_workspace(x_session_id: str | None = Header(default="default")) -> dic
     return {"state": _state_summary(state, sid)}
 
 
-@router.post("/workspace/save")
+@router.post("/workspace/save", dependencies=[Depends(require_permission("report:generate"))])
 def save_workspace_uap(
     project_name: str = Form(default="omniforge_project"),
     notes: str = Form(default=""),
@@ -1549,7 +1549,7 @@ def s02_run_clustering(req: ClusterReq, x_session_id: str | None = Header(defaul
                     "silhouette": -1.0,
                     "calinski_harabasz": 0.0,
                     "davies_bouldin": 99.0,
-                    "error": str(exc)[:120],
+                    "error": f"Clustering could not evaluate these rows ({type(exc).__name__}).",
                 }
             )
 
@@ -1982,7 +1982,8 @@ def s02_data_mining(req: MiningReq, x_session_id: str | None = Header(default="d
                 color_col=color,
             )
         except Exception as exc:
-            out["manifold"] = {"error": str(exc)}
+            logger.warning("manifold_projection_failed", error_type=type(exc).__name__)
+            out["manifold"] = {"error": "The manifold method could not evaluate the selected study columns."}
     state["uap_mining_result"] = out
     record_lineage(state, "Data Mining", f"Executed Data Mining ({mode})", f"Tasks={', '.join(tasks)}")
     return _cache_and_respond(state, sid, "s02_mining", dict(out))

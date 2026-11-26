@@ -13,8 +13,9 @@ from typing import Any
 import networkx as nx
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
 
+from omniforge.api.auth import require_permission
 from omniforge.api.studios.schemas import GraphReq, NLPReq, RecommendReq, SurvivalReq, TwinControlReq
 from omniforge.simulation import ClosedLoopMPCController, build_default_twin
 
@@ -61,7 +62,7 @@ def _nlp_backends() -> list[dict[str, Any]]:
 
         return list(probe_nlp_backends())
     except Exception as exc:  # pragma: no cover - defensive
-        return [{"id": "native_nlp", "name": "OmniForge Advanced NLP Suite (Offline Always-On)", "available": True, "version": "unknown", "probe_error": str(exc)}]
+        return [{"id": "native_nlp", "name": "OmniForge Advanced NLP Suite (Offline Always-On)", "available": True, "version": "unknown", "probe_error": type(exc).__name__}]
 
 
 def _vision_hub() -> Any:
@@ -76,7 +77,7 @@ def _vision_backends() -> dict[str, Any]:
 
         return dict(probe_vision_backends())
     except Exception as exc:  # pragma: no cover - defensive
-        return {"device": "cpu", "backends": [{"id": "native_pyramid", "name": "OmniForge Spatial-Pyramid Descriptor (Offline Always-On)", "available": True, "version": "unknown", "probe_error": str(exc)}]}
+        return {"device": "cpu", "backends": [{"id": "native_pyramid", "name": "OmniForge Spatial-Pyramid Descriptor (Offline Always-On)", "available": True, "version": "unknown", "probe_error": type(exc).__name__}]}
 
 
 def _graph_suite() -> Any:
@@ -502,7 +503,7 @@ def s09_graph(req: GraphReq, x_session_id: str | None = Header(default="default"
         except Exception as exc:
             supervised = {
                 "available": False,
-                "reason": f"{type(exc).__name__}: {exc}",
+                "reason": f"Model fitting could not be completed ({type(exc).__name__}).",
                 "metrics": {"roc_auc": None, "average_precision": None, "edge_operator": (req.edge_operator or "hadamard").lower(), "classifier": "rf"},
                 "top_predictions": [],
             }
@@ -517,7 +518,7 @@ def s09_graph(req: GraphReq, x_session_id: str | None = Header(default="default"
         except Exception as exc:
             neural = {
                 "available": False,
-                "reason": f"{type(exc).__name__}: {exc}",
+                "reason": f"Model fitting could not be completed ({type(exc).__name__}).",
                 "metrics": {"roc_auc": None, "average_precision": None},
                 "top_predictions": [],
             }
@@ -801,7 +802,7 @@ def s09_survival(req: SurvivalReq, x_session_id: str | None = Header(default="de
             }
         except Exception as exc:
             cox_payload = None
-            cox_note = f"CoxPH fit skipped: {type(exc).__name__}: {exc}"
+            cox_note = f"CoxPH fit could not be completed ({type(exc).__name__})."
     else:
         cox_note = "No additional numeric predictor columns available for Cox PH."
 
@@ -824,7 +825,7 @@ def s09_survival(req: SurvivalReq, x_session_id: str | None = Header(default="de
 # --------------------------------------------------------------------------- Phase 6 C7: Closed-Loop Digital Twin MPC
 
 
-@router.post("/s09/twin-control")
+@router.post("/s09/twin-control", dependencies=[Depends(require_permission("mlops:write"))])
 def s09_twin_control(
     req: TwinControlReq,
     x_session_id: str | None = Header(default=None),

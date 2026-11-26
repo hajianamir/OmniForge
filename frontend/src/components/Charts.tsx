@@ -528,6 +528,7 @@ export const SupervisoryTrendSVG: React.FC<{
     label?: string;
     record_id?: string;
     actual?: number | null;
+    threshold?: number;
     predicted?: number | null;
     model_pred?: number;
     baseline?: number | null;
@@ -543,7 +544,7 @@ export const SupervisoryTrendSVG: React.FC<{
 
   const vals: number[] = [];
   points.forEach((p) => {
-    [p.actual, p.model_pred ?? p.predicted, p.baseline_pred ?? p.baseline, p.tol_upper, p.tol_lower].forEach((v) => {
+    [p.actual, p.threshold, p.model_pred ?? p.predicted, p.baseline_pred ?? p.baseline, p.tol_upper, p.tol_lower].forEach((v) => {
       if (typeof v === 'number' && Number.isFinite(v)) vals.push(v);
     });
   });
@@ -594,6 +595,7 @@ export const SupervisoryTrendSVG: React.FC<{
   const modelPath = buildPath((p) => p.model_pred ?? p.predicted);
   const basePath = buildPath((p) => p.baseline_pred ?? p.baseline);
   const actualPath = buildPath((p) => p.actual);
+  const thresholdPath = buildPath((p) => p.threshold);
 
   return (
     <InspectableBox title={title} subtitle={`${points.length} operational readings`} compact>
@@ -612,6 +614,7 @@ export const SupervisoryTrendSVG: React.FC<{
         {corridor && <polygon points={corridor} fill="rgba(52, 211, 153, 0.14)" />}
         {basePath && <path d={basePath} fill="none" stroke="#a78bfa" strokeWidth={1.7} strokeDasharray="5 4" />}
         {modelPath && <path d={modelPath} fill="none" stroke="#38bdf8" strokeWidth={2.2} />}
+        {thresholdPath && <path d={thresholdPath} fill="none" stroke="#fbbf24" strokeWidth={1.8} strokeDasharray="4 3" aria-label="Accuracy threshold" />}
         {actualPath && <path d={actualPath} fill="none" stroke="var(--text)" strokeWidth={1.8} opacity={0.92} />}
 
         {points.map((p, i) => {
@@ -642,7 +645,7 @@ export const SupervisoryTrendSVG: React.FC<{
           <rect x={0} y={-8} width={10} height={8} fill="rgba(52,211,153,0.35)" />
           <text x={14} y={0} fill="#94a3b8">Tolerance Band</text>
           <line x1={102} y1={-4} x2={118} y2={-4} stroke="var(--text)" strokeWidth={2} />
-          <text x={122} y={0} fill="#94a3b8">Actual</text>
+          <text x={122} y={0} fill="#94a3b8">{thresholdPath ? "Threshold" : "Actual"}</text>
           <line x1={164} y1={-4} x2={180} y2={-4} stroke="#38bdf8" strokeWidth={2.2} />
           <text x={184} y={0} fill="#94a3b8">Model Pred</text>
           <line x1={254} y1={-4} x2={270} y2={-4} stroke="#a78bfa" strokeWidth={1.8} strokeDasharray="4 3" />
@@ -697,7 +700,7 @@ export const SPCControlSVG: React.FC<{
   }).join(' ');
 
   return (
-    <InspectableBox title={title} subtitle="Center Line (CL), Warning Limits (±W), Control Limits (UCL/LCL)" compact>
+    <InspectableBox title={title} subtitle={limits ? "Center Line (CL), Warning Limits (±W), Control Limits (UCL/LCL)" : "Reference control limits unavailable"} compact>
       <svg viewBox={`0 0 ${W} ${H}`} style={{ width: '100%', height, background: 'var(--bg)', borderRadius: 10 }}>
         {isFiniteNumber(ucl) && (
           <>
