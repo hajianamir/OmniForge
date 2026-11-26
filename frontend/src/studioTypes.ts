@@ -303,6 +303,7 @@ export interface EquationPayload {
 }
 
 export interface AutoMLResponse extends StateEnvelope {
+  target?: string;
   best_model_name?: string;
   best_score?: number;
   baseline_score?: number;

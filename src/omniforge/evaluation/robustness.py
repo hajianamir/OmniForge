@@ -22,8 +22,11 @@ def split_conformal_quantile(scores: np.ndarray, alpha: float) -> tuple[float, b
     ``k = ceil((n + 1) * (1 - alpha))``, matching the empirical inverted-CDF quantile
     ``Quantile(s_1, ..., s_n; k / n)`` without NumPy's ``method='higher'`` +1 shift
     or floating-point rounding drift. Returns ``(q_hat, finite_sample_valid)`` where
-    ``finite_sample_valid`` is ``True`` iff ``k <= n`` (guaranteeing coverage in
-    ``[1 - alpha, 1 - alpha + 1/(n+1)]`` under exchangeability).
+    ``finite_sample_valid`` is ``True`` iff ``k <= n``. Under exchangeability the
+    valid order statistic gives marginal coverage at least ``1 - alpha``.
+    An upper bound also requires appropriate tie assumptions. If the rank is
+    unavailable, the numerical result is the maximum observed score and is
+    not a guaranteed threshold.
     """
     arr = np.asarray(scores, dtype=float).ravel()
     arr = arr[np.isfinite(arr)]
@@ -111,7 +114,7 @@ class ConformalPredictor:
             scores = np.abs(y_arr.astype(float) - preds)
 
         self.quantile_, self.finite_sample_valid_ = split_conformal_quantile(scores, self.alpha)
-        self.n_calibration_ = n
+        self.n_calibration_ = int(np.isfinite(scores).sum())
         self.group_quantiles_ = {}
         self.group_validity_ = {}
         if groups is not None:
@@ -136,12 +139,17 @@ class ConformalPredictor:
         return self
 
     def _resolve_thresholds(self, n_rows: int, groups: np.ndarray | pd.Series | list[Any] | None) -> np.ndarray:
+        marginal_threshold = self.quantile_ if self.finite_sample_valid_ else np.inf
         if groups is None or not self.group_quantiles_:
-            return np.full(n_rows, self.quantile_, dtype=float)
+            return np.full(n_rows, marginal_threshold, dtype=float)
         g_arr = np.asarray(groups).astype(str)
         if len(g_arr) != n_rows:
             raise EvaluationError("groups length must match X row count.")
-        return np.array([self.group_quantiles_.get(g, self.quantile_) for g in g_arr], dtype=float)
+        return np.array([
+            self.group_quantiles_[g] if self.group_validity_.get(g, False)
+            else np.inf if g in self.group_quantiles_ else marginal_threshold
+            for g in g_arr
+        ], dtype=float)
 
     def predict_intervals(
         self,

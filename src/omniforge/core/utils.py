@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import math
 import os
 import platform
 import random
@@ -327,3 +328,34 @@ def infer_semantic_column_type(series: pd.Series) -> str:
     if unique_ratio > 0.95 and len(series) >= 20:
         return "identifier"
     return "categorical"
+
+
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def sanitize_spreadsheet_value(val: Any) -> Any:
+    """Neutralize spreadsheet formula injection (CWE-1236) in CSV/XLSX string cells.
+
+    Preserves legitimate signed numeric literals (e.g. ``"-42.5"``, ``"+3.14e-2"``) while
+    prefixing a leading single quote onto strings starting with ``=``, ``+``, ``-``, ``@``,
+    tab, or carriage-return characters.
+    """
+    if isinstance(val, str) and val:
+        stripped = val.lstrip(" ")
+        if val[0] in ("\t", "\r") or stripped.startswith(_FORMULA_PREFIXES):
+            if stripped[0] in ("+", "-"):
+                try:
+                    num = float(stripped)
+                    if math.isfinite(num):
+                        return val
+                except ValueError:
+                    pass
+            return f"'{val}"
+    return val
+
+
+def sanitize_spreadsheet_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Prepare values and headers for spreadsheet exports without changing the source frame."""
+    safe = frame.map(sanitize_spreadsheet_value, na_action="ignore")
+    safe.columns = frame.columns.map(sanitize_spreadsheet_value)
+    return safe

@@ -71,15 +71,19 @@ else:
 
 rest = call(rest_models, bearer=token)["versions"]
 wb = call(workbench + "/s11/overview", bearer=token)["registered_models"]
-assert [(v["model_name"], v["version"], v["stage"]) for v in rest] == [("rest-smoke", 1, "Staging")]
-assert [(v["model_name"], v["version"], v["stage"]) for v in wb] == [("workbench-smoke", 1, "Production")]
-assert wb[0]["fairness_evidence"]["artifact_checksum"] == wb[0]["checksum_sha256"]
-assert wb[0]["fairness_evidence"]["version"] == 1
-for version in rest + wb:
+expected = [("rest-smoke", 1, "Staging"), ("workbench-smoke", 1, "Production")]
+assert [(v["model_name"], v["version"], v["stage"]) for v in rest] == expected
+assert [(v["model_name"], v["version"], v["stage"]) for v in wb] == expected
+assert wb[1]["fairness_evidence"]["artifact_checksum"] == wb[1]["checksum_sha256"]
+assert wb[1]["fairness_evidence"]["version"] == 1
+assert rest == wb
+for version in rest:
     path = Path(version["artifact_path"])
     assert path.is_relative_to("/var/lib/omniforge/tenants"), path
-    assert BaseOmniForgeModel.load(path, encrypted=version["encrypted_at_rest"]).is_fitted_
-print(json.dumps([v["checksum_sha256"] for v in rest + wb] + [wb[0]["fairness_evidence"]["holdout_fingerprint"]]))
+    assert BaseOmniForgeModel.load(
+        path, encrypted=version["encrypted_at_rest"], expected_artifact_checksum=version["checksum_sha256"],
+    ).is_fitted_
+print(json.dumps([v["checksum_sha256"] for v in rest] + [wb[1]["fairness_evidence"]["holdout_fingerprint"]]))
 """
 
 
@@ -131,7 +135,7 @@ def main() -> None:
         reader, after = phase(f"{prefix}-ui", "ui", "8501", "read")
         if writer == reader or before != after:
             raise RuntimeError("Registry versions, artifacts, or evidence changed after container replacement.")
-        print("Verified both tenant registries, signed artifacts, and bound evidence after container replacement.")
+        print("Verified the shared tenant registry through both APIs, signed artifacts, and bound evidence after container replacement.")
     finally:
         docker("volume", "rm", volume, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 

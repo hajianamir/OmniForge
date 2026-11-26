@@ -9,6 +9,7 @@ import pandas as pd
 from sklearn.linear_model import Ridge
 
 from omniforge.core.types import TaskType
+from omniforge.core.utils import to_json_safe
 from omniforge.evaluation.robustness import ConformalPredictor, split_conformal_quantile
 from omniforge.models.base import BaseOmniForgeModel
 
@@ -471,16 +472,17 @@ class InterpretabilityEngine:
         if is_clf:
             cp = ConformalPredictor(model, alpha=a, score_method="aps", random_seed=self.random_seed)
             cp.calibrate(X_calib, y_arr)
-            pred_sets = cp.predict_sets(x_row)
+            pred_sets = cp.predict_sets(x_row) if cp.finite_sample_valid_ else []
             pred_set = pred_sets[0] if pred_sets else []
             return {
                 "method": "conformal_aps_prediction_set",
                 "task_type": str(model.task_type),
                 "alpha": a,
-                "coverage_guarantee": round(1.0 - a, 6),
+                "nominal_coverage": round(1.0 - a, 6),
+                "coverage_guarantee": round(1.0 - a, 6) if cp.finite_sample_valid_ else None,
                 "finite_sample_valid": bool(cp.finite_sample_valid_),
                 "prediction": round(pred, 6),
-                "prediction_set": sorted(int(v) for v in pred_set),
+                "prediction_set": to_json_safe(pred_set) if cp.finite_sample_valid_ else None,
                 "n_calibration": int(cp.n_calibration_),
             }
 
@@ -488,16 +490,17 @@ class InterpretabilityEngine:
         calib_preds = np.asarray(model.predict(X_calib), dtype=float).ravel()
         scores = np.abs(calib_preds - y_arr)
         q_hat, finite_sample_valid = split_conformal_quantile(scores, a)
-        lower = round(float(pred - q_hat), 6)
-        upper = round(float(pred + q_hat), 6)
+        lower = float(pred - q_hat)
+        upper = float(pred + q_hat)
         return {
             "method": "conformal_lac_interval",
             "task_type": str(model.task_type),
             "alpha": a,
-            "coverage_guarantee": round(1.0 - a, 6),
+            "nominal_coverage": round(1.0 - a, 6),
+            "coverage_guarantee": round(1.0 - a, 6) if finite_sample_valid else None,
             "finite_sample_valid": bool(finite_sample_valid),
-            "prediction": round(pred, 6),
-            "interval": [lower, upper],
-            "half_width": float(upper - lower) / 2,
-            "n_calibration": int(len(scores)),
+            "prediction": pred,
+            "interval": [lower, upper] if finite_sample_valid else None,
+            "half_width": (upper - lower) / 2 if finite_sample_valid else None,
+            "n_calibration": int(np.isfinite(scores).sum()),
         }

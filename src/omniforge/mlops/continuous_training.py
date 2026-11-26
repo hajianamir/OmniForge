@@ -184,8 +184,8 @@ class ContinuousTrainingOrchestrator:
                 champion_score is not None
                 and challenger_score >= champion_score + min_improvement
             )
-            promoted = would_have_promoted and self.auto_promote
-            if would_have_promoted and not self.auto_promote:
+            promoted = would_have_promoted and self.auto_promote and not self.registry.require_fairness_gate
+            if would_have_promoted and not promoted:
                 logger.warning(
                     "continuous_training_auto_promotion_withheld",
                     model=model_name,
@@ -198,7 +198,7 @@ class ContinuousTrainingOrchestrator:
                     details={
                         "challenger_score": round(challenger_score, 6),
                         "champion_score": round(champion_score, 6) if champion_score is not None else None,
-                        "env": "OMNIFORGE_CT_AUTO_PROMOTE",
+                        "reason": "fairness_evidence_required" if self.registry.require_fairness_gate else "auto_promote_disabled",
                         "stage": ModelStage.STAGING.value,
                     },
                 )
@@ -238,7 +238,7 @@ class ContinuousTrainingOrchestrator:
             "drift_report": drift_report.model_dump(),
             "kill_switch": False,
             "auto_promote": self.auto_promote,
-            "promotion_withheld": would_have_promoted and not self.auto_promote,
+            "promotion_withheld": would_have_promoted and not promoted,
         }
 
     def monitor_and_rollback(

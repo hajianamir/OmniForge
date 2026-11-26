@@ -282,7 +282,7 @@ export const Studio01Data: React.FC<StudioProps & { sectionMode?: 'ingestion' | 
   const [imputeCat, setImputeCat] = useState('most_frequent');
   const [dropDups, setDropDups] = useState(true);
   const [outlierMethod, setOutlierMethod] = useState('iqr');
-  const [outlierAction, setOutlierAction] = useState('clip');
+  const [outlierAction, setOutlierAction] = useState('flag');
   const [outlierThresh, setOutlierThresh] = useState(1.5);
   const [stdMissingTokens, setStdMissingTokens] = useState(true);
   const [cleanStrings, setCleanStrings] = useState(true);
@@ -685,7 +685,7 @@ export const Studio01Data: React.FC<StudioProps & { sectionMode?: 'ingestion' | 
           )}
           {cleanMode === 'complete' && (
             <p style={{ margin: '0 0 12px', fontSize: 12.5, color: 'var(--text-muted)' }}>
-              <strong>Complete (Select All)</strong> executes the full enterprise remediation stack: missing-token standardization, whitespace/HTML strip, type inference, high-missing (&gt;80%) &amp; constant-column drop, missingness indicator flags, exact duplicate deduplication, median/mode imputation, and IQR outlier clipping.
+              <strong>Complete (Select All)</strong> standardizes missing tokens, removes whitespace and HTML, infers types, drops high-missing and constant columns, adds missingness indicators, removes exact duplicates, imputes missing values, and flags IQR outliers.
             </p>
           )}
 

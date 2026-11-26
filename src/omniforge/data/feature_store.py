@@ -78,8 +78,10 @@ class FeatureViewSpec(BaseModel):
 class LocalFeatureStore:
     """Production-ready Feast-compatible Feature Store with point-in-time joins and online serving."""
 
-    def __init__(self, repo_path: str | Path = "./.omniforge_workspace/feature_store") -> None:
-        self.repo_path = Path(repo_path)
+    def __init__(self, repo_path: str | Path | None = None) -> None:
+        from omniforge.config.settings import get_settings
+
+        self.repo_path = Path(repo_path) if repo_path is not None else get_settings().paths.workspace_dir / "feature_store"
         self.repo_path.mkdir(parents=True, exist_ok=True)
         self._offline_dir = self.repo_path / "offline"
         self._offline_dir.mkdir(parents=True, exist_ok=True)

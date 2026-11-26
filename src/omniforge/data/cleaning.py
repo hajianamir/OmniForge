@@ -131,6 +131,8 @@ class _FittedCleanerState:
     missforest_models: dict[str, tuple[Any, list[str]]] = field(default_factory=dict)
     missing_indicator_cols: list[str] = field(default_factory=list)
     outlier_bounds: dict[str, tuple[float, float]] = field(default_factory=dict)
+    outlier_flag_columns: dict[str, str] = field(default_factory=dict)
+    multivariate_flag_column: str = "__is_multivariate_outlier"
     multivariate_detector: Any | None = None
     detector_fitted: bool = False
     multivariate_columns: list[str] = field(default_factory=list)
@@ -334,6 +336,16 @@ class DataCleaner:
             self._state.multivariate_columns = list(num_cols)
             self._state.multivariate_medians = mv_meds
             self._state.detector_fitted = True
+
+        if self.config.outlier_action == "flag":
+            used_columns = set(work.columns)
+            for source_col in self._state.outlier_bounds:
+                flag_name = self._reserve_flag_column(used_columns, source_col, "__is_outlier")
+                self._state.outlier_flag_columns[source_col] = flag_name
+            if self._state.multivariate_detector is not None:
+                self._state.multivariate_flag_column = self._reserve_flag_column(
+                    used_columns, "", "__is_multivariate_outlier",
+                )
 
         if self.config.outlier_method != "none" and self.config.outlier_action != "none" and len(work) > 0:
             work, _, outlier_flag_cols, _, _, _ = self._handle_outliers(work, excluded)
@@ -718,6 +730,16 @@ class DataCleaner:
                 seen.append(norm)
         return df.loc[keep_mask].copy(), removed, keep_mask
 
+    @staticmethod
+    def _reserve_flag_column(used_columns: set[Any], prefix: str, suffix: str) -> str:
+        name = f"{prefix}{suffix}"
+        index = 2
+        while name in used_columns:
+            name = f"{prefix}_{index}{suffix}"
+            index += 1
+        used_columns.add(name)
+        return name
+
     def _handle_outliers(
         self, df: pd.DataFrame, excluded: set[str]
     ) -> tuple[pd.DataFrame, dict[str, int], list[str], pd.DataFrame, np.ndarray, list[str]]:
@@ -740,6 +762,10 @@ class DataCleaner:
                 series = df[col].astype(float)
                 mask = (series < low) | (series > high)
                 count = int(mask.sum())
+                if action == "flag":
+                    flag_name = self._state.outlier_flag_columns[col]
+                    df[flag_name] = mask.astype(np.int8)
+                    flag_cols.append(flag_name)
                 if count > 0:
                     detected[col] = count
                     if action == "clip":
@@ -750,10 +776,6 @@ class DataCleaner:
                         rows_to_drop |= mask
                         for pos in np.flatnonzero(mask.to_numpy(dtype=bool)):
                             per_row_cols.setdefault(int(pos), []).append(col)
-                    elif action == "flag":
-                        flag_name = f"{col}__is_outlier"
-                        df[flag_name] = mask.astype(np.int8)
-                        flag_cols.append(flag_name)
             if action == "remove" and rows_to_drop.any():
                 drop_arr = rows_to_drop.to_numpy(dtype=bool)
                 removed_pos = np.flatnonzero(drop_arr)
@@ -772,14 +794,18 @@ class DataCleaner:
             and self._state.multivariate_columns
         ):
             cols_present = [c for c in self._state.multivariate_columns if c in df.columns]
-            if len(cols_present) == len(self._state.multivariate_columns) and len(df) > 0:
+            if len(cols_present) == len(self._state.multivariate_columns) and (len(df) > 0 or action == "flag"):
                 matrix = df[cols_present].copy()
                 for c in cols_present:
                     med = self._state.multivariate_medians.get(c, 0.0)
                     matrix[c] = pd.to_numeric(matrix[c], errors="coerce").fillna(med)
-                preds = self._state.multivariate_detector.predict(matrix.to_numpy(dtype=float))
+                preds = self._state.multivariate_detector.predict(matrix.to_numpy(dtype=float)) if len(df) else np.empty(0)
                 mask = pd.Series(preds == -1, index=df.index)
                 count = int(mask.sum())
+                if action == "flag":
+                    flag_name = self._state.multivariate_flag_column
+                    df[flag_name] = mask.astype(np.int8)
+                    flag_cols.append(flag_name)
                 if count > 0:
                     detected["__multivariate__"] = count
                     if action == "remove":
@@ -788,9 +814,6 @@ class DataCleaner:
                         removed_df = df.iloc[removed_pos].copy()
                         removed_reasons = [f"Multivariate Outlier Removed ({method.upper()})"] * len(removed_pos)
                         df = df.loc[~drop_arr].copy()
-                    elif action == "flag":
-                        df["__is_multivariate_outlier"] = mask.astype(np.int8)
-                        flag_cols.append("__is_multivariate_outlier")
                     elif action == "nan":
                         df.loc[mask, cols_present] = np.nan
                     elif action == "clip":

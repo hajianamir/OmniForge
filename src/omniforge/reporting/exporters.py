@@ -6,7 +6,6 @@ import base64
 import csv
 import io
 import json
-import math
 import re
 import tempfile
 import zipfile
@@ -23,31 +22,9 @@ from openpyxl.utils import get_column_letter
 from omniforge.core.exceptions import ReportingError
 from omniforge.core.logging import get_logger
 from omniforge.core.utils import safe_json_default
+from omniforge.core.utils import sanitize_spreadsheet_value as sanitize_spreadsheet_value
 
 logger = get_logger(__name__)
-
-_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
-
-
-def sanitize_spreadsheet_value(val: Any) -> Any:
-    """Neutralize spreadsheet formula injection (CWE-1236) in CSV/XLSX string cells.
-
-    Preserves legitimate signed numeric literals (e.g. ``"-42.5"``, ``"+3.14e-2"``) while
-    prefixing a leading single quote onto strings starting with ``=``, ``+``, ``-``, ``@``,
-    tab, or carriage-return characters.
-    """
-    if isinstance(val, str) and val:
-        stripped = val.lstrip(" ")
-        if val[0] in ("\t", "\r") or stripped.startswith(_FORMULA_PREFIXES):
-            if stripped[0] in ("+", "-"):
-                try:
-                    num = float(stripped)
-                    if math.isfinite(num):
-                        return val
-                except ValueError:
-                    pass
-            return f"'{val}"
-    return val
 
 # Logical mapping from table names to report section IDs for contextual placement
 _TABLE_SECTION_MAP: dict[str, str] = {
@@ -804,7 +781,7 @@ class ReportExporters:
                         name="Calibri", size=12, bold=True, color="0F172A"
                     )
                     cur_row += 1
-                    ws_ch.cell(row=cur_row, column=2, value=str(ch.get("caption", ""))).font = Font(
+                    ws_ch.cell(row=cur_row, column=2, value=sanitize_spreadsheet_value(str(ch.get("caption", "")))).font = Font(
                         name="Calibri", size=9.5, italic=True, color="475569"
                     )
                     ws_ch.cell(row=cur_row, column=2).alignment = wrap_align
@@ -957,7 +934,8 @@ class ReportExporters:
                 p.runs[0].font.size = Pt(10)
             for b in sec.get("bullets") or []:
                 bp_item = doc.add_paragraph(str(b), style="List Bullet")
-                bp_item.runs[0].font.size = Pt(9.5)
+                if bp_item.runs:
+                    bp_item.runs[0].font.size = Pt(9.5)
 
             # Detailed Mathematical Formulas / Equations Callout Cards
             if sid == "mathematical_equations" and payload.get("formulas_and_rules"):
@@ -1031,7 +1009,8 @@ class ReportExporters:
             doc.add_heading("Prioritized Action Plan & Recommendations", level=1)
             for rec in payload["recommendations"]:
                 rp = doc.add_paragraph(str(rec), style="List Number")
-                rp.runs[0].font.size = Pt(9.5)
+                if rp.runs:
+                    rp.runs[0].font.size = Pt(9.5)
 
         # Ensure qn referenced cleanly (no unused import lint)
         _ = qn

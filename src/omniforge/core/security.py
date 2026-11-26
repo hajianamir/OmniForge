@@ -1134,10 +1134,14 @@ class AccessController:
         Raises:
             AuthorizationError: If any authorization check fails.
         """
-        if self._enforce_tenant_isolation and resource_tenant_id is not None:
-            cross_tenant = principal.tenant_id != resource_tenant_id
+        cross_tenant = (
+            self._enforce_tenant_isolation
+            and resource_tenant_id is not None
+            and principal.tenant_id != resource_tenant_id
+        )
+        decision_error: AuthorizationError | None = None
+        try:
             if cross_tenant and "platform_admin" not in principal.roles:
-                self._audit_cross_tenant(principal, permission, str(resource_tenant_id), status="denied")
                 raise AuthorizationError(
                     f"Cross-tenant access denied for principal '{principal.subject}'.",
                     context={
@@ -1146,32 +1150,40 @@ class AccessController:
                     },
                     suggestions=["Authenticate within the target tenant context."],
                 )
-            if cross_tenant:
-                try:
-                    self._audit_cross_tenant(principal, permission, str(resource_tenant_id), status="success")
-                except OSError as exc:
+            if permission not in self.get_permissions(principal):
+                raise AuthorizationError(
+                    f"Principal '{principal.subject}' lacks required permission '{permission}'.",
+                    context={"roles": principal.roles, "required_permission": permission},
+                    suggestions=["Request elevated role assignment from a platform administrator."],
+                )
+
+            for attr_key, expected_val in (required_attributes or {}).items():
+                if principal.attributes.get(attr_key) != expected_val:
+                    raise AuthorizationError(
+                        f"ABAC policy check failed for attribute '{attr_key}'.",
+                        context={"attribute": attr_key},
+                    )
+        except AuthorizationError as exc:
+            decision_error = exc
+
+        if cross_tenant:
+            try:
+                self._audit_cross_tenant(
+                    principal, permission, str(resource_tenant_id),
+                    status="denied" if decision_error is not None else "success",
+                )
+            except OSError as exc:
+                if decision_error is None:
                     raise SecurityError(
                         "Cross-tenant authorization refused: the mandatory audit record could not be written.",
                         suggestions=[
                             "Check audit log writability/disk space; cross-tenant access is fail-closed by design.",
                         ],
                     ) from exc
+                raise decision_error from exc
 
-        effective_permissions = self.get_permissions(principal)
-        if permission not in effective_permissions:
-            raise AuthorizationError(
-                f"Principal '{principal.subject}' lacks required permission '{permission}'.",
-                context={"roles": principal.roles, "required_permission": permission},
-                suggestions=["Request elevated role assignment from a platform administrator."],
-            )
-
-        if required_attributes:
-            for attr_key, expected_val in required_attributes.items():
-                if principal.attributes.get(attr_key) != expected_val:
-                    raise AuthorizationError(
-                        f"ABAC policy check failed for attribute '{attr_key}'.",
-                        context={"attribute": attr_key},
-                    )
+        if decision_error is not None:
+            raise decision_error
         return True
 
 
@@ -1733,13 +1745,15 @@ class AuditLogger:
 
     def __init__(
         self,
-        log_path: str | Path = "./.omniforge_workspace/audit.jsonl",
+        log_path: str | Path | None = None,
         *,
         anchor_path: str | Path | None = None,
         checkpoint_key: str | bytes | None = None,
         anchor_every: int | None = None,
     ) -> None:
-        self._path = Path(log_path)
+        from omniforge.config.settings import get_settings
+
+        self._path = Path(log_path) if log_path is not None else get_settings().paths.audit_log_path
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._audit_signer: ArtifactSigner | None = None
         self._last_hash = "0" * 64

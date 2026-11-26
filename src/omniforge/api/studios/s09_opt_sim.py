@@ -14,9 +14,8 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile
-from pydantic import BaseModel, Field
 
-from omniforge.api.studios.schemas import TwinControlReq
+from omniforge.api.studios.schemas import GraphReq, NLPReq, RecommendReq, SurvivalReq, TwinControlReq
 from omniforge.simulation import ClosedLoopMPCController, build_default_twin
 
 router: APIRouter = APIRouter(tags=["workbench-s09"])
@@ -38,36 +37,6 @@ def _wb() -> Any:
 
 
 # ---------------------------------------------------------------------------
-# Request models
-# ---------------------------------------------------------------------------
-class NLPReq(BaseModel):
-    task: str = Field(default="overview", description="overview|zero_shot|qa|semantic_search|emotions|pii_toxicity|topics|cluster")
-    custom_texts: list[str] = Field(default_factory=list)
-    candidate_labels: list[str] = Field(default_factory=list)
-    question: str = ""
-    query: str = ""
-
-
-class GraphReq(BaseModel):
-    source_col: str | None = None
-    target_col: str | None = None
-    link_method: str = "ensemble_rrf"
-    edge_operator: str = "hadamard"
-    run_supervised: bool = True
-    run_neural_gae: bool = True
-    top_k: int = Field(default=12, ge=1, le=50)
-
-
-class RecommendReq(BaseModel):
-    top_k: int = Field(default=12, ge=1, le=25)
-
-
-class SurvivalReq(BaseModel):
-    duration_col: str | None = None
-    event_col: str | None = None
-
-
-# ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
 def _clean_texts(req_texts: list[str]) -> list[str]:
@@ -80,10 +49,10 @@ def _clean_labels(req_labels: list[str]) -> list[str]:
     return labels if labels else list(_DEFAULT_LABELS)
 
 
-def _nlp_suite() -> Any:
+def _nlp_suite(*, use_pretrained: bool = False) -> Any:
     from omniforge.models.nlp.advanced_nlp import AdvancedNLPSuite
 
-    return AdvancedNLPSuite(random_seed=42, use_pretrained=False)
+    return AdvancedNLPSuite(random_seed=42, use_pretrained=use_pretrained)
 
 
 def _nlp_backends() -> list[dict[str, Any]]:
@@ -121,7 +90,8 @@ def _safe(section: str, fn: Any, fallback: Any) -> Any:
     try:
         return fn()
     except Exception as exc:
-        return {**(fallback if isinstance(fallback, dict) else {"data": fallback}), "section": section, "error": f"{type(exc).__name__}: {exc}"}
+        _wb().logger.warning("specialized_analysis_failed", section=section, error_type=type(exc).__name__)
+        return {**(fallback if isinstance(fallback, dict) else {"data": fallback}), "section": section, "error": "This analysis could not be evaluated."}
 
 
 def _synthetic_benchmark_scene() -> np.ndarray:
@@ -213,13 +183,24 @@ def s09_nlp(req: NLPReq, x_session_id: str | None = Header(default="default")) -
     sid = wb._sid(x_session_id)
     state = wb.get_session_state(sid)
 
-    texts = _clean_texts(req.custom_texts)
+    text_source = "provided_text" if any(text.strip() for text in req.custom_texts) else "example"
+    if req.text_col is not None:
+        active = wb.get_analysis_dataframe(state, wb._require_df(state))
+        if req.text_col not in active:
+            raise HTTPException(status_code=400, detail="The selected text column is outside the active study columns.")
+        observed = active[req.text_col].dropna().astype(str).str.strip()
+        texts = observed.loc[observed.ne("")].head(500).tolist()
+        if not texts:
+            raise HTTPException(status_code=400, detail="The selected text column has no observed text.")
+        text_source = "active_dataset"
+    else:
+        texts = _clean_texts(req.custom_texts)
     labels = _clean_labels(req.candidate_labels)
     question = (req.question or "").strip() or _DEFAULT_QUESTION
     query = (req.query or "").strip() or question
     task = (req.task or "overview").strip().lower()
-    suite = _nlp_suite()
-    context = " ".join(texts)
+    suite = _nlp_suite(use_pretrained=req.use_pretrained)
+    context = req.context.strip() or " ".join(texts)
 
     def _zero_shot() -> Any:
         return suite.zero_shot_classify(texts, labels)
@@ -237,16 +218,18 @@ def s09_nlp(req: NLPReq, x_session_id: str | None = Header(default="default")) -
         return suite.screen_toxicity_and_pii(texts)
 
     def _topics() -> Any:
-        return suite.extract_topics_lda(texts, n_topics=4, top_words=8)
+        return suite.extract_topics_lda(texts, n_topics=req.n_topics, top_words=8)
 
     def _cluster() -> Any:
-        cluster = suite.cluster_documents(texts, n_clusters=min(3, len(texts)))
+        cluster = suite.cluster_documents(texts, n_clusters=min(req.n_clusters, len(texts)))
         cluster["near_duplicates"] = suite.find_near_duplicates(texts, threshold=0.78)
         return cluster
 
     result: dict[str, Any] = {
         "task": task,
         "texts_analyzed": len(texts),
+        "text_source": text_source,
+        "text_column": req.text_col,
         "backends": _nlp_backends(),
     }
 
@@ -279,10 +262,6 @@ def s09_nlp(req: NLPReq, x_session_id: str | None = Header(default="default")) -
             status_code=400,
             detail=f"Unknown NLP task '{task}'. Expected one of: overview, zero_shot, qa, semantic_search, emotions, pii_toxicity, topics, cluster.",
         )
-
-    # The overview contract requires a non-empty zero_shot section; enforce it loudly.
-    if task == "overview" and not result.get("zero_shot"):
-        result["zero_shot"] = [{"text": texts[0][:140], "top_label": labels[0], "confidence": 0.0, "scores": {lb: 0.0 for lb in labels}, "backend": "unavailable"}]
 
     wb.record_lineage(state, "Studio 09 NLP", f"Ran NLP task '{task}' on {len(texts)} document(s)", "Backends: native/optional probed")
     payload: dict[str, Any] = wb._cache_and_respond(state, sid, "s09_nlp", result)
@@ -668,6 +647,46 @@ def s09_recommend(req: RecommendReq, x_session_id: str | None = Header(default="
     top_k = int(req.top_k)
 
     df = state.get("uap_df")
+    if any(value is not None for value in (req.user_col, req.item_col, req.rating_col, req.user_id)):
+        from omniforge.models.recommendation.recommender import HybridRecommender
+
+        if not isinstance(df, pd.DataFrame) or df.empty or not req.user_col or not req.item_col or req.user_id is None:
+            raise HTTPException(status_code=400, detail="Select user and item columns and enter a user ID.")
+        interactions = wb.get_analysis_dataframe(state, df)
+        keys = [req.user_col, req.item_col] + ([req.rating_col] if req.rating_col is not None else [])
+        if len(set(keys)) != len(keys) or any(key not in interactions for key in keys):
+            raise HTTPException(status_code=400, detail="Interaction columns must be distinct active columns.")
+        interactions = interactions.loc[:, keys].dropna().copy()
+        if req.rating_col is not None:
+            ratings = pd.to_numeric(interactions[req.rating_col], errors="coerce")
+            if not np.isfinite(ratings).all():
+                raise HTTPException(status_code=400, detail="Ratings must be finite numeric values.")
+            interactions[req.rating_col] = ratings
+        n_users = interactions[req.user_col].nunique()
+        n_items = interactions[req.item_col].nunique()
+        if not n_users or not n_items:
+            raise HTTPException(status_code=400, detail="No complete user–item records are available.")
+        if n_items * (n_users + n_items) > 4_000_000:
+            raise HTTPException(status_code=400, detail="This interaction set exceeds the current recommender matrix limit.")
+        observed = interactions.loc[interactions[req.user_col].astype(str).eq(req.user_id), req.user_col].unique()
+        user_id = observed[0] if len(observed) == 1 else req.user_id
+        if len(observed) > 1:
+            raise HTTPException(status_code=400, detail="The user identifier is ambiguous in the selected column.")
+        recommender = HybridRecommender().fit(
+            interactions, user_col=req.user_col, item_col=req.item_col,
+            rating_col=req.rating_col if req.rating_col is not None else "",
+        )
+        item_results = recommender.recommend(user_id, top_k=top_k)
+        item_payload: dict[str, Any] = wb._cache_and_respond(state, sid, "s09_recommend", {
+            "strategy": "fitted_item_recommender",
+            "n_rows": len(interactions),
+            "n_features": len(keys),
+            "recommendations": [
+                {"item": row["item_id"], "category": "catalog_item", "score": row["score"], "reason": row["strategy"], "rank": index}
+                for index, row in enumerate(item_results, start=1)
+            ],
+        })
+        return item_payload
     has_df = isinstance(df, pd.DataFrame) and not df.empty
     target = None
     if has_df:

@@ -124,8 +124,8 @@ class TestClaim1_PromotePermission:
         found = False
         for route in s11_mlops.router.routes:
             if hasattr(route, "path") and route.path == "/s11/promote":
-                deps = getattr(route, "dependencies", [])
-                dep_dependencies = [getattr(d, "dependency", None) for d in deps]
+                deps = route.dependant.dependencies
+                dep_dependencies = [dep.call for dep in deps]
                 # require_permission returns a _checker closure, so check by name
                 assert any(
                     getattr(dep, "__name__", None) == "_checker" for dep in dep_dependencies

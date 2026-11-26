@@ -20,7 +20,13 @@ from sklearn.metrics import accuracy_score, r2_score
 
 from omniforge.core.carbon import CarbonTracker
 from omniforge.core.constants import DEFAULT_RANDOM_SEED
-from omniforge.core.exceptions import ModelNotFittedError, ModelSerializationError, ModelTrainingError, SecurityError
+from omniforge.core.exceptions import (
+    DependencyMissingError,
+    ModelNotFittedError,
+    ModelSerializationError,
+    ModelTrainingError,
+    SecurityError,
+)
 from omniforge.core.logging import get_logger
 from omniforge.core.security import ArtifactSigner, EncryptionManager, safe_joblib_load_bytes
 from omniforge.core.types import ModelMetadata, TaskType
@@ -94,6 +100,8 @@ class BaseOmniForgeModel(ABC):
                 enabled=self.track_carbon,
             ) as tracker:
                 self._fit(X_arr, y_arr, **kwargs)
+        except DependencyMissingError:
+            raise
         except Exception as exc:
             raise ModelTrainingError(
                 f"Training failed for model '{self.name}' ({self.model_family}).",
@@ -264,6 +272,7 @@ class BaseOmniForgeModel(ABC):
         encrypted: bool = False,
         encryption_key: str | bytes | None = None,
         require_signature: bool = True,
+        expected_artifact_checksum: str | None = None,
     ) -> BaseOmniForgeModel:
         """Verify HMAC-SHA256 signature and safely load a serialized OmniForge model from disk."""
         src = Path(path)
@@ -271,6 +280,9 @@ class BaseOmniForgeModel(ABC):
             raise ModelSerializationError(f"Model artifact not found: {src}")
         try:
             raw_bytes = src.read_bytes()
+            checksum = hashlib.sha256(raw_bytes).hexdigest()
+            if expected_artifact_checksum is not None and not hmac.compare_digest(checksum, expected_artifact_checksum):
+                raise SecurityError("The model artifact does not match the registered checksum.")
             if require_signature:
                 meta_path = src.with_suffix(src.suffix + ".meta.json")
                 if not meta_path.is_file():
@@ -286,7 +298,7 @@ class BaseOmniForgeModel(ABC):
                     )
                 expected_checksum = str(meta_payload.get("artifact_checksum") or "")
                 if expected_checksum and not hmac.compare_digest(
-                    hashlib.sha256(raw_bytes).hexdigest(), expected_checksum
+                    checksum, expected_checksum
                 ):
                     raise SecurityError(
                         f"Model artifact '{src.name}' failed SHA-256 checksum verification."
@@ -299,6 +311,7 @@ class BaseOmniForgeModel(ABC):
             loaded = safe_joblib_load_bytes(payload_bytes, filename=src.name)
             if not isinstance(loaded, BaseOmniForgeModel):
                 raise ModelSerializationError(f"Loaded artifact is not a BaseOmniForgeModel: {type(loaded).__name__}")
+            loaded.metadata_.artifact_checksum = checksum
             return loaded
         except (ModelSerializationError, SecurityError):
             raise

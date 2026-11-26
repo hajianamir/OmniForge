@@ -69,6 +69,10 @@ v4.0.0 is a major SemVer bump from 3.3.0. It delivers three contracted capabilit
 
 ## Quick Installation
 
+For upgrades from a release that kept separate REST and Workbench registries, stop older instances before starting the new release. The new release imports each tenant’s legacy REST catalog into the shared Workbench catalog and keeps model version IDs and artifact paths. Retain the entire workspace volume, including legacy artifact directories, and its signing keys. If catalog versions or Production stages conflict, the import stops for operator resolution without replacing either version.
+
+SQL SDK readers and prediction writers now use the connector policy. Put local database files under the workspace directory or configure `OMNIFORGE_ALLOWED_DB_DIRS`. Studio 01 and the visual DAG flag statistical outliers by default. Existing SDK cleaning defaults remain available, and a programmatic run can select `CleaningConfig(outlier_action="flag")`. Custom cacheable pipeline steps must provide `implementation_version` and update it when external dependencies change. Include input fingerprints for resources outside the pipeline context.
+
 ### Windows One-Click Installation, Launcher & Standalone `.exe` Build
 
 OmniForge ships with complete Windows automation scripts and PyInstaller/Inno Setup packaging:

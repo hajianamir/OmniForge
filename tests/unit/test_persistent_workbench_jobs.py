@@ -171,7 +171,7 @@ def test_thread_termination_is_recorded_as_failure(tmp_path: Path) -> None:
     try:
         job = manager.submit("stop", stops_thread)
         _wait_for(manager, job.job_id, "failed")
-        assert manager.get(job.job_id).error == "stopped"  # type: ignore[union-attr]
+        assert manager.get(job.job_id).error == "The job failed. Check the inputs and retry."  # type: ignore[union-attr]
     finally:
         manager.shutdown()
 

@@ -39,8 +39,9 @@ class FormulaRulesCatalog:
                     category="Data Quality & Profiling",
                     name="6-Dimensional Enterprise Data Quality Index (DQI)",
                     mathematical_expression=(
-                        "DQI = 0.25*Completeness + 0.20*Uniqueness + 0.20*Validity "
-                        "+ 0.15*Consistency + 0.10*Accuracy + 0.10*Timeliness"
+                        "DQI = weighted mean of evaluated dimensions. Base weights: "
+                        "Completeness 0.25, Uniqueness 0.15, Validity 0.20, "
+                        "Consistency 0.15, Accuracy 0.15, Timeliness 0.10."
                     ),
                     variables_and_parameters=(
                         "Completeness = 100*(1 - missing_cells / total_cells); "
@@ -283,13 +284,16 @@ class FormulaRulesCatalog:
                         continue
                     cat = str(eq_dict.get("category", "Trained Model"))
                     eq_type = str(eq_dict.get("equation_type", "exact"))
-                    plain_eq = str(eq_dict.get("plain_equation") or "").strip()
+                    plain_eq = str(eq_dict.get("plain_equation") or eq_dict.get("formula_plain") or "").strip()
                     surr_eq = str(eq_dict.get("surrogate_plain_equation") or "").strip()
                     surr_r2 = eq_dict.get("surrogate_fidelity_r2")
                     param_cnt = eq_dict.get("parameter_count")
                     notes = str(eq_dict.get("notes") or "").strip()
                     arch = str(eq_dict.get("architecture_summary") or "").strip()
-                    terms = eq_dict.get("terms") or []
+                    terms = eq_dict.get("terms") or [
+                        {"feature": name, "coefficient": value}
+                        for name, value in (eq_dict.get("surrogate_coefficients") or eq_dict.get("coefficients") or {}).items()
+                    ]
                     rules = eq_dict.get("decision_rules") or []
 
                     expr_parts: list[str] = []

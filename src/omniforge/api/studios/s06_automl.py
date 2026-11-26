@@ -55,6 +55,21 @@ def _prepare_holdout(
     return preprocessor.transform(observed.drop(columns=[target])), observed[target]
 
 
+def _modeling_scope(
+    frame: pd.DataFrame, targets: list[str], requested: str | None,
+) -> tuple[str, list[str]]:
+    if requested is None and len(targets) != 1:
+        raise HTTPException(status_code=400, detail="Select exactly one target for this run.")
+    target = requested if requested is not None else targets[0]
+    if target not in frame.columns:
+        raise HTTPException(status_code=400, detail="The requested target is outside the active study columns.")
+    outcomes = set(targets) - {target}
+    columns = [col for col in frame.columns if col not in outcomes]
+    if len(columns) < 2:
+        raise HTTPException(status_code=400, detail="No predictor columns remain after excluding selected outcomes.")
+    return target, columns
+
+
 @router.get("/s06/backends")
 def s06_list_backends() -> dict[str, Any]:
     return to_json_object({"automl_backends": probe_automl_backends()})
@@ -67,15 +82,15 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
     active_df = _wb()._require_df(state)
     df = _wb().get_analysis_dataframe(state, active_df)
     targets = _wb().get_selected_targets(state, active_df)
-    active_targets = [req.target] if (req.target and req.target in df.columns) else targets
-    if not active_targets:
-        raise HTTPException(status_code=400, detail="Select a target column first.")
-    target = active_targets[0]
-
-    # Honor Split Lock: train only on train partition when lock is active
+    target, columns = _modeling_scope(df, targets, req.target)
+    scope_lock = state.get("uap_split_lock")
+    scope_targets = tuple(targets)
+    scope_exclusions = tuple(_wb().get_excluded_columns(state, active_df))
     train_df, test_df, lock = _wb().get_active_split_frames(state, active_df)
-    automl_source = train_df.loc[:, df.columns]
-    holdout_source = test_df.loc[:, df.columns] if test_df is not None else None
+    automl_source = train_df.loc[:, columns]
+    if int(automl_source[target].notna().sum()) < 10:
+        raise HTTPException(status_code=400, detail="The training partition needs at least 10 observed target values.")
+    holdout_source = test_df.loc[:, columns] if test_df is not None else None
     native_backend = req.backend.strip().lower() == "omniforge_native"
     strategy = lock.get("strategy", "auto") if lock else None
 
@@ -103,39 +118,6 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
         return observed.iloc[reserved.train_indices], observed.iloc[reserved.test_indices]
 
     def _execute(*, cancellation_token: JobCancellationToken | None = None) -> dict[str, Any]:
-        multi_target_summary: list[dict[str, Any]] = []
-        if len(active_targets) > 1:
-            for extra_t in active_targets[1:]:
-                if cancellation_token is not None:
-                    cancellation_token.checkpoint()
-                try:
-                    extra_source, extra_test = sources_for(extra_t)
-                    Xt, yt, tt, extra_preprocessor = _wb()._prepare_xy_fitted(extra_source, extra_t, raw_features=True)
-                    extra_holdout = _prepare_holdout(extra_test, extra_t, extra_preprocessor)
-                    wdf_t = Xt.copy()
-                    wdf_t[extra_t] = yt.to_numpy()
-                    res_t = AutoMLBackendHub.run(
-                        wdf_t,
-                        target_col=extra_t,
-                        backend=req.backend,
-                        task_type=tt,
-                        time_budget_seconds=max(5, req.time_budget_seconds // len(active_targets)),
-                        cv_folds=req.cv_folds,
-                        max_carbon_grams_co2e=req.max_carbon_grams_co2e,
-                        max_inference_latency_ms=req.max_inference_latency_ms,
-                        holdout=extra_holdout,
-                        **split_options(extra_t),
-                    )
-                    multi_target_summary.append(
-                        {
-                            "target": extra_t,
-                            "task_type": tt,
-                            "best_model": getattr(res_t, "best_model_name", None),
-                            "best_score": getattr(res_t, "best_score", None),
-                        }
-                    )
-                except Exception:
-                    multi_target_summary.append({"target": extra_t, "task_type": "error", "best_model": None, "best_score": None})
         if cancellation_token is not None:
             cancellation_token.checkpoint()
         fit_source, test_source = sources_for(target)
@@ -195,10 +177,19 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
                 r_copy["rationale"] = f"Validation {res.primary_metric}={r_score:.4f}."
             ranked_lb.append(r_copy)
 
+        if (
+            state.get("uap_df") is not active_df
+            or state.get("uap_split_lock") is not scope_lock
+            or tuple(state.get("uap_targets") or ()) != scope_targets
+            or tuple(_wb().get_excluded_columns(state, active_df)) != scope_exclusions
+        ):
+            raise HTTPException(status_code=409, detail="The workspace changed during training. Start a new AutoML run.")
+
         # Once model publication begins, cancellation is no longer accepted.
         if cancellation_token is not None:
             cancellation_token.begin_commit()
         state["uap_active_model"] = res.best_model
+        state["uap_active_model_target"] = target
         state["uap_active_model_name"] = f"{res.best_model_name} ({res.executed_backend})"
         state["uap_active_model_metrics"] = {
             res.primary_metric: res.best_score,
@@ -231,6 +222,7 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
             sid,
             "s06_automl",
             {
+                "target": target,
                 "backend_requested": res.requested_backend,
                 "backend_used": res.executed_backend,
                 "fallback_reason": res.fallback_reason,
@@ -295,13 +287,12 @@ def s06_export_external_formula(
     rules = str(eq.get("decision_rules_text") or "")
 
     script_parts = [
-        'r"""',
         "OmniForge — Standalone External Deployment Equation & Scoring Module",
         f"Model:  {model_name}",
         f"Target: {target_name}",
         f"Type:   {eq.get('equation_type', 'analytical')}",
         f"Summary: {summary}",
-        f"Surrogate Fidelity R^2: {r2_val if r2_val is not None else 'Exact (1.0000)'}",
+        f"Reference-Fitted Surrogate R^2: {r2_val if r2_val is not None else 'Unavailable'}",
         "",
         "Plain Analytical Relationship:",
         f"  {plain_eq}",
@@ -320,9 +311,15 @@ def s06_export_external_formula(
     ]
     if rules:
         script_parts.extend(["", "Representative Decision Tree Rules:", rules])
-    script_parts.extend(['"""', "", py_code, ""])
-    payload_bytes = "\n".join(script_parts).encode("utf-8")
-    safe_fname = "".join(ch if (ch.isalnum() or ch in "_-") else "_" for ch in f"omniforge_{target_name}_{model_name}")[:60]
+    if not py_code.strip():
+        raise HTTPException(status_code=400, detail="No executable Python equation is available for this model.")
+    script = "\n\n".join((repr("\n".join(script_parts)), py_code))
+    try:
+        compile(script, "<equation export>", "exec")
+    except (SyntaxError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="The saved equation cannot be exported as valid Python. Regenerate the equation.") from exc
+    payload_bytes = script.encode("utf-8")
+    safe_fname = "".join(ch if (ch.isascii() and ch.isalnum()) or ch in "_-" else "_" for ch in f"omniforge_{target_name}_{model_name}")[:60]
     return StreamingResponse(
         io.BytesIO(payload_bytes),
         media_type="text/x-python",
@@ -340,12 +337,10 @@ def s06_run_nonparametric_analytical(
     active_df = _wb()._require_df(state)
     df = _wb().get_analysis_dataframe(state, active_df)
     targets = _wb().get_selected_targets(state, df)
-    target = req.target if (req.target and req.target in df.columns) else (targets[0] if targets else None)
-    if not target:
-        raise HTTPException(status_code=400, detail="Select a target column first.")
+    target, columns = _modeling_scope(df, targets, req.target)
     train_df, test_df, _ = _wb().get_active_split_frames(state, active_df)
-    X, y, task, input_preprocessor = _wb()._prepare_xy_fitted(train_df.loc[:, df.columns], target)
-    holdout = _prepare_holdout(test_df.loc[:, df.columns] if test_df is not None else None, target, input_preprocessor)
+    X, y, task, input_preprocessor = _wb()._prepare_xy_fitted(train_df.loc[:, columns], target)
+    holdout = _prepare_holdout(test_df.loc[:, columns] if test_df is not None else None, target, input_preprocessor)
     if len(X) < 12 or X.shape[1] < 1:
         raise HTTPException(status_code=400, detail="Non-parametric analytical modeling requires at least 12 rows and 1 predictor.")
 
@@ -387,6 +382,7 @@ def s06_run_nonparametric_analytical(
     champ_obj = fitted_map.get(champ_name)
     if champ_obj is not None and state.get("uap_active_model") is None:
         state["uap_active_model"] = champ_obj
+        state["uap_active_model_target"] = target
         state["uap_active_model_name"] = champ_name
         state["uap_active_model_metrics"] = {
             "score": float(res.get("champion_score", 0.0)),
@@ -413,10 +409,8 @@ def s06_run_deep_benchmark(req: DeepBenchReq, x_session_id: str | None = Header(
     state = _wb().get_session_state(sid)
     df = _wb().get_analysis_dataframe(state, _wb()._require_df(state))
     targets = _wb().get_selected_targets(state, df)
-    target = req.target if (req.target and req.target in df.columns) else (targets[0] if targets else None)
-    if not target:
-        raise HTTPException(status_code=400, detail="Select a target column first.")
-    X_full, y_full, task = _wb()._prepare_xy(df, target)
+    target, columns = _modeling_scope(df, targets, req.target)
+    X_full, y_full, task = _wb()._prepare_xy(df.loc[:, columns], target)
     if len(X_full) < 6:
         raise HTTPException(status_code=400, detail="Deep learning benchmark requires at least 6 rows.")
     if len(X_full) > req.max_rows:
@@ -432,8 +426,8 @@ def s06_run_deep_benchmark(req: DeepBenchReq, x_session_id: str | None = Header(
     base_res = base_suite.run_classification(X_tr, y_tr, X_te, y_te) if is_clf else base_suite.run_regression(X_tr, y_tr, X_te, y_te)
     rows: list[dict[str, Any]] = []
     for bname, bm in base_res.items():
-        sc = float(bm.get("f1_weighted", bm.get("accuracy", 0.0))) if is_clf else float(bm.get("r2", 0.0))
-        rows.append({"model": f"Baseline: {bname}", "family": "Baseline", "framework": "sklearn", "score": round(sc, 5), "elapsed_sec": 0.01, "loss_curve": []})
+        score = bm.get("f1_weighted" if is_clf else "r2")
+        rows.append({"model": f"Baseline: {bname}", "family": "Baseline", "framework": "sklearn", "score": round(float(score), 5) if score is not None else None, "elapsed_sec": None, "loss_curve": []})
 
     arch_map = {
         "ft_transformer": lambda: FTTransformerModel(d_model=24, n_heads=4, n_layers=2, epochs=req.epochs, task_type=task, track_carbon=False),
@@ -480,17 +474,27 @@ def s06_run_deep_benchmark(req: DeepBenchReq, x_session_id: str | None = Header(
                     if int(i) < len(X_tr.columns)
                 ]
         except Exception as exc:
-            rows.append({"model": arch, "family": "Deep Learning", "framework": "error", "score": 0.0, "elapsed_sec": round(_wb().time.perf_counter() - t0, 3), "error": str(exc), "loss_curve": []})
+            _wb().logger.warning("deep_benchmark_candidate_failed", architecture=arch, error_type=type(exc).__name__)
+            rows.append({
+                "model": arch, "family": "Deep Learning", "framework": None, "score": None,
+                "elapsed_sec": round(_wb().time.perf_counter() - t0, 3),
+                "error": "Graph attention requires PyTorch and at most 4,000 training rows."
+                if arch.lower() == "gnn_gat" else "This candidate could not be evaluated.",
+                "loss_curve": [],
+            })
 
-    rows.sort(key=lambda r: r["score"], reverse=True)
+    rows.sort(key=lambda r: r["score"] if r["score"] is not None else -float("inf"), reverse=True)
     state["uap_dl_benchmark_df"] = pd.DataFrame([{k: v for k, v in r.items() if k != "loss_curve"} for r in rows])
     state["uap_dl_models"] = fitted_dl
-    _wb().record_lineage(state, "Deep Learning", f"Benchmarked {len(fitted_dl)} paper-grade architectures", f"Top={rows[0]['model']} ({rows[0]['score']:.4f})")
+    winner = next((row for row in rows if row["score"] is not None), None)
+    outcome = f"Top={winner['model']} ({winner['score']:.4f})" if winner is not None else "No candidate or baseline produced a score."
+    _wb().record_lineage(state, "Deep Learning", f"Benchmarked {len(fitted_dl)} architectures", outcome)
     return wb_cache_and_respond(
         state,
         sid,
         "s06_dl",
         {
+            "target": target,
             "metric": "f1_weighted" if is_clf else "r2",
             "results": rows,
             "feature_importances": feature_importances,
@@ -564,7 +568,7 @@ async def s06_predict_batch(
     if inc_df.empty:
         raise HTTPException(status_code=400, detail="The CSV must contain at least one record.")
     ref_df = state.get("uap_df")
-    target = (_wb().get_selected_targets(state, ref_df) or ["target"])[0]
+    target = state.get("uap_active_model_target") or (_wb().get_selected_targets(state, ref_df) or ["target"])[0]
     aligned = _prediction_frame(state, inc_df)
     try:
         preds = model.predict(aligned)

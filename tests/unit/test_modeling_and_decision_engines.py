@@ -239,8 +239,9 @@ def test_clustering_engine_all_algorithms_autok_and_profiling() -> None:
     assert float(cmp_df.iloc[0]["silhouette"]) > 0.65
 
 
-def test_model_equations_and_future_target_prediction_manual_file_sql(tmp_path) -> None:
+def test_model_equations_and_future_target_prediction_manual_file_sql(tmp_path, monkeypatch) -> None:
     """Verify exact mathematical equations (Baseline, Neural, Advanced) and Manual/File/SQL future scoring."""
+    monkeypatch.setenv("OMNIFORGE_ALLOWED_DB_DIRS", str(tmp_path))
     from omniforge.data.validation import DataValidator, ValidationRule
     from omniforge.evaluation.equations import ModelEquationExtractor
     from omniforge.mlops.future_scoring import FutureTargetPredictor

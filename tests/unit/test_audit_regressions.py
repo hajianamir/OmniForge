@@ -263,7 +263,7 @@ def test_root_does_not_auto_issue_admin_cookie_by_default() -> None:
     prev = sec.auto_bootstrap_local_ui
     sec.auto_bootstrap_local_ui = False
     try:
-        client = TestClient(app)
+        client = TestClient(app, base_url="http://localhost", client=("127.0.0.1", 51000))
         resp = client.get("/")
         assert resp.status_code == 200
         assert "omniforge_wb_auth" not in resp.cookies
@@ -544,7 +544,7 @@ def test_advanced_audit_and_mining_endpoints() -> None:
     prev = sec.auto_bootstrap_local_ui
     sec.auto_bootstrap_local_ui = True
     try:
-        client = TestClient(app)
+        client = TestClient(app, base_url="http://localhost", client=("127.0.0.1", 51000))
         client.get("/")
         csrf = client.cookies.get("omniforge_csrf", "")
         headers = {"X-Session-ID": "adv-ep-test", "X-CSRF-Token": csrf}

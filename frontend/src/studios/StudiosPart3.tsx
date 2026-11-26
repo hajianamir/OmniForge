@@ -35,9 +35,8 @@ export const Studio09Specialized: React.FC<StudioProps> = ({ ws, studioCache, se
 
   // NLP
   const [nlpTask, setNlpTask] = useState('overview');
-  const [nlpText, setNlpText] = useState(
-    'Quarterly revenue grew 18% with strong customer trust and reliable cloud delivery.\nSecurity alert: user john.doe@example.com reported a potential fraud breach from 192.168.1.44.\nCustomer churn increased after terrible service outage and unacceptable billing delays.'
-  );
+  const [nlpText, setNlpText] = useState('');
+  const [textColumn, setTextColumn] = useState('');
   const [nlpLabels, setNlpLabels] = useState('Finance, Security, Operations, Customer Support');
   const [nlpQuery, setNlpQuery] = useState('What grew by 18%?');
   const nlpRes = studioCache.s09_nlp ?? null;
@@ -53,6 +52,12 @@ export const Studio09Specialized: React.FC<StudioProps> = ({ ws, studioCache, se
 
   // Recsys & Survival
   const recRes = studioCache.s09_recommend ?? null;
+  const [recMode, setRecMode] = useState<'guidance' | 'items'>('guidance');
+  const [recUserColumn, setRecUserColumn] = useState('');
+  const [recItemColumn, setRecItemColumn] = useState('');
+  const [recRatingColumn, setRecRatingColumn] = useState('');
+  const [recUserId, setRecUserId] = useState('');
+  const studyColumns = ws.columns.filter((col) => !ws.excluded_columns.includes(col));
   const survRes = studioCache.s09_survival ?? null;
   const [durCol, setDurCol] = useState(ws.numeric_columns[0] || '');
   const [evtCol, setEvtCol] = useState(ws.numeric_columns[1] || ws.numeric_columns[0] || '');
@@ -69,6 +74,7 @@ export const Studio09Specialized: React.FC<StudioProps> = ({ ws, studioCache, se
     try {
       const res = await apiPost<NLPResponse>('/api/workbench/s09/nlp', {
         task: nlpTask,
+        text_col: textColumn || null,
         custom_texts: nlpText.split('\n').filter((s) => s.trim()),
         candidate_labels: nlpLabels.split(',').map((s) => s.trim()).filter(Boolean),
         question: nlpQuery,
@@ -148,12 +154,19 @@ export const Studio09Specialized: React.FC<StudioProps> = ({ ws, studioCache, se
               <input type="text" value={nlpTask === 'qa' || nlpTask === 'semantic_search' ? nlpQuery : nlpLabels} onChange={(e) => (nlpTask === 'qa' || nlpTask === 'semantic_search' ? setNlpQuery(e.target.value) : setNlpLabels(e.target.value))} />
             </label>
           </div>
-          <label className="field" style={{ marginBottom: 10 }}>Input Documents (one per line)
-            <textarea rows={4} value={nlpText} onChange={(e) => setNlpText(e.target.value)} />
-          </label>
+          {studyColumns.length > 0 && <label className="field">Text Column
+            <select value={textColumn} onChange={(e) => setTextColumn(e.target.value)}>
+              <option value="">Manual input or example</option>
+              {studyColumns.map((col) => <option key={col} value={col}>{col}</option>)}
+            </select>
+          </label>}
+          {!textColumn && <label className="field" style={{ marginBottom: 10 }}>Input Documents (one per line)
+            <textarea rows={4} placeholder="Leave empty to analyze the built-in example" value={nlpText} onChange={(e) => setNlpText(e.target.value)} />
+          </label>}
           <button className="btn btn-primary" disabled={busy} onClick={runNLP}>{busy ? <span className="spinner" /> : null} Run Advanced NLP</button>
           {nlpRes && (
             <div style={{ marginTop: 12 }}>
+              {nlpRes.text_source === 'example' && <p>Results use the built-in example documents.</p>}
               {(() => {
                 const zsRows = Array.isArray(nlpRes.zero_shot) ? (nlpRes.zero_shot as Array<Record<string, unknown>>) : [];
                 const firstScores = zsRows[0]?.scores;
@@ -269,16 +282,49 @@ export const Studio09Specialized: React.FC<StudioProps> = ({ ws, studioCache, se
 
       {tab === 'recsys' && (
         <div className="card">
-          <button className="btn btn-primary" disabled={busy} onClick={async () => {
+          <label className="field">Recommendation Type
+            <select value={recMode} onChange={(e) => setRecMode(e.target.value === 'items' ? 'items' : 'guidance')}>
+              <option value="guidance">Algorithm guidance</option>
+              <option value="items" disabled={!ws.has_dataset}>User–item recommendations</option>
+            </select>
+          </label>
+          {recMode === 'items' && <div className="row">
+            <label className="field">User Column
+              <select value={recUserColumn} onChange={(e) => setRecUserColumn(e.target.value)}>
+                <option value="">Choose user column</option>
+                {studyColumns.map((col) => <option key={col} value={col}>{col}</option>)}
+              </select>
+            </label>
+            <label className="field">Item Column
+              <select value={recItemColumn} onChange={(e) => setRecItemColumn(e.target.value)}>
+                <option value="">Choose item column</option>
+                {studyColumns.map((col) => <option key={col} value={col}>{col}</option>)}
+              </select>
+            </label>
+            <label className="field">Rating Column
+              <select value={recRatingColumn} onChange={(e) => setRecRatingColumn(e.target.value)}>
+                <option value="">Implicit interactions</option>
+                {studyColumns.map((col) => <option key={col} value={col}>{col}</option>)}
+              </select>
+            </label>
+            <label className="field">User ID
+              <input value={recUserId} onChange={(e) => setRecUserId(e.target.value)} />
+            </label>
+          </div>}
+          <button className="btn btn-primary" disabled={busy || (recMode === 'items' && (!recUserColumn || !recItemColumn || !recUserId))} onClick={async () => {
             setBusy(true); setErr(null);
-            try { setStudioResult('s09_recommend', await apiPost<RecommendResponse>('/api/workbench/s09/recommend', {})); } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
-          }}>Run Hybrid Recommender</button>
+            try {
+              setStudioResult('s09_recommend', await apiPost<RecommendResponse>('/api/workbench/s09/recommend', recMode === 'items'
+                ? { user_col: recUserColumn, item_col: recItemColumn, rating_col: recRatingColumn || null, user_id: recUserId }
+                : {}));
+            } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
+          }}>{recMode === 'items' ? 'Recommend Items' : 'Show Algorithm Guidance'}</button>
           {recRes && (
             <div style={{ marginTop: 12 }}>
               {(recRes.recommendations?.length ?? 0) > 0 && (
                 <div style={{ marginBottom: 12 }}>
                   <BarChartSVG
-                    title="Hybrid Recommendation Affinity Scores"
+                    title={recRes.strategy === 'fitted_item_recommender' ? 'Item Affinity Scores' : 'Heuristic Suitability and Feature Association'}
                     horizontal
                     items={(recRes.recommendations || []).slice(0, 12).flatMap((r, idx) => {
                       const sc = Number(r.score ?? r.affinity ?? NaN);

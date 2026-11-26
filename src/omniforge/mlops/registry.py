@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 from omniforge.core.exceptions import MLOpsError, SecurityError
 from omniforge.core.logging import get_logger
-from omniforge.core.types import ModelStage
+from omniforge.core.types import ModelStage, Principal
 from omniforge.mlops.fairness_evidence import FairnessEvidence, RegisteredFairnessEvidence, model_fingerprint
 from omniforge.models.base import BaseOmniForgeModel, SklearnEstimatorAdapter
 
@@ -38,7 +38,9 @@ def _normalize_stage(stage: ModelStage | str) -> ModelStage:
     raise MLOpsError(f"Invalid model stage {stage!r}. Valid stages: {valid}.")
 
 
-def _audit_registry_event(action: str, *, model_name: str, status: str, details: dict[str, Any]) -> None:
+def _audit_registry_event(
+    action: str, *, model_name: str, status: str, details: dict[str, Any], principal: Principal | None,
+) -> None:
     """Best-effort tamper-evident audit logging for registry governance gates & rollbacks."""
     try:
         from omniforge.config.settings import get_settings
@@ -49,13 +51,13 @@ def _audit_registry_event(action: str, *, model_name: str, status: str, details:
             action=action,
             resource_type="model_registry",
             resource_id=model_name,
-            actor="system",
-            tenant_id=str(getattr(settings, "default_tenant_id", "default-tenant")),
+            actor=principal.subject if principal is not None else "system",
+            tenant_id=principal.tenant_id if principal is not None else settings.default_tenant_id,
             status=status,
             details=details,
         )
     except Exception as exc:
-        logger.error("registry_governance_audit_failed", action=action, model=model_name, error=str(exc))
+        logger.error("registry_governance_audit_failed", action=action, model=model_name, error_type=type(exc).__name__)
 
 
 @contextmanager
@@ -171,6 +173,40 @@ class ModelRegistry:
                     conn.execute(f"ALTER TABLE model_versions ADD COLUMN {col_name} {col_ddl}")
             conn.commit()
 
+    def import_legacy_registry(self, legacy_db: Path) -> None:
+        """Import a retired registry into this store while retaining model version identities."""
+        if not legacy_db.is_file():
+            return
+        source_uri = legacy_db.resolve().as_uri() + "?mode=ro"
+        with _sqlite_conn(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("CREATE TABLE IF NOT EXISTS legacy_registry_imports (source TEXT PRIMARY KEY)")
+            if conn.execute("SELECT 1 FROM legacy_registry_imports WHERE source = ?", (str(legacy_db),)).fetchone():
+                return
+            with _sqlite_conn(source_uri, uri=True) as source:
+                source.row_factory = sqlite3.Row
+                old_rows = source.execute("SELECT * FROM model_versions").fetchall()
+            for row in old_rows:
+                current = conn.execute(
+                    f"SELECT {self._SELECT_COLS} FROM model_versions WHERE model_name = ? AND version = ?",
+                    (row["model_name"], row["version"]),
+                ).fetchone()
+                fields = {name: row[name] for name in self._SELECT_COLS.split(", ") if name in row.keys()}
+                if current is not None:
+                    current_fields = dict(zip(self._SELECT_COLS.split(", "), current, strict=True))
+                    if any(current_fields[key] != value for key, value in fields.items()):
+                        raise MLOpsError("Legacy model registry has a version collision. Resolve it before importing.")
+                    continue
+                if str(row["stage"]).casefold() == ModelStage.PRODUCTION.value.casefold() and conn.execute(
+                    "SELECT 1 FROM model_versions WHERE model_name = ? AND lower(stage) = lower(?)",
+                    (row["model_name"], ModelStage.PRODUCTION.value),
+                ).fetchone():
+                    raise MLOpsError("Legacy model registry has a production stage collision. Resolve it before importing.")
+                columns = ", ".join(fields)
+                placeholders = ", ".join("?" for _ in fields)
+                conn.execute(f"INSERT INTO model_versions ({columns}) VALUES ({placeholders})", tuple(fields.values()))
+            conn.execute("INSERT INTO legacy_registry_imports (source) VALUES (?)", (str(legacy_db),))
+
     def _enforce_fairness_gate(
         self,
         *,
@@ -181,6 +217,7 @@ class ModelRegistry:
         require_fairness_gate: bool | None,
         override_reason: str | None,
         tags: dict[str, str],
+        principal: Principal | None,
     ) -> dict[str, str]:
         """Enforce Responsible AI fairness promotion gate when transitioning to PRODUCTION (NIST AI RMF MANAGE 2.2)."""
         eff_require = self.require_fairness_gate if require_fairness_gate is None else bool(require_fairness_gate)
@@ -200,6 +237,7 @@ class ModelRegistry:
                 "registry:fairness_gate_blocked",
                 model_name=model_name,
                 status="blocked",
+                principal=principal,
                 details={"version": version, "fairness_passed": fairness_passed, "require_fairness_gate": eff_require},
             )
             raise MLOpsError(
@@ -213,6 +251,7 @@ class ModelRegistry:
             "registry:fairness_gate_override",
             model_name=model_name,
             status="warning",
+            principal=principal,
             details={
                 "version": version,
                 "fairness_passed": fairness_passed,
@@ -240,6 +279,7 @@ class ModelRegistry:
         override_reason: str | None = None,
         stage: ModelStage | str = ModelStage.NONE,
         encrypt: bool = False,
+        principal: Principal | None = None,
     ) -> RegisteredModelVersion:
         """Persist a fitted model with governance metadata and an optional fairness gate.
 
@@ -291,6 +331,7 @@ class ModelRegistry:
                     require_fairness_gate=require_fairness_gate,
                     override_reason=override_reason,
                     tags=eff_tags,
+                    principal=principal,
                 )
 
             root_resolved = self.artifact_dir.resolve()
@@ -383,6 +424,7 @@ class ModelRegistry:
         fairness_report: Any | None = None,
         require_fairness_gate: bool | None = None,
         override_reason: str | None = None,
+        principal: Principal | None = None,
     ) -> RegisteredModelVersion:
         """Promote or transition a registered model version across lifecycle stages with Responsible AI gate."""
         target_stage = _normalize_stage(target_stage)
@@ -402,6 +444,7 @@ class ModelRegistry:
                 require_fairness_gate=require_fairness_gate,
                 override_reason=override_reason,
                 tags=eff_tags,
+                principal=principal,
             )
 
         now = datetime.now(UTC).isoformat()
@@ -454,6 +497,7 @@ class ModelRegistry:
         *,
         reason: str = "Automated or operator-initiated SLA degradation rollback",
         target_version: int | None = None,
+        principal: Principal | None = None,
     ) -> RegisteredModelVersion:
         """Atomically demote failing PRODUCTION version and restore the prior healthy version (NIST AI RMF MANAGE 2.4)."""
         versions = self.list_versions(model_name)
@@ -494,6 +538,7 @@ class ModelRegistry:
             require_fairness_gate=None,
             override_reason=None,
             tags=dict(candidate.tags),
+            principal=principal,
         )
         cand_tags["rollback_restored_at"] = now
         cand_tags["rollback_reason"] = str(reason).strip() or "SLA rollback"
@@ -513,6 +558,7 @@ class ModelRegistry:
             "registry:production_rollback",
             model_name=model_name,
             status="rolled_back",
+            principal=principal,
             details={
                 "demoted_version": current_prod.version if current_prod else None,
                 "restored_version": candidate.version,
@@ -560,7 +606,11 @@ class ModelRegistry:
             chosen = versions[-1]
         if chosen is None:
             raise MLOpsError(f"No matching version found for '{model_name}' (version={version}, stage={stage}).")
-        return BaseOmniForgeModel.load(chosen.artifact_path, encrypted=chosen.encrypted_at_rest), chosen
+        return BaseOmniForgeModel.load(
+            chosen.artifact_path,
+            encrypted=chosen.encrypted_at_rest,
+            expected_artifact_checksum=chosen.checksum_sha256,
+        ), chosen
 
     def list_versions(self, model_name: str | None = None) -> list[RegisteredModelVersion]:
         """List registered model versions, optionally scoped to one model name."""

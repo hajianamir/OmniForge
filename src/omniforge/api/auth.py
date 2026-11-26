@@ -231,20 +231,16 @@ def _is_loopback_bootstrap_disabled_by_env() -> bool:
 
 def should_auto_bootstrap_local_ui(request: Request | None = None) -> bool:
     """Return True when non-production local UI cookie bootstrap is permitted for ``request``."""
-    if _is_production_env():
+    if _is_production_env() or _is_loopback_bootstrap_disabled_by_env():
         return False
-    if bool(get_settings().security.auto_bootstrap_local_ui):
-        return True
-    if _loopback_workbench_bootstrap_enabled and not _is_loopback_bootstrap_disabled_by_env():
-        if request is None:
-            return False
-        if not is_loopback_host(request.url.hostname):
-            return False
-        client_host = request.client.host if request.client is not None else None
-        if client_host is not None and not is_loopback_host(client_host):
-            return False
-        return True
-    return False
+    if not (_loopback_workbench_bootstrap_enabled or get_settings().security.auto_bootstrap_local_ui):
+        return False
+    return bool(
+        request is not None
+        and request.client is not None
+        and is_loopback_host(request.url.hostname)
+        and is_loopback_host(request.client.host)
+    )
 
 
 def _authenticate_from_cookie(request: Request) -> Principal | None:

@@ -273,9 +273,11 @@ def test_workspace_archive_spoofed_zip_header_bomb_and_member_hygiene(tmp_path: 
     assert victim.exists()
 
 
-def test_future_scoring_sql_readonly_and_credential_redaction(tmp_path: Path) -> None:
+def test_future_scoring_sql_readonly_and_credential_redaction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """FutureTargetPredictor.load_from_sql must block DDL/DML/stacked SQL and redact credentials on error."""
     from omniforge.mlops.future_scoring import FutureTargetPredictor
+
+    monkeypatch.setenv("OMNIFORGE_ALLOWED_DB_DIRS", str(tmp_path))
 
     ref = pd.DataFrame({"feat_a": [1.0, 2.0, 3.0], "feat_b": ["x", "y", "x"]})
     db_path = tmp_path / "future_test.sqlite"
@@ -295,14 +297,14 @@ def test_future_scoring_sql_readonly_and_credential_redaction(tmp_path: Path) ->
         with pytest.raises(SecurityError):
             FutureTargetPredictor.load_from_sql(uri, bad_sql)
 
-    with pytest.raises(DataIngestionError) as exc_info:
+    with pytest.raises((DataIngestionError, SecurityError)) as exc_info:
         FutureTargetPredictor.load_from_sql(
             "sqlite://admin:super_secret_pw@nonexistent_dir_xyz/missing.db",
             "SELECT 1",
         )
     assert "super_secret_pw" not in str(exc_info.value)
 
-    with pytest.raises(DataIngestionError) as w_exc:
+    with pytest.raises((DataIngestionError, SecurityError)) as w_exc:
         FutureTargetPredictor.write_predictions_to_sql(
             loaded,
             "sqlite://admin:super_secret_pw@nonexistent_dir_xyz/missing.db",

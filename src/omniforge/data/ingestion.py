@@ -120,12 +120,14 @@ class DataIngestionEngine:
         default_encoding: str = "utf-8",
         tenant_id: str = "default-tenant",
         allow_unsafe_pickle: bool = False,
+        allow_unsafe_hdf5: bool = False,
     ) -> None:
         self.optimize_dtypes = optimize_dtypes
         self.compute_checksum = compute_checksum
         self.default_encoding = default_encoding
         self.tenant_id = tenant_id
         self.allow_unsafe_pickle = allow_unsafe_pickle
+        self.allow_unsafe_hdf5 = allow_unsafe_hdf5
 
     def load_file(self, path: str | Path, **kwargs: Any) -> pd.DataFrame:
         """Convenience wrapper around :meth:`ingest` returning the loaded DataFrame directly."""
@@ -585,6 +587,10 @@ class DataIngestionEngine:
                     records = list(fastavro.reader(handle))
                 return pd.DataFrame(records)
             if fmt == "hdf5":
+                if not self.allow_unsafe_hdf5 or urlparse(path_or_uri).scheme in SUPPORTED_CLOUD_SCHEMES:
+                    raise DataIngestionError(
+                        "HDF5 ingestion is disabled for untrusted data. Convert the dataset to Parquet or CSV."
+                    )
                 return pd.read_hdf(path_or_uri, **kwargs)
             if fmt == "pickle":
                 if not self.allow_unsafe_pickle:
@@ -659,11 +665,17 @@ class DataIngestionEngine:
         table_name = kwargs.pop("table", None)
 
         try:
-            if scheme == "sqlite" or uri.lower().endswith((".db", ".sqlite", ".sqlite3")):
-                from omniforge.data.connectors import make_sqlite_authorizer, validate_readonly_sql
+            if scheme == "sqlite" or (not scheme and uri.lower().endswith((".db", ".sqlite", ".sqlite3"))):
+                from omniforge.data.connectors import (
+                    _ALLOWED_SQLITE_SUFFIXES,
+                    _resolve_allowed_local_db_path,
+                    make_sqlite_authorizer,
+                    validate_readonly_sql,
+                )
 
                 db_path = uri.replace("sqlite:///", "") if scheme == "sqlite" else uri
-                sqlite_conn = self._open_sqlite_readonly(db_path)
+                local_db = _resolve_allowed_local_db_path(db_path, allowed_suffixes=_ALLOWED_SQLITE_SUFFIXES, verify_sqlite_magic=True)
+                sqlite_conn = self._open_sqlite_readonly(str(local_db))
                 try:
                     sqlite_conn.set_authorizer(
                         make_sqlite_authorizer(
@@ -682,16 +694,18 @@ class DataIngestionEngine:
                 finally:
                     sqlite_conn.close()
 
-            if scheme == "duckdb" or uri.lower().endswith(".duckdb"):
+            if scheme == "duckdb" or (not scheme and uri.lower().endswith(".duckdb")):
                 if not is_package_available("duckdb"):
                     raise DependencyMissingError("Install 'duckdb' to ingest from DuckDB.")
                 import duckdb
 
-                from omniforge.data.connectors import validate_readonly_sql
+                from omniforge.data.connectors import _resolve_duckdb_url_path, validate_readonly_sql
 
-                db_path = uri.replace("duckdb:///", "") if scheme == "duckdb" else uri
+                duckdb_path = _resolve_duckdb_url_path(uri)
+                if duckdb_path is None:
+                    raise DataIngestionError("A local DuckDB file is required.")
                 with duckdb.connect(
-                    db_path, read_only=True, config={"enable_external_access": False}
+                    str(duckdb_path), read_only=True, config={"enable_external_access": False}
                 ) as conn:
                     if query:
                         return conn.execute(validate_readonly_sql(query)).df(), "duckdb"
@@ -708,13 +722,24 @@ class DataIngestionEngine:
                 if not is_package_available("pymongo"):
                     raise DependencyMissingError("Install 'pymongo' to ingest from MongoDB.")
                 from pymongo import MongoClient
+                from pymongo.uri_parser import parse_uri
+
+                from omniforge.data.connectors import _validate_remote_db_host
+
+                if scheme != "mongodb":
+                    raise SecurityError("MongoDB ingestion requires an explicit host and port in a mongodb:// URI.")
+                mongo_uri = parse_uri(uri)
+                seeds = mongo_uri["nodelist"]
+                if len(seeds) != 1 or seeds[0][0].endswith(".sock"):
+                    raise SecurityError("MongoDB ingestion requires one explicit network host.")
+                _validate_remote_db_host(seeds[0][0], seeds[0][1])
 
                 db_name = kwargs.pop("database", parsed.path.lstrip("/") or "default")
                 collection_name = kwargs.pop("collection", table_name or query)
                 if not collection_name:
                     raise DataIngestionError("MongoDB ingestion requires 'collection' or 'table'.")
                 mongo_filter = kwargs.pop("filter", {})
-                client = MongoClient(uri)
+                client = MongoClient(uri, directConnection=True)
                 try:
                     docs = list(client[db_name][collection_name].find(mongo_filter))
                 finally:
@@ -728,9 +753,11 @@ class DataIngestionEngine:
                 raise DependencyMissingError(
                     f"Install 'sqlalchemy' and the database driver for '{scheme}'."
                 )
-            from sqlalchemy import create_engine, inspect
+            from sqlalchemy import inspect
 
-            engine = create_engine(uri)
+            from omniforge.data.connectors import _create_readonly_sql_engine
+
+            engine, _ = _create_readonly_sql_engine(uri)
             try:
                 if query:
                     from omniforge.data.connectors import validate_readonly_sql
@@ -874,6 +901,8 @@ class DataIngestionEngine:
         **kwargs: Any,
     ) -> pd.DataFrame:
         """Download a validated HTTP(S) file into an isolated temp directory and parse via ``_ingest_file``."""
+        if fmt in {"hdf5", "pickle"}:
+            raise DataIngestionError("Remote HDF5 and pickle datasets are not supported. Use Parquet or CSV.")
         try:
             with httpx.Client(
                 timeout=timeout,

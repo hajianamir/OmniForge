@@ -43,13 +43,17 @@ def _training_frame() -> pd.DataFrame:
 def test_studio06_single_and_batch_use_fitted_training_pipeline(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Known/unseen categories, timestamps and missing fields agree with direct model inference."""
     frame = _training_frame()
+    frame["alternate_outcome"] = 1 - frame["target"]
     session = f"raw-{uuid.uuid4().hex}"
     principal = Principal(subject="api_key_principal", roles=["admin"], tenant_id=get_settings().default_tenant_id)
     state = get_session_state(wb._sid(session, principal))
     load_new_dataset(state, frame, "test", "test", default_target="target")
+    fitted_targets: list[str] = []
 
     def train(df: pd.DataFrame, target_col: str, **kwargs: object) -> SimpleNamespace:
+        fitted_targets.append(target_col)
         X = df.drop(columns=[target_col])
+        assert "alternate_outcome" not in X.columns
         pipe = Pipeline([("pre", _build_preprocessor(X)), ("model", LogisticRegression())])
         pipe.fit(X, df[target_col])
         return SimpleNamespace(
@@ -60,8 +64,14 @@ def test_studio06_single_and_batch_use_fitted_training_pipeline(monkeypatch: pyt
 
     monkeypatch.setattr("omniforge.api.studios.s06_automl.AutoMLBackendHub.run", train)
     client = TestClient(create_app(), headers={"X-API-Key": get_api_key(), "X-Session-ID": session})
+    assert client.post("/api/workbench/targets", json={"targets": ["target", "alternate_outcome"]}).status_code == 200
+    assert client.post("/api/workbench/s06/automl", json={"backend": "test"}).status_code == 400
+    assert client.post("/api/workbench/s06/automl", json={"target": "missing", "backend": "test"}).status_code == 400
+    assert not fitted_targets
     trained = client.post("/api/workbench/s06/automl", json={"target": "target", "backend": "test"})
     assert trained.status_code == 200, trained.text
+    assert trained.json()["target"] == "target"
+    assert fitted_targets == ["target"]
     summary = trained.json()["state"]
     assert summary["active_input_feature_types"]["when"] == "datetime"
     assert summary["active_input_feature_types"]["segment"] == "categorical"
@@ -110,6 +120,8 @@ def test_studio06_single_and_batch_use_fitted_training_pipeline(monkeypatch: pyt
                 break
             time.sleep(0.02)
         assert polled.json()["status"] == "completed", polled.text
+        assert polled.json()["result"]["target"] == "target"
+        assert fitted_targets == ["target", "target"]
         assert polled.json()["result"]["best_model_name"] == "logistic"
         shared = observer.get(job_id, owner_key=wb.current_job_owner_key(principal))
         assert shared is not None and shared.status == "completed"

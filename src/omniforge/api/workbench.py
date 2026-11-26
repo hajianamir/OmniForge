@@ -28,7 +28,7 @@ from omniforge.core.performance import (
     compact_scatter_payload,
 )
 from omniforge.core.types import ModelStage, Principal, TaskType
-from omniforge.core.utils import to_json_object, to_json_safe
+from omniforge.core.utils import sanitize_spreadsheet_frame, to_json_object, to_json_safe
 from omniforge.data.cleaning import CleaningConfig, DataCleaner
 from omniforge.data.connectors import (
     access_inspect_database,
@@ -128,6 +128,7 @@ def get_tenant_registry(principal: Principal | None = None) -> ModelRegistry:
             db_path=base / "model_registry.db",
             artifact_dir=base / "artifacts" / "registry",
         )
+        reg.import_legacy_registry(base / "api_v1" / "model_registry.db")
         _TENANT_REGISTRIES[tenant] = reg
         while len(_TENANT_REGISTRIES) > _MAX_TENANT_STORES:
             _TENANT_REGISTRIES.popitem(last=False)
@@ -221,6 +222,25 @@ async def read_upload_bounded(file: UploadFile, max_bytes: int | None = None) ->
             )
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+def parse_tabular_upload(raw: bytes, filename: str, *, sheet_name: str | None = None) -> pd.DataFrame:
+    """Read an untrusted tabular upload through the same format policy on all API surfaces."""
+    from omniforge.core.constants import SUPPORTED_FILE_FORMATS
+
+    suffix = Path(filename).suffix.lower() or ".csv"
+    fmt = SUPPORTED_FILE_FORMATS.get(suffix)
+    if fmt not in {
+        "csv", "tsv", "excel", "parquet", "feather", "arrow", "json", "jsonl",
+        "orc", "avro", "sas", "spss", "stata", "yaml", "toml", "xml",
+    }:
+        raise HTTPException(status_code=400, detail="Unsupported upload format. Use a supported tabular format such as CSV, Excel, Parquet, or JSON.")
+    if fmt == "excel":
+        return read_excel_sheet(raw, sheet_name=sheet_name or 0)
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / f"upload{suffix}"
+        path.write_bytes(raw)
+        return DataIngestionEngine().ingest(path).data
 
 
 # ---------------------------------------------------------------------------
@@ -748,29 +768,16 @@ async def s01_upload_dataset(
     state = get_session_state(sid)
     fname = file.filename or "uploaded.csv"
     suffix = Path(fname).suffix.lower() or ".csv"
-    if suffix in {".pkl", ".pickle", ".joblib", ".dill"}:
-        raise HTTPException(
-            status_code=400,
-            detail="Pickle/joblib uploads are blocked for security (CWE-502). Please upload CSV, Parquet, Excel, or JSON.",
-        )
     raw = await read_upload_bounded(file)
     t0 = time.perf_counter()
+    df = parse_tabular_upload(raw, fname, sheet_name=sheet_name)
     if suffix in {".xlsx", ".xls", ".xlsm"}:
-        chosen_sheet: str | int = sheet_name if sheet_name else 0
-        df = read_excel_sheet(raw, sheet_name=chosen_sheet)
         src_label = (
             f"Excel Upload ({fname} · Sheet '{sheet_name}')"
             if sheet_name
             else f"Excel Upload ({fname})"
         )
     else:
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(raw)
-            tmp_path = Path(tmp.name)
-        try:
-            df = DataIngestionEngine().ingest(tmp_path).data
-        finally:
-            tmp_path.unlink(missing_ok=True)
         src_label = f"File Upload ({fname})"
     load_new_dataset(state, df, name=Path(fname).stem, source=src_label)
     return to_json_object(
@@ -783,7 +790,7 @@ async def s01_upload_dataset(
     )
 
 
-@router.post("/s01/sql/demo")
+@router.post("/s01/sql/demo", dependencies=[Depends(require_permission("data:write"))])
 def s01_sql_demo_db() -> dict[str, Any]:
     """Ensure the built-in SQLite enterprise demo database exists and return its connection info & tables."""
     db_path = ensure_demo_sqlite_database()
@@ -792,7 +799,7 @@ def s01_sql_demo_db() -> dict[str, Any]:
     return to_json_object({"connection_url": conn_url, "db_path": str(db_path), **info})
 
 
-@router.post("/s01/sql/inspect")
+@router.post("/s01/sql/inspect", dependencies=[Depends(require_permission("data:write"))])
 def s01_sql_inspect(req: SQLInspectReq) -> dict[str, Any]:
     return to_json_object(sql_inspect_database(req.connection_url))
 
@@ -815,7 +822,7 @@ def s01_sql_load(req: SQLLoadReq, x_session_id: str | None = Header(default="def
     )
 
 
-@router.post("/s01/access/inspect")
+@router.post("/s01/access/inspect", dependencies=[Depends(require_permission("data:write"))])
 def s01_access_inspect(req: AccessInspectReq) -> dict[str, Any]:
     return to_json_object(access_inspect_database(req.file_path))
 
@@ -1009,7 +1016,7 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
             categorical_imputation=str(preset.get("categorical_imputation", "most_frequent")),
             drop_exact_duplicates=bool(preset.get("drop_exact_duplicates", True)),
             outlier_method=str(preset.get("outlier_method", "iqr")),
-            outlier_action=str(preset.get("outlier_action", "clip")),
+            outlier_action="flag",
             outlier_threshold=float(preset.get("outlier_threshold", 1.5)),
             exclude_columns=list(dict.fromkeys([*get_excluded_columns(state, df), *get_selected_targets(state, df)])),
         )
@@ -1029,7 +1036,7 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
             add_missing_indicators=True,
             drop_exact_duplicates=True,
             outlier_method="iqr",
-            outlier_action="clip",
+            outlier_action="flag",
             outlier_threshold=1.5,
             exclude_columns=list(dict.fromkeys([*get_excluded_columns(state, df), *get_selected_targets(state, df)])),
         )
@@ -1099,6 +1106,11 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
     dropped_const_cols: list[str] = []
     if drop_const:
         excl_set = set(get_excluded_columns(state, cleaned)) | set(get_selected_targets(state, cleaned))
+        if cfg.outlier_action == "flag":
+            excl_set.update(
+                col for col in cleaned.columns
+                if col not in before_cols and col.endswith(("__is_outlier", "__is_multivariate_outlier"))
+            )
         const_source = (
             cleaned_tr
             if (rep_dict.get("split_lock_leakage_safe") and isinstance(cleaned_tr, pd.DataFrame) and not cleaned_tr.empty)
@@ -1292,8 +1304,9 @@ def s01_run_cleaning(req: CleanReq, x_session_id: str | None = Header(default="d
 @router.get("/s01/export-clean/{fmt}")
 def s01_export_clean_dataset(fmt: str, x_session_id: str | None = Header(default="default")) -> Response:
     state = get_session_state(_sid(x_session_id))
-    df = _require_df(state)
+    df = sanitize_spreadsheet_frame(_require_df(state))
     stem = str(state.get("uap_dataset_name") or "omniforge_cleaned")
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")[:120] or "omniforge_cleaned"
     fmt_l = fmt.lower()
     if fmt_l == "xlsx":
         buf = io.BytesIO()
@@ -1357,7 +1370,7 @@ def s01_deleted_audit(x_session_id: str | None = Header(default="default")) -> d
 def s01_deleted_audit_csv(x_session_id: str | None = Header(default="default")) -> Response:
     state = get_session_state(_sid(x_session_id))
     del_df = get_all_deleted_records_df(state)
-    csv_bytes = del_df.to_csv(index=False).encode("utf-8")
+    csv_bytes = sanitize_spreadsheet_frame(del_df).to_csv(index=False).encode("utf-8")
     return Response(
         content=csv_bytes,
         media_type="text/csv",
@@ -1817,6 +1830,8 @@ def s02_commit_anomaly(req: AnomalyCommitReq, x_session_id: str | None = Header(
     removed = 0
     if req.mode == "remove_anomalies":
         drop_mask = is_anom_ser == 1
+        if rows_before > 0 and drop_mask.all():
+            raise HTTPException(status_code=400, detail="Anomaly removal would leave an empty dataset.")
         removed_df = work.loc[drop_mask].copy()
         removed = int(len(removed_df))
         if removed > 0:

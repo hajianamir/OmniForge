@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import io
 import threading
 import uuid
 from collections import OrderedDict
@@ -20,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from omniforge.api.auth import (
     WORKBENCH_AUTH_COOKIE,
     access_controller,
+    authorize_principal,
     clear_local_workbench_cookies,
     has_valid_workbench_cookie,
     issue_local_workbench_cookies,
@@ -137,31 +136,27 @@ def create_app() -> FastAPI:
             response.headers.setdefault("Strict-Transport-Security", hsts)
         return response
 
-    from omniforge.api.workbench import parse_model_stage, read_upload_bounded
+    from omniforge.api.workbench import (
+        get_tenant_registry,
+        parse_model_stage,
+        parse_tabular_upload,
+        read_upload_bounded,
+    )
     from omniforge.api.workbench import router as workbench_router
 
     app.include_router(workbench_router)
 
-    default_registry = ModelRegistry()
-    default_serving = ModelServingEngine(registry=default_registry)
     tenant_lock = threading.RLock()
     tenant_mlops: OrderedDict[str, tuple[ModelRegistry, ModelServingEngine]] = OrderedDict()
     copilot_sessions: OrderedDict[str, tuple[threading.RLock, OmniForgeCopilotAgent]] = OrderedDict()
 
     def _get_api_mlops(principal: Principal) -> tuple[ModelRegistry, ModelServingEngine]:
         tenant = str(getattr(principal, "tenant_id", "") or "default-tenant")
-        if tenant == "default-tenant":
-            return default_registry, default_serving
         with tenant_lock:
             if tenant in tenant_mlops:
                 tenant_mlops.move_to_end(tenant)
                 return tenant_mlops[tenant]
-            slug = hashlib.sha256(tenant.encode("utf-8", errors="replace")).hexdigest()[:16]
-            base = settings.paths.workspace_dir / "tenants" / slug / "api_v1"
-            reg = ModelRegistry(
-                db_path=base / "model_registry.db",
-                artifact_dir=base / "artifacts" / "registry",
-            )
+            reg = get_tenant_registry(principal)
             srv = ModelServingEngine(registry=reg)
             tenant_mlops[tenant] = (reg, srv)
             while len(tenant_mlops) > 128:
@@ -190,7 +185,7 @@ def create_app() -> FastAPI:
             path=str(request.url.path),
             error_code=exc.error_code,
             trace_id=exc.trace_id,
-            cause=f"{type(exc.cause).__name__}: {exc.cause}" if exc.cause is not None else None,
+            cause_type=type(exc.cause).__name__ if exc.cause is not None else None,
         )
         return JSONResponse(
             status_code=status_code,
@@ -205,7 +200,6 @@ def create_app() -> FastAPI:
             error_id=error_id,
             path=str(request.url.path),
             error_type=type(exc).__name__,
-            error=str(exc),
         )
         payload: dict[str, Any] = {
             "error_type": "InternalServerError",
@@ -341,17 +335,7 @@ def create_app() -> FastAPI:
     ) -> dict[str, Any]:
         raw = await read_upload_bounded(file)
         fname = (file.filename or "upload.csv").lower()
-        if fname.endswith((".pkl", ".pickle", ".joblib", ".dill")):
-            raise HTTPException(
-                status_code=400,
-                detail="Pickle/joblib uploads are blocked for security (CWE-502). Use CSV, Parquet, or JSON.",
-            )
-        if fname.endswith(".parquet"):
-            df = pd.read_parquet(io.BytesIO(raw))
-        elif fname.endswith(".json"):
-            df = pd.read_json(io.BytesIO(raw))
-        else:
-            df = pd.read_csv(io.BytesIO(raw))
+        df = parse_tabular_upload(raw, fname)
         cop_lock, cop_agent = _get_api_copilot(_principal)
         with cop_lock:
             cop_agent.load_dataframe(df, name=fname)
@@ -408,6 +392,8 @@ def create_app() -> FastAPI:
         req: AutoMLRequest,
         _principal: Principal = Depends(require_permission("model:train")),
     ) -> dict[str, Any]:
+        if req.deploy_endpoint:
+            authorize_principal(_principal, "model:deploy")
         df = pd.DataFrame(req.records)
         if req.target_column not in df.columns:
             raise HTTPException(status_code=422, detail=f"Target column '{req.target_column}' missing.")
@@ -425,10 +411,12 @@ def create_app() -> FastAPI:
                 req.register_as,
                 metrics={res.primary_metric: res.best_score},
                 stage=ModelStage.STAGING,
+                principal=_principal,
             )
             reg_info = ver.model_dump()
         if req.deploy_endpoint:
-            srv.deploy_model(req.deploy_endpoint, res.best_model, version="v1")
+            deployment_version = f"v{ver.version}" if req.register_as else uuid.uuid4().hex
+            srv.deploy_model(req.deploy_endpoint, res.best_model, version=deployment_version)
 
         return to_json_object(
             {
@@ -532,7 +520,7 @@ def create_app() -> FastAPI:
             except AuthorizationError as exc:
                 raise HTTPException(status_code=403, detail=exc.message) from exc
         reg, _ = _get_api_mlops(_principal)
-        ver = reg.transition_stage(model_name, version, stage)
+        ver = reg.transition_stage(model_name, version, stage, principal=_principal)
         return to_json_object(ver.model_dump())
 
     @app.post("/api/v1/mlops/drift", tags=["MLOps"])
@@ -549,6 +537,8 @@ def create_app() -> FastAPI:
         req: CopilotChatRequest,
         _principal: Principal = Depends(require_permission("data:read")),
     ) -> dict[str, Any]:
+        if req.records:
+            authorize_principal(_principal, "data:write")
         cop_lock, cop_agent = _get_api_copilot(_principal)
         with cop_lock:
             if req.records:
@@ -563,6 +553,17 @@ def create_app() -> FastAPI:
         _principal: Principal = Depends(require_permission("pipeline:execute")),
     ) -> dict[str, Any]:
         dag = PipelineBuilder.from_dict(req.pipeline_spec)
+        for step in dag.steps.values():
+            if step.step_type in {"train", "automl"}:
+                authorize_principal(_principal, "model:train")
+            elif step.step_type == "ingest":
+                from omniforge.copilot.tools import _validate_copilot_ingest_source
+
+                authorize_principal(_principal, "data:write")
+                source = step.config.get("source")
+                if not isinstance(source, str):
+                    raise HTTPException(status_code=422, detail="Pipeline ingestion requires a file path or HTTP URL.")
+                step.config["source"] = _validate_copilot_ingest_source(source)
         initial: dict[str, Any] = {}
         if req.records:
             initial["data"] = pd.DataFrame(req.records)

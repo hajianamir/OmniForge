@@ -13,6 +13,7 @@ from omniforge.api.studios.schemas import DAGRunReq, wb_cache_and_respond
 from omniforge.automl.backends import AutoMLBackendHub
 from omniforge.core.performance import compute_df_fingerprint
 from omniforge.core.types import Principal
+from omniforge.data.cleaning import CleaningConfig
 from omniforge.features.engineering import FeatureConfig, FeatureEngineeringPipeline
 from omniforge.pipelines.builder import PipelineBuilder
 from omniforge.pipelines.executor import PipelineExecutor
@@ -52,6 +53,8 @@ def s10_run_dag(
     df = _wb().get_analysis_dataframe(state, active_df)
     targets = _wb().get_selected_targets(state, df)
     target = req.target if (req.target and req.target in df.columns) else (targets[0] if targets else None)
+    if target is not None and ("features" in req.stages or "automl" in req.stages):
+        df = df.drop(columns=[col for col in targets if col != target])
 
     init_train, init_test = _initial_split_frames(state, active_df, df)
 
@@ -78,7 +81,7 @@ def s10_run_dag(
             def _step_clean(ctx: Any) -> dict[str, Any]:
                 tr_in: pd.DataFrame = ctx.get("train_df")
                 te_in: pd.DataFrame = ctx.get("test_df")
-                cleaner = _wb().DataCleaner()
+                cleaner = _wb().DataCleaner(CleaningConfig(outlier_action="flag"))
                 if len(te_in) > 0:
                     clean_tr, clean_te, _, _ = cleaner.fit_transform_split(tr_in, te_in)
                     combined = pd.concat([clean_tr, clean_te], ignore_index=True)

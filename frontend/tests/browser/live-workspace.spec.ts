@@ -132,9 +132,20 @@ test('native AutoML labels candidate validation and champion test scores separat
     name: 'automl-study.csv', mimeType: 'text/csv', buffer: Buffer.from(rows.join('\n')),
   });
   await expect(page.getByText(/Ingested 'automl-study.csv'/)).toBeVisible();
+  await page.getByRole('button', { name: 'Targets (1)' }).click();
+  await page.locator('.modal-panel').getByRole('button', { name: 'load', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Targets (2)' })).toBeVisible();
+  await page.locator('.modal-backdrop').click({ position: { x: 5, y: 5 } });
   await page.locator('[data-studio="06"]').click();
+  const launch = page.getByRole('button', { name: 'Launch AutoML Tournament' });
+  await expect(launch).toBeDisabled();
+  await page.getByLabel('Target for this run').selectOption('target');
   await page.getByLabel('Time Budget (sec)').fill('10');
-  await page.getByRole('button', { name: 'Launch AutoML Tournament' }).click();
+  const resultResponse = page.waitForResponse((response) => response.url().endsWith('/api/workbench/s06/automl'));
+  await launch.click();
+  const result = await (await resultResponse).json();
+  expect(result.target).toBe('target');
+  expect(result.state.active_input_feature_cols).toEqual(['reading']);
   await expect(page.getByText('Test f1_weighted', { exact: true })).toBeVisible({ timeout: 20_000 });
   await expect(page.getByText(/16 held-out rows/)).toBeVisible();
   await expect(page.getByText('Validation f1_weighted (higher is better)').first()).toBeVisible();
