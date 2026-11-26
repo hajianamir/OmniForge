@@ -287,3 +287,13 @@ def test_integer_valued_regression_remains_regression_after_workspace_restore() 
     assert after["data"] == original["data"]
     monitored = SupervisoryPredictionMonitor().evaluate_incoming(restored, study.iloc[14:], model_id="active_champion")
     assert monitored["kpis"]["task_mode"] == "regression"
+
+
+
+@pytest.mark.parametrize("option", ["init_command", "read_default_file", "option_files", "conn_properties"])
+def test_connector_refuses_driver_options_that_run_before_guards(option: str) -> None:
+    from omniforge.core.exceptions import SecurityError
+    from omniforge.data.connectors import _validated_sql_url
+
+    with pytest.raises(SecurityError, match="Forbidden SQL connection query option"):
+        _validated_sql_url(f"mysql+pymysql://localhost/study?{option}=fixture")

@@ -77,6 +77,15 @@ _BLOCKED_SQL_QUERY_OPTIONS: frozenset[str] = frozenset(
         "odbc_connect",
         "service",
         "servicefile",
+        # Driver startup SQL and client configuration have effects before
+        # the connector's transaction and endpoint controls take effect.
+        "init_command",
+        "init_sql",
+        "conn_properties",
+        "read_default_file",
+        "read_default_group",
+        "option_files",
+        "option_groups",
     }
 )
 
