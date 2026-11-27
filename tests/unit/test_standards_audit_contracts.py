@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from omniforge.api.studios.schemas import AutoMLRunReq, DeepBenchReq, DiagnosticsReq, NonParametricRunReq
+from omniforge.automl.pipeline_search import AutoMLPipelineSearch
 from omniforge.eda.diagnostics import UniversalDiagnosticsSuite
 
 
@@ -58,3 +59,15 @@ def test_paired_bootstrap_preserves_reference_pairing() -> None:
     assert result['ci_lower'] == pytest.approx(1)
     assert result['ci_upper'] == pytest.approx(1)
     assert result['supports_improvement'] is True
+
+
+def test_native_distance_references_use_nominal_features() -> None:
+    x = np.arange(100, dtype=float)
+    X = pd.DataFrame({'sensor': x, 'category': [f'l{i % 36}' for i in range(100)]})
+    result = AutoMLPipelineSearch(
+        time_budget_seconds=5, include_deep=False, enable_ensembling=False,
+        use_cv_pipeline=False, tune_trials=1, tune_top_k=1,
+    ).fit(X, pd.Series(x * 2.5))
+    row = next(row for row in result.leaderboard if row['model'] == 'NonParametric_WeightedKNN')
+    assert row['n_features'] > X.shape[1]
+    assert result.metadata['evaluation']['input_columns'] == list(X.columns)

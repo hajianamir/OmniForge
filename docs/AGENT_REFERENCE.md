@@ -805,3 +805,10 @@ The CPCV kernel is `data.cpcv.iter_cpcv_splits`. For new evaluation code, use
 `evaluation.validation.CombinatorialPurgedKFold` (pre-test purge, post-test embargo, optional
 label interval purge). `data.splitting.CombinatorialPurgedKFold` is a compatibility adapter for
 the list-returning, symmetric positional-purge API; the post-buffer is its purge plus embargo.
+
+Native AutoML's reference suite fits bounded nominal indicators independently on each
+reference training partition; specialized backend references receive a named, train-fitted
+column-transformer matrix. Standalone `ModelBase` ordinal behavior remains a separate
+SDK compatibility path, not the encoding for Workbench or native AutoML distance references.
+A diagnostic ledger row can carry a nested sample size (e.g. a Shapiro–Wilk cap) distinct
+from the enclosing report scope; sampled Hodges–Lehmann effects report both group sizes.

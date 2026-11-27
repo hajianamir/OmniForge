@@ -1097,8 +1097,10 @@ class AutoMLBackendHub:
         ) -> MultiBackendAutoMLResult:
             # Fit baseline preprocessing on the same development rows as the selected adapter.
             preprocessor = _build_preprocessor(X_tr)
-            X_train_matrix = preprocessor.fit_transform(X_tr)
-            X_validation_matrix = preprocessor.transform(X_va)
+            X_train_values = preprocessor.fit_transform(X_tr)
+            baseline_columns = preprocessor.get_feature_names_out()
+            X_train_matrix = pd.DataFrame(X_train_values, columns=baseline_columns, index=X_tr.index)
+            X_validation_matrix = pd.DataFrame(preprocessor.transform(X_va), columns=baseline_columns, index=X_va.index)
             validation_score = float(result["best_score"])
             metric = "f1_weighted" if is_clf else "rmse"
 
@@ -1154,7 +1156,7 @@ class AutoMLBackendHub:
             test_positions = None
             if holdout is not None:
                 X_test, y_test = holdout[0].loc[:, input_columns], holdout[1]
-                X_test_matrix = preprocessor.transform(X_test)
+                X_test_matrix = pd.DataFrame(preprocessor.transform(X_test), columns=baseline_columns, index=X_test.index)
                 test_predictions = result["best_model"].predict(X_test)
                 best_score = score(y_test, test_predictions)
                 test_evidence: BaselineEvidence = {

@@ -81,3 +81,16 @@ def test_legacy_cpcv_delegates_label_interval_purge() -> None:
     for (left_train, left_test), (right_train, right_test) in zip(lhs, rhs, strict=True):
         np.testing.assert_array_equal(left_train, right_train)
         np.testing.assert_array_equal(left_test, right_test)
+
+
+def test_shapiro_nested_sample_is_disclosed_on_ledger_row() -> None:
+    from omniforge.eda.diagnostics import StatisticalCriteriaConfig
+
+    frame = pd.DataFrame({'x': np.random.default_rng(12).normal(size=5_100)})
+    report = UniversalDiagnosticsSuite().run(
+        frame, selected_modules=['normality_distribution'],
+        criteria=StatisticalCriteriaConfig(normality_method='shapiro_wilk', bootstrap_samples=50),
+    )
+    assert report.n_scanned == 5_100
+    assert report.hypothesis_ledger[0]['n_scanned'] == 5_000
+    assert report.hypothesis_ledger[0]['sampled_from'] == 5_100

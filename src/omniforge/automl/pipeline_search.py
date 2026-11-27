@@ -38,7 +38,7 @@ from omniforge.data.splitting import (
     SplitStrategyType,
 )
 from omniforge.evaluation.paired_comparison import paired_score_interval
-from omniforge.features.inference import nonconstant_predictors
+from omniforge.features.inference import WorkbenchInputPreprocessor, nonconstant_predictors
 from omniforge.models.base import BaseOmniForgeModel
 from omniforge.models.baselines import (
     BaselineBenchmarkSuite,
@@ -433,9 +433,12 @@ class AutoMLPipelineSearch:
                 BaselineBenchmarkSuite.run_classification_detailed
                 if is_clf else BaselineBenchmarkSuite.run_regression_detailed
             )
+            baseline_preprocessor = WorkbenchInputPreprocessor(mode="numeric").fit(X_tr)
+            validation_baseline_inputs = baseline_preprocessor.transform(X_tr)
             validation_evidence: BaselineEvidence = {}
             validation_baselines, baseline_models = benchmark(
-                X_tr, y_tr, X_va, y_va, self.random_seed, evidence=validation_evidence,
+                validation_baseline_inputs, y_tr, baseline_preprocessor.transform(X_va), y_va,
+                self.random_seed, evidence=validation_evidence,
             )
             validation_reference = strongest_scored_reference(
                 validation_baselines, validation_evidence, primary_metric, higher_is_better=is_clf,
@@ -710,8 +713,10 @@ class AutoMLPipelineSearch:
             best_test_score = float(f1_score(y_test, best_predictions, average="weighted", zero_division=0)) if is_clf else float(root_mean_squared_error(y_test, best_predictions))
             test_evidence: BaselineEvidence = {}
             baseline_predictions: dict[str, np.ndarray] = {}
+            baseline_preprocessor = WorkbenchInputPreprocessor(mode="numeric").fit(X_dev)
             baselines, _ = benchmark(
-                X_dev, y_dev, X_test, y_test, self.random_seed, evidence=test_evidence, predictions=baseline_predictions,
+                baseline_preprocessor.transform(X_dev), y_dev, baseline_preprocessor.transform(X_test), y_test,
+                self.random_seed, evidence=test_evidence, predictions=baseline_predictions,
             )
             test_reference = strongest_scored_reference(baselines, test_evidence, primary_metric, higher_is_better=is_clf)
             best_bl_score = test_reference[1] if test_reference is not None else None
@@ -734,10 +739,11 @@ class AutoMLPipelineSearch:
             equations_map: dict[str, dict[str, Any]] = {}
             for m_name, m_obj in all_fitted_models.items():
                 try:
+                    equation_inputs = validation_baseline_inputs if m_name in baseline_models else X_tr
                     equations_map[m_name] = ModelEquationExtractor.extract(
                         m_obj,
-                        X_reference=X_tr,
-                        feature_names=list(X_work.columns),
+                        X_reference=equation_inputs,
+                        feature_names=list(equation_inputs.columns),
                         target_name=target_label,
                     ).model_dump()
                 except Exception as exc:

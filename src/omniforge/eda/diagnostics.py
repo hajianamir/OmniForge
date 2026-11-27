@@ -276,6 +276,7 @@ class UniversalDiagnosticsSuite:
                     "ci_high": res.ci_high,
                     "decision": "Reject H0" if res.p_value < cfg.alpha else "Fail to Reject H0",
                     "interpretation": res.interpretation,
+                    **{key: res.details[key] for key in ("n_scanned", "sampled_from", "effect_size_scan") if key in res.details},
                 }
             )
 
