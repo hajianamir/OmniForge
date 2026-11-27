@@ -5,7 +5,7 @@ from __future__ import annotations
 import itertools
 import time
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 from pydantic import BaseModel, Field
@@ -25,7 +25,8 @@ class OptimizationTrial(BaseModel):
 
     trial_id: int
     params: dict[str, Any]
-    score: float
+    score: float | None
+    status: Literal["completed", "nonfinite", "failed"] = "completed"
     duration_seconds: float
 
 
@@ -55,7 +56,10 @@ class HyperparameterOptimizer:
     ) -> None:
         self.strategy = strategy.lower()
         self.acquisition = acquisition.lower()
-        self.direction = direction.lower()
+        normalized_direction = direction.lower()
+        if normalized_direction not in {"maximize", "minimize"}:
+            raise AutoMLError("HPO direction must be maximize or minimize.")
+        self.direction: Literal["maximize", "minimize"] = "maximize" if normalized_direction == "maximize" else "minimize"
         self.max_trials = max(2, int(max_trials))
         self.time_budget_seconds = float(time_budget_seconds)
         self.random_seed = random_seed
@@ -158,6 +162,27 @@ class HyperparameterOptimizer:
                     vec.append((float(val) - low) / max(high - low, 1e-12))
         return np.asarray(vec, dtype=float)
 
+    @staticmethod
+    def _evaluate_trial(
+        trial_id: int, config: dict[str, Any], objective_fn: Callable[[dict[str, Any]], float],
+    ) -> OptimizationTrial:
+        start = time.perf_counter()
+        status: Literal["completed", "nonfinite", "failed"] = "completed"
+        score = None
+        try:
+            value = float(objective_fn(dict(config)))
+            if np.isfinite(value):
+                score = value
+            else:
+                status = "nonfinite"
+        except Exception as exc:
+            status = "failed"
+            logger.warning("hpo_trial_failed", trial_id=trial_id, error_type=type(exc).__name__)
+        return OptimizationTrial(
+            trial_id=trial_id, params=config, score=score, status=status,
+            duration_seconds=round(time.perf_counter() - start, 4),
+        )
+
     def _optimize_random(
         self, search_space: dict[str, dict[str, Any]], objective_fn: Callable[[dict[str, Any]], float]
     ) -> HPOResult:
@@ -168,9 +193,7 @@ class HyperparameterOptimizer:
             if time.perf_counter() - t0 > self.time_budget_seconds:
                 break
             cfg = self._sample_random_config(search_space, rng)
-            ts = time.perf_counter()
-            score = float(objective_fn(cfg))
-            trials.append(OptimizationTrial(trial_id=tid, params=cfg, score=round(score, 6), duration_seconds=round(time.perf_counter() - ts, 4)))
+            trials.append(self._evaluate_trial(tid, cfg, objective_fn))
         return self._summarize("random", trials)
 
     def _optimize_bayesian(
@@ -225,12 +248,11 @@ class HyperparameterOptimizer:
                     acq = np.where(std > 1e-12, imp * stats.norm.cdf(z) + std * stats.norm.pdf(z), np.maximum(imp, 0.0))
                 cfg = cands[int(np.argmax(acq))]
 
-            ts = time.perf_counter()
-            score = float(objective_fn(cfg))
-            if np.isfinite(score):
+            trial_result = self._evaluate_trial(tid, cfg, objective_fn)
+            trials.append(trial_result)
+            if trial_result.score is not None:
                 X_obs.append(self._encode_config(cfg, search_space))
-                y_obs.append(score)
-                trials.append(OptimizationTrial(trial_id=tid, params=cfg, score=round(score, 6), duration_seconds=round(time.perf_counter() - ts, 4)))
+                y_obs.append(trial_result.score)
         strat_label = "bayesian_gp_ucb" if self.acquisition == "ucb" else "bayesian_gp_ei"
         return self._summarize(strat_label, trials)
 
@@ -256,9 +278,7 @@ class HyperparameterOptimizer:
             if tid >= self.max_trials or (time.perf_counter() - t0 > self.time_budget_seconds):
                 break
             cfg = dict(zip(keys, combo, strict=False))
-            ts = time.perf_counter()
-            score = float(objective_fn(cfg))
-            trials.append(OptimizationTrial(trial_id=tid, params=cfg, score=round(score, 6), duration_seconds=round(time.perf_counter() - ts, 4)))
+            trials.append(self._evaluate_trial(tid, cfg, objective_fn))
         return self._summarize("grid", trials)
 
     def _optimize_optuna(
@@ -279,10 +299,10 @@ class HyperparameterOptimizer:
                     cfg[name] = trial.suggest_int(name, int(spec["low"]), int(spec["high"]))
                 else:
                     cfg[name] = trial.suggest_float(name, float(spec["low"]), float(spec["high"]), log=bool(spec.get("log", False)))
-            ts = time.perf_counter()
-            val = float(objective_fn(cfg))
-            trials.append(OptimizationTrial(trial_id=trial.number, params=cfg, score=round(val, 6), duration_seconds=round(time.perf_counter() - ts, 4)))
-            return val
+            result = self._evaluate_trial(trial.number, cfg, objective_fn)
+            trials.append(result)
+            # Optuna records NaN objectives as failed and excludes them from TPE.
+            return result.score if result.score is not None else float("nan")
 
         study = optuna.create_study(direction=self.direction, sampler=optuna.samplers.TPESampler(seed=self.random_seed))
         study.optimize(_obj, n_trials=self.max_trials, timeout=self.time_budget_seconds)
@@ -291,13 +311,19 @@ class HyperparameterOptimizer:
     def _summarize(self, strategy: str, trials: list[OptimizationTrial]) -> HPOResult:
         if not trials:
             raise AutoMLError("No HPO trials completed within budget.")
-        best = max(trials, key=lambda t: t.score) if self.direction == "maximize" else min(trials, key=lambda t: t.score)
-        logger.info("hpo_completed", strategy=strategy, trials=len(trials), best_score=best.score)
+        scored = [(trial.score, trial) for trial in trials
+                  if trial.status == "completed" and trial.score is not None and np.isfinite(trial.score)]
+        if not scored:
+            raise AutoMLError("No HPO trial produced a finite objective.",
+                              context={"n_trials": len(trials), "trial_statuses": [trial.status for trial in trials]})
+        choose = max if self.direction == "maximize" else min
+        best_score, best = choose(scored, key=lambda entry: entry[0])
+        logger.info("hpo_completed", strategy=strategy, trials=len(trials), best_score=best_score)
         return HPOResult(
             strategy=strategy,
             direction=self.direction,
             best_params=best.params,
-            best_score=best.score,
+            best_score=best_score,
             n_trials=len(trials),
             trials=trials,
         )

@@ -8,6 +8,7 @@ are probed and used only when installed; otherwise calibrated native fallbacks r
 from __future__ import annotations
 
 import io
+from copy import deepcopy
 from typing import Any
 
 import networkx as nx
@@ -312,7 +313,11 @@ async def s09_vision(
         emb = res.get("embedding")
         dim = int(res.get("embedding_dim", 0) or 0)
         norm = float(np.linalg.norm(emb)) if emb is not None and dim else 0.0
-        return {"backend": res.get("backend"), "dim": dim, "norm": round(norm, 6), "image_shape": [h, w, 3]}
+        return {
+            "backend": res.get("backend"), "dim": dim, "norm": round(norm, 6), "image_shape": [h, w, 3],
+            "requested_backbone": res.get("requested_backbone"), "executed_backbone": res.get("executed_backbone"),
+            "pretrained_loaded": res.get("pretrained_loaded"), "weights": res.get("weights"),
+        }
 
     result = {
         "image": {"width": w, "height": h, "mode": "RGB", "synthetic": bool(synthetic), "filename": filename},
@@ -839,11 +844,39 @@ def s09_twin_control(
     sid = _wb()._sid(x_session_id or "default")
     state = _wb().get_session_state(sid)
 
-    # Build a default or state-cached twin.
-    twin = state.get("uap_digital_twin")
-    if twin is None or twin.A[0, 1] != req.dt:
-        twin = build_default_twin(n_x=req.n_x, n_u=req.n_u, dt=req.dt)
-        state["uap_digital_twin"] = twin
+    vectors = {
+        "setpoint": (req.setpoint, req.n_x), "Q_diag": (req.Q_diag, req.n_x),
+        "R_diag": (req.R_diag, req.n_u), "x_min": (req.x_min, req.n_x),
+        "x_max": (req.x_max, req.n_x), "u_min": (req.u_min, req.n_u), "u_max": (req.u_max, req.n_u),
+    }
+    for name, (values, expected) in vectors.items():
+        if values is not None and (len(values) != expected or not np.isfinite(values).all()):
+            raise HTTPException(status_code=422, detail=f"{name} requires {expected} finite values.")
+    if req.Q_diag is not None and any(value < 0 for value in req.Q_diag):
+        raise HTTPException(status_code=422, detail="Q_diag must be nonnegative.")
+    if req.R_diag is not None and any(value <= 0 for value in req.R_diag):
+        raise HTTPException(status_code=422, detail="R_diag must be positive.")
+    for lower, upper in ((req.x_min, req.x_max), (req.u_min, req.u_max)):
+        if lower is not None and upper is not None and any(a > b for a, b in zip(lower, upper, strict=True)):
+            raise HTTPException(status_code=422, detail="Lower bounds must not exceed upper bounds.")
+
+    measurement_source = "observed" if req.measurements is not None else "synthetic_simulation"
+    if req.measurements is not None:
+        if len(req.measurements) != req.n_steps or any(
+            len(row) != req.n_x or not np.isfinite(row).all() for row in req.measurements
+        ):
+            raise HTTPException(status_code=422, detail="Supply exactly n_steps measurements, each with n_x finite values.")
+        measurements = [np.asarray(row, dtype=float) for row in req.measurements]
+    else:
+        rng = np.random.default_rng(1234)
+        measurements = [rng.normal(0.0, 0.5, size=req.n_x) for _ in range(req.n_steps)]
+
+    previous = state.get("uap_digital_twin")
+    twin = build_default_twin(n_x=req.n_x, n_u=req.n_u, dt=req.dt)
+    if req.state_mode == "resume":
+        if previous is None or not np.array_equal(previous.A, twin.A) or not np.array_equal(previous.B, twin.B):
+            raise HTTPException(status_code=409, detail="No saved twin matches the requested dynamics. Start a fresh run.")
+        twin = deepcopy(previous)
 
     controller = ClosedLoopMPCController(
         twin,
@@ -857,35 +890,18 @@ def s09_twin_control(
         random_seed=42,
     )
 
-    # Deterministic measurement stream if none supplied.
-    if req.measurements:
-        measurements = [np.asarray(m, dtype=float) for m in req.measurements]
-        if len(measurements) < req.n_steps:
-            # Tile to required length.
-            rng = np.random.default_rng(7)
-            while len(measurements) < req.n_steps:
-                measurements.append(measurements[-1] + rng.normal(0, 0.05, size=req.n_x))
-        measurements = measurements[: req.n_steps]
-    else:
-        rng = np.random.default_rng(1234)
-        measurements = [rng.normal(0.0, 0.5, size=req.n_x) for _ in range(req.n_steps)]
-
-    setpoint = None
-    if req.setpoint:
-        sp = np.asarray(req.setpoint, dtype=float).ravel()
-        if sp.size >= req.n_x:
-            setpoint = sp[: req.n_x]
-        else:
-            setpoint = np.pad(sp, (0, req.n_x - sp.size), mode="edge")
-
+    initial_state = twin.x.tolist()
+    setpoint = np.asarray(req.setpoint, dtype=float) if req.setpoint is not None else None
     report = controller.run_closed_loop(measurements, setpoint=setpoint)
-
-    # Cache a copy of the controller for warm-start continuation.
+    if req.state_mode == "resume" and state.get("uap_digital_twin") is not previous:
+        raise HTTPException(status_code=409, detail="The twin changed during this run. Retry with the latest state.")
+    state["uap_digital_twin"] = twin
     state["uap_mpc_controller"] = controller
     state["uap_twin_control_report"] = report.model_dump()
 
     result = {
         "twin_control": report.model_dump(),
+        "provenance": {"measurement_source": measurement_source, "state_mode": req.state_mode, "initial_state": initial_state},
         "twin_dimensions": {"n_x": req.n_x, "n_u": req.n_u},
         "horizon": req.horizon,
         "n_steps_applied": report.n_steps_applied,

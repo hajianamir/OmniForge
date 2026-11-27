@@ -11,6 +11,7 @@ from scipy import stats
 from omniforge.core.exceptions import ForecastingError
 from omniforge.core.types import TaskType
 from omniforge.core.utils import is_package_available
+from omniforge.models._torch_state import TorchStateMixin
 from omniforge.models.deep.mlp import MLPModel
 from omniforge.models.deep.rnn_lstm import RecurrentSequenceModel
 
@@ -24,7 +25,7 @@ def _causal_series_to_array(y: pd.Series | np.ndarray) -> np.ndarray:
     return np.asarray(s.ffill().fillna(first_valid).to_numpy(dtype=float).ravel(), dtype=float)
 
 
-class DeepForecaster:
+class DeepForecaster(TorchStateMixin):
     """Windowed deep sequence forecaster supporting N-BEATS, PatchTST, TFT, LSTM/GRU & Residual MLP with split conformal calibration."""
 
     SUPPORTED_ARCHITECTURES: tuple[str, ...] = ("nbeats", "patchtst", "tft", "nbeats_mlp", "lstm", "gru")
@@ -74,41 +75,10 @@ class DeepForecaster:
             track_carbon=False,
         )
 
-    def _fit_paper_torch_forecaster(self, arr: np.ndarray) -> bool:
-        """Train genuine PyTorch N-BEATS / PatchTST / TFT multi-horizon forecaster."""
-        if not is_package_available("torch") or self.architecture not in ("nbeats", "patchtst", "tft"):
-            return False
-
+    def _build_torch_net(self, L: int, H: int) -> Any:
         import torch
         import torch.nn as nn
         import torch.nn.functional as F
-
-        torch.manual_seed(self.random_seed)
-        L = self._eff_context
-        H = min(self.horizon_train, max(1, (len(arr) - L) // 3))
-        if len(arr) <= L + H + 4:
-            return False
-        self._eff_horizon = H
-        alpha = float(np.clip(1.0 - self.confidence_level, 1e-4, 0.5))
-
-        # Determine chronological train / calibration split BEFORE scaling to prevent calibration leakage
-        n_windows = len(arr) - L - H + 1
-        cal_n = max(2, int(n_windows * 0.2))
-        has_holdout = n_windows > cal_n + H + 3
-        if has_holdout:
-            # Last training window starts at (n_windows - cal_n - H) so its H-step target never overlaps calibration targets
-            train_end_win = max(2, n_windows - cal_n - (H - 1))
-            scaler_end_idx = min(len(arr), L + train_end_win + H - 1)
-        else:
-            train_end_win = n_windows
-            scaler_end_idx = len(arr)
-
-        self._mean = float(np.mean(arr[:scaler_end_idx]))
-        self._std = max(float(np.std(arr[:scaler_end_idx])), 1e-6)
-        norm_arr = (arr - self._mean) / self._std
-
-        X_win = np.array([norm_arr[i - L : i] for i in range(L, len(norm_arr) - H + 1)], dtype=np.float32)
-        Y_win = np.array([norm_arr[i : i + H] for i in range(L, len(norm_arr) - H + 1)], dtype=np.float32)
 
         arch = self.architecture
 
@@ -183,8 +153,45 @@ class DeepForecaster:
                 fused = self.norm(seq + self.gate(att) * att)
                 out_q: torch.Tensor = self.q_head(fused[:, -1, :]).view(x.size(0), H, 3)
                 return out_q
+        return _NBEATSNet() if arch == "nbeats" else (_PatchTSTNet() if arch == "patchtst" else _TFTNet())
 
-        net: nn.Module = _NBEATSNet() if arch == "nbeats" else (_PatchTSTNet() if arch == "patchtst" else _TFTNet())
+    def _fit_paper_torch_forecaster(self, arr: np.ndarray) -> bool:
+        """Train genuine PyTorch N-BEATS / PatchTST / TFT multi-horizon forecaster."""
+        if not is_package_available("torch") or self.architecture not in ("nbeats", "patchtst", "tft"):
+            return False
+
+        import torch
+
+        torch.manual_seed(self.random_seed)
+        L = self._eff_context
+        H = min(self.horizon_train, max(1, (len(arr) - L) // 3))
+        if len(arr) <= L + H + 4:
+            return False
+        self._eff_horizon = H
+        alpha = float(np.clip(1.0 - self.confidence_level, 1e-4, 0.5))
+
+        # Determine chronological train / calibration split BEFORE scaling to prevent calibration leakage
+        n_windows = len(arr) - L - H + 1
+        cal_n = max(2, int(n_windows * 0.2))
+        has_holdout = n_windows > cal_n + H + 3
+        if has_holdout:
+            # Last training window starts at (n_windows - cal_n - H) so its H-step target never overlaps calibration targets
+            train_end_win = max(2, n_windows - cal_n - (H - 1))
+            scaler_end_idx = min(len(arr), L + train_end_win + H - 1)
+        else:
+            train_end_win = n_windows
+            scaler_end_idx = len(arr)
+
+        self._mean = float(np.mean(arr[:scaler_end_idx]))
+        self._std = max(float(np.std(arr[:scaler_end_idx])), 1e-6)
+        norm_arr = (arr - self._mean) / self._std
+
+        X_win = np.array([norm_arr[i - L : i] for i in range(L, len(norm_arr) - H + 1)], dtype=np.float32)
+        Y_win = np.array([norm_arr[i : i + H] for i in range(L, len(norm_arr) - H + 1)], dtype=np.float32)
+
+        arch = self.architecture
+        self._torch_build_config = {"L": L, "H": H}
+        net = self._build_torch_net(**self._torch_build_config)
         opt = torch.optim.AdamW(net.parameters(), lr=5e-3, weight_decay=1e-4)
         Xt = torch.tensor(X_win)
         Yt = torch.tensor(Y_win)
@@ -205,7 +212,7 @@ class DeepForecaster:
                 err = Y_tr.unsqueeze(-1) - out
                 loss = torch.mean(torch.maximum(quantiles * err, (quantiles - 1.0) * err))
             else:
-                loss = F.mse_loss(out, Y_tr)
+                loss = torch.nn.functional.mse_loss(out, Y_tr)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(net.parameters(), 2.0)
             opt.step()

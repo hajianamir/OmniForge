@@ -32,7 +32,7 @@ class MultimodalFusionModel(BaseOmniForgeModel):
             name="MultimodalFusionNet",
             task_type=task_type,
             embedding_dim=embedding_dim,
-            hidden_dims=list(hidden_dims),
+            hidden_dims=hidden_dims,
             epochs=epochs,
             **kwargs,
         )

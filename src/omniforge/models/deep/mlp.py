@@ -9,6 +9,7 @@ from sklearn.preprocessing import StandardScaler
 
 from omniforge.core.types import TaskType
 from omniforge.core.utils import is_package_available
+from omniforge.models._torch_state import TorchStateMixin
 from omniforge.models.base import BaseOmniForgeModel
 
 
@@ -44,7 +45,7 @@ def _activate_grad(z: np.ndarray, kind: str) -> np.ndarray:
     return (z > 0.0).astype(np.float64)
 
 
-class MLPModel(BaseOmniForgeModel):
+class MLPModel(TorchStateMixin, BaseOmniForgeModel):
     """Deep Feedforward MLP for classification and regression with Dropout, L2 decay, and Adam."""
 
     model_family = "deep_mlp"
@@ -66,7 +67,7 @@ class MLPModel(BaseOmniForgeModel):
         super().__init__(
             name="DeepMLP",
             task_type=task_type,
-            hidden_dims=list(hidden_dims),
+            hidden_dims=hidden_dims,
             activation=activation,
             dropout=dropout,
             learning_rate=learning_rate,
@@ -113,6 +114,21 @@ class MLPModel(BaseOmniForgeModel):
         self.metadata_.framework = self.framework
         self._fit_numpy(X_scaled, y_idx, out_dim, is_clf)
 
+    def _build_torch_net(self, in_dim: int, out_dim: int) -> Any:
+        import torch.nn as nn
+
+        act_cls = {"relu": nn.ReLU, "gelu": nn.GELU, "tanh": nn.Tanh}.get(self.activation, nn.ReLU)
+
+        layers: list[nn.Module] = []
+        prev = in_dim
+        for h in self.hidden_dims:
+            layers.extend([nn.Linear(prev, h), act_cls()])
+            if self.dropout > 0:
+                layers.append(nn.Dropout(self.dropout))
+            prev = h
+        layers.append(nn.Linear(prev, out_dim))
+        return nn.Sequential(*layers)
+
     def _fit_torch(self, X: np.ndarray, y: np.ndarray, out_dim: int, is_clf: bool) -> None:
         import torch
         import torch.nn as nn
@@ -120,17 +136,8 @@ class MLPModel(BaseOmniForgeModel):
         self.framework = "pytorch"
         self.metadata_.framework = self.framework
         torch.manual_seed(self.random_seed)
-        act_cls = {"relu": nn.ReLU, "gelu": nn.GELU, "tanh": nn.Tanh}.get(self.activation, nn.ReLU)
-
-        layers: list[nn.Module] = []
-        prev = X.shape[1]
-        for h in self.hidden_dims:
-            layers.extend([nn.Linear(prev, h), act_cls()])
-            if self.dropout > 0:
-                layers.append(nn.Dropout(self.dropout))
-            prev = h
-        layers.append(nn.Linear(prev, out_dim))
-        net = nn.Sequential(*layers)
+        self._torch_build_config = {"in_dim": X.shape[1], "out_dim": out_dim}
+        net = self._build_torch_net(**self._torch_build_config)
 
         optimizer = torch.optim.AdamW(
             net.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay

@@ -88,15 +88,21 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
     scope_targets = tuple(targets)
     scope_exclusions = tuple(_wb().get_excluded_columns(state, active_df))
     train_df, test_df, lock = _wb().get_active_split_frames(state, active_df)
+    if lock:
+        controls = {lock.get(key) for key in ("row_id_col", "group_col", "time_col")}
+        columns = [column for column in columns if column == target or column not in controls]
     automl_source = train_df.loc[:, columns]
     if int(automl_source[target].notna().sum()) < 10:
         raise HTTPException(status_code=400, detail="The training partition needs at least 10 observed target values.")
     holdout_source = test_df.loc[:, columns] if test_df is not None else None
-    native_backend = req.backend.strip().lower() == "omniforge_native"
+    backend_id = req.backend.strip().lower()
+    native_backend = backend_id == "omniforge_native"
     strategy = lock.get("strategy", "auto") if lock else None
 
     def split_options(target_name: str) -> dict[str, Any]:
-        if not lock or not native_backend:
+        if not lock:
+            return {}
+        if backend_id not in {"omniforge_native", "multi_layer_stacker"} and strategy not in {"group", "time_series"}:
             return {}
         rows = train_df.loc[train_df[target_name].notna()]
         options: dict[str, Any] = {"split_strategy": strategy}

@@ -177,8 +177,16 @@ def test_layer_one_and_landmarking_fit_preprocessing_only_on_fold_training_rows(
     stacker = MultiLayerStackingAutoML(cv_folds=3)
     monkeypatch.setattr(stacker, "_layer1_specs", lambda is_clf: {"L1_Ridge": Ridge()})
     result = stacker.fit(train, y.iloc[:30], holdout, y.iloc[30:], TaskType.REGRESSION)
-    splits = KFold(n_splits=3, shuffle=True, random_state=42).split(train)
-    assert fit_rows == [tuple(train.index), *[tuple(train.index[rows]) for rows, _ in splits]]
+    expected = [tuple(train.index)]
+    for outer_train, outer_val in KFold(n_splits=3, shuffle=True, random_state=42).split(train):
+        expected.append(tuple(train.index[outer_train]))
+        for inner_train, inner_val in KFold(n_splits=3, shuffle=True, random_state=42).split(outer_train):
+            fit_indices = outer_train[inner_train]
+            assert not set(fit_indices) & set(outer_val)
+            assert not set(fit_indices) & set(outer_train[inner_val])
+            expected.append(tuple(train.index[fit_indices]))
+    assert fit_rows == expected
+    assert result["stacking_validation"]["layer_two_candidates"]
     assert np.isfinite(result["best_model"].predict(holdout)).all()
 
     fit_rows.clear()

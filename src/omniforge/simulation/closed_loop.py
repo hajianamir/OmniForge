@@ -512,9 +512,8 @@ class ClosedLoopMPCController:
             total_cost += stage_cost
 
             # Apply control to twin (open-loop prediction), then assimilate measurement.
-            predicted = self.twin.A @ z_t + self.twin.B @ u_applied
-            state_traj.append(predicted.tolist())
             self.twin.assimilate(meas[t], control=u_applied)
+            state_traj.append(self.twin.x.tolist())
 
             # Build warm-start for next step: shift control sequence and state trajectory,
             # padding the terminal control/state so warm_start matches H * (n_u + n_x).

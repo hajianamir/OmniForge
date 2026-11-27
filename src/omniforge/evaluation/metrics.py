@@ -5,7 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import pandas as pd
 from scipy import optimize, stats
+from scipy.special import logsumexp
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -544,9 +546,10 @@ def evaluate_anomaly_adbench(
 class ProbabilityCalibrator:
     """Post-hoc probability calibration via Temperature Scaling (Guo et al. 2017), Platt Scaling, or Isotonic Regression.
 
-    Fitted strictly on held-out validation probabilities/logits so test-set argmax accuracy
-    (for Temperature Scaling) and rank ordering (for Platt / Isotonic) are preserved while
-    minimizing out-of-sample negative log-likelihood / Expected Calibration Error (ECE).
+    Fit on held-out validation predictions. Probability columns follow the
+    estimator's class order. For a vector or single column, values denote the
+    probability of the second class. Temperature scaling preserves ordering
+    within a probability row, up to clipping and numerical precision.
     """
 
     def __init__(self, method: str = "temperature") -> None:
@@ -582,84 +585,118 @@ class ProbabilityCalibrator:
         exps = np.exp(shifted)
         return np.asarray(exps / np.maximum(np.sum(exps, axis=1, keepdims=True), 1e-12), dtype=float)
 
-    def fit(self, y_val: np.ndarray, proba_val: np.ndarray) -> ProbabilityCalibrator:
-        """Fit post-hoc calibration parameters on validation ground truth and uncalibrated probabilities."""
-        yv = np.asarray(y_val)
-        pv = np.asarray(proba_val, dtype=float)
-        if len(yv) == 0 or len(yv) != len(pv):
-            raise EvaluationError("y_val and proba_val must be non-empty arrays of identical length.")
-        self._is_binary_1d = pv.ndim == 1 or (pv.ndim == 2 and pv.shape[1] == 1)
-        logits = self._to_logits(pv)
-        n_cols = logits.shape[1]
-        uniq = np.unique(yv)
-        if len(uniq) == n_cols:
-            self._classes = uniq
-            label_to_idx = {c: idx for idx, c in enumerate(uniq)}
-            y_idx = np.array([label_to_idx[v] for v in yv], dtype=int)
-        else:
-            self._classes = np.arange(n_cols)
-            y_idx = np.clip(yv.astype(int), 0, n_cols - 1)
+    @staticmethod
+    def _validate_probabilities(proba: np.ndarray) -> tuple[np.ndarray, int, bool]:
+        try:
+            values = np.asarray(proba, dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise EvaluationError("Probabilities must be numeric.") from exc
+        if values.ndim not in (1, 2) or (values.ndim == 2 and values.shape[1] == 0) or len(values) == 0:
+            raise EvaluationError("Expected a non-empty probability vector or matrix.")
+        binary_vector = values.ndim == 1 or values.shape[1] == 1
+        if not np.isfinite(values).all() or (values < 0).any() or (values > 1).any():
+            raise EvaluationError("Probabilities must be finite and in [0, 1].")
+        if not binary_vector and not np.allclose(values.sum(axis=1), 1, atol=1e-6, rtol=0):
+            raise EvaluationError("Each probability row must sum to one.")
+        return values, 2 if binary_vector else values.shape[1], binary_vector
 
+    @property
+    def classes_(self) -> np.ndarray:
+        """Class labels in the fitted probability-column order."""
+        if not self._is_fitted:
+            raise EvaluationError("ProbabilityCalibrator must be fitted before reading its class order.")
+        return self._classes.copy()
+
+    def fit(
+        self, y_val: np.ndarray, proba_val: np.ndarray, *, classes: np.ndarray | list[Any] | None = None,
+    ) -> ProbabilityCalibrator:
+        """Fit on validation data, using explicit class order when supplied.
+
+        Without `classes`, use the usual sorted estimator order only when
+        validation labels cover every probability column. Temperature scaling
+        can fit with an absent class if at least two classes are observed and
+        the caller supplies the full class order. Platt and isotonic require
+        observations for every class.
+        """
+        pv, n_cols, binary_vector = self._validate_probabilities(proba_val)
+        yv = np.asarray(y_val)
+        if yv.ndim != 1 or len(yv) != len(pv) or pd.isna(yv).any():
+            raise EvaluationError("Supply one observed validation label per probability row.")
+        if classes is None:
+            try:
+                class_order = np.unique(yv)
+            except TypeError as exc:
+                raise EvaluationError("Supply the estimator's probability-column class order explicitly.") from exc
+        else:
+            class_order = np.asarray(classes)
+        if class_order.ndim != 1 or len(class_order) != n_cols:
+            raise EvaluationError("Supply one class label per probability column in the estimator's order.")
+        labels = pd.Index(class_order)
+        if not labels.is_unique or labels.hasnans:
+            raise EvaluationError("Probability-column class labels must be unique and observed.")
+        y_idx = labels.get_indexer(yv)
+        if (y_idx < 0).any():
+            raise EvaluationError("Validation contains a label outside the estimator's class order.")
+        n_observed = len(np.unique(y_idx))
+        if n_observed < 2 or (self.method != "temperature" and n_observed != n_cols):
+            raise EvaluationError(f"Insufficient validation class coverage for {self.method} calibration.")
+
+        logits = self._to_logits(pv)
+        temperature = 1.0
+        platt = None
+        isotonic_models = []
         if self.method == "temperature":
             def _nll(log_t: float) -> float:
-                temp = float(np.exp(log_t))
-                scaled = logits / max(temp, 1e-4)
-                log_probs = scaled - (
-                    np.max(scaled, axis=1, keepdims=True)
-                    + np.log(np.sum(np.exp(scaled - np.max(scaled, axis=1, keepdims=True)), axis=1, keepdims=True))
-                )
-                return float(-np.mean(log_probs[np.arange(len(y_idx)), y_idx]))
+                scaled = logits / np.exp(log_t)
+                return float(np.mean(logsumexp(scaled, axis=1) - scaled[np.arange(len(y_idx)), y_idx]))
 
             opt = optimize.minimize_scalar(_nll, bounds=(-3.0, 3.5), method="bounded")
-            self.temperature_ = float(np.exp(float(opt.x)))
+            if not opt.success or not np.isfinite(opt.fun):
+                raise EvaluationError("Temperature optimization did not converge to a finite solution.")
+            temperature = float(np.exp(opt.x))
         elif self.method == "platt":
-            if len(np.unique(y_idx)) < 2:
-                self.temperature_ = 1.0
-                self._platt = None
-            else:
-                clf = LogisticRegression(C=1e4, max_iter=500, random_state=42)
-                feat = (logits[:, 1] - logits[:, 0]).reshape(-1, 1) if n_cols == 2 else logits
-                clf.fit(feat, y_idx)
-                self._platt = clf
-        else:  # isotonic
-            self._isotonic_models = []
+            platt = LogisticRegression(C=1e4, max_iter=500, random_state=42)
+            feat = (logits[:, 1] - logits[:, 0]).reshape(-1, 1) if n_cols == 2 else logits
+            platt.fit(feat, y_idx)
+        else:
             probs_2d = self._softmax(logits)
             for k in range(n_cols):
                 iso = IsotonicRegression(y_min=1e-6, y_max=1.0 - 1e-6, out_of_bounds="clip")
                 iso.fit(probs_2d[:, k], (y_idx == k).astype(float))
-                self._isotonic_models.append(iso)
+                isotonic_models.append(iso)
 
+        self._classes = class_order.copy()
+        self._is_binary_1d = binary_vector
+        self.temperature_ = temperature
+        self._platt = platt
+        self._isotonic_models = isotonic_models
         self._is_fitted = True
         return self
 
     def transform(self, proba: np.ndarray) -> np.ndarray:
-        """Transform uncalibrated probabilities into calibrated probabilities."""
+        """Transform probabilities in the class order and representation used during fit."""
         if not self._is_fitted:
             raise EvaluationError("ProbabilityCalibrator must be fitted before transform().")
-        pv = np.asarray(proba, dtype=float)
+        pv, n_cols, binary_vector = self._validate_probabilities(proba)
+        if n_cols != len(self._classes) or binary_vector != self._is_binary_1d:
+            raise EvaluationError("The probability schema differs from the fitted calibration input.")
         logits = self._to_logits(pv)
-        n_cols = logits.shape[1]
 
         if self.method == "temperature":
-            cal_2d = self._softmax(logits / max(self.temperature_, 1e-4))
+            cal_2d = self._softmax(logits / self.temperature_)
         elif self.method == "platt":
-            if self._platt is None:
-                cal_2d = self._softmax(logits)
-            else:
-                feat = (logits[:, 1] - logits[:, 0]).reshape(-1, 1) if n_cols == 2 else logits
-                cal_2d = np.asarray(self._platt.predict_proba(feat), dtype=float)
+            assert self._platt is not None
+            feat = (logits[:, 1] - logits[:, 0]).reshape(-1, 1) if n_cols == 2 else logits
+            cal_2d = np.asarray(self._platt.predict_proba(feat), dtype=float)
         else:
             probs_2d = self._softmax(logits)
-            cols = [iso.transform(probs_2d[:, k]) for k, iso in enumerate(self._isotonic_models)]
-            stacked = np.column_stack(cols)
-            cal_2d = stacked / np.maximum(stacked.sum(axis=1, keepdims=True), 1e-12)
+            stacked = np.column_stack([iso.transform(probs_2d[:, k]) for k, iso in enumerate(self._isotonic_models)])
+            cal_2d = stacked / stacked.sum(axis=1, keepdims=True)
 
-        if self._is_binary_1d:
-            return np.asarray(cal_2d[:, 1], dtype=float)
-        return np.asarray(cal_2d, dtype=float)
+        return np.asarray(cal_2d[:, 1] if binary_vector else cal_2d, dtype=float)
 
-    def fit_transform(self, y_val: np.ndarray, proba_val: np.ndarray) -> np.ndarray:
+    def fit_transform(
+        self, y_val: np.ndarray, proba_val: np.ndarray, *, classes: np.ndarray | list[Any] | None = None,
+    ) -> np.ndarray:
         """Fit on validation predictions and return calibrated validation probabilities."""
-        return self.fit(y_val, proba_val).transform(proba_val)
-
-
+        return self.fit(y_val, proba_val, classes=classes).transform(proba_val)

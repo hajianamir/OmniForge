@@ -9,6 +9,7 @@ from sklearn.preprocessing import StandardScaler
 
 from omniforge.core.types import TaskType
 from omniforge.core.utils import is_package_available
+from omniforge.models._torch_state import TorchStateMixin
 from omniforge.models.base import BaseOmniForgeModel
 
 
@@ -33,7 +34,7 @@ def _softmax_last(x: np.ndarray) -> np.ndarray:
     return np.asarray(exps / np.maximum(np.sum(exps, axis=-1, keepdims=True), 1e-12), dtype=np.float64)
 
 
-class TabularTransformerModel(BaseOmniForgeModel):
+class TabularTransformerModel(TorchStateMixin, BaseOmniForgeModel):
     """Feature Tokenizer + Multi-Head Self-Attention Transformer for tabular & time-series tasks."""
 
     model_family = "deep_transformer"
@@ -326,26 +327,12 @@ class TabularTransformerModel(BaseOmniForgeModel):
             return
         self._fit_numpy(X_scaled, y, is_clf)
 
-    def _fit_torch(self, X: np.ndarray, y: np.ndarray, is_clf: bool) -> None:
+    def _build_torch_net(self, n_feats: int, out_dim: int) -> Any:
         import torch
         import torch.nn as nn
         import torch.nn.functional as F
 
-        self.framework = "pytorch_ft_transformer"
-        self.metadata_.framework = self.framework
-        torch.manual_seed(self.random_seed)
-        if is_clf:
-            classes = np.unique(y)
-            l2i = {c: i for i, c in enumerate(classes)}
-            self._idx_to_label = {i: c for i, c in enumerate(classes)}
-            y_t = torch.tensor([l2i[v] for v in y], dtype=torch.long)
-            out_dim = len(classes)
-        else:
-            y_t = torch.tensor(y.astype(np.float32).reshape(-1, 1), dtype=torch.float32)
-            out_dim = 1
-
         d_mod, heads, layers_n = self.d_model, self.n_heads, self.n_layers
-        n_feats = X.shape[1]
 
         class _PreNormGEGLUBlock(nn.Module):
             """Gorishniy et al. (NeurIPS 2021) Pre-Norm MHSA + GEGLU FFN Transformer Block."""
@@ -388,9 +375,29 @@ class TabularTransformerModel(BaseOmniForgeModel):
                     seq = blk(seq)
                 cls_out = F.relu(self.head_norm(seq[:, 0, :]))
                 return self.head(cls_out)
+        return _FTTransformer()
 
-        net = _FTTransformer()
-        opt = torch.optim.AdamW(net.parameters(), lr=self.learning_rate, weight_decay=1e-4)
+    def _fit_torch(self, X: np.ndarray, y: np.ndarray, is_clf: bool) -> None:
+        import torch
+        import torch.nn as nn
+
+        self.framework = "pytorch_ft_transformer"
+        self.metadata_.framework = self.framework
+        torch.manual_seed(self.random_seed)
+        if is_clf:
+            classes = np.unique(y)
+            l2i = {c: i for i, c in enumerate(classes)}
+            self._idx_to_label = {i: c for i, c in enumerate(classes)}
+            y_t = torch.tensor([l2i[v] for v in y], dtype=torch.long)
+            out_dim = len(classes)
+        else:
+            y_t = torch.tensor(y.astype(np.float32).reshape(-1, 1), dtype=torch.float32)
+            out_dim = 1
+
+        n_feats = X.shape[1]
+        self._torch_build_config = {"n_feats": n_feats, "out_dim": out_dim}
+        net = self._build_torch_net(**self._torch_build_config)
+        opt = torch.optim.AdamW(net.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(self.epochs, 1))
         loss_fn: Any = nn.CrossEntropyLoss() if is_clf else nn.MSELoss()
         X_t = torch.tensor(X.astype(np.float32))

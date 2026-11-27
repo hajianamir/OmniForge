@@ -27,7 +27,14 @@ from sklearn.feature_selection import SelectKBest, f_classif, f_regression
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import f1_score, root_mean_squared_error
-from sklearn.model_selection import KFold, StratifiedKFold, cross_val_score
+from sklearn.model_selection import (
+    GroupKFold,
+    KFold,
+    StratifiedGroupKFold,
+    StratifiedKFold,
+    TimeSeriesSplit,
+    cross_val_score,
+)
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.pipeline import Pipeline
@@ -223,6 +230,7 @@ class _WrappedSklearnModel(BaseOmniForgeModel):
         self._estimator = estimator
         self.is_fitted_ = True
         self._classes = classes
+        self.classes_ = classes
         self.extra_meta = extra_meta or {}
 
     def _fit(self, X: np.ndarray, y: np.ndarray | None, **kwargs: Any) -> None:
@@ -259,6 +267,7 @@ class _CaruanaStackPredictor:
         *,
         is_clf: bool,
         classes: np.ndarray | None = None,
+        stack_features: list[str] | None = None,
     ) -> None:
         self.preprocessor = preprocessor
         self.l1_models = l1_models
@@ -266,18 +275,22 @@ class _CaruanaStackPredictor:
         self.weights = weights
         self.is_clf = is_clf
         self.classes_ = classes
+        self.stack_features = list(l1_models) if stack_features is None else stack_features
 
     def _transform_and_l1(self, X: pd.DataFrame | np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray], np.ndarray]:
+        if not isinstance(X, pd.DataFrame) and hasattr(self.preprocessor, "feature_names_in_"):
+            values = np.asarray(X)
+            names = self.preprocessor.feature_names_in_
+            if values.ndim != 2 or values.shape[1] != len(names):
+                raise AutoMLError("Stacking input columns do not match the fitted feature schema.")
+            X = pd.DataFrame(values, columns=names)
         X_mat = self.preprocessor.transform(X)
-        l1_preds: dict[str, np.ndarray] = {}
-        stack_blocks: list[np.ndarray] = [X_mat]
-        for mname, est in self.l1_models.items():
-            if self.is_clf and hasattr(est, "predict_proba"):
-                p = np.asarray(est.predict_proba(X_mat), dtype=float)
-            else:
-                p = np.asarray(est.predict(X_mat), dtype=float).reshape(-1, 1)
-            l1_preds[mname] = p
-            stack_blocks.append(p)
+        l1_preds = {
+            name: MultiLayerStackingAutoML._response(estimator, X_mat, self.classes_ if self.is_clf else None)
+            for name, estimator in self.l1_models.items()
+        }
+        stack_features = getattr(self, "stack_features", self.l1_models)
+        stack_blocks = [X_mat, *[l1_preds[name] for name in stack_features]]
         return X_mat, l1_preds, np.hstack(stack_blocks)
 
     def predict_proba(self, X: pd.DataFrame | np.ndarray) -> np.ndarray:
@@ -286,7 +299,7 @@ class _CaruanaStackPredictor:
         _, l1_preds, X_l2 = self._transform_and_l1(X)
         all_preds = dict(l1_preds)
         for mname, est in self.l2_models.items():
-            all_preds[mname] = np.asarray(est.predict_proba(X_l2), dtype=float)
+            all_preds[mname] = MultiLayerStackingAutoML._response(est, X_l2, self.classes_)
         blend: np.ndarray | None = None
         total_w = 0.0
         for mname, w in self.weights.items():
@@ -309,7 +322,7 @@ class _CaruanaStackPredictor:
         _, l1_preds, X_l2 = self._transform_and_l1(X)
         all_preds = dict(l1_preds)
         for mname, est in self.l2_models.items():
-            all_preds[mname] = np.asarray(est.predict(X_l2), dtype=float).reshape(-1, 1)
+            all_preds[mname] = MultiLayerStackingAutoML._response(est, X_l2, None)
         blend: np.ndarray | None = None
         total_w = 0.0
         for mname, w in self.weights.items():
@@ -364,6 +377,16 @@ def _caruana_greedy_weights(
     return weights, best_score
 
 
+@dataclass
+class _StackingScope:
+    preprocessor: ColumnTransformer
+    train_matrix: np.ndarray
+    eval_matrix: np.ndarray
+    estimators: dict[str, Any] = field(default_factory=dict)
+    eval_preds: dict[str, np.ndarray] = field(default_factory=dict)
+    inner_preds: dict[str, np.ndarray] = field(default_factory=dict)
+
+
 class MultiLayerStackingAutoML:
     """AutoGluon-inspired K-Fold Out-of-Fold Multi-Layer Stack Ensembling + Caruana Weighted Ensemble."""
 
@@ -399,142 +422,238 @@ class MultiLayerStackingAutoML:
             specs_r["L1_LightGBM"] = LGBMRegressor(n_estimators=140, verbosity=-1, random_state=self.random_seed, n_jobs=jobs)
         return specs_r
 
-    def fit(self, X_train: pd.DataFrame, y_train: pd.Series, X_val: pd.DataFrame, y_val: pd.Series, task_type: TaskType) -> dict[str, Any]:
-        t0 = time.perf_counter()
-        is_clf = task_type != TaskType.REGRESSION
-        classes = np.unique(y_train) if is_clf else None
-        n_classes = len(classes) if classes is not None else 1
-
-        pre = _build_preprocessor(X_train)
-        X_tr_mat = pre.fit_transform(X_train)
-        X_va_mat = pre.transform(X_val)
-        y_tr_arr = np.asarray(y_train)
-        y_va_arr = np.asarray(y_val)
-
-        if is_clf:
-            min_cls = int(pd.Series(y_tr_arr).value_counts().min())
-            if n_classes < 2 or min_cls < 2:
-                raise AutoMLError("Stacking requires at least two training observations in every class.")
-            n_splits = max(2, min(self.cv_folds, min_cls))
-            splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=self.random_seed)
-            splits = list(splitter.split(X_train, y_tr_arr))
+    def _folds(
+        self, y: np.ndarray, classes: np.ndarray | None, groups: np.ndarray | None,
+        *, time_ordered: bool, gap: int,
+    ) -> list[tuple[np.ndarray, np.ndarray]]:
+        if len(y) < 3:
+            return []
+        rows = np.arange(len(y))
+        if time_ordered:
+            # Preserve the requested embargo. Reduce the number of folds only
+            # when the series cannot support that many chronological splits.
+            for n_splits in range(min(self.cv_folds, len(y) - 1), 1, -1):
+                try:
+                    folds = list(TimeSeriesSplit(n_splits=n_splits, gap=gap).split(rows))
+                    break
+                except ValueError:
+                    continue
+            else:
+                return []
+        elif groups is not None:
+            n_splits = min(self.cv_folds, len(pd.unique(groups)))
+            if classes is not None:
+                n_splits = min(n_splits, int(pd.Series(y).value_counts().min()))
+            if n_splits < 2:
+                return []
+            cv = GroupKFold(n_splits=n_splits) if classes is None else StratifiedGroupKFold(
+                n_splits=n_splits, shuffle=True, random_state=self.random_seed,
+            )
+            folds = list(cv.split(rows, y, groups))
+        elif classes is not None:
+            if len(np.unique(y)) != len(classes):
+                return []
+            n_splits = min(self.cv_folds, int(pd.Series(y).value_counts().min()))
+            if n_splits < 2:
+                return []
+            folds = list(StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=self.random_seed).split(rows, y))
         else:
-            n_splits = max(2, min(self.cv_folds, len(X_tr_mat) // 5))
-            splitter = KFold(n_splits=n_splits, shuffle=True, random_state=self.random_seed)
-            splits = list(splitter.split(X_train))
+            n_splits = max(2, min(self.cv_folds, len(y) // 5))
+            folds = list(KFold(n_splits=n_splits, shuffle=True, random_state=self.random_seed).split(rows))
+        return [
+            (train, valid) for train, valid in folds
+            if len(train) >= 2 and (classes is None or np.array_equal(np.unique(y[train]), classes))
+        ]
 
-        # Share each fitted fold transform across the base estimators in that fold.
-        fold_matrices = []
-        for tr_i, va_i in splits:
-            fold_train = X_train.iloc[tr_i]
-            fold_preprocessor = _build_preprocessor(fold_train)
-            fold_matrices.append((fold_preprocessor.fit_transform(fold_train), fold_preprocessor.transform(X_train.iloc[va_i])))
+    @staticmethod
+    def _response(estimator: Any, matrix: np.ndarray, classes: np.ndarray | None) -> np.ndarray:
+        if classes is None:
+            response = np.asarray(estimator.predict(matrix), dtype=float).reshape(-1, 1)
+            n_columns = 1
+        else:
+            probabilities = np.asarray(estimator.predict_proba(matrix), dtype=float)
+            order = pd.Index(estimator.classes_).get_indexer(classes)
+            if (order < 0).any() or probabilities.shape != (len(matrix), len(order)):
+                raise AutoMLError("The stacking candidate did not provide the fitted class columns.")
+            response = probabilities[:, order]
+            if (response < 0).any() or (response > 1).any() or not np.allclose(response.sum(axis=1), 1, atol=1e-6, rtol=0):
+                raise AutoMLError("Stacking requires normalized class probabilities.")
+            n_columns = len(classes)
+        if response.shape != (len(matrix), n_columns) or not np.isfinite(response).all():
+            raise AutoMLError("The stacking candidate produced invalid predictions.")
+        return response
 
-        # Layer 1 OOF + full fits
-        l1_specs = self._layer1_specs(is_clf)
-        oof_preds: dict[str, np.ndarray] = {}
-        val_preds: dict[str, np.ndarray] = {}
-        l1_fitted: dict[str, Any] = {}
-        leaderboard: list[dict[str, Any]] = []
-
-        for mname, proto in l1_specs.items():
+    def _layer1_scope(
+        self, X: pd.DataFrame, y: np.ndarray, X_eval: pd.DataFrame, specs: dict[str, Any],
+        classes: np.ndarray | None, inner_folds: list[tuple[np.ndarray, np.ndarray]],
+    ) -> _StackingScope:
+        pre = _build_preprocessor(X)
+        train_matrix = pre.fit_transform(X)
+        eval_matrix = pre.transform(X_eval)
+        inner_matrices = []
+        for train, valid in inner_folds:
+            transformer = _build_preprocessor(X.iloc[train])
+            inner_matrices.append((transformer.fit_transform(X.iloc[train]), transformer.transform(X.iloc[valid])))
+        scope = _StackingScope(pre, train_matrix, eval_matrix)
+        for name, proto in specs.items():
             try:
-                oof = np.zeros((len(X_tr_mat), n_classes), dtype=float)
-                for (tr_i, va_i), (fold_train_mat, fold_val_mat) in zip(splits, fold_matrices, strict=True):
-                    est_f = clone(proto)
-                    est_f.fit(fold_train_mat, y_tr_arr[tr_i])
-                    if is_clf and hasattr(est_f, "predict_proba"):
-                        oof[va_i] = est_f.predict_proba(fold_val_mat)
-                    else:
-                        oof[va_i, 0] = est_f.predict(fold_val_mat)
-                full_est = clone(proto)
-                full_est.fit(X_tr_mat, y_tr_arr)
-                l1_fitted[mname] = full_est
-                oof_preds[mname] = oof
-                vp = full_est.predict_proba(X_va_mat) if (is_clf and hasattr(full_est, "predict_proba")) else full_est.predict(X_va_mat).reshape(-1, 1)
-                val_preds[mname] = np.asarray(vp, dtype=float)
-                val_sc = (
-                    float(f1_score(y_va_arr, classes[np.argmax(vp, axis=1)], average="macro", zero_division=0))
-                    if (is_clf and classes is not None)
-                    else float(root_mean_squared_error(y_va_arr, vp.ravel()))
-                )
-                leaderboard.append({"model": mname, "layer": "L1", "metric": "f1_macro" if is_clf else "rmse", "score": round(val_sc, 6)})
+                estimator = clone(proto).fit(train_matrix, y)
+                scope.eval_preds[name] = self._response(estimator, eval_matrix, classes)
+                scope.estimators[name] = estimator
             except Exception as exc:
-                logger.warning("stack_l1_model_skipped", model=mname, error=str(exc))
+                logger.warning("stack_l1_model_skipped", model=name, error_type=type(exc).__name__)
+                continue
+            if not inner_folds:
+                continue
+            oof = np.full((len(X), len(classes) if classes is not None else 1), np.nan)
+            try:
+                for (train, valid), (inner_train, inner_valid) in zip(inner_folds, inner_matrices, strict=True):
+                    inner_model = clone(proto).fit(inner_train, y[train])
+                    oof[valid] = self._response(inner_model, inner_valid, classes)
+                scope.inner_preds[name] = oof
+            except Exception as exc:
+                logger.warning("stack_inner_candidate_skipped", model=name, error_type=type(exc).__name__)
+        return scope
 
-        if not l1_fitted:
-            raise AutoMLError("Multi-Layer Stacker failed to fit any Layer-1 base models.")
+    def fit(
+        self, X_train: pd.DataFrame, y_train: pd.Series, X_val: pd.DataFrame, y_val: pd.Series, task_type: TaskType,
+        *, groups: np.ndarray | None = None, time_ordered: bool = False, gap: int = 0,
+    ) -> dict[str, Any]:
+        """Fit nested stacking. A chronological development frame must already be ordered."""
+        t0 = time.perf_counter()
+        if not X_train.index.equals(y_train.index) or not X_val.index.equals(y_val.index):
+            raise AutoMLError("Stacking predictors and targets must have aligned row indexes.")
+        if gap < 0 or (gap and not time_ordered) or (time_ordered and groups is not None):
+            raise AutoMLError("Choose either grouped or chronological stacking. Embargo gaps require chronology.")
+        if groups is not None:
+            groups = np.asarray(groups)
+            if groups.shape != (len(X_train),) or pd.isna(groups).any():
+                raise AutoMLError("Stacking requires one observed group per development row.")
+        y = np.asarray(y_train)
+        y_val_arr = np.asarray(y_val)
+        if not len(y_val_arr) or pd.isna(y).any() or pd.isna(y_val_arr).any():
+            raise AutoMLError("Stacking requires observed development and validation outcomes.")
+        is_clf = task_type != TaskType.REGRESSION
+        classes = np.unique(y) if is_clf else None
+        if classes is not None and (len(classes) < 2 or not pd.Series(y_val_arr).isin(classes).all()):
+            raise AutoMLError("The development set must contain at least two classes and cover the validation classes.")
+        folds = self._folds(y, classes, groups, time_ordered=time_ordered, gap=gap)
+        if not folds:
+            raise AutoMLError("The development set cannot support leakage-safe stacking folds.")
 
-        # Layer 2 Stacker Features: [Original Features + Layer 1 OOF Predictions]
-        X_l2_tr = np.hstack([X_tr_mat, *[oof_preds[k] for k in l1_fitted]])
-        X_l2_va = np.hstack([X_va_mat, *[val_preds[k] for k in l1_fitted]])
+        specs = self._layer1_specs(is_clf)
+        final = self._layer1_scope(X_train, y, X_val, specs, classes, [])
+        n_columns = len(classes) if classes is not None else 1
+        outer_predictions = {name: np.full((len(y), n_columns), np.nan) for name in final.estimators}
+        outer_scopes: list[tuple[np.ndarray, np.ndarray, _StackingScope]] = []
+        provenance = []
+        for train, valid in folds:
+            inner_folds = self._folds(
+                y[train], classes, groups[train] if groups is not None else None,
+                time_ordered=time_ordered, gap=gap,
+            )
+            scope = self._layer1_scope(X_train.iloc[train], y[train], X_train.iloc[valid], specs, classes, inner_folds)
+            # Outer estimators are used only to produce fold predictions.
+            scope.estimators.clear()
+            for name, preds in scope.eval_preds.items():
+                if name in outer_predictions:
+                    outer_predictions[name][valid] = preds
+            outer_scopes.append((train, valid, scope))
+            provenance.append({
+                "train": train.tolist(), "validation": valid.tolist(),
+                "inner_folds": [{"train": train[a].tolist(), "validation": train[b].tolist()} for a, b in inner_folds],
+            })
 
-        l2_specs: dict[str, Any] = (
-            {
-                "L2_Stack_HistGBM": HistGradientBoostingClassifier(max_iter=100, max_depth=5, random_state=self.random_seed),
-                "L2_Stack_Logistic": LogisticRegression(C=0.5, max_iter=500, random_state=self.random_seed),
-            }
-            if is_clf
-            else {
-                "L2_Stack_HistGBM": HistGradientBoostingRegressor(max_iter=100, max_depth=5, random_state=self.random_seed),
-                "L2_Stack_Ridge": Ridge(alpha=5.0),
-            }
-        )
+        scored_rows = np.sort(np.concatenate([valid for _, valid in folds]))
+        names = [name for name, preds in outer_predictions.items() if np.isfinite(preds[scored_rows]).all()]
+        if not names:
+            raise AutoMLError("No Layer-1 model completed all eligible outer folds.")
+        l1_fitted = {name: final.estimators[name] for name in names}
+        oof_preds = {name: outer_predictions[name][scored_rows] for name in names}
+        metric = "f1_macro" if is_clf else "rmse"
+
+        def validation_score(preds: np.ndarray) -> float:
+            if classes is not None:
+                return float(f1_score(y_val_arr, classes[np.argmax(preds, axis=1)], average="macro", zero_division=0))
+            return float(root_mean_squared_error(y_val_arr, preds.ravel()))
+
+        leaderboard: list[dict[str, Any]] = [
+            {"model": name, "layer": "L1", "metric": metric, "score": round(validation_score(final.eval_preds[name]), 6)}
+            for name in names
+        ]
+
+        # All stacking folds must have the same base-model feature blocks.
+        # Each outer scope learns the augmented training matrix solely from
+        # inner OOF predictions within that outer training set.
+        stack_features = [name for name in names if all(name in scope.inner_preds for _, _, scope in outer_scopes)]
+        nested_matrices = []
+        for train, valid, scope in outer_scopes:
+            if not stack_features:
+                break
+            inner = np.hstack([scope.train_matrix, *[scope.inner_preds[name] for name in stack_features]])
+            usable = np.isfinite(inner).all(axis=1)
+            if usable.sum() < 2 or (classes is not None and not np.array_equal(np.unique(y[train][usable]), classes)):
+                break
+            held_out = np.hstack([scope.eval_matrix, *[scope.eval_preds[name] for name in stack_features]])
+            nested_matrices.append((train[usable], valid, inner[usable], held_out))
+
         l2_fitted: dict[str, Any] = {}
-        for mname, proto in l2_specs.items():
-            try:
-                oof2 = np.zeros((len(X_l2_tr), n_classes), dtype=float)
-                for tr_i, va_i in splits:
-                    est_f = clone(proto)
-                    est_f.fit(X_l2_tr[tr_i], y_tr_arr[tr_i])
-                    if is_clf and hasattr(est_f, "predict_proba"):
-                        oof2[va_i] = est_f.predict_proba(X_l2_tr[va_i])
-                    else:
-                        oof2[va_i, 0] = est_f.predict(X_l2_tr[va_i])
-                full_est2 = clone(proto)
-                full_est2.fit(X_l2_tr, y_tr_arr)
-                l2_fitted[mname] = full_est2
-                oof_preds[mname] = oof2
-                vp2 = full_est2.predict_proba(X_l2_va) if (is_clf and hasattr(full_est2, "predict_proba")) else full_est2.predict(X_l2_va).reshape(-1, 1)
-                val_sc2 = (
-                    float(f1_score(y_va_arr, classes[np.argmax(vp2, axis=1)], average="macro", zero_division=0))
-                    if (is_clf and classes is not None)
-                    else float(root_mean_squared_error(y_va_arr, vp2.ravel()))
-                )
-                leaderboard.append({"model": mname, "layer": "L2_Stack", "metric": "f1_macro" if is_clf else "rmse", "score": round(val_sc2, 6)})
-            except Exception as exc:
-                logger.warning("stack_l2_model_skipped", model=mname, error=str(exc))
+        if len(nested_matrices) == len(outer_scopes):
+            dev = np.hstack([final.train_matrix[scored_rows], *[oof_preds[name] for name in stack_features]])
+            validation = np.hstack([final.eval_matrix, *[final.eval_preds[name] for name in stack_features]])
+            l2_specs = (
+                {
+                    "L2_Stack_HistGBM": HistGradientBoostingClassifier(max_iter=100, max_depth=5, random_state=self.random_seed),
+                    "L2_Stack_Logistic": LogisticRegression(C=0.5, max_iter=500, random_state=self.random_seed),
+                } if is_clf else {
+                    "L2_Stack_HistGBM": HistGradientBoostingRegressor(max_iter=100, max_depth=5, random_state=self.random_seed),
+                    "L2_Stack_Ridge": Ridge(alpha=5.0),
+                }
+            )
+            for name, proto in l2_specs.items():
+                try:
+                    oof = np.full((len(y), n_columns), np.nan)
+                    for train, valid, inner, held_out in nested_matrices:
+                        fold_model = clone(proto).fit(inner, y[train])
+                        oof[valid] = self._response(fold_model, held_out, classes)
+                    model = clone(proto).fit(dev, y[scored_rows])
+                    score = validation_score(self._response(model, validation, classes))
+                    l2_fitted[name] = model
+                    oof_preds[name] = oof[scored_rows]
+                    leaderboard.append({"model": name, "layer": "L2_Stack", "metric": metric, "score": round(score, 6)})
+                except Exception as exc:
+                    logger.warning("stack_l2_candidate_skipped", model=name, error_type=type(exc).__name__)
 
-        # Layer 3: Caruana Greedy Weighted Ensemble Selection on OOF predictions
-        weights, _ = _caruana_greedy_weights(oof_preds, y_tr_arr, is_clf=is_clf, classes=classes, n_rounds=15)
-        predictor = _CaruanaStackPredictor(pre, l1_fitted, l2_fitted, weights, is_clf=is_clf, classes=classes)
-        ens_preds = predictor.predict(X_val)
-        ens_score = (
-            float(f1_score(y_va_arr, ens_preds, average="macro", zero_division=0))
-            if is_clf
-            else float(root_mean_squared_error(y_va_arr, ens_preds))
+        weights, _ = _caruana_greedy_weights(oof_preds, y[scored_rows], is_clf=is_clf, classes=classes, n_rounds=15)
+        predictor = _CaruanaStackPredictor(
+            final.preprocessor, l1_fitted, l2_fitted, weights,
+            is_clf=is_clf, classes=classes, stack_features=stack_features,
         )
-        leaderboard.append({"model": "L3_WeightedEnsemble_Caruana", "layer": "L3_Ensemble", "metric": "f1_macro" if is_clf else "rmse", "score": round(ens_score, 6)})
-        leaderboard.sort(key=lambda r: float(r["score"]), reverse=is_clf)
-
-        wrapped = _WrappedSklearnModel(
-            name="MultiLayerStackEnsemble",
-            estimator=predictor,
-            task_type=task_type,
-            classes=classes,
-            extra_meta={"ensemble_weights": weights, "layers": 3},
-            random_seed=self.random_seed,
-        )
+        ensemble_predictions = predictor.predict_proba(X_val) if is_clf else predictor.predict(X_val)
+        ens_score = validation_score(ensemble_predictions)
+        ensemble_name = "L3_WeightedEnsemble_Caruana" if l2_fitted else "L1_WeightedEnsemble_Caruana"
+        leaderboard.append({"model": ensemble_name, "layer": "L3_Ensemble" if l2_fitted else "L1_Ensemble",
+                            "metric": metric, "score": round(ens_score, 6)})
+        leaderboard.sort(key=lambda row: float(row["score"]), reverse=is_clf)
+        summary = {
+            "n_oof_rows": len(scored_rows), "n_outer_folds": len(folds),
+            "layer_two_candidates": list(l2_fitted),
+            "layer_two_inputs": stack_features if l2_fitted else [],
+        }
         return {
-            "best_model": wrapped,
-            "best_model_name": "L3_WeightedEnsemble_Caruana",
+            "best_model": _WrappedSklearnModel(
+                name="MultiLayerStackEnsemble", estimator=predictor, task_type=task_type, classes=classes,
+                extra_meta={"ensemble_weights": weights, "stacking_validation": summary}, random_seed=self.random_seed,
+            ),
+            "best_model_name": ensemble_name,
             "best_score": round(ens_score, 6),
-            "primary_metric": "f1_macro" if is_clf else "rmse",
+            "primary_metric": metric,
             "leaderboard": leaderboard,
             "ensemble_weights": weights,
+            "stacking_validation": summary,
+            "fold_provenance": provenance,
             "elapsed_seconds": round(time.perf_counter() - t0, 3),
         }
-
 
 @dataclass
 class _PipelineGenome:
@@ -909,15 +1028,56 @@ class AutoMLBackendHub:
         if req_backend == "omniforge_native":
             return run_native()
 
-        if groups is not None or time_values is not None or gap:
+        explicit_split = groups is not None or time_values is not None or gap or split_strategy in {"group", "time_series"}
+        if explicit_split and req_backend != "multi_layer_stacker":
             raise AutoMLError(
                 "This AutoML backend does not support explicit group or time split metadata.",
-                suggestions=["Choose the OmniForge native backend for grouped or chronological evaluation."],
+                suggestions=["Choose the OmniForge native backend or nested stacker for grouped or chronological evaluation."],
             )
 
-        # Benchmark comparison for specialized and external backends.
-        splitter = LeakageSafeSplitter(SplitConfig(strategy=split_strategy, test_size=0.2, cv_folds=cv_folds, random_seed=random_seed))
-        split_res = splitter.split(clean_df, target_col=target_col)
+        # Metadata guides the split and is excluded from model inputs.
+        benchmark_source = clean_df
+        stack_groups = None
+        stack_ordered = False
+        group_col = time_col = None
+        benchmark_strategy = split_strategy
+        if explicit_split:
+            if any(values is not None and np.asarray(values).shape != (len(df),) for values in (groups, time_values)):
+                raise AutoMLError("Group and time vectors must align with the input data.")
+            if (groups is not None and (time_values is not None or gap or split_strategy == "time_series")) or (
+                split_strategy == "group" and groups is None
+            ):
+                raise AutoMLError("Supply a single supported group or chronological split contract.")
+            positions = df[target_col].notna().to_numpy()
+            metadata_col = "__omniforge_split_metadata__"
+            while metadata_col in clean_df.columns:
+                metadata_col += "_"
+            if groups is not None:
+                stack_groups = np.asarray(groups)[positions]
+                if pd.isna(stack_groups).any():
+                    raise AutoMLError("Grouped stacking requires observed group membership.")
+                group_col = metadata_col
+                benchmark_strategy = "group"
+                benchmark_source = clean_df.assign(**{metadata_col: stack_groups})
+            else:
+                stack_ordered = True
+                benchmark_strategy = "time_series"
+                if time_values is not None:
+                    times = pd.Series(np.asarray(time_values)[positions])
+                    if not pd.api.types.is_numeric_dtype(times):
+                        times = pd.to_datetime(times, errors="coerce", utc=True, format="mixed")
+                    if times.isna().any() or not times.is_unique:
+                        raise AutoMLError("Chronological stacking requires observed, distinct timestamps. Use a grouped design for panel data.")
+                    time_col = metadata_col
+                    benchmark_source = clean_df.assign(**{metadata_col: times.to_numpy()})
+
+        splitter = LeakageSafeSplitter(SplitConfig(
+            strategy=benchmark_strategy, test_size=0.2, cv_folds=cv_folds, random_seed=random_seed,
+            group_col=group_col, time_col=time_col, gap=gap,
+        ))
+        split_res = splitter.split(benchmark_source, target_col=target_col)
+        if stack_ordered and gap and len(clean_df) - len(split_res.train_indices) - len(split_res.test_indices) < gap:
+            raise AutoMLError("Insufficient rows to preserve the requested chronological embargo.")
         tr_df = clean_df.iloc[split_res.train_indices]
         va_df = clean_df.iloc[split_res.test_indices]
         X_tr, y_tr = tr_df.drop(columns=[target_col]), tr_df[target_col]
@@ -1020,8 +1180,12 @@ class AutoMLBackendHub:
 
         # Specialized engines select using development rows only.
         if exec_backend == "multi_layer_stacker":
-            res = MultiLayerStackingAutoML(cv_folds=cv_folds, random_seed=random_seed).fit(X_tr, y_tr, X_va, y_va, resolved_task)
-            return finish(res, extra={"ensemble_weights": res.get("ensemble_weights", {})})
+            res = MultiLayerStackingAutoML(cv_folds=cv_folds, random_seed=random_seed).fit(
+                X_tr, y_tr, X_va, y_va, resolved_task,
+                groups=stack_groups[split_res.train_indices] if stack_groups is not None else None,
+                time_ordered=stack_ordered, gap=gap,
+            )
+            return finish(res, extra={"ensemble_weights": res["ensemble_weights"], "stacking_validation": res["stacking_validation"]})
 
         if exec_backend == "genetic_pipeline":
             res = GeneticPipelineAutoML(cv_folds=cv_folds, random_seed=random_seed).fit(X_tr, y_tr, X_va, y_va, resolved_task)

@@ -12,12 +12,18 @@ from sklearn.preprocessing import StandardScaler
 from omniforge.core.exceptions import DependencyMissingError, ModelTrainingError
 from omniforge.core.types import TaskType
 from omniforge.core.utils import is_package_available
+from omniforge.models._torch_state import TorchStateMixin
 from omniforge.models.base import BaseOmniForgeModel
 from omniforge.models.deep.mlp import MLPModel
 
 
-class GraphNeuralNetworkModel(BaseOmniForgeModel):
-    """End-to-end GCN (Kipf & Welling 2017), GraphSAGE (Hamilton 2017) & Multi-Head GAT (Velickovic 2018) with PyTorch & NumPy fallback."""
+class GraphNeuralNetworkModel(TorchStateMixin, BaseOmniForgeModel):
+    """Train PyTorch graph layers or a fixed NumPy projection with a learned readout.
+
+    Fits using explicit adjacency require graph context at inference. Fits using
+    implicit neighbors retain a training reference for request-independent scoring.
+    Graph attention requires PyTorch.
+    """
 
     model_family = "deep_gnn"
     framework = "pytorch_or_numpy_gnn"
@@ -101,6 +107,12 @@ class GraphNeuralNetworkModel(BaseOmniForgeModel):
         assert y is not None
         X_scaled = self._scaler.fit_transform(X)
         adjacency = kwargs.get("adjacency")
+        self._torch_net = None
+        self._head = None
+        self._reference_features = X_scaled.copy() if adjacency is None else None
+        if adjacency is not None:
+            adjacency = self._checked_adjacency(adjacency, len(X_scaled))
+        self.metadata_.hyperparameters["inference_graph_context"] = "training_neighbors" if adjacency is None else "explicit_adjacency"
         is_clf = self.task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION)
 
         if is_clf:
@@ -153,25 +165,15 @@ class GraphNeuralNetworkModel(BaseOmniForgeModel):
             executed_architecture=f"{self.architecture}_random_projection",
         )
 
-    def _fit_torch(
-        self,
-        X_s: np.ndarray,
-        y_enc: np.ndarray,
-        *,
-        adjacency: np.ndarray | None,
-        out_dim: int,
-        is_clf: bool,
-    ) -> None:
+    def _build_torch_net(self, in_dim: int, out_dim: int) -> Any:
         import torch
         import torch.nn as nn
         import torch.nn.functional as F
 
-        torch.manual_seed(self.random_seed)
-        adj = adjacency if adjacency is not None else self._build_knn_adjacency(X_s)
-        in_dim = X_s.shape[1]
         h_dim = self.hidden_dim
         arch = self.architecture
         n_heads = self.n_heads
+        n_hops = self.n_hops
 
         class _GATLayer(nn.Module):
             """Velickovic et al. (ICLR 2018) Multi-Head Graph Attention Layer."""
@@ -199,36 +201,52 @@ class GraphNeuralNetworkModel(BaseOmniForgeModel):
         class _GNNNet(nn.Module):
             def __init__(self) -> None:
                 super().__init__()
-                if arch == "gat":
-                    self.l1: Any = _GATLayer(in_dim, h_dim, n_heads)
-                    d1 = self.l1.heads * self.l1.d_h
-                    self.l2: Any = _GATLayer(d1, h_dim, 1)
-                    d2 = self.l2.heads * self.l2.d_h
-                elif arch == "graphsage":
-                    self.l1 = nn.Linear(in_dim * 2, h_dim)
-                    self.l2 = nn.Linear(h_dim * 2, h_dim)
-                    d2 = h_dim
-                else:
-                    self.l1 = nn.Linear(in_dim, h_dim)
-                    self.l2 = nn.Linear(h_dim, h_dim)
-                    d2 = h_dim
-                self.head = nn.Linear(d2, out_dim)
+                layers = []
+                width = in_dim
+                for hop in range(n_hops):
+                    layer: nn.Module
+                    if arch == "gat":
+                        attention = _GATLayer(width, h_dim, n_heads if hop == 0 else 1)
+                        width = attention.heads * attention.d_h
+                        layer = attention
+                    else:
+                        layer = nn.Linear(width * (2 if arch == "graphsage" else 1), h_dim)
+                        width = h_dim
+                    layers.append(layer)
+                self.layers = nn.ModuleList(layers)
+                self.head = nn.Linear(width, out_dim)
 
             def forward(self, x: torch.Tensor, a_t: torch.Tensor) -> torch.Tensor:
-                if arch == "gat":
-                    h = self.l1(x, a_t)
-                    h = self.l2(h, a_t)
-                elif arch == "graphsage":
-                    h = F.relu(self.l1(torch.cat([x, a_t @ x], dim=-1)))
-                    h = F.dropout(h, p=0.15, training=self.training)
-                    h = F.relu(self.l2(torch.cat([h, a_t @ h], dim=-1)))
-                else:
-                    h = F.relu(a_t @ self.l1(x))
-                    h = F.dropout(h, p=0.15, training=self.training)
-                    h = F.relu(a_t @ self.l2(h))
+                h = x
+                for hop, layer in enumerate(self.layers):
+                    if arch == "gat":
+                        h = layer(h, a_t)
+                        continue
+                    if arch == "graphsage":
+                        h = F.relu(layer(torch.cat([h, a_t @ h], dim=-1)))
+                    else:
+                        h = F.relu(a_t @ layer(h))
+                    if hop < n_hops - 1:
+                        h = F.dropout(h, p=0.15, training=self.training)
                 out: torch.Tensor = self.head(h)
                 return out
+        return _GNNNet()
 
+    def _fit_torch(
+        self,
+        X_s: np.ndarray,
+        y_enc: np.ndarray,
+        *,
+        adjacency: np.ndarray | None,
+        out_dim: int,
+        is_clf: bool,
+    ) -> None:
+        import torch
+        import torch.nn as nn
+
+        torch.manual_seed(self.random_seed)
+        adj = adjacency if adjacency is not None else self._build_knn_adjacency(X_s)
+        arch = self.architecture
         a_mat = (
             adj + np.eye(len(adj))
             if arch == "gat"
@@ -238,7 +256,8 @@ class GraphNeuralNetworkModel(BaseOmniForgeModel):
         At = torch.tensor(a_mat, dtype=torch.float32)
         yt = torch.tensor(y_enc, dtype=torch.long if is_clf else torch.float32)
 
-        net = _GNNNet()
+        self._torch_build_config = {"in_dim": X_s.shape[1], "out_dim": out_dim}
+        net = self._build_torch_net(**self._torch_build_config)
         opt = torch.optim.AdamW(net.parameters(), lr=self.learning_rate, weight_decay=5e-4)
         loss_fn: Any = nn.CrossEntropyLoss() if is_clf else nn.MSELoss()
         net.train()
@@ -251,46 +270,60 @@ class GraphNeuralNetworkModel(BaseOmniForgeModel):
         net.eval()
         self._torch_net = net
 
-    def _predict(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
-        X_s = self._scaler.transform(X)
-        adjacency = kwargs.get("adjacency")
+    @staticmethod
+    def _checked_adjacency(adjacency: Any, size: int) -> np.ndarray:
+        matrix = np.asarray(adjacency, dtype=float)
+        if matrix.shape != (size, size) or not np.isfinite(matrix).all() or (matrix < 0).any():
+            raise ModelTrainingError("Adjacency must be a finite, nonnegative square matrix aligned to node rows.")
+        return matrix
+
+    def _score_graph(self, X_s: np.ndarray, adj: np.ndarray, *, probabilities: bool) -> np.ndarray:
         if self._torch_net is not None:
             import torch
 
-            adj = adjacency if adjacency is not None else self._build_knn_adjacency(X_s)
-            a_mat = (
+            normalized = (
                 adj + np.eye(len(adj))
                 if self.architecture == "gat"
                 else (self.row_normalize_adjacency(adj) if self.architecture == "graphsage" else self.normalize_adjacency(adj))
             )
             with torch.no_grad():
-                out = self._torch_net(torch.tensor(X_s, dtype=torch.float32), torch.tensor(a_mat, dtype=torch.float32))
+                out = self._torch_net(torch.tensor(X_s, dtype=torch.float32), torch.tensor(normalized, dtype=torch.float32))
+                if probabilities:
+                    return np.asarray(torch.softmax(out, dim=-1).cpu().numpy(), dtype=float)
                 if self.task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
-                    idx = torch.argmax(out, dim=-1).cpu().numpy()
-                    return np.array([self._idx_to_label[int(i)] for i in idx])
+                    return np.asarray([self._idx_to_label[int(i)] for i in out.argmax(dim=-1).cpu().numpy()])
                 return np.asarray(out.squeeze(-1).cpu().numpy(), dtype=float)
         assert self._head is not None
-        emb = self._propagate_numpy(X_s, adjacency=adjacency)
-        return self._head.predict(emb)
+        embedded = self._propagate_numpy(X_s, adjacency=adj)
+        return self._head.predict_proba(embedded) if probabilities else self._head.predict(embedded)
+
+    def _score_rows(self, X: np.ndarray, adjacency: Any, *, probabilities: bool) -> np.ndarray:
+        X_s = self._scaler.transform(X)
+        if adjacency is not None:
+            return self._score_graph(X_s, self._checked_adjacency(adjacency, len(X_s)), probabilities=probabilities)
+        reference = getattr(self, "_reference_features", None)
+        if reference is None:
+            raise ModelTrainingError(
+                "This fit requires a graph adjacency aligned to prediction rows.",
+                suggestions=["Supply the graph context or refit with implicit training neighbors for tabular scoring."],
+            )
+        # Each request row sees only its own neighbors in the stored training
+        # reference. Request peers never create edges or change its scores.
+        k = min(self.knn_k, len(reference))
+        outputs = []
+        for row in X_s:
+            neighbors = np.argsort(np.sum(np.square(reference - row), axis=1), kind="stable")[:k]
+            local = np.vstack([row, reference[neighbors]])
+            outputs.append(self._score_graph(local, self._build_knn_adjacency(local), probabilities=probabilities)[:1])
+        return np.concatenate(outputs)
+
+    def _predict(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
+        return self._score_rows(X, kwargs.get("adjacency"), probabilities=False)
 
     def _predict_proba(self, X: np.ndarray, **kwargs: Any) -> np.ndarray:
-        X_s = self._scaler.transform(X)
-        adjacency = kwargs.get("adjacency")
-        if self._torch_net is not None:
-            import torch
-
-            adj = adjacency if adjacency is not None else self._build_knn_adjacency(X_s)
-            a_mat = (
-                adj + np.eye(len(adj))
-                if self.architecture == "gat"
-                else (self.row_normalize_adjacency(adj) if self.architecture == "graphsage" else self.normalize_adjacency(adj))
-            )
-            with torch.no_grad():
-                logits = self._torch_net(torch.tensor(X_s, dtype=torch.float32), torch.tensor(a_mat, dtype=torch.float32))
-                return np.asarray(torch.softmax(logits, dim=-1).cpu().numpy(), dtype=float)
-        assert self._head is not None
-        emb = self._propagate_numpy(X_s, adjacency=adjacency)
-        return self._head.predict_proba(emb)
+        if self.task_type not in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
+            raise ModelTrainingError("Graph probability predictions require a classification model.")
+        return self._score_rows(X, kwargs.get("adjacency"), probabilities=True)
 
 
 class GraphAutoencoderLinkModel:

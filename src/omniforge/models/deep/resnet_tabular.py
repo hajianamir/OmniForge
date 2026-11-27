@@ -9,11 +9,12 @@ from sklearn.preprocessing import StandardScaler
 
 from omniforge.core.types import TaskType
 from omniforge.core.utils import is_package_available
+from omniforge.models._torch_state import TorchStateMixin
 from omniforge.models.base import BaseOmniForgeModel
 from omniforge.models.deep.mlp import MLPModel
 
 
-class ResNetTabularModel(BaseOmniForgeModel):
+class ResNetTabularModel(TorchStateMixin, BaseOmniForgeModel):
     """Exact Gorishniy et al. (NeurIPS 2021) Tabular ResNet with PyTorch AdamW/CosineLR & NumPy fallback."""
 
     model_family = "deep_resnet_tabular"
@@ -61,6 +62,38 @@ class ResNetTabularModel(BaseOmniForgeModel):
         self._fallback: MLPModel | None = None
         self._idx_to_label: dict[int, Any] = {}
 
+    def _build_torch_net(self, in_dim: int, out_dim: int) -> Any:
+        import torch
+        import torch.nn as nn
+
+        d_m, d_h = self.d_main, self.d_hidden
+        dp1, dp2 = self.dropout_first, self.dropout_second
+
+        class _ResBlock(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.block = nn.Sequential(
+                    nn.BatchNorm1d(d_m),
+                    nn.Linear(d_m, d_h),
+                    nn.SiLU(),
+                    nn.Dropout(dp1),
+                    nn.Linear(d_h, d_m),
+                    nn.Dropout(dp2),
+                )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                out: torch.Tensor = x + self.block(x)
+                return out
+
+        net = nn.Sequential(
+            nn.Linear(in_dim, d_m),
+            *[_ResBlock() for _ in range(self.n_blocks)],
+            nn.BatchNorm1d(d_m),
+            nn.SiLU(),
+            nn.Linear(d_m, out_dim),
+        )
+        return net
+
     def _fit(self, X: np.ndarray, y: np.ndarray | None, **kwargs: Any) -> None:
         _ = kwargs
         assert y is not None
@@ -83,33 +116,8 @@ class ResNetTabularModel(BaseOmniForgeModel):
             import torch.nn as nn
 
             torch.manual_seed(self.random_seed)
-            in_dim = X_s.shape[1]
-            d_m, d_h = self.d_main, self.d_hidden
-            dp1, dp2 = self.dropout_first, self.dropout_second
-
-            class _ResBlock(nn.Module):
-                def __init__(self) -> None:
-                    super().__init__()
-                    self.block = nn.Sequential(
-                        nn.BatchNorm1d(d_m),
-                        nn.Linear(d_m, d_h),
-                        nn.SiLU(),
-                        nn.Dropout(dp1),
-                        nn.Linear(d_h, d_m),
-                        nn.Dropout(dp2),
-                    )
-
-                def forward(self, x: torch.Tensor) -> torch.Tensor:
-                    out: torch.Tensor = x + self.block(x)
-                    return out
-
-            net = nn.Sequential(
-                nn.Linear(in_dim, d_m),
-                *[_ResBlock() for _ in range(self.n_blocks)],
-                nn.BatchNorm1d(d_m),
-                nn.SiLU(),
-                nn.Linear(d_m, out_dim),
-            )
+            self._torch_build_config = {"in_dim": X_s.shape[1], "out_dim": out_dim}
+            net = self._build_torch_net(**self._torch_build_config)
             opt = torch.optim.AdamW(net.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
             sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(self.epochs, 1))
             loss_fn: Any = nn.CrossEntropyLoss() if is_clf else nn.MSELoss()

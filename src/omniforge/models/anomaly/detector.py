@@ -30,17 +30,18 @@ class AnomalyDetector(BaseOmniForgeModel):
         contamination: float = 0.05,
         **kwargs: Any,
     ) -> None:
-        method = method.strip().lower()
-        if method not in {"isolation_forest", "lof", "ocsvm", "pca_recon", "mad", "zscore", "ensemble"}:
+        normalized_method = method.strip().lower()
+        if normalized_method not in {"isolation_forest", "lof", "ocsvm", "pca_recon", "mad", "zscore", "ensemble"}:
             raise ModelTrainingError("Unsupported anomaly detection method.")
         super().__init__(
-            name=f"Anomaly_{method}",
+            name=f"Anomaly_{normalized_method}",
             task_type=TaskType.ANOMALY_DETECTION,
-            method=method,
+            method=normalized_method,
             contamination=contamination,
             **kwargs,
         )
-        self.method = method.lower()
+        self._constructor_params = {"method": method}
+        self.method = normalized_method
         self.contamination = float(np.clip(contamination, 0.001, 0.49))
         self._scaler = StandardScaler()
         self._detectors: dict[str, Any] = {}

@@ -67,7 +67,7 @@ class ComputerVisionEngine:
         )
         return np.asarray(luma, dtype=np.float32)
 
-    def load_image(self, image_or_path: np.ndarray | str | Path) -> np.ndarray:
+    def load_image(self, image_or_path: np.ndarray | str | Path, *, resize: bool = True) -> np.ndarray:
         """Load and resize an image to canonical RGB uint8 format."""
         if isinstance(image_or_path, (str, Path)):
             path_str = str(image_or_path)
@@ -88,11 +88,19 @@ class ComputerVisionEngine:
             arr = np.asarray(image_or_path)
             if arr.ndim == 2:
                 rgb = np.stack([arr, arr, arr], axis=-1)
-            else:
+            elif arr.ndim == 3 and arr.shape[-1] == 1:
+                rgb = np.repeat(arr, 3, axis=-1)
+            elif arr.ndim == 3 and arr.shape[-1] in (3, 4):
                 rgb = arr[:, :, :3]
+            else:
+                raise ModelError("Supply a grayscale, RGB, or RGBA image.")
             if rgb.dtype != np.uint8:
                 rgb = np.clip(rgb, 0, 255).astype(np.uint8)
 
+        if not rgb.size:
+            raise ModelError("The supplied image is empty.")
+        if not resize:
+            return np.asarray(rgb, dtype=np.uint8)
         target_w, target_h = self.image_size
         if _HAS_CV2 and cv2 is not None:
             return np.asarray(cv2.resize(rgb, (target_w, target_h)))
