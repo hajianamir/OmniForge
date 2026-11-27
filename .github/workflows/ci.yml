@@ -75,6 +75,33 @@ jobs:
       - name: Smoke-import the locked dependency set
         run: |
           python -c "import omniforge, fastapi, pandas, sklearn, numpy, duckdb, cryptography, pydantic; print('requirements.lock installs and imports cleanly')"
+  redis-integration:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    services:
+      redis:
+        image: redis:7.4-alpine@sha256:7f7d30b7fdd09467bac58198a1f166dd69789d348d4fe859cccb20e0cf287fbe
+        ports:
+          - 6379/tcp
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install the Redis backend and test dependencies
+        run: python -m pip install -e ".[dev,redis,api,data]"
+      - name: Verify the shared rate limit against Redis
+        env:
+          OMNIFORGE_TEST_REDIS_URL: redis://127.0.0.1:${{ job.services.redis.ports[6379] }}/0
+        run: python -m pytest -q tests/integration/test_redis_rate_limit.py tests/unit/test_rate_limit_shared.py
   e2e:
     runs-on: ubuntu-latest
     steps:
