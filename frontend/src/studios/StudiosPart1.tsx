@@ -1401,6 +1401,9 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
   const [corrMethod, setCorrMethod] = useState('auto');
   const [vifThresh, setVifThresh] = useState(5.0);
   const [riskAlpha, setRiskAlpha] = useState(0.05);
+  const [useRunScope, setUseRunScope] = useState(false);
+  const selection = studioCache.s05_select;
+  const runScope = ws.split_lock?.active && ws.targets.length === 1 && selection?.run_scope_target === ws.targets[0] ? selection.run_scope : null;
   const [selectedMods, setSelectedMods] = useState<string[]>([]);
   const [catalog, setCatalog] = useState<Record<string, string> | null>(null);
   const [catalogError, setCatalogError] = useState<string | null>(null);
@@ -1441,6 +1444,7 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
         vif_threshold: vifThresh,
         risk_tail_alpha: riskAlpha,
         selected_modules: mode === 'custom' ? selectedMods : [],
+        ignored_columns: useRunScope && runScope ? runScope.ignored_columns : [],
       });
       onSync(res.state);
       setStudioResult('s03_diagnostics', res);
@@ -1528,6 +1532,7 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
             ))}
           </div>
         )}
+        {runScope && <label className="row"><input type="checkbox" checked={useRunScope} onChange={(e) => setUseRunScope(e.target.checked)} /> Apply Studio 05 selection to this baseline run only</label>}
         <button className="btn btn-primary" disabled={busy || !ws.has_dataset || (mode === 'custom' && !selectedMods.length)} onClick={run}>
           {busy ? <span className="spinner" /> : null} Execute Universal Diagnostics ({mode.toUpperCase()})
         </button>
@@ -2005,6 +2010,14 @@ export const Studio05Features: React.FC<StudioProps> = ({ ws, onSync, bumpGrid, 
                 setStudioResult('s05_select', r);
               } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
             }}>Rank Features ({selMode.toUpperCase()})</button>
+            <button className="btn" disabled={busy || !ws.split_lock?.active} onClick={async () => {
+              setBusy(true); setErr(null);
+              try {
+                const r = await apiPost<SelectionResponse>('/api/workbench/s05/select', { mode: selMode, method, top_k: topK, apply_to_run: true });
+                onSync(r.state);
+                setStudioResult('s05_select', r);
+              } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
+            }}>Prepare Scope for One Run</button>
             <button className="btn btn-success" disabled={busy || !ws.has_dataset} onClick={async () => {
               setBusy(true); setErr(null);
               try {
@@ -2022,7 +2035,7 @@ export const Studio05Features: React.FC<StudioProps> = ({ ws, onSync, bumpGrid, 
         <div className="card">
           <div className="card-title">Feature Importance Ranking ({selRes.selected_features?.length || 0} selected · Mode: {String(selRes.mode || selMode).toUpperCase()})</div>
           {selRes.selected_source_columns && (
-            <p>{selRes.committed ? 'Applied' : 'Preview'} · {selRes.fit_scope === 'train_only' ? 'Fitted on locked training rows' : 'Fitted on the full study'} · Source predictors {selRes.selected_source_columns.join(', ')}</p>
+            <p>{selRes.committed ? 'Applied to study' : selRes.run_scope ? 'Run scope ready in Studio 03/06' : 'Preview'} · {selRes.fit_scope === 'train_only' ? 'Fitted on locked training rows' : 'Fitted on the full study'} · Source predictors {selRes.selected_source_columns.join(', ')}</p>
           )}
           <BarChartSVG
             title="Feature Importance / Consensus Ranking"

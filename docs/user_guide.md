@@ -1254,3 +1254,19 @@ Green AI Carbon Tracker reports `emissions_g_co2eq` for every AutoML and forecas
 ---
 
 *End of User Guide. For architecture details, see [`docs/architecture.md`](docs/architecture.md). For audit anchor replication, see [`docs/AUDIT_ANCHOR_REPLICATION.md`](docs/AUDIT_ANCHOR_REPLICATION.md). For risk register, see [`docs/RISK_REGISTER.md`](docs/RISK_REGISTER.md).*
+
+### Run-level predictor scope
+
+Studio 03 and Studio 06 model the eligible predictors by default. A run can specify `ignored_columns`
+without changing workspace exclusions or the Studio 03 statistical scans. Constant and wholly missing
+predictors are omitted based on training observations, not on held-out values. IDs and correlated
+predictors remain analyst decisions. With a Split Lock, Studio 05 can prepare a scope without
+committing it to the study; opt into that scope for the corresponding target in Studio 03 or 06.
+Where reported, a parsimonious L1 reference lists its nonzero fitted support (possibly empty).
+
+Selection rank and observed lift are not acceptance decisions. Where available, Studio 03/06
+report a paired, Bonferroni-adjusted holdout bootstrap interval conditional on the fitted models;
+stratified classification resamples within classes. Acceptance requires a lower bound above zero.
+Small, dependent, or unspecified holdout designs have no row-bootstrap interval. AutoML reports
+weighted F1 for classification and RMSE for regression; optional adapters' internal search tables
+are not cross-backend tournament scores.

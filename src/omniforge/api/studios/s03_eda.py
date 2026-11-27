@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, cast
 
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, HTTPException
 
 from omniforge.api.auth import authorize_principal, require_permission
 from omniforge.api.studios.schemas import DiagnosticsReq, wb_cache_and_respond
@@ -50,9 +50,12 @@ def s03_run_diagnostics(
     state = _wb().get_session_state(sid)
     active = _wb()._require_df(state)
     df = _wb().get_analysis_dataframe(state, active)
-    train, test, _ = _wb().get_active_split_frames(state, active)
+    train, test, lock = _wb().get_active_split_frames(state, active)
     partitions = (train.loc[:, df.columns], test.loc[:, df.columns]) if test is not None else None
     targets = _wb().get_selected_targets(state, df)
+    if set(req.ignored_columns) - set(active.columns) or set(req.ignored_columns) & set(targets):
+        raise HTTPException(status_code=400, detail="Ignored columns must exist and cannot include an outcome.")
+    controls = [lock[key] for key in ("row_id_col", "group_col", "time_col") if lock and lock.get(key)]
     criteria = StatisticalCriteriaConfig(
         alpha=req.alpha,
         confidence_level=req.confidence_level,
@@ -76,7 +79,10 @@ def s03_run_diagnostics(
     fit_baselines = bool(targets and "baseline_benchmark" in modules)
     if fit_baselines:
         authorize_principal(principal, "model:train")
-    report = suite.run(df, target_cols=targets, selected_modules=modules, criteria=criteria, baseline_partitions=partitions)
+    report = suite.run(
+        df, target_cols=targets, selected_modules=modules, criteria=criteria, baseline_partitions=partitions,
+        ignored_columns=[*req.ignored_columns, *controls], baseline_split_strategy=lock.get("strategy") if lock else None,
+    )
     state["uap_diag_report"] = report
     state["uap_diag_criteria"] = criteria.model_dump() if hasattr(criteria, "model_dump") else dataclasses.asdict(criteria)
     state["uap_baseline_results"] = report.baseline_benchmarks

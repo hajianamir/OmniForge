@@ -15,7 +15,14 @@ from omniforge.core.exceptions import DataValidationError
 from omniforge.core.performance import smart_sample_df
 from omniforge.data.quality import DataQualityProfiler
 from omniforge.eda.statistics import HypothesisTestResult, StatisticalAnalyzer
-from omniforge.models.baselines import BaselineBenchmarkSuite, BaselineEvidence, strongest_scored_reference
+from omniforge.evaluation.paired_comparison import paired_score_interval
+from omniforge.features.inference import WorkbenchInputPreprocessor, nonconstant_predictors
+from omniforge.models.baselines import (
+    BaselineBenchmarkSuite,
+    BaselineEvidence,
+    baseline_feature_evidence,
+    strongest_scored_reference,
+)
 
 # Complete catalog of selectable diagnostic & analytical modules (domain-agnostic)
 DIAGNOSTIC_TEST_CATALOG: dict[str, str] = {
@@ -203,6 +210,8 @@ class UniversalDiagnosticsSuite:
         selected_modules: list[str] | None = None,
         criteria: StatisticalCriteriaConfig | None = None,
         baseline_partitions: tuple[pd.DataFrame, pd.DataFrame] | None = None,
+        ignored_columns: list[str] | None = None,
+        baseline_split_strategy: str | None = None,
     ) -> UniversalDiagnosticsReport:
         """Execute user-selected statistical tests, baseline benchmarks, and risk audits with exact criteria."""
         cfg = criteria or StatisticalCriteriaConfig()
@@ -437,11 +446,13 @@ class UniversalDiagnosticsSuite:
         if "baseline_benchmark" in modules and targets:
             from omniforge.evaluation.equations import ModelEquationExtractor
 
-            pred_cols = [c for c in df.columns if c not in targets]
-            if pred_cols:
+            excluded = set(targets) | set(ignored_columns or ())
+            eligible_predictors = [c for c in full_df.columns if c not in excluded]
+            if eligible_predictors:
                 for t_col in targets:
+                    strat: pd.Series | None = None
                     if baseline_partitions is None:
-                        work = df.dropna(subset=[t_col]).copy()
+                        work = full_df.dropna(subset=[t_col]).copy()
                         if len(work) < 12:
                             continue
                         target = work[t_col]
@@ -463,7 +474,10 @@ class UniversalDiagnosticsSuite:
                         continue
                     y_tr, y_val = train[t_col], test[t_col]
                     is_clf = self._is_classification_series(y_tr)
-                    from omniforge.features.inference import WorkbenchInputPreprocessor
+                    pred_cols = nonconstant_predictors(train[eligible_predictors])
+                    if not pred_cols:
+                        report.recommendations.append(f"Skipped baseline for '{t_col}': no nonconstant predictors in the training partition.")
+                        continue
 
                     preprocessor = WorkbenchInputPreprocessor(mode="numeric").fit(train[pred_cols])
                     X_tr = preprocessor.transform(train[pred_cols])
@@ -486,14 +500,15 @@ class UniversalDiagnosticsSuite:
                         continue
 
                     baseline_evidence: BaselineEvidence = {}
+                    baseline_predictions: dict[str, np.ndarray] = {}
                     report.baseline_evidence[t_col] = baseline_evidence
                     if is_clf:
                         bl_metrics, bl_models = BaselineBenchmarkSuite.run_classification_detailed(
-                            X_tr, y_tr, X_val, y_val, evidence=baseline_evidence,
+                            X_tr, y_tr, X_val, y_val, evidence=baseline_evidence, predictions=baseline_predictions,
                         )
                     else:
                         bl_metrics, bl_models = BaselineBenchmarkSuite.run_regression_detailed(
-                            X_tr, y_tr, X_val, y_val, evidence=baseline_evidence,
+                            X_tr, y_tr, X_val, y_val, evidence=baseline_evidence, predictions=baseline_predictions,
                         )
                     report.baseline_benchmarks[t_col] = bl_metrics
                     report.baseline_feature_cols[t_col] = list(pred_cols)
@@ -549,16 +564,25 @@ class UniversalDiagnosticsSuite:
                             if lift_abs is not None and naive_floor is not None and abs(naive_floor) > 1e-4 else None
                         )
 
-                        if naive_floor is None or lift_abs is None:
-                            acc_status = "NOT EVALUATED — NAIVE FLOOR UNAVAILABLE"
-                        elif rank_num == 1 and not is_naive and lift_abs > 0:
-                            acc_status = "ACCEPTED — CHAMPION BASELINE"
-                        elif is_naive:
-                            acc_status = "REFERENCE — NAIVE FLOOR"
-                        elif lift_abs >= 0:
-                            acc_status = "ACCEPTED — VALIDATED BASELINE"
+                        comparison: dict[str, Any] = {"status": "unavailable", "reason": "No evaluable naive reference."}
+                        if naive_reference is not None and not is_naive:
+                            strategy = baseline_split_strategy if baseline_partitions is not None else (
+                                "stratified" if strat is not None else "random"
+                            )
+                            comparison = paired_score_interval(
+                                y_val, baseline_predictions[bl_name], baseline_predictions[naive_reference[0]],
+                                metric=primary_metric, split_strategy=strategy, reference_name=naive_reference[0],
+                                comparisons=len(bl_metrics) * sum(row["role"] == "naive" for row in baseline_evidence.values()),
+                                confidence=cfg.confidence_level,
+                            )
+                        if is_naive:
+                            acc_status = "REFERENCE — NAIVE FLOOR" if naive_reference else "REFERENCE — NAIVE FAMILY INCOMPLETE"
+                        elif comparison.get("supports_improvement"):
+                            acc_status = "ACCEPTED — CHAMPION BASELINE" if rank_num == 1 else "ACCEPTED — VALIDATED BASELINE"
+                        elif comparison["status"] == "available":
+                            acc_status = "BENCHMARKED — IMPROVEMENT NOT ESTABLISHED"
                         else:
-                            acc_status = "REJECTED — BELOW NAIVE FLOOR"
+                            acc_status = "BENCHMARKED — COMPARISON UNAVAILABLE"
 
                         reasons: list[str] = [
                             f"Ranked #{rank_num} of {len(ranked_names)} candidates on {len(test)} held-out rows ({partition_source}).",
@@ -618,6 +642,7 @@ class UniversalDiagnosticsSuite:
 
                         eq_d.update(
                             {
+                                **baseline_feature_evidence(bl_m),
                                 "rank": rank_num,
                                 "total_candidates": len(ranked_names),
                                 "model_paradigm": model_paradigm,
@@ -631,6 +656,7 @@ class UniversalDiagnosticsSuite:
                                 "naive_floor_model": naive_reference[0] if naive_reference is not None else None,
                                 "lift_over_naive": lift_abs,
                                 "lift_over_naive_pct": lift_pct,
+                                "lift_comparison": comparison,
                                 "acceptance_status": acc_status,
                                 "acceptance_reasons": reasons,
                                 "metrics": {k: round(float(v), 5) for k, v in m_scores.items() if isinstance(v, (int, float)) and np.isfinite(v)},
@@ -650,12 +676,12 @@ class UniversalDiagnosticsSuite:
                         }
                     report.baseline_equations[t_col] = enriched_eqs
                     self.last_baseline_models_[t_col] = raw_models
-            elif len(df) >= 20:
+            elif len(full_df.columns) == len(targets) and len(full_df) >= 20:
                 # Forecasting baselines use chronological partitions for standalone series.
                 for t_col in targets:
                     if pd.api.types.is_numeric_dtype(df[t_col]):
                         if baseline_partitions is None:
-                            vals = df[t_col].dropna().to_numpy(dtype=float)
+                            vals = full_df[t_col].dropna().to_numpy(dtype=float)
                             split_i = max(10, int(len(vals) * (1.0 - cfg.holdout_ratio)))
                             train_vals, test_vals = vals[:split_i], vals[split_i:]
                             source = "diagnostics_chronological_holdout"

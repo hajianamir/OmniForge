@@ -13,6 +13,17 @@ import numpy as np
 import pandas as pd
 
 
+def nonconstant_predictors(frame: pd.DataFrame) -> list[str]:
+    """Predictors with at least two observed levels on the fit partition only."""
+    columns: list[str] = []
+    for name, values in frame.items():
+        if pd.api.types.is_numeric_dtype(values):
+            values = values.replace([np.inf, -np.inf], np.nan)
+        if values.nunique(dropna=True) > 1:
+            columns.append(str(name))
+    return columns
+
+
 class WorkbenchInputPreprocessor:
     """Remember the input schema and, for numeric-only models, fitted encodings.
 

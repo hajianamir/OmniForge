@@ -37,3 +37,57 @@ T1 sibling review: AutoML API, CLI, Copilot, and report narrative had assumption
 ## Phase 1 — Summary
 
 Seven targeted Python checks passed, including the locked baseline/feature preview integration check, and the catalog/risk browser scenario passed. The full pristine coverage run was started before the baseline fix; it was still running at this checkpoint. Phase 1's code is not an assertion of full §6 or CI verification; see the final roll-up for aggregate results. OF-25's route spelling necessarily changed in the same Studio 03 API documentation diff; OF-29's direct score transport necessarily changed with nullable lift.
+
+## Phase 2 / Iteration 1 / OF-05
+
+Add a modelling-only `ignored_columns` contract; keep statistical scans on the study and keep target and control columns out of predictors. Define constants on the fit partition, not on test. Do not automatically drop IDs or correlations on an advisory heuristic.
+
+## Phase 2 / Iteration 1 / OF-06
+
+Make the fitted L1 regression/classification support explicit, including the possibility of empty support. Keep inclusive strong comparisons; expose feature count and sparse-reference support instead of activating the fold-only selector as a production selector.
+
+## Phase 2 / Iteration 1 / OF-04
+
+Distinguish model selection from statistical superiority. Use same-row paired comparisons only where a defensible independent holdout exists, and withhold validation labels otherwise. Keep validation partitions, preprocessing, and optional-adapter limitations visible.
+
+## Phase 2 / Iteration 1 / OF-24
+
+Compare fitted baselines to fitted dummies on the exact scored cohort; distinguish name/role and point rank from acceptance. Dependent or underpowered holdouts do not support an IID bootstrap.
+
+## Phase 2 / Iteration 1 / OF-20
+
+Select a non-mutating run scope with a locked training cohort. The selection returns explicit request options rather than editing the workspace; studios require an opt-in to consume them. Keep the existing session commit and exclusion/undo behavior.
+
+## Phase 2 — Summary
+
+Ignored-scope, sparse-reference and non-mutating scope tests failed first on the audit snapshot, then eight scope checks passed (including locked splits). The small-holdout fixture independently reproduced a false acceptance on the audit snapshot. Comparison uses paired percentile bootstrap with a Bonferroni family bound (models conditional on trained fits), no IID inference for time/group/unknown design, and visible status for small or unevaluable splits. Existing specialized adapter comparison coverage was updated from macro to weighted F1. Optional backend internal rankings are not uniformly comparable (notably H2O's internal selection): do not give the whole OF-04 row closure credit based on native coverage only. Specialized baseline support is in evaluation metadata; graph/sequence methods are not silently represented as sparse fits. See the final roll-up for gates still in progress.
+
+## Phase 3 / Iteration 1 / OF-09
+
+Publish the actual sampled row count, full frame count, and module cap disclosures, including pair limits when columns alone cannot express omitted comparisons. Preserve quality profiling and baseline cohorts on their own scopes.
+
+## Phase 3 / Iteration 1 / OF-10
+
+Use the Workbench's ten exact integer levels rule, also in the backend hub discovered by search (previously accepted any numeric target up to fifteen values). Preserve explicit task overrides. Cardinality still drives exploratory grouping separately from supervised task selection.
+
+## Phase 3 / Iteration 1 / OF-13
+
+Preserve the existing global Studio 03 family for backward numerical comparability, but name it and disclose family size. Name the Studio 04 battery family separately; single exploratory selection is not a corrected battery.
+
+## Phase 3 / Iteration 1 / OF-14
+
+Centralize interval overlaps and purge/embargo in one kernel. Preserve legacy public list and positional-call conventions with a translating adapter; do not collapse the old symmetric purge into the evaluation API's explicit pre-gap and post-embargo without disclosure.
+
+## Phase 3 / Iteration 1 / OF-12
+
+Use bounded nominal indicators for new numeric-workbench fits instead of ordinal distances. Keep persisted legacy encoding reproducible and preserve sklearn's trained ColumnTransformer in specialist backends.
+
+## Phase 3 / Iteration 1 / OF-23
+
+Retire the duplicated 12-column preparation algorithm in favor of the fitted Workbench implementation. Explicitly document specialist preprocessing and remaining native ordinal handling; do not rewrite persisted model schemas.
+
+## Phase 3 / Iteration 1 / OF-18
+
+Use the uncorrected Pearson statistic for Cramér's V, retaining the existing continuity-corrected or Fisher test for its p-value. Do not alter fairness statistics or VIF.
+
+Phase 2 verification: targeted selection/scope/paired comparison/fitted-schema checks: **13 passed**; mypy found only the same optional-Redis baseline error, and SPA rebuilt successfully. The native strong-failure integration test from Phase 1 is green (and red on pristine). Phase 2 also removed the misleading hard-coded deep baseline framework (OF-28) when exposing its fitted baseline metadata; the dedicated deep benchmark verification follows in Phase 4.

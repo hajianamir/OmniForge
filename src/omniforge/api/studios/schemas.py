@@ -120,6 +120,7 @@ class MiningReq(BaseModel):
 
 
 class DiagnosticsReq(BaseModel):
+    ignored_columns: list[str] = Field(default_factory=list)
     mode: Literal["all", "complete", "auto", "custom"] = "all"
     alpha: float = 0.05
     confidence_level: float = 0.95
@@ -168,6 +169,14 @@ class FeatureEngReq(BaseModel):
 
 
 class FeatureSelReq(BaseModel):
+    apply_to_run: bool = False
+
+    @model_validator(mode="after")
+    def validate_commit_scope(self) -> Self:
+        if self.commit and self.apply_to_run:
+            raise ValueError("Choose either a session commit or a non-mutating model-run scope.")
+        return self
+
     mode: str = "custom"  # custom | auto | complete
     method: str = "mutual_info"
     top_k: int = 10
@@ -176,6 +185,7 @@ class FeatureSelReq(BaseModel):
 
 
 class AutoMLRunReq(BaseModel):
+    ignored_columns: list[str] = Field(default_factory=list)
     target: str | None = None
     backend: str = "omniforge_native"
     time_budget_seconds: float = Field(default=30.0, ge=5.0, le=3600.0)
@@ -187,6 +197,7 @@ class AutoMLRunReq(BaseModel):
 
 
 class DeepBenchReq(BaseModel):
+    ignored_columns: list[str] = Field(default_factory=list)
     target: str | None = None
     architectures: list[str] = Field(
         default_factory=lambda: ["ft_transformer", "tabnet", "resnet_tabular", "mlp", "cnn1d", "gnn_gcn"]
@@ -409,6 +420,7 @@ class CopilotToolExecReq(BaseModel):
 
 
 class NonParametricRunReq(BaseModel):
+    ignored_columns: list[str] = Field(default_factory=list)
     target: str | None = None
     cv_folds: int = Field(default=5, ge=2, le=10)
     models: list[str] | None = None

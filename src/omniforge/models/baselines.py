@@ -325,6 +325,17 @@ def strongest_scored_reference(
     return (max if higher_is_better else min)(values, key=lambda row: row[1])
 
 
+def baseline_feature_evidence(model: BaseOmniForgeModel) -> dict[str, Any]:
+    """Return the actual nonzero encoded support of fitted L1 references."""
+    columns = model.feature_names_
+    if not isinstance(model, (LassoLinearBaseline, LogisticBaseline)):
+        return {"n_features": len(columns)}
+    coefficients = np.asarray(model._model.coef_)
+    supported = np.any(np.atleast_2d(coefficients) != 0, axis=0)
+    support = [name for name, selected in zip(columns, supported, strict=True) if selected]
+    return {"reference_kind": "parsimonious_l1", "selected_support": support, "n_features": len(support)}
+
+
 class BaselineBenchmarkSuite:
     """Automatically evaluates strong baseline models so candidate ML models always prove lift."""
 
@@ -337,6 +348,7 @@ class BaselineBenchmarkSuite:
         random_seed: int = 42,
         *,
         evidence: BaselineEvidence | None = None,
+        predictions: dict[str, np.ndarray] | None = None,
     ) -> tuple[dict[str, dict[str, float]], dict[str, BaseOmniForgeModel]]:
         """Run all classification baselines and return both comparative metrics and fitted baseline models."""
         baselines: list[BaseOmniForgeModel] = [
@@ -365,6 +377,8 @@ class BaselineBenchmarkSuite:
                 if not all(math.isfinite(value) for value in results[model.name].values()):
                     raise ArithmeticError("nonfinite baseline score")
                 fitted_models[model.name] = model
+                if predictions is not None:
+                    predictions[model.name] = np.asarray(preds)
                 if evidence is not None:
                     evidence[model.name] = {"status": "scored", "role": role}
             except Exception as exc:
@@ -396,6 +410,7 @@ class BaselineBenchmarkSuite:
         random_seed: int = 42,
         *,
         evidence: BaselineEvidence | None = None,
+        predictions: dict[str, np.ndarray] | None = None,
     ) -> tuple[dict[str, dict[str, float]], dict[str, BaseOmniForgeModel]]:
         """Run all regression baselines and return both comparative metrics and fitted baseline models."""
         baselines: list[BaseOmniForgeModel] = [
@@ -429,6 +444,8 @@ class BaselineBenchmarkSuite:
                 if not all(math.isfinite(value) for value in results[model.name].values()):
                     raise ArithmeticError("nonfinite baseline score")
                 fitted_models[model.name] = model
+                if predictions is not None:
+                    predictions[model.name] = np.asarray(preds)
                 if evidence is not None:
                     evidence[model.name] = {"status": "scored", "role": role}
             except Exception as exc:

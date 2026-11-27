@@ -43,7 +43,7 @@ from omniforge.data.feature_store import LocalFeatureStore
 from omniforge.data.ingestion import DataIngestionEngine
 from omniforge.data.quality import DataQualityProfiler
 from omniforge.domains import default_domain_registry
-from omniforge.features.inference import WorkbenchInputPreprocessor
+from omniforge.features.inference import WorkbenchInputPreprocessor, nonconstant_predictors
 from omniforge.mlops.registry import ModelRegistry
 from omniforge.mlops.supervisory_monitor import SupervisoryPredictionMonitor
 from omniforge.mlops.tracking import ExperimentTracker
@@ -485,6 +485,8 @@ def _prepare_xy_fitted(
     if len(work) < 10:
         raise HTTPException(status_code=400, detail=f"Target '{target}' has fewer than 10 non-null observations.")
     raw = work.drop(columns=[target])
+    if not raw_features:
+        raw = raw.loc[:, nonconstant_predictors(raw)]
     if raw.shape[1] == 0:
         raise HTTPException(status_code=400, detail="No usable predictor columns remain after excluding target.")
     try:

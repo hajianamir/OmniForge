@@ -513,3 +513,10 @@ See [`docs/user_guide.md`](docs/user_guide.md) Section 11 for complete Python SD
 ---
 
 *End of API Reference. For installation and quickstart, see [`README.md`](README.md). For the complete user guide, see [`docs/user_guide.md`](docs/user_guide.md).*
+### Run-level model inputs
+
+`DiagnosticsReq`, `AutoMLRunReq`, `NonParametricRunReq`, and `DeepBenchReq` accept `ignored_columns`.
+This filters predictor inputs, not the session dataset. Studio 03 still scans the entire analysis
+scope, subject to its diagnostic caps. The list must not name an outcome. Call `/s05/select` with
+`apply_to_run: true` on a locked training cohort to obtain a `run_scope` object to pass into one
+modelling request. This cannot be combined with a session-wide `commit: true`.

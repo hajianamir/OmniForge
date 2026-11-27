@@ -35,6 +35,9 @@ export interface EquationEntry {
   coefficients?: Record<string, number>;
   coefficients_table?: Record<string, unknown>[];
   structured_terms?: StructuredTerm[];
+  reference_kind?: string;
+  selected_support?: string[];
+  n_features?: number;
   feature_importance?: Record<string, number>;
   metrics?: Record<string, number>;
   rank?: number;
@@ -42,7 +45,8 @@ export interface EquationEntry {
   primary_metric?: string;
   primary_score?: number;
   naive_floor_score?: number;
-  lift_over_naive?: number;
+  lift_over_naive?: number | null;
+  lift_comparison?: { status: string; reason?: string; ci_lower?: number; ci_upper?: number };
   lift_over_naive_pct?: number;
   acceptance_status?: string;
   acceptance_reasons?: string[];
@@ -211,6 +215,7 @@ export const MathEquationCard: React.FC<{
                 {eq.model_paradigm || 'Non-Parametric Analytical'}
               </span>
             )}
+            {eq.reference_kind === 'parsimonious_l1' && <span title={eq.selected_support?.join(', ') || 'Empty support'}>Parsimonious L1 reference · {eq.n_features} active features</span>}
             {eq.acceptance_status && (
               <span className={`badge ${badge.cls}`} style={{ gap: 4 }}>
                 {badge.icon} {eq.acceptance_status}
@@ -223,11 +228,13 @@ export const MathEquationCard: React.FC<{
                 {eq.primary_metric.toUpperCase()} = {Number(eq.primary_score).toFixed(4)}
               </span>
             )}
-            {eq.lift_over_naive !== undefined && (
+            {typeof eq.lift_over_naive === 'number' && (
               <span className={`badge mono ${eq.lift_over_naive > 0 ? 'badge-green' : eq.lift_over_naive < 0 ? 'badge-red' : ''}`}>
                 Lift vs Naive: {eq.lift_over_naive >= 0 ? '+' : ''}{Number(eq.lift_over_naive).toFixed(4)}
               </span>
             )}
+            {eq.lift_comparison?.status === 'available' && <span className="badge mono">Paired interval: [{eq.lift_comparison.ci_lower?.toFixed(4)}, {eq.lift_comparison.ci_upper?.toFixed(4)}]</span>}
+            {eq.lift_comparison?.status === 'unavailable' && <span title={eq.lift_comparison.reason}>Paired interval unavailable</span>}
             {latexFormula && (
               <button className="btn btn-sm" onClick={() => copyText('latex', latexFormula)}>
                 <Copy size={11} /> {copied === 'latex' ? 'Copied LaTeX!' : 'LaTeX'}

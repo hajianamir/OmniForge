@@ -34,6 +34,10 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
   const [cvFolds, setCvFolds] = useState(3);
   const [selectedTarget, setSelectedTarget] = useState('');
   const modelingTarget = ws.targets.length === 1 ? ws.targets[0] : ws.targets.includes(selectedTarget) ? selectedTarget : '';
+  const [useRunScope, setUseRunScope] = useState(false);
+  const selection = studioCache.s05_select;
+  const runScope = ws.split_lock?.active && selection?.run_scope_target === modelingTarget ? selection?.run_scope : null;
+  const ignoredColumns = useRunScope && runScope ? runScope.ignored_columns : [];
   const automlRes = studioCache.s06_automl ?? null;
 
   // Non-Parametric Analytical Suite state
@@ -68,6 +72,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
     try {
       const res = await apiPost<AutoMLResponse>('/api/workbench/s06/automl', {
         target: modelingTarget,
+        ignored_columns: ignoredColumns,
         backend: selectedBackend,
         time_budget_seconds: budget,
         cv_folds: cvFolds,
@@ -88,6 +93,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
       const chosen = npMode === 'custom' ? npModels : npMode === 'auto' ? ['gam_spline', 'nadaraya_watson', 'kernel_ridge_rbf', 'weighted_knn'] : allModels;
       const res = await apiPost<NonParametricResponse>('/api/workbench/s06/nonparametric', {
         target: modelingTarget,
+        ignored_columns: ignoredColumns,
         models: chosen.length ? chosen : allModels,
         n_knots: npKnots,
         spline_degree: npDegree,
@@ -108,7 +114,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
   const runDeep = async () => {
     setBusy(true); setErr(null);
     try {
-      const res = await apiPost<DeepLearningResponse>('/api/workbench/s06/deep-learning', { target: modelingTarget, architectures: dlArchs, epochs: dlEpochs });
+      const res = await apiPost<DeepLearningResponse>('/api/workbench/s06/deep-learning', { target: modelingTarget, ignored_columns: ignoredColumns, architectures: dlArchs, epochs: dlEpochs });
       onSync(res.state);
       setStudioResult('s06_dl', res);
     } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
@@ -149,6 +155,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
         <ProvenancePill ws={ws} />
       </div>
       {err && <div className="alert alert-error">{err}</div>}
+      {tab !== 'predict' && runScope && <label className="row"><input type="checkbox" checked={useRunScope} onChange={(e) => setUseRunScope(e.target.checked)} /> Apply Studio 05 selection to this model run only</label>}
       {tab !== 'predict' && ws.targets.length > 1 && (
         <label className="field">
           Target for this run
@@ -257,6 +264,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
                       primary_score: automlRes.best_score,
                       naive_floor_score: automlRes.baseline_score ?? undefined,
                       lift_over_naive: automlRes.lift_over_baseline ?? undefined,
+                      lift_comparison: automlRes.lift_comparison,
                       selection_criterion: automlRes.metadata?.evaluation?.leaderboard_partition === 'validation'
                         ? `Selected by validation ${automlRes.primary_metric ?? 'score'}`
                         : 'Selected by the active AutoML backend',

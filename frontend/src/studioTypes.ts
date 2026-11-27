@@ -275,6 +275,8 @@ export interface FeatureRanking extends JsonRow {
 export interface SelectionResponse extends StateEnvelope {
   selected_source_columns?: string[];
   fit_scope?: 'train_only' | 'full_frame';
+  run_scope?: { ignored_columns: string[] } | null;
+  run_scope_target?: string | null;
   committed?: boolean;
   mode?: string;
   rankings?: FeatureRanking[];
@@ -315,6 +317,7 @@ export interface AutoMLResponse extends StateEnvelope {
   best_score?: number;
   baseline_score?: number | null;
   lift_over_baseline?: number | null;
+  lift_comparison?: { status: string; reason?: string; ci_lower?: number; ci_upper?: number };
   primary_metric?: string;
   backend_used?: string;
   fallback_reason?: string | null;

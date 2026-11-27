@@ -553,7 +553,7 @@ def test_studio03_benchmarks_use_the_same_locked_cohort_and_studio05_preview_is_
     assert diagnostics.status_code == 200, diagnostics.text
     report = diagnostics.json()["report"]
     assert report["baseline_split"]["target"] == {"source": "split_lock", "training_rows": 60, "holdout_rows": 20}
-    assert report["baseline_feature_cols"]["target"] == ["alpha", "beta", "constant"]
+    assert report["baseline_feature_cols"]["target"] == ["alpha", "beta"]
     selection = {"mode": "custom", "method": "f_test", "top_k": 1, "target": "target"}
     preview = client.post("/api/workbench/s05/select", headers=headers, json=selection)
     assert preview.status_code == 200, preview.text
@@ -741,3 +741,24 @@ def test_diagnostics_rejects_silent_dispatch_fallbacks() -> None:
         {'mode': 'auto', 'selected_modules': ['baseline_benchmark']},
     ]:
         assert client.post('/api/workbench/s03/run', headers=headers, json=payload).status_code == 422, payload
+
+
+def test_feature_selection_run_scope_leaves_study_and_split_intact() -> None:
+    client, headers = _client()
+    _upload(client, headers)
+    locked = client.post('/api/workbench/split-lock', headers=headers, json={'strategy': 'random'})
+    assert locked.status_code == 200, locked.text
+    response = client.post('/api/workbench/s05/select', headers=headers, json={
+        'target': 'target', 'method': 'f_test', 'top_k': 1, 'apply_to_run': True,
+    })
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result['committed'] is False
+    assert result['run_scope']['ignored_columns'] == ['beta', 'constant']
+    assert result['state']['columns'] == ['alpha', 'beta', 'constant', 'target']
+    assert result['state']['split_lock'] == locked.json()['state']['split_lock']
+    run = client.post('/api/workbench/s03/run', headers=headers, json={
+        'mode': 'custom', 'selected_modules': ['baseline_benchmark'], **result['run_scope'],
+    })
+    assert run.status_code == 200, run.text
+    assert run.json()['report']['baseline_feature_cols'] == {'target': ['alpha']}

@@ -36,8 +36,15 @@ from omniforge.data.splitting import (
     SplitConfig,
     SplitStrategyType,
 )
+from omniforge.evaluation.paired_comparison import paired_score_interval
+from omniforge.features.inference import nonconstant_predictors
 from omniforge.models.base import BaseOmniForgeModel
-from omniforge.models.baselines import BaselineBenchmarkSuite, BaselineEvidence, strongest_scored_reference
+from omniforge.models.baselines import (
+    BaselineBenchmarkSuite,
+    BaselineEvidence,
+    baseline_feature_evidence,
+    strongest_scored_reference,
+)
 from omniforge.models.classical import ClassicalMLModel
 from omniforge.models.deep.cnn import CNN1DModel
 from omniforge.models.deep.mlp import MLPModel
@@ -300,6 +307,7 @@ class AutoMLPipelineSearch:
         groups: pd.Series | np.ndarray | None = None,
         time_values: pd.Series | np.ndarray | None = None,
         holdout: tuple[pd.DataFrame, pd.Series] | None = None,
+        holdout_strategy: str | None = None,
     ) -> AutoMLResult:
         """Search on development data and evaluate on the supplied or internally reserved holdout.
 
@@ -367,6 +375,11 @@ class AutoMLPipelineSearch:
                 suggestions=["Provide more examples of each class or review the split strategy."],
             )
         split_cfg = split_cfg.model_copy(update={"strategy": cast(SplitStrategyType, split_res.strategy_used)})
+
+        input_columns = nonconstant_predictors(X_work.iloc[tr_idx])
+        if not input_columns:
+            raise AutoMLError("No nonconstant predictors remain on the training partition.")
+        X_work = X_work.loc[:, input_columns]
 
         # Predictor matrix excludes temporary audit columns
         X_tr = X_work.iloc[tr_idx].reset_index(drop=True)
@@ -436,6 +449,7 @@ class AutoMLPipelineSearch:
                 {
                     "model": name,
                     "family": "baseline",
+                    **baseline_feature_evidence(baseline_models[name]),
                     primary_metric: scores[primary_metric],
                     "split_strategy": split_res.strategy_used,
                     "fit_time_s": 0.0,
@@ -690,17 +704,28 @@ class AutoMLPipelineSearch:
             X_dev = X_work.iloc[development_indices].reset_index(drop=True)
             y_dev = y_arr[development_indices]
             X_test, y_test = (
-                (holdout[0].reset_index(drop=True), holdout[1].to_numpy())
+                (holdout[0].loc[:, input_columns].reset_index(drop=True), holdout[1].to_numpy())
                 if holdout is not None
                 else (X_work.iloc[te_idx].reset_index(drop=True), y_arr[te_idx])
             )
 
             best_model = copy.deepcopy(best_cand_model).fit(X_dev, y_dev)
-            best_test_score = _score_model(best_model, X_test, y_test)
+            best_predictions = best_model.predict(X_test)
+            best_test_score = float(f1_score(y_test, best_predictions, average="weighted", zero_division=0)) if is_clf else float(root_mean_squared_error(y_test, best_predictions))
             test_evidence: BaselineEvidence = {}
-            baselines, _ = benchmark(X_dev, y_dev, X_test, y_test, self.random_seed, evidence=test_evidence)
+            baseline_predictions: dict[str, np.ndarray] = {}
+            baselines, _ = benchmark(
+                X_dev, y_dev, X_test, y_test, self.random_seed, evidence=test_evidence, predictions=baseline_predictions,
+            )
             test_reference = strongest_scored_reference(baselines, test_evidence, primary_metric, higher_is_better=is_clf)
             best_bl_score = test_reference[1] if test_reference is not None else None
+            comparison = {"status": "unavailable", "reason": "Reference suite incomplete."}
+            if test_reference:
+                comparison = paired_score_interval(
+                    y_test, best_predictions, baseline_predictions[test_reference[0]], metric=primary_metric,
+                    split_strategy=holdout_strategy if holdout is not None else split_res.strategy_used,
+                    comparisons=len(baselines), reference_name=test_reference[0], seed=self.random_seed,
+                )
             all_fitted_models[best_name] = best_model
             best_model.metadata_.baseline_comparison = baselines
             best_model.metadata_.metrics[primary_metric] = round(best_test_score, 6)
@@ -722,6 +747,8 @@ class AutoMLPipelineSearch:
                 except Exception as exc:
                     logger.debug("automl_equation_extract_skipped", model=m_name, error=str(exc))
 
+            for row in leaderboard:
+                row.setdefault("n_features", len(input_columns))
             leaderboard.sort(key=lambda row: row[primary_metric], reverse=is_clf)
             lift = None if best_bl_score is None else (
                 (best_test_score - best_bl_score) if is_clf else (best_bl_score - best_test_score)
@@ -774,8 +801,10 @@ class AutoMLPipelineSearch:
                     "test_baseline_score": best_bl_score,
                     "validation_baseline_score": validation_reference[1] if validation_reference else None,
                     "test_baseline_name": test_reference[0] if test_reference else None,
+                    "lift_comparison": comparison,
                     "baseline_comparison_status": "available" if test_reference else "unavailable",
                     "baseline_evidence": {"validation": validation_evidence, "test": test_evidence},
+                    "input_columns": input_columns,
                     "n_train": len(tr_idx),
                     "n_validation": len(va_idx),
                     "n_test": len(te_idx),

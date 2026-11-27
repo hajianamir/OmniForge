@@ -123,6 +123,8 @@ def s05_select_features(
     if not target:
         raise HTTPException(status_code=400, detail="Select a target column before running Feature Selection.")
     train_df, _test_df, lock = _wb().get_active_split_frames(state, full_df)
+    if req.apply_to_run and lock is None:
+        raise HTTPException(status_code=400, detail="Lock the training split before preparing a feature scope for model evaluation.")
     train_df = train_df.loc[:, df.columns]
     protected = set(targets) | {target}
     if isinstance(lock, dict) and lock.get("active"):
@@ -226,6 +228,9 @@ def s05_select_features(
             "selected_source_columns": selected_raw,
             "fit_scope": "train_only" if isinstance(lock, dict) and lock.get("active") else "full_frame",
             "committed": req.commit,
+            "run_scope": {"ignored_columns": [c for c in df.columns if c not in protected and c not in selected_raw]}
+            if req.apply_to_run else None,
+            "run_scope_target": target if req.apply_to_run else None,
             "rankings": ranked,
         },
     )
