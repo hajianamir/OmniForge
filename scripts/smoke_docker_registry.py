@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import urllib.request
+from datetime import date, timedelta
 from pathlib import Path
 
 from omniforge.models.base import BaseOmniForgeModel
@@ -51,17 +52,27 @@ if mode == "write":
         "records": rows, "target_column": "y", "register_as": "rest-smoke", "time_budget_seconds": 5,
     }, bearer=token)
 
-    csv = "x,target,group\n" + "".join(
-        f"{i if i % 2 else -i},{i % 2},{'A' if i % 4 < 2 else 'B'}\n" for i in range(1, 81)
+    # Controlled fixture: each consecutive block contains both outcomes in both
+    # groups. Reserve the last five complete blocks for the promotion audit.
+    outcomes_and_groups = ((0, "A"), (1, "A"), (0, "B"), (1, "B"))
+    csv = "observed_at,x,target,group\n" + "".join(
+        f"{date(2025, 1, 1) + timedelta(days=i)},{10 if label else -10},{label},{group}\n"
+        for i, (label, group) in enumerate(outcomes_and_groups * 20)
     )
     boundary = "omniforge-smoke-boundary"
     payload = (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="sample.csv"\r\n'
                f'Content-Type: text/csv\r\n\r\n{csv}\r\n--{boundary}--\r\n').encode()
     call(workbench + "/s01/upload", payload, bearer=token, content_type=f"multipart/form-data; boundary={boundary}")
     call(workbench + "/targets", {"targets": ["target"]}, bearer=token)
-    call(workbench + "/s14/quick-train", {"method": "random_forest", "target": "target"}, bearer=token)
+    call(workbench + "/exclusions", {"excluded_columns": ["group"]}, bearer=token)
+    call(workbench + "/split-lock", {
+        "strategy": "time_series", "time_col": "observed_at", "target_col": "target", "test_size": 0.25,
+    }, bearer=token)
+    training = call(workbench + "/s14/quick-train", {"method": "random_forest", "target": "target"}, bearer=token)
+    assert training["evaluation"] == {"partition": "test", "source": "split_lock", "n_train": 60, "n_test": 20}, training["evaluation"]
     fairness = call(workbench + "/s07/fairness", {"sensitive_col": "group"}, bearer=token)
-    assert fairness["fairness"]["passed"] and fairness["promotion_evidence"]
+    assert fairness["fairness"]["passed"], fairness["fairness"]
+    assert fairness["promotion_evidence"]["n_holdout_rows"] == 20
     call(workbench + "/s11/register", {"model_name": "workbench-smoke", "stage": "Production"}, bearer=token)
 else:
     promoted = call(workbench + "/s11/promote", {

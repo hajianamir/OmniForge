@@ -9,7 +9,7 @@ all processes (requires the optional ``redis`` package, ``pip install omniforge[
 
 The Redis backend implements the window as a single Lua script (ZSET-based), so
 check-and-record is atomic across processes — no race between the count check and
-the insert. On Redis errors the limiter degrades to a per-process in-memory window
+the insert. It uses Redis's clock for every replica. On Redis errors the limiter degrades to a per-process in-memory window
 and logs the failure (availability first), while a *missing* redis package with
 ``backend=redis`` is a boot-time configuration error (fail fast, not silent).
 
@@ -44,7 +44,13 @@ local limit = tonumber(ARGV[2])
 local now_ms = tonumber(ARGV[3])
 local member = ARGV[4]
 
-redis.call('ZREMRANGEBYSCORE', key, 0, now_ms - window_ms)
+if now_ms == nil then
+    -- Redis 5/6 support effects replication for scripts that read server time.
+    redis.replicate_commands()
+    local server_time = redis.call('TIME')
+    now_ms = tonumber(server_time[1]) * 1000 + math.floor(tonumber(server_time[2]) / 1000)
+end
+redis.call('ZREMRANGEBYSCORE', key, '-inf', now_ms - window_ms)
 local count = redis.call('ZCARD', key)
 if count >= limit then
     local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
@@ -134,7 +140,7 @@ class RedisSlidingWindowLimiter:
         self.max_requests = int(max_requests)
         self.window_seconds = float(window_seconds)
         self.key_prefix = key_prefix.rstrip(":")
-        self._clock = clock or time.time
+        self._clock = clock
         if client is not None:
             self._client = client
             self._owns_client = False
@@ -148,10 +154,10 @@ class RedisSlidingWindowLimiter:
             self._owns_client = True
 
     async def hit(self, key: str) -> RateLimitDecision:
-        now_ms = int(self._clock() * 1000)
+        now_ms = "" if self._clock is None else str(int(self._clock() * 1000))
         window_ms = int(self.window_seconds * 1000)
         full_key = f"{self.key_prefix}:{key}"
-        member = f"{now_ms}:{uuid.uuid4().hex}"
+        member = uuid.uuid4().hex
         result = await self._client.eval(
             _LUA_SLIDING_WINDOW, 1, full_key, window_ms, self.max_requests, now_ms, member
         )
@@ -180,7 +186,7 @@ class ResilientRateLimiter:
 
     async def hit(self, key: str) -> RateLimitDecision:
         try:
-            return await self._primary.hit(key)
+            decision = await self._primary.hit(key)
         except Exception as exc:
             if not self._degraded_logged:
                 logger.error(
@@ -190,6 +196,10 @@ class ResilientRateLimiter:
                 )
                 self._degraded_logged = True
             return await self._fallback.hit(key)
+        if self._degraded_logged:
+            logger.info("rate_limiter_backend_recovered")
+            self._degraded_logged = False
+        return decision
 
     async def aclose(self) -> None:
         close_primary = getattr(self._primary, "aclose", None)
