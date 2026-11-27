@@ -13,6 +13,8 @@ from sklearn.model_selection import train_test_split
 
 from omniforge.core.exceptions import DataValidationError
 from omniforge.core.performance import smart_sample_df
+from omniforge.core.task_inference import infer_supervised_task
+from omniforge.core.types import TaskType
 from omniforge.data.quality import DataQualityProfiler
 from omniforge.eda.statistics import HypothesisTestResult, StatisticalAnalyzer
 from omniforge.evaluation.paired_comparison import paired_score_interval
@@ -75,6 +77,11 @@ class UniversalDiagnosticsReport:
 
     criteria: StatisticalCriteriaConfig
     executed_modules: list[str]
+    n_scanned: int = 0
+    sampled_from: int = 0
+    columns_skipped: dict[str, list[str]] = field(default_factory=dict)
+    scan_limits: dict[str, Any] = field(default_factory=dict)
+    correction_family: dict[str, Any] | None = None
     module_status: dict[str, str] = field(default_factory=dict)
     hypothesis_ledger: list[dict[str, Any]] = field(default_factory=list)
     quality_report: dict[str, Any] | None = None
@@ -155,10 +162,7 @@ class UniversalDiagnosticsSuite:
 
     @staticmethod
     def _is_classification_series(series: pd.Series) -> bool:
-        if not pd.api.types.is_numeric_dtype(series):
-            return True
-        observed = series.dropna().drop_duplicates().to_numpy(dtype=float)
-        return bool(len(observed) <= 15 and np.all(np.isfinite(observed)) and np.all(observed == np.trunc(observed)))
+        return infer_supervised_task(series) != TaskType.REGRESSION
 
     @staticmethod
     def _bootstrap_mean_ci(
@@ -227,12 +231,21 @@ class UniversalDiagnosticsSuite:
         modules = [module for module in dict.fromkeys(modules) if module in EXECUTABLE_MODULES]
         report = UniversalDiagnosticsReport(criteria=cfg, executed_modules=[])
         # Bound heavy statistical scans deterministically on huge tables (>25k rows) for sub-second UX
-        work_df, _was_sampled = smart_sample_df(
+        work_df, was_sampled = smart_sample_df(
             df,
             max_rows=25_000,
             stratify_col=targets[0] if targets and targets[0] in df.columns else None,
             seed=42,
         )
+        report.n_scanned = len(work_df)
+        report.sampled_from = len(df)
+        report.scan_limits["row_sampling"] = {"sampled": was_sampled, "max_rows": 25_000, "seed": 42}
+
+        def bounded_columns(key: str, candidates: list[str], limit: int) -> list[str]:
+            report.scan_limits[key] = {"max_columns": limit, "eligible_columns": len(candidates)}
+            report.columns_skipped[key] = candidates[limit:]
+            return candidates[:limit]
+
         num_cols = list(work_df.select_dtypes(include=[np.number]).columns)
         cat_cols = [
             c
@@ -277,7 +290,7 @@ class UniversalDiagnosticsSuite:
 
         # 2. Normality, Shape & Bootstrap CIs
         if "normality_distribution" in modules or "group_difference_tests" in modules or "correlation_association" in modules:
-            for col in num_cols[:30]:
+            for col in bounded_columns("normality_distribution", num_cols, 30):
                 vals = pd.to_numeric(df[col], errors="coerce").dropna().to_numpy(dtype=float)
                 n_res = StatisticalAnalyzer.normality_test(df[col], alpha=cfg.alpha, method=cfg.normality_method)
                 normality_flags[col] = not n_res.reject_null
@@ -305,7 +318,7 @@ class UniversalDiagnosticsSuite:
 
         # 3. Outlier & Extreme Value Scan
         if "outlier_anomaly_scan" in modules:
-            for col in num_cols[:30]:
+            for col in bounded_columns("outlier_anomaly_scan", num_cols, 30):
                 vals = pd.to_numeric(df[col], errors="coerce").dropna().to_numpy(dtype=float)
                 cnt, pct, low, high = self._detect_outliers(vals, cfg.outlier_method)
                 report.outlier_profiles.append(
@@ -345,7 +358,14 @@ class UniversalDiagnosticsSuite:
                         seen_pairs.add(key)
                         num_pairs.append((c1, c2))
 
-            for c1, c2 in num_pairs[:35]:
+            selected_num_pairs = num_pairs[:35]
+            scanned_num = {c for pair in selected_num_pairs for c in pair}
+            report.columns_skipped["correlation_numeric"] = [c for c in num_cols if c not in scanned_num]
+            report.scan_limits["correlation_numeric"] = {
+                "non_target_candidate_columns": 12, "max_pairs": 35, "n_pairs": len(selected_num_pairs),
+                "all_possible_pairs": len(num_cols) * (len(num_cols) - 1) // 2,
+            }
+            for c1, c2 in selected_num_pairs:
                 if cfg.correlation_method == "auto":
                     both_normal = normality_flags.get(c1, False) and normality_flags.get(c2, False)
                     corr_m: Literal["pearson", "spearman", "kendall"] = (
@@ -363,18 +383,27 @@ class UniversalDiagnosticsSuite:
             for i, a in enumerate(cat_cols[:10]):
                 for b in cat_cols[i + 1 : 10]:
                     cat_pairs.append((a, b))
-            for a, b in cat_pairs[:20]:
+            selected_cat_pairs = cat_pairs[:20]
+            scanned_cat = {c for pair in selected_cat_pairs for c in pair}
+            report.columns_skipped["correlation_categorical"] = [c for c in cat_cols if c not in scanned_cat]
+            report.scan_limits["correlation_categorical"] = {
+                "candidate_columns": 10, "max_pairs": 20, "n_pairs": len(selected_cat_pairs),
+                "all_possible_pairs": len(cat_cols) * (len(cat_cols) - 1) // 2,
+            }
+            for a, b in selected_cat_pairs:
                 chi_res = StatisticalAnalyzer.chi_square_independence(df[a], df[b], alpha=cfg.alpha)
                 _append_test("Categorical Association", f"{a} vs {b}", chi_res)
 
         # 5. Group & Target Difference Hypothesis Tests (Levene + Student/Welch T-test / Mann-Whitney U / ANOVA / Kruskal)
         if "group_difference_tests" in modules:
             group_candidates = [t for t in targets if t in cat_cols] + [c for c in cat_cols if c not in targets]
-            group_cols_used = group_candidates[:4]
-            numeric_predictors = [c for c in num_cols if c not in group_cols_used][:15]
+            group_cols_used = bounded_columns("group_columns", group_candidates, 4)
+            numeric_predictors = bounded_columns("group_numeric_predictors", [c for c in num_cols if c not in group_cols_used], 15)
+            report.scan_limits["group_columns"]["max_levels"] = 12
             for g_col in group_cols_used:
                 n_grps = int(df[g_col].nunique(dropna=True))
                 if n_grps < 2 or n_grps > 12:
+                    report.columns_skipped["group_columns"].append(g_col)
                     continue
                 for v_col in numeric_predictors:
                     lev = StatisticalAnalyzer.levene_variance_test(df, v_col, g_col, alpha=cfg.alpha)
@@ -421,7 +450,7 @@ class UniversalDiagnosticsSuite:
         # 7. Sequential Stationarity (ADF) & Autocorrelation (Ljung-Box)
         if "stationarity_autocorrelation" in modules and num_cols:
             seq_cols = [t for t in targets if t in num_cols] + [c for c in num_cols if c not in targets]
-            for col in seq_cols[:8]:
+            for col in bounded_columns("stationarity_autocorrelation", seq_cols, 8):
                 adf_res = StatisticalAnalyzer.stationarity_test(df[col], alpha=cfg.alpha)
                 lb_res = StatisticalAnalyzer.ljung_box_autocorrelation_test(df[col], alpha=cfg.alpha)
                 _append_test("Stationarity", col, adf_res)
@@ -431,8 +460,14 @@ class UniversalDiagnosticsSuite:
         if raw_ledger:
             raw_ps = [float(r["p_value"]) for r in raw_ledger]
             adj_ps = StatisticalAnalyzer.adjust_p_values(raw_ps, method=cfg.multiple_testing_correction)
+            family = "studio03_global_evaluable_ledger" if cfg.multiple_testing_correction != "none" else None
+            report.correction_family = {
+                "id": family, "method": cfg.multiple_testing_correction,
+                "n_evaluable": int(np.isfinite(adj_ps).sum()),
+            }
             for row, adj_p in zip(raw_ledger, adj_ps, strict=False):
                 evaluable = bool(np.isfinite(adj_p))
+                row["correction_family"] = family
                 row["adjusted_p_value"] = adj_p if evaluable else None
                 if not evaluable:
                     row["p_value"] = None
@@ -706,7 +741,11 @@ class UniversalDiagnosticsSuite:
 
         # 9. Quantitative Risk & Uncertainty Assessment (VaR, CVaR, Tail Risk, Structural Risk Index, Target Uncertainty)
         if "risk_uncertainty_audit" in modules:
-            report.risk_assessment = self._compute_risk_assessment(df, targets, num_cols, report, cfg)
+            tail_columns = bounded_columns("risk_tail_columns", num_cols, 25)
+            risk_outlier_columns = bounded_columns("risk_outlier_columns", num_cols, 15) if not report.outlier_profiles else []
+            report.risk_assessment = self._compute_risk_assessment(
+                df, targets, num_cols, report, cfg, tail_columns=tail_columns, risk_outlier_columns=risk_outlier_columns,
+            )
 
         tested_families = {row["family"] for row in raw_ledger if row["decision"] != "Not evaluable"}
         evidence = {
@@ -731,11 +770,14 @@ class UniversalDiagnosticsSuite:
         num_cols: list[str],
         report: UniversalDiagnosticsReport,
         cfg: StatisticalCriteriaConfig,
+        *,
+        tail_columns: list[str],
+        risk_outlier_columns: list[str],
     ) -> dict[str, Any]:
         """Compute quantitative tail risk (VaR/CVaR), structural data risk index (0-100), and target uncertainty."""
         tail_rows: list[dict[str, Any]] = []
         fat_tail_count = 0
-        for col in num_cols[:25]:
+        for col in tail_columns:
             vals = pd.to_numeric(df[col], errors="coerce").dropna().to_numpy(dtype=float)
             if len(vals) < 5:
                 continue
@@ -774,8 +816,8 @@ class UniversalDiagnosticsSuite:
             float(np.mean([r["Outlier %"] for r in report.outlier_profiles]))
             if report.outlier_profiles
             else float(
-                np.mean([self._detect_outliers(pd.to_numeric(df[c], errors="coerce").dropna().to_numpy(dtype=float), cfg.outlier_method)[1] for c in num_cols[:15]])
-                if num_cols
+                np.mean([self._detect_outliers(pd.to_numeric(df[c], errors="coerce").dropna().to_numpy(dtype=float), cfg.outlier_method)[1] for c in risk_outlier_columns])
+                if risk_outlier_columns
                 else 0.0
             )
         )

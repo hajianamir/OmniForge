@@ -91,3 +91,67 @@ Retire the duplicated 12-column preparation algorithm in favor of the fitted Wor
 Use the uncorrected Pearson statistic for Cramér's V, retaining the existing continuity-corrected or Fisher test for its p-value. Do not alter fairness statistics or VIF.
 
 Phase 2 verification: targeted selection/scope/paired comparison/fitted-schema checks: **13 passed**; mypy found only the same optional-Redis baseline error, and SPA rebuilt successfully. The native strong-failure integration test from Phase 1 is green (and red on pristine). Phase 2 also removed the misleading hard-coded deep baseline framework (OF-28) when exposing its fitted baseline metadata; the dedicated deep benchmark verification follows in Phase 4.
+
+## Phase 4 / Iteration 1 / OF-07
+
+Correct the handbook and migration notes to positional membership and fail-closed index-label realignment. Do not claim an authoritative row-ID writer or modify the existing fail-closed remapping logic.
+
+## Phase 4 / Iteration 1 / OF-08
+
+Make new Split Lock audits strict about exact cross-partition duplicates. Keep the original row membership available for inspection and explicitly mark the warning in the badge, including historical locks. Re-audits after transformations enforce the same duplicate rule.
+
+## Phase 4 / Iteration 1 / OF-15
+
+De-list SDK-only controls in the register and guide without removing or advertising new product pathways. Distinguish forecast interval options already exposed from the separate predictive conformal methods.
+
+## Phase 4 / Iteration 1 / OF-16
+
+Source drift/misattribution: the cited variance maximum is the PSM path; AIPW already uses the sample SD of the influence scores divided by square root n. Document the PSM SATE variance floor and AIPW's small-arm non-cross-fitted fallback. Leave Hájek IPW and both estimators' numerical contracts unchanged.
+
+## Phase 4 / Iteration 1 / OF-17
+
+Treat chi-square MCD as a large-sample screening approximation; require at least max(50, 10p) complete rows. Disclose complete-case denominator, and report fit failures rather than substituting classical covariance and retaining the MCD label.
+
+## Phase 4 / Iteration 1 / OF-19
+
+Relabel the structural index as an uncalibrated screening heuristic and publish its cap/method metadata. Keep its wire keys stable. Do not invent weights or calibration evidence.
+
+## Phase 4 / Iteration 1 / OF-21
+
+Use stratified sampling for capped holdouts when feasible; disclose available and retained class counts and a random fallback. Preserve chronological ordering within the selected indices; no test membership goes into model fitting.
+
+## Phase 4 / Iteration 1 / OF-25
+
+The route and contract were documented with the selector change (Phase 1). Verify the docs point to the catalog and run routes rather than Studio 04's EDA contract.
+
+## Phase 4 / Iteration 1 / OF-26
+
+Remove the dead `penalty=` compatibility paths given the declared scikit-learn minimum. Verify the pinned runtime's active paths; nobody can rely on the deprecated fallback within the supported range.
+
+## Phase 4 / Iteration 1 / OF-27
+
+Document the nominal feature cap includes the infrequent bucket and verify it against a fitted `ColumnTransformer`. No change to its handling of unknown categories.
+
+## Phase 4 / Iteration 1 / OF-28
+
+Use the executed baseline wrapper's framework and implementation rather than a universal sklearn label. Verify alongside deep benchmark evidence; do not label failed fits as running on a particular framework.
+
+## Phase 4 / Iteration 1 / OF-29
+
+Lift can be absent after Phase 1; read the actual reference score and name from evaluation metadata rather than reconstructing it. Add explicit round-trip coverage.
+
+## Phase 4 / Iteration 1 / OF-30
+
+Keep 422 and compatible `detail` while adding a typed, correlated OmniForge error envelope. Validation exceptions may include rejected input or free-form custom exceptions; do not include either in HTTP or logs.
+
+## Phase 4 / Iteration 1 / OF-31
+
+The audit did not reproduce a leading-digit defect. Prefer a regression check for extreme decimal notation and deliberate deferral over an untested rewrite with log10 underflow and exact-power boundary risks.
+
+## Phase 4 / Iteration 1 / OF-32
+
+Document the actual Gaussian random-walk volatility scaling. Do not touch the real split-conformal implementation or imply coverage guarantees for this baseline.
+
+## Phase 3 — Summary
+
+The three additional red fixtures reproduced the high-cardinality ordinal encoding, the thirteenth categorical column loss, and incompatible CPCV interval support. Twelve targeted tests passed after the changes, including existing purge/embargo assertions and numeric inference serialization. SPA rebuild passed. Redis integration: 13 passed against a local Redis 7.4 build (Unix socket instead of CI TCP). Mypy still reports only the known combined-environment Redis typing mismatch. The grep for BH correction also identified three mining candidate families (OF-13a); they now name the adjusted family and its pre-display-truncation size. This sibling has no dedicated red/green result, so it remains separately tracked. The prior native ordinal representation of `BaseOmniForgeModel` remains an explicitly documented path; the distance-baseline Workbench paths use the new nominal representation.

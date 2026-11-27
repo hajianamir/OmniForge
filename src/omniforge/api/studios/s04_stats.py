@@ -436,6 +436,7 @@ def s04_run_hypothesis(req: HypothesisReq, x_session_id: str | None = Header(def
             evaluate("chi_square", cat_cols[0], cat_cols[1], f"{cat_cols[0]} x {cat_cols[1]}")
         adjusted = StatisticalAnalyzer.adjust_p_values([float(row["p_value"]) for row in battery])
         for row, p_adj in zip(battery, adjusted, strict=True):
+            row["correction_family"] = "studio04_evaluable_battery"
             row["significant_raw"] = row["significant"]
             row["p_value_fdr"] = p_adj
             row["significant_fdr"] = p_adj < req.alpha
@@ -451,6 +452,7 @@ def s04_run_hypothesis(req: HypothesisReq, x_session_id: str | None = Header(def
                 "significant_tests": sum(1 for r in battery if r.get("significant")),
                 "raw_significant_tests": sum(1 for r in battery if r.get("significant_raw")),
                 "decision_policy": "Benjamini–Hochberg across the evaluable battery",
+                "correction_family": {"id": "studio04_evaluable_battery", "method": "fdr_bh", "n_evaluable": len(battery)},
                 "battery": battery,
                 "skipped": skipped,
                 "result": battery[0] if battery else None,

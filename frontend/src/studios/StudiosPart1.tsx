@@ -1551,6 +1551,13 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
             <p>Unavailable modules: {Object.entries(report.module_status ?? {}).filter(([, status]) => status === 'unavailable').map(([id]) => id).join(', ')}</p>
           )}
 
+          {typeof report.n_scanned === 'number' && typeof report.sampled_from === 'number' && (
+            <p>Statistical scan scope: {report.n_scanned.toLocaleString()} of {report.sampled_from.toLocaleString()} rows. Quality and baseline cohorts are reported separately.</p>
+          )}
+          {Object.entries(report.columns_skipped ?? {}).filter(([, cols]) => cols.length > 0).map(([scan, cols]) => (
+            <p key={scan}>Columns skipped ({scan}): {cols.join(', ')}</p>
+          ))}
+
           {/* Visual Diagnostics Charts: Baseline Comparison, Hypothesis Significance & VIF */}
           <div className="grid-2" style={{ marginBottom: 14 }}>
             {report.baseline_equations && Object.keys(report.baseline_equations).length > 0 && (() => {
@@ -1641,7 +1648,8 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
           )}
 
           <div className="card">
-            <div className="card-title">Hypothesis Test Ledger (FDR Adjusted)</div>
+            <div className="card-title">Hypothesis Test Ledger</div>
+            {report.correction_family && <p>Correction: {report.correction_family.method} · {report.correction_family.id ?? 'no correction family'} ({report.correction_family.n_evaluable} evaluable tests)</p>}
             <SimpleTable title="Universal Statistical Diagnostics Ledger" rows={report.hypothesis_ledger || []} maxRows={80} />
           </div>
 

@@ -27,6 +27,7 @@ from omniforge.core.logging import get_logger
 from omniforge.core.performance import (
     compact_scatter_payload,
 )
+from omniforge.core.task_inference import infer_supervised_task
 from omniforge.core.types import ModelStage, Principal, TaskType
 from omniforge.core.utils import sanitize_spreadsheet_frame, to_json_object, to_json_safe
 from omniforge.data.cleaning import CleaningConfig, DataCleaner
@@ -433,48 +434,13 @@ def _cache_and_respond(
 
 
 def _infer_task(y: pd.Series) -> TaskType:
-    s = y.dropna()
-    if not pd.api.types.is_numeric_dtype(s) or pd.api.types.is_bool_dtype(s):
-        return TaskType.BINARY_CLASSIFICATION if s.nunique() <= 2 else TaskType.MULTICLASS_CLASSIFICATION
-    if s.nunique() <= 10 and np.all(np.isclose(s.to_numpy(dtype=float), np.round(s.to_numpy(dtype=float)))):
-        return TaskType.BINARY_CLASSIFICATION if s.nunique() <= 2 else TaskType.MULTICLASS_CLASSIFICATION
-    return TaskType.REGRESSION
+    return infer_supervised_task(y)
 
 
 def _prepare_xy(df: pd.DataFrame, target: str, *, raw_features: bool = False) -> tuple[pd.DataFrame, pd.Series, TaskType]:
-    work = df.dropna(subset=[target]).copy()
-    if len(work) < 10:
-        raise HTTPException(status_code=400, detail=f"Target '{target}' has fewer than 10 non-null observations.")
-    y = work[target]
-    X_raw = work.drop(columns=[target])
-    if raw_features:
-        if X_raw.shape[1] == 0:
-            raise HTTPException(status_code=400, detail="No usable predictor columns remain after excluding target.")
-        X_out = X_raw.copy()
-        for dt_col in X_out.select_dtypes(include=["datetime", "datetimetz"]).columns:
-            s_dt = X_out[dt_col]
-            nat_mask = s_dt.isna()
-            if isinstance(s_dt.dtype, pd.DatetimeTZDtype):
-                s_dt = s_dt.dt.tz_convert("UTC").dt.tz_localize(None)
-            ns_vals = s_dt.astype("datetime64[ns]").astype("int64").astype(float) / 1e9
-            ns_vals[nat_mask] = np.nan
-            X_out[dt_col] = ns_vals
-        return X_out.replace([np.inf, -np.inf], np.nan), y, _infer_task(y)
-    num_df = X_raw.select_dtypes(include=[np.number]).copy()
-    cat_cols = [c for c in X_raw.columns if c not in num_df.columns]
-    for c in cat_cols[:12]:
-        if X_raw[c].nunique(dropna=True) <= 20:
-            dummies = pd.get_dummies(X_raw[c].astype(str), prefix=c, drop_first=False, dtype=float)
-            num_df = pd.concat([num_df, dummies], axis=1)
-        else:
-            codes, _ = pd.factorize(X_raw[c].astype(str))
-            num_df[f"{c}_code"] = codes.astype(float)
-    num_df = num_df.replace([np.inf, -np.inf], np.nan)
-    medians = num_df.median(numeric_only=True).fillna(0.0)
-    num_df = num_df.fillna(medians)
-    if num_df.shape[1] == 0:
-        raise HTTPException(status_code=400, detail="No usable predictor columns remain after excluding target.")
-    return num_df, y, _infer_task(y)
+    """Compatibility entry point using the same training preparation as inference."""
+    X, y, task, _ = _prepare_xy_fitted(df, target, raw_features=raw_features)
+    return X, y, task
 
 
 def _prepare_xy_fitted(

@@ -28,6 +28,7 @@ from omniforge.automl.optimizer import HyperparameterOptimizer
 from omniforge.core.carbon import CarbonTracker
 from omniforge.core.exceptions import AutoMLError
 from omniforge.core.logging import get_logger
+from omniforge.core.task_inference import infer_supervised_task
 from omniforge.core.types import CarbonReport, TaskType
 from omniforge.data.splitting import (
     LeakageAuditReport,
@@ -158,12 +159,7 @@ class AutoMLPipelineSearch:
     @staticmethod
     def infer_task_type(y: pd.Series | np.ndarray) -> TaskType:
         """Infer binary classification, multiclass classification, or regression from target."""
-        s = pd.Series(y).dropna()
-        if not pd.api.types.is_numeric_dtype(s) or pd.api.types.is_bool_dtype(s):
-            return TaskType.BINARY_CLASSIFICATION if s.nunique() <= 2 else TaskType.MULTICLASS_CLASSIFICATION
-        if s.nunique() <= 10 and np.all(np.isclose(s, np.round(s))):
-            return TaskType.BINARY_CLASSIFICATION if s.nunique() <= 2 else TaskType.MULTICLASS_CLASSIFICATION
-        return TaskType.REGRESSION
+        return infer_supervised_task(y)
 
     @staticmethod
     def pareto_frontier(

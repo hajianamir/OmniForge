@@ -174,6 +174,8 @@ class AssociationRuleMiner:
 
             q_vals = StatisticalAnalyzer.adjust_p_values([float(r["p_value"]) for r in rules], method="fdr_bh")
             for r_row, q_v in zip(rules, q_vals, strict=False):
+                r_row["correction_family"] = "frequent_itemset_rule_candidates"
+                r_row["correction_family_size"] = len(rules)
                 r_row["fdr_q_value"] = round(float(q_v), 8)
                 r_row["significant"] = bool(q_v < 0.05)
 
@@ -269,6 +271,8 @@ class AssociationRuleMiner:
 
             q_vals = StatisticalAnalyzer.adjust_p_values([float(r["p_value"]) for r in rules], method="fdr_bh")
             for r_row, q_v in zip(rules, q_vals, strict=False):
+                r_row["correction_family"] = "transaction_rule_candidates"
+                r_row["correction_family_size"] = len(rules)
                 r_row["fdr_q_value"] = round(float(q_v), 8)
                 r_row["significant"] = bool(q_v < 0.05)
         rules.sort(key=lambda r: (r["lift"], r["confidence"], r["support"]), reverse=True)
@@ -368,6 +372,8 @@ class SubgroupDiscoveryMiner:
 
             adj_ps = StatisticalAnalyzer.adjust_p_values([float(r["p_value"]) for r in subgroups], method="fdr_bh")
             for row, adj_p in zip(subgroups, adj_ps, strict=False):
+                row["correction_family"] = "subgroup_candidate_tests"
+                row["correction_family_size"] = len(subgroups)
                 row["adjusted_p_value"] = round(float(adj_p), 6)
                 row["significant"] = "Yes (FDR<0.05)" if adj_p < 0.05 else "No"
 

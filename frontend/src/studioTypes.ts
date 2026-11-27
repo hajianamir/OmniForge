@@ -204,6 +204,10 @@ export interface RiskAssessment {
 }
 
 export interface DiagnosticsReport {
+  n_scanned?: number;
+  sampled_from?: number;
+  columns_skipped?: Record<string, string[]>;
+  correction_family?: { id: string | null; method: string; n_evaluable: number } | null;
   total_tests?: number;
   significant_tests?: number;
   hypothesis_ledger?: JsonRow[];

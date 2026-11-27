@@ -12,6 +12,8 @@ from typing import Any, Literal
 import numpy as np
 import pandas as pd
 
+MAX_CATEGORY_INDICATORS = 32
+
 
 def nonconstant_predictors(frame: pd.DataFrame) -> list[str]:
     """Predictors with at least two observed levels on the fit partition only."""
@@ -28,7 +30,8 @@ class WorkbenchInputPreprocessor:
     """Remember the input schema and, for numeric-only models, fitted encodings.
 
     Missing numeric values use training medians in ``numeric`` mode. Unseen
-    categories become all-zero one-hot vectors or -1 for high-cardinality columns.
+    categories become all-zero one-hot vectors. Category width is bounded to 32,
+    including an infrequent bucket when grouping is needed.
     ``raw`` mode leaves imputation and category encoding to the fitted model.
     """
 
@@ -38,6 +41,8 @@ class WorkbenchInputPreprocessor:
         self.column_types: dict[str, str] = {}
         self.medians: dict[str, float] = {}
         self.categories: dict[str, list[str]] = {}
+        self.infrequent_categories: dict[str, set[str]] = {}
+        self.infrequent_names: dict[str, str] = {}
         self.output_columns: list[str] = []
         self._fitted = False
 
@@ -89,6 +94,8 @@ class WorkbenchInputPreprocessor:
         self.column_types = {}
         self.medians = {}
         self.categories = {}
+        self.infrequent_categories = {}
+        self.infrequent_names = {}
         for column in self.input_columns:
             series = frame[column]
             if pd.api.types.is_datetime64_any_dtype(series.dtype):
@@ -101,8 +108,16 @@ class WorkbenchInputPreprocessor:
             if self.mode == "numeric":
                 if kind == "categorical":
                     values = self._category(series).fillna("__MISSING__")
-                    # Preserve factorize order for large-cardinality columns.
-                    self.categories[column] = list(dict.fromkeys(values.tolist()))
+                    counts = values.value_counts()
+                    levels = sorted(counts.index, key=lambda level: (-counts[level], level))
+                    if len(levels) > MAX_CATEGORY_INDICATORS:
+                        self.infrequent_categories[column] = set(levels[MAX_CATEGORY_INDICATORS - 1:])
+                        levels = levels[:MAX_CATEGORY_INDICATORS - 1]
+                        bucket = "__INFREQUENT__"
+                        while bucket in counts.index or f"{column}_{bucket}" in self.input_columns:
+                            bucket += "_"
+                        self.infrequent_names[column] = bucket
+                    self.categories[column] = sorted(levels)
                 else:
                     values = self._datetime(series, column) if kind == "datetime" else self._number(series, column)
                     self.medians[column] = float(values.median()) if values.notna().any() else 0.0
@@ -137,13 +152,20 @@ class WorkbenchInputPreprocessor:
                 continue
             values = normalized[column].fillna("__MISSING__")
             categories = self.categories[column]
-            if len(categories) <= 20:
+            if hasattr(self, "infrequent_categories") or len(categories) <= 20:
                 for category in sorted(categories):
                     name = f"{column}_{category}"
                     if name in result:
                         raise ValueError(f"Encoded feature name '{name}' conflicts with another feature.")
                     result[name] = (values == category).astype(float)
+                name_suffix = getattr(self, "infrequent_names", {}).get(column)
+                if name_suffix:
+                    name = f"{column}_{name_suffix}"
+                    if name in result:
+                        raise ValueError(f"Encoded feature name '{name}' conflicts with another feature.")
+                    result[name] = values.isin(self.infrequent_categories[column]).astype(float)
             else:
+                # Older persisted Workbench models expect this exact ordinal representation.
                 name = f"{column}_code"
                 if name in result:
                     raise ValueError(f"Encoded feature name '{name}' conflicts with another feature.")
@@ -166,8 +188,11 @@ class WorkbenchInputPreprocessor:
         for column in self.input_columns:
             if self.mode == "raw" or self.column_types[column] != "categorical":
                 sources[column] = column
-            elif len(self.categories[column]) > 20:
+            elif not hasattr(self, "infrequent_categories") and len(self.categories[column]) > 20:
                 sources[f"{column}_code"] = column
             else:
                 sources.update({f"{column}_{value}": column for value in self.categories[column]})
+                suffix = getattr(self, "infrequent_names", {}).get(column)
+                if suffix:
+                    sources[f"{column}_{suffix}"] = column
         return sources

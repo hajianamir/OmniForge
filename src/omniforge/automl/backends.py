@@ -45,11 +45,12 @@ from omniforge.automl.pipeline_search import AutoMLPipelineSearch, AutoMLResult
 from omniforge.core.exceptions import AutoMLError
 from omniforge.core.logging import get_logger
 from omniforge.core.performance import parallel_n_jobs
+from omniforge.core.task_inference import infer_supervised_task
 from omniforge.core.types import TaskType
 from omniforge.core.utils import is_package_available
 from omniforge.data.splitting import LeakageSafeSplitter, SplitConfig, SplitStrategyType
 from omniforge.evaluation.paired_comparison import paired_score_interval
-from omniforge.features.inference import nonconstant_predictors
+from omniforge.features.inference import MAX_CATEGORY_INDICATORS, nonconstant_predictors
 from omniforge.models.base import BaseOmniForgeModel
 from omniforge.models.baselines import (
     BaselineBenchmarkSuite,
@@ -190,12 +191,7 @@ def probe_automl_backends() -> list[dict[str, Any]]:
 
 
 def _infer_task(y: pd.Series, requested: TaskType | None) -> TaskType:
-    if requested is not None:
-        return requested
-    n_uniq = int(y.nunique(dropna=True))
-    if not pd.api.types.is_numeric_dtype(y) or pd.api.types.is_bool_dtype(y) or n_uniq <= 15:
-        return TaskType.BINARY_CLASSIFICATION if n_uniq <= 2 else TaskType.MULTICLASS_CLASSIFICATION
-    return TaskType.REGRESSION
+    return requested if requested is not None else infer_supervised_task(y)
 
 
 def _build_preprocessor(X: pd.DataFrame, *, scaler_kind: str = "standard", imputer_kind: str = "median") -> ColumnTransformer:
@@ -207,10 +203,11 @@ def _build_preprocessor(X: pd.DataFrame, *, scaler_kind: str = "standard", imput
         num_pipe = Pipeline([("imp", SimpleImputer(strategy=imputer_kind)), ("scl", scaler)])
         transformers.append(("num", num_pipe, num_cols))
     if cat_cols:
+        # sklearn's cap includes the infrequent bucket when grouping is needed.
         cat_pipe = Pipeline(
             [
                 ("imp", SimpleImputer(strategy="most_frequent")),
-                ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False, max_categories=32)),
+                ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False, max_categories=MAX_CATEGORY_INDICATORS)),
             ]
         )
         transformers.append(("cat", cat_pipe, cat_cols))

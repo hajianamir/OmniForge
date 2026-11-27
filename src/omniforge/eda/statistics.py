@@ -592,7 +592,8 @@ class StatisticalAnalyzer:
         chi2, p_val, dof, expected = stats.chi2_contingency(ct)
         n = float(ct.to_numpy().sum())
         min_dim = max(min(ct.shape) - 1, 1)
-        cramers_v = float(np.sqrt(chi2 / max(n * min_dim, 1e-12)))
+        pearson_chi2 = float(stats.chi2_contingency(ct, correction=False).statistic) if dof == 1 else float(chi2)
+        cramers_v = float(np.sqrt(pearson_chi2 / max(n * min_dim, 1e-12)))
 
         test_name = "chi_square_independence"
         stat_out = float(chi2)

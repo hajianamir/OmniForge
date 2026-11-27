@@ -520,3 +520,13 @@ This filters predictor inputs, not the session dataset. Studio 03 still scans th
 scope, subject to its diagnostic caps. The list must not name an outcome. Call `/s05/select` with
 `apply_to_run: true` on a locked training cohort to obtain a `run_scope` object to pass into one
 modelling request. This cannot be combined with a session-wide `commit: true`.
+
+### Diagnostic sampling and correction families
+
+Studio 03 discloses `n_scanned`, `sampled_from`, `columns_skipped`, and `scan_limits` for the
+bounded statistical scan; individual tests can use fewer observations due to missing values.
+Quality and baseline partitions are separate. The available hypothesis ledger is one predeclared
+family (`studio03_global_evaluable_ledger`), rather than per-method families; its method and
+size are returned. Studio 04's battery identifies `studio04_evaluable_battery`; a single selected
+exploratory test does not get a battery-wide adjustment. Mining families represent the candidate
+rules or subgroups tested, before the top-N display truncation, not the universe of all rules.
