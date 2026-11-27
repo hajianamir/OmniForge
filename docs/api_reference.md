@@ -96,13 +96,18 @@ Each studio follows the pattern: `POST /api/workbench/sXX/<action>` with an `X-S
 
 ---
 
-### 2.4 Studio 03 — EDA (`s03`)
+### 2.4 Studio 03 — Universal Diagnostics (`s03`)
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/s03/eda` | POST | Automated exploratory data analysis |
+| `/s03/catalog` | GET | Module descriptions, including `executable_modules` for Studio 03 (not downstream suggestions) |
+| `/s03/run` | POST | Run diagnostics with `mode: all` (or `complete`), `auto`, or `custom` |
 
-**Response:** Distribution profiles, correlation matrix, missingness report, executive narrative, Plotly figures.
+Custom mode requires a nonempty `selected_modules` array of unique executable IDs.
+Other modes must omit the list or send an empty list. Invalid selections or modes return 422.
+The response includes `report.executed_modules`, `report.module_status`, the hypothesis ledger,
+and any available baseline or risk evidence. Modules without evaluable results are marked `unavailable`.
+Risk uses `structural_risk_index`, `risk_band`, and `tail_risk_table`.
 
 ---
 

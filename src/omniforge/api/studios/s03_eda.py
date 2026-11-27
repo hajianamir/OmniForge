@@ -14,6 +14,7 @@ from omniforge.core.utils import to_json_object
 from omniforge.eda.diagnostics import (
     DIAGNOSTIC_TEST_CATALOG,
     DOWNSTREAM_MODULE_CATALOG,
+    EXECUTABLE_MODULES,
     StatisticalCriteriaConfig,
     UniversalDiagnosticsSuite,
 )
@@ -34,6 +35,7 @@ def s03_catalog() -> dict[str, Any]:
         {
             "diagnostic_tests": DIAGNOSTIC_TEST_CATALOG,
             "downstream_modules": DOWNSTREAM_MODULE_CATALOG,
+            "executable_modules": EXECUTABLE_MODULES,
         }
     )
 
@@ -64,14 +66,14 @@ def s03_run_diagnostics(
         holdout_ratio=req.holdout_ratio,
     )
     suite = UniversalDiagnosticsSuite()
-    modules: list[str] | None
+    modules: list[str]
     if req.mode == "auto":
-        modules = list(suite.recommend_modules(df, target_cols=targets).keys())
-    elif req.mode == "custom" and req.selected_modules:
+        modules = [name for name in suite.recommend_modules(df, target_cols=targets) if name in EXECUTABLE_MODULES]
+    elif req.mode == "custom":
         modules = list(req.selected_modules)
     else:
-        modules = None  # Complete / Select All
-    fit_baselines = bool(targets and (modules is None or "baseline_benchmark" in modules))
+        modules = list(EXECUTABLE_MODULES)
+    fit_baselines = bool(targets and "baseline_benchmark" in modules)
     if fit_baselines:
         authorize_principal(principal, "model:train")
     report = suite.run(df, target_cols=targets, selected_modules=modules, criteria=criteria, baseline_partitions=partitions)

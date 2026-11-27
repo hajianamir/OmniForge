@@ -11,10 +11,11 @@ from pydantic import BaseModel, Field
 from scipy import stats
 from sklearn.model_selection import train_test_split
 
+from omniforge.core.exceptions import DataValidationError
 from omniforge.core.performance import smart_sample_df
 from omniforge.data.quality import DataQualityProfiler
 from omniforge.eda.statistics import HypothesisTestResult, StatisticalAnalyzer
-from omniforge.models.baselines import BaselineBenchmarkSuite
+from omniforge.models.baselines import BaselineBenchmarkSuite, BaselineEvidence, strongest_scored_reference
 
 # Complete catalog of selectable diagnostic & analytical modules (domain-agnostic)
 DIAGNOSTIC_TEST_CATALOG: dict[str, str] = {
@@ -34,6 +35,13 @@ DOWNSTREAM_MODULE_CATALOG: dict[str, str] = {
     "automated_eda": "Automated EDA Visual Report & Insights",
     "automl_benchmark": "Baseline-First AutoML Tournament (Single or Multi-Target)",
     "model_card": "Governance & Compliance Model Card",
+}
+
+
+EXECUTABLE_MODULES = {
+    **DIAGNOSTIC_TEST_CATALOG,
+    "baseline_benchmark": DOWNSTREAM_MODULE_CATALOG["baseline_benchmark"],
+    "risk_uncertainty_audit": "Empirical Tail Risk (VaR / CVaR) and Structural Screening",
 }
 
 
@@ -60,12 +68,14 @@ class UniversalDiagnosticsReport:
 
     criteria: StatisticalCriteriaConfig
     executed_modules: list[str]
+    module_status: dict[str, str] = field(default_factory=dict)
     hypothesis_ledger: list[dict[str, Any]] = field(default_factory=list)
     quality_report: dict[str, Any] | None = None
     distribution_profiles: list[dict[str, Any]] = field(default_factory=list)
     outlier_profiles: list[dict[str, Any]] = field(default_factory=list)
     vif_scores: dict[str, float] = field(default_factory=dict)
     baseline_benchmarks: dict[str, dict[str, dict[str, float]]] = field(default_factory=dict)
+    baseline_evidence: dict[str, BaselineEvidence] = field(default_factory=dict)
     baseline_equations: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     baseline_feature_cols: dict[str, list[str]] = field(default_factory=dict)
     baseline_split: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -199,7 +209,14 @@ class UniversalDiagnosticsSuite:
         targets = [t for t in (target_cols or []) if t in df.columns]
         modules = list(selected_modules) if selected_modules is not None else list(self.recommend_modules(df, targets).keys())
 
-        report = UniversalDiagnosticsReport(criteria=cfg, executed_modules=modules)
+        unknown = set(modules) - EXECUTABLE_MODULES.keys() if selected_modules is not None else set()
+        if unknown:
+            raise DataValidationError(
+                "Unknown or non-executable diagnostic modules.",
+                suggestions=["Choose modules from the executable diagnostics catalog."],
+            )
+        modules = [module for module in dict.fromkeys(modules) if module in EXECUTABLE_MODULES]
+        report = UniversalDiagnosticsReport(criteria=cfg, executed_modules=[])
         # Bound heavy statistical scans deterministically on huge tables (>25k rows) for sub-second UX
         work_df, _was_sampled = smart_sample_df(
             df,
@@ -468,13 +485,15 @@ class UniversalDiagnosticsSuite:
                         )
                         continue
 
+                    baseline_evidence: BaselineEvidence = {}
+                    report.baseline_evidence[t_col] = baseline_evidence
                     if is_clf:
                         bl_metrics, bl_models = BaselineBenchmarkSuite.run_classification_detailed(
-                            X_tr, y_tr, X_val, y_val
+                            X_tr, y_tr, X_val, y_val, evidence=baseline_evidence,
                         )
                     else:
                         bl_metrics, bl_models = BaselineBenchmarkSuite.run_regression_detailed(
-                            X_tr, y_tr, X_val, y_val
+                            X_tr, y_tr, X_val, y_val, evidence=baseline_evidence,
                         )
                     report.baseline_benchmarks[t_col] = bl_metrics
                     report.baseline_feature_cols[t_col] = list(pred_cols)
@@ -489,12 +508,10 @@ class UniversalDiagnosticsSuite:
                     )
 
                     # Determine naive floor baseline score for explicit lift & acceptance criteria
-                    naive_candidates = [
-                        (name, m.get(primary_metric, 0.0))
-                        for name, m in bl_metrics.items()
-                        if any(tok in name.lower() for tok in ("most_frequent", "stratified", "mean", "median", "dummy"))
-                    ]
-                    naive_floor = max((float(v) for _, v in naive_candidates), default=0.0)
+                    naive_reference = strongest_scored_reference(
+                        bl_metrics, baseline_evidence, primary_metric, higher_is_better=True, role="naive",
+                    )
+                    naive_floor = naive_reference[1] if naive_reference is not None else None
                     max_vif = max((float(v) for v in report.vif_scores.values() if not np.isnan(v)), default=1.0)
 
                     # Rank all baselines best -> worst
@@ -525,13 +542,16 @@ class UniversalDiagnosticsSuite:
                         m_scores = dict(bl_metrics.get(bl_name, {}))
                         p_score = float(m_scores.get(primary_metric, 0.0))
                         rank_num = int(rank_lookup.get(bl_name, len(ranked_names)))
-                        is_naive = any(
-                            tok in bl_name.lower() for tok in ("most_frequent", "stratified", "mean", "median", "dummy")
+                        is_naive = baseline_evidence[bl_name]["role"] == "naive"
+                        lift_abs = round(p_score - naive_floor, 5) if naive_floor is not None else None
+                        lift_pct = (
+                            round(lift_abs / abs(naive_floor) * 100.0, 2)
+                            if lift_abs is not None and naive_floor is not None and abs(naive_floor) > 1e-4 else None
                         )
-                        lift_abs = round(p_score - naive_floor, 5)
-                        lift_pct = round((lift_abs / max(abs(naive_floor), 1e-4)) * 100.0, 2) if abs(naive_floor) > 1e-4 else None
 
-                        if rank_num == 1 and not is_naive and lift_abs > 0:
+                        if naive_floor is None or lift_abs is None:
+                            acc_status = "NOT EVALUATED — NAIVE FLOOR UNAVAILABLE"
+                        elif rank_num == 1 and not is_naive and lift_abs > 0:
                             acc_status = "ACCEPTED — CHAMPION BASELINE"
                         elif is_naive:
                             acc_status = "REFERENCE — NAIVE FLOOR"
@@ -545,7 +565,9 @@ class UniversalDiagnosticsSuite:
                             f"Primary Criterion ({criterion_label}): {primary_metric.upper()} = {p_score:.4f}"
                             + (f" | RMSE = {float(m_scores.get('rmse', 0.0)):.4f}, MAE = {float(m_scores.get('mae', 0.0)):.4f}" if not is_clf else f" | Accuracy = {float(m_scores.get('accuracy', 0.0)):.4f}"),
                         ]
-                        if is_naive:
+                        if naive_floor is None or lift_abs is None:
+                            reasons.append("Naive floor unavailable: not all designated dummy references were scored.")
+                        elif is_naive:
                             reasons.append(
                                 "Retained as mandatory zero-skill statistical reference floor — all downstream ML/Neural models must statistically beat this floor."
                             )
@@ -604,7 +626,9 @@ class UniversalDiagnosticsSuite:
                                 "primary_score": round(p_score, 5),
                                 "higher_is_better": higher_is_better,
                                 "selection_criterion": criterion_label,
-                                "naive_floor_score": round(naive_floor, 5),
+                                "naive_floor_score": naive_floor,
+                                "naive_floor_status": "available" if naive_reference is not None else "unavailable",
+                                "naive_floor_model": naive_reference[0] if naive_reference is not None else None,
                                 "lift_over_naive": lift_abs,
                                 "lift_over_naive_pct": lift_pct,
                                 "acceptance_status": acc_status,
@@ -658,6 +682,20 @@ class UniversalDiagnosticsSuite:
         if "risk_uncertainty_audit" in modules:
             report.risk_assessment = self._compute_risk_assessment(df, targets, num_cols, report, cfg)
 
+        tested_families = {row["family"] for row in raw_ledger if row["decision"] != "Not evaluable"}
+        evidence = {
+            "data_quality_integrity": bool(report.quality_report),
+            "normality_distribution": bool(report.distribution_profiles),
+            "outlier_anomaly_scan": bool(report.outlier_profiles),
+            "correlation_association": bool({"Correlation", "Categorical Association"} & tested_families),
+            "group_difference_tests": "Group Comparison" in tested_families,
+            "multicollinearity_vif": bool(report.vif_scores),
+            "stationarity_autocorrelation": bool({"Stationarity", "Autocorrelation"} & tested_families),
+            "baseline_benchmark": any(report.baseline_benchmarks.values()),
+            "risk_uncertainty_audit": report.risk_assessment is not None,
+        }
+        report.module_status = {module: "executed" if evidence[module] else "unavailable" for module in modules}
+        report.executed_modules = [module for module in modules if evidence[module]]
         return report
 
     def _compute_risk_assessment(

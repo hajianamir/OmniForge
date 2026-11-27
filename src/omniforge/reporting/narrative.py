@@ -287,9 +287,9 @@ class NarrativeGenerator:
             score = model_summary.get("best_score", model_summary.get("score", "N/A"))
             lift = model_summary.get("lift_over_best_baseline")
             lift_str = (
-                f" This delivers a verified lift of {float(lift):+.4f} over the strongest baseline model."
+                f" The observed score difference was {float(lift):+.4f} over the strongest baseline model."
                 if isinstance(lift, (int, float))
-                else ""
+                else " Lift over the intended reference suite was unavailable."
             )
             body = (
                 f"Multi-family model benchmarking selected champion architecture '{champ}' achieving "
@@ -408,11 +408,11 @@ class NarrativeGenerator:
         if "decision_intelligence" in enabled and decision_summary:
             bits = []
             bullets = []
-            if decision_summary.get("risk_index") is not None:
+            if decision_summary.get("structural_risk_index") is not None:
                 bits.append(
-                    f"Structural Risk Index scored {decision_summary['risk_index']} (Band: {decision_summary.get('risk_band', 'N/A')})."
+                    f"Structural Risk Index scored {decision_summary['structural_risk_index']} (Band: {decision_summary.get('risk_band', 'N/A')})."
                 )
-                bullets.append(f"Structural Risk Index: {decision_summary['risk_index']} ({decision_summary.get('risk_band', 'N/A')})")
+                bullets.append(f"Structural Risk Index: {decision_summary['structural_risk_index']} ({decision_summary.get('risk_band', 'N/A')})")
             if decision_summary.get("forecast_champion"):
                 bits.append(
                     f"Time-series forecasting selected champion '{decision_summary['forecast_champion']}'."

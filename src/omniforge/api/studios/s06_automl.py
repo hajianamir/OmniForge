@@ -159,11 +159,11 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
             _wb().logger.debug("equation_extract_skipped", error_type=type(exc).__name__)
 
         regression = task == _wb().TaskType.REGRESSION
-        baseline_score = round(float(
-            res.best_score + res.lift_over_best_baseline if regression
-            else res.best_score - res.lift_over_best_baseline
-        ), 4)
         evaluation = res.extra.get("evaluation") or {}
+        partition = evaluation.get("best_score_partition", "test")
+        baseline_score = evaluation.get(f"{partition}_baseline_score")
+        lift = res.lift_over_best_baseline
+        lift_label = f"{lift:+.4f}" if lift is not None else "unavailable"
         ranked_lb = []
         for idx_lb, row_lb in enumerate(res.leaderboard or [], start=1):
             r_copy = dict(row_lb)
@@ -171,7 +171,7 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
             raw_score = r_copy.get(res.primary_metric, r_copy.get("cv_score", r_copy.get("score")))
             r_copy["rank"] = idx_lb
             if name == res.best_model_name:
-                r_copy["acceptance_status"] = "ACCEPTED (CHAMPION)" if res.lift_over_best_baseline >= 0 else "ACCEPTED (BEST AVAILABLE)"
+                r_copy["acceptance_status"] = "SELECTED — BASELINE UNAVAILABLE" if lift is None else ("ACCEPTED (CHAMPION)" if lift >= 0 else "ACCEPTED (BEST AVAILABLE)")
             else:
                 r_copy["acceptance_status"] = "BENCHMARKED"
             if evaluation.get("leaderboard_partition") == "validation" and raw_score is not None:
@@ -222,7 +222,7 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
             state,
             "AutoML",
             f"Trained {res.executed_backend} ({res.best_model_name})",
-            f"{res.primary_metric}={res.best_score:.4f} (Lift {res.lift_over_best_baseline:+.4f})",
+            f"{res.primary_metric}={res.best_score:.4f} (Lift {lift_label})",
         )
         return wb_cache_and_respond(
             state,
@@ -238,6 +238,8 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
                 "best_model_name": res.best_model_name,
                 "best_score": res.best_score,
                 "baseline_score": baseline_score,
+                "baseline_name": evaluation.get(f"{partition}_baseline_name"),
+                "baseline_comparison_status": "available" if lift is not None else "unavailable",
                 "lift_over_baseline": res.lift_over_best_baseline,
                 "elapsed_seconds": res.elapsed_seconds,
                 "leaderboard": ranked_lb,

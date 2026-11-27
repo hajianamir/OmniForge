@@ -300,6 +300,31 @@ class ForecastingBaseline:
         return {"yhat": fc, "yhat_lower": fc - half_width, "yhat_upper": fc + half_width}
 
 
+# Baseline scores remain numeric for SDK compatibility; diagnostic evidence is separate.
+BaselineEvidence = dict[str, dict[str, str]]
+
+
+def strongest_scored_reference(
+    scores: dict[str, dict[str, float]],
+    evidence: BaselineEvidence,
+    metric: str,
+    *,
+    higher_is_better: bool,
+    role: str | None = None,
+) -> tuple[str, float] | None:
+    """Select only after the entire intended reference family was scored."""
+    names = [name for name, row in evidence.items() if role is None or row.get("role") == role]
+    values: list[tuple[str, float]] = []
+    for name in names:
+        value = scores.get(name, {}).get(metric)
+        if evidence[name].get("status") != "scored" or value is None or not math.isfinite(value):
+            return None
+        values.append((name, value))
+    if not values:
+        return None
+    return (max if higher_is_better else min)(values, key=lambda row: row[1])
+
+
 class BaselineBenchmarkSuite:
     """Automatically evaluates strong baseline models so candidate ML models always prove lift."""
 
@@ -310,6 +335,8 @@ class BaselineBenchmarkSuite:
         X_val: pd.DataFrame | np.ndarray,
         y_val: pd.Series | np.ndarray,
         random_seed: int = 42,
+        *,
+        evidence: BaselineEvidence | None = None,
     ) -> tuple[dict[str, dict[str, float]], dict[str, BaseOmniForgeModel]]:
         """Run all classification baselines and return both comparative metrics and fitted baseline models."""
         baselines: list[BaseOmniForgeModel] = [
@@ -325,16 +352,25 @@ class BaselineBenchmarkSuite:
         fitted_models: dict[str, BaseOmniForgeModel] = {}
         y_true = np.asarray(y_val)
         for model in baselines:
+            role = "naive" if isinstance(model, (DummyClassifierBaseline, DummyRegressorBaseline)) else "strong"
+            stage = "fit"
             try:
                 model.fit(X_train, y_train)
+                stage = "score"
                 preds = model.predict(X_val)
                 results[model.name] = {
                     "accuracy": round(float(accuracy_score(y_true, preds)), 6),
                     "f1_weighted": round(float(f1_score(y_true, preds, average="weighted", zero_division=0)), 6),
                 }
+                if not all(math.isfinite(value) for value in results[model.name].values()):
+                    raise ArithmeticError("nonfinite baseline score")
                 fitted_models[model.name] = model
-            except Exception:
-                continue
+                if evidence is not None:
+                    evidence[model.name] = {"status": "scored", "role": role}
+            except Exception as exc:
+                results.pop(model.name, None)
+                if evidence is not None:
+                    evidence[model.name] = {"status": "failed", "role": role, "error": f"{stage}: {type(exc).__name__}"}
         return results, fitted_models
 
     @staticmethod
@@ -358,6 +394,8 @@ class BaselineBenchmarkSuite:
         X_val: pd.DataFrame | np.ndarray,
         y_val: pd.Series | np.ndarray,
         random_seed: int = 42,
+        *,
+        evidence: BaselineEvidence | None = None,
     ) -> tuple[dict[str, dict[str, float]], dict[str, BaseOmniForgeModel]]:
         """Run all regression baselines and return both comparative metrics and fitted baseline models."""
         baselines: list[BaseOmniForgeModel] = [
@@ -374,8 +412,11 @@ class BaselineBenchmarkSuite:
         fitted_models: dict[str, BaseOmniForgeModel] = {}
         y_true = np.asarray(y_val, dtype=float)
         for model in baselines:
+            role = "naive" if isinstance(model, (DummyClassifierBaseline, DummyRegressorBaseline)) else "strong"
+            stage = "fit"
             try:
                 model.fit(X_train, y_train)
+                stage = "score"
                 preds = np.asarray(model.predict(X_val), dtype=float)
                 ss_res = float(np.sum((y_true - preds) ** 2))
                 ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
@@ -385,9 +426,15 @@ class BaselineBenchmarkSuite:
                     "rmse": round(float(root_mean_squared_error(y_true, preds)), 6),
                     "mae": round(float(mean_absolute_error(y_true, preds)), 6),
                 }
+                if not all(math.isfinite(value) for value in results[model.name].values()):
+                    raise ArithmeticError("nonfinite baseline score")
                 fitted_models[model.name] = model
-            except Exception:
-                continue
+                if evidence is not None:
+                    evidence[model.name] = {"status": "scored", "role": role}
+            except Exception as exc:
+                results.pop(model.name, None)
+                if evidence is not None:
+                    evidence[model.name] = {"status": "failed", "role": role, "error": f"{stage}: {type(exc).__name__}"}
         return results, fitted_models
 
     @staticmethod

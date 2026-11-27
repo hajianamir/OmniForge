@@ -37,7 +37,7 @@ from omniforge.data.splitting import (
     SplitStrategyType,
 )
 from omniforge.models.base import BaseOmniForgeModel
-from omniforge.models.baselines import BaselineBenchmarkSuite
+from omniforge.models.baselines import BaselineBenchmarkSuite, BaselineEvidence, strongest_scored_reference
 from omniforge.models.classical import ClassicalMLModel
 from omniforge.models.deep.cnn import CNN1DModel
 from omniforge.models.deep.mlp import MLPModel
@@ -58,7 +58,7 @@ class AutoMLResult:
     primary_metric: str
     leaderboard: list[dict[str, Any]]
     baseline_benchmarks: dict[str, dict[str, float]]
-    lift_over_best_baseline: float
+    lift_over_best_baseline: float | None
     carbon_report: CarbonReport | None = None
     elapsed_seconds: float = 0.0
     leakage_audit: LeakageAuditReport | None = None
@@ -424,7 +424,13 @@ class AutoMLPipelineSearch:
                 BaselineBenchmarkSuite.run_classification_detailed
                 if is_clf else BaselineBenchmarkSuite.run_regression_detailed
             )
-            validation_baselines, baseline_models = benchmark(X_tr, y_tr, X_va, y_va, self.random_seed)
+            validation_evidence: BaselineEvidence = {}
+            validation_baselines, baseline_models = benchmark(
+                X_tr, y_tr, X_va, y_va, self.random_seed, evidence=validation_evidence,
+            )
+            validation_reference = strongest_scored_reference(
+                validation_baselines, validation_evidence, primary_metric, higher_is_better=is_clf,
+            )
 
             leaderboard: list[dict[str, Any]] = [
                 {
@@ -691,13 +697,10 @@ class AutoMLPipelineSearch:
 
             best_model = copy.deepcopy(best_cand_model).fit(X_dev, y_dev)
             best_test_score = _score_model(best_model, X_test, y_test)
-            baselines, _ = benchmark(X_dev, y_dev, X_test, y_test, self.random_seed)
-            if not baselines:
-                raise AutoMLError(
-                    "No baseline could be evaluated on the independent AutoML test partition.",
-                    suggestions=["Review the data and split configuration."],
-                )
-            best_bl_score = (max if is_clf else min)(row[primary_metric] for row in baselines.values())
+            test_evidence: BaselineEvidence = {}
+            baselines, _ = benchmark(X_dev, y_dev, X_test, y_test, self.random_seed, evidence=test_evidence)
+            test_reference = strongest_scored_reference(baselines, test_evidence, primary_metric, higher_is_better=is_clf)
+            best_bl_score = test_reference[1] if test_reference is not None else None
             all_fitted_models[best_name] = best_model
             best_model.metadata_.baseline_comparison = baselines
             best_model.metadata_.metrics[primary_metric] = round(best_test_score, 6)
@@ -720,7 +723,9 @@ class AutoMLPipelineSearch:
                     logger.debug("automl_equation_extract_skipped", model=m_name, error=str(exc))
 
             leaderboard.sort(key=lambda row: row[primary_metric], reverse=is_clf)
-            lift = (best_test_score - best_bl_score) if is_clf else (best_bl_score - best_test_score)
+            lift = None if best_bl_score is None else (
+                (best_test_score - best_bl_score) if is_clf else (best_bl_score - best_test_score)
+            )
 
         # C3 Green-AI: Pareto frontier over accepted candidates (metric × latency × carbon).
         pareto_rows = self.pareto_frontier(
@@ -734,7 +739,7 @@ class AutoMLPipelineSearch:
             "automl_completed",
             best_model=best_name,
             score=round(best_test_score, 4),
-            lift=round(lift, 4),
+            lift=round(lift, 4) if lift is not None else None,
             split_strategy=split_res.strategy_used,
             leakage_audit_passed=split_res.audit_report.passed if split_res.audit_report else True,
         )
@@ -746,7 +751,7 @@ class AutoMLPipelineSearch:
             primary_metric=primary_metric,
             leaderboard=leaderboard,
             baseline_benchmarks=baselines,
-            lift_over_best_baseline=round(float(lift), 6),
+            lift_over_best_baseline=round(lift, 6) if lift is not None else None,
             carbon_report=tracker.report,
             elapsed_seconds=elapsed,
             leakage_audit=split_res.audit_report,
@@ -767,9 +772,10 @@ class AutoMLPipelineSearch:
                     "test_partition_source": "supplied_holdout" if holdout is not None else "internal_split",
                     "validation_score": round(best_val_score, 6),
                     "test_baseline_score": best_bl_score,
-                    "validation_baseline_score": (max if is_clf else min)(
-                        (row[primary_metric] for row in validation_baselines.values()), default=None,
-                    ),
+                    "validation_baseline_score": validation_reference[1] if validation_reference else None,
+                    "test_baseline_name": test_reference[0] if test_reference else None,
+                    "baseline_comparison_status": "available" if test_reference else "unavailable",
+                    "baseline_evidence": {"validation": validation_evidence, "test": test_evidence},
                     "n_train": len(tr_idx),
                     "n_validation": len(va_idx),
                     "n_test": len(te_idx),

@@ -712,3 +712,32 @@ def test_mining_requires_explicit_target_for_multiple_outcomes() -> None:
     assert advanced.status_code == 200, advanced.text
     assert advanced.json()["target"] == "outcome_b"
     assert set(advanced.json()["distance_correlation"]) == {"x", "z"}
+
+
+def test_diagnostics_catalog_custom_executes_real_module() -> None:
+    client, headers = _client()
+    _upload(client, headers)
+    catalog = client.get('/api/workbench/s03/catalog', headers=headers).json()
+    assert 'normality_distribution' in catalog['executable_modules']
+    assert 'automated_eda' not in catalog['executable_modules']
+    response = client.post('/api/workbench/s03/run', headers=headers, json={
+        'mode': 'custom', 'selected_modules': ['normality_distribution'],
+    })
+    assert response.status_code == 200, response.text
+    report = response.json()['report']
+    assert report['executed_modules'] == ['normality_distribution']
+    assert report['total_tests'] > 0
+
+
+def test_diagnostics_rejects_silent_dispatch_fallbacks() -> None:
+    client, headers = _client()
+    _upload(client, headers)
+    for payload in [
+        {'mode': 'Custom'},
+        {'mode': 'custom'},
+        {'mode': 'custom', 'selected_modules': ['statistical_tests']},
+        {'mode': 'custom', 'selected_modules': 'normality_distribution'},
+        {'mode': 'custom', 'selected_modules': ['automated_eda']},
+        {'mode': 'auto', 'selected_modules': ['baseline_benchmark']},
+    ]:
+        assert client.post('/api/workbench/s03/run', headers=headers, json=payload).status_code == 422, payload

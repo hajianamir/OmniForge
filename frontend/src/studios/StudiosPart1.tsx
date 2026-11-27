@@ -1401,21 +1401,27 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
   const [corrMethod, setCorrMethod] = useState('auto');
   const [vifThresh, setVifThresh] = useState(5.0);
   const [riskAlpha, setRiskAlpha] = useState(0.05);
-  const [selectedMods, setSelectedMods] = useState<string[]>([
-    'statistical_tests', 'baselines', 'risk_analysis', 'multicollinearity', 'outliers',
-  ]);
+  const [selectedMods, setSelectedMods] = useState<string[]>([]);
+  const [catalog, setCatalog] = useState<Record<string, string> | null>(null);
+  const [catalogError, setCatalogError] = useState<string | null>(null);
   const report = studioCache.s03_diagnostics?.report ?? null;
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  const ALL_MODS = [
-    ['statistical_tests', 'Normality & Hypothesis Tests'],
-    ['baselines', 'Strong Baselines & Equations'],
-    ['risk_analysis', 'VaR / CVaR / Tail Risk'],
-    ['multicollinearity', 'VIF Multicollinearity'],
-    ['outliers', 'Multi-Method Outliers'],
-    ['feature_screening', 'Target-Feature Screening'],
-  ];
+  useEffect(() => {
+    if (mode !== 'custom' || catalog !== null) return;
+    let current = true;
+    setCatalogError(null);
+    apiGet<{ executable_modules: Record<string, string> }>('/api/workbench/s03/catalog')
+      .then(({ executable_modules }) => {
+        if (!current) return;
+        if (!executable_modules || !Object.keys(executable_modules).length) throw new Error('No executable modules in the diagnostics catalog.');
+        setCatalog(executable_modules);
+        setSelectedMods(Object.keys(executable_modules));
+      })
+      .catch((error: unknown) => { if (current) setCatalogError(toErrorMessage(error)); });
+    return () => { current = false; };
+  }, [mode, catalog]);
 
   const toggleMod = (m: string) =>
     setSelectedMods((prev) => (prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m]));
@@ -1513,14 +1519,16 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
         </div>
         {mode === 'custom' && (
           <div className="chip-grid" style={{ marginBottom: 12 }}>
-            {ALL_MODS.map(([id, lbl]) => (
+            {catalogError && <div className="alert alert-error">{catalogError}</div>}
+            {!catalog && !catalogError && <span>Loading diagnostic modules…</span>}
+            {Object.entries(catalog ?? {}).map(([id, lbl]) => (
               <button key={id} type="button" className={`chip ${selectedMods.includes(id) ? 'selected' : ''}`} onClick={() => toggleMod(id)}>
                 {lbl}
               </button>
             ))}
           </div>
         )}
-        <button className="btn btn-primary" disabled={busy || !ws.has_dataset} onClick={run}>
+        <button className="btn btn-primary" disabled={busy || !ws.has_dataset || (mode === 'custom' && !selectedMods.length)} onClick={run}>
           {busy ? <span className="spinner" /> : null} Execute Universal Diagnostics ({mode.toUpperCase()})
         </button>
       </div>
@@ -1530,9 +1538,13 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
           <div className="kpi-grid">
             <div className="kpi-card"><div className="kpi-label">Total Hypothesis Tests</div><div className="kpi-value">{report.total_tests ?? report.hypothesis_ledger?.length ?? 0}</div></div>
             <div className="kpi-card"><div className="kpi-label">Significant (p &lt; α)</div><div className="kpi-value">{report.significant_tests ?? 0}</div></div>
-            <div className="kpi-card"><div className="kpi-label">Risk Index</div><div className="kpi-value">{Number(report.risk_assessment?.overall_risk_index ?? 0).toFixed(1)}</div></div>
-            <div className="kpi-card"><div className="kpi-label">Risk Band</div><div className="kpi-value">{report.risk_assessment?.overall_risk_band || 'N/A'}</div></div>
+            <div className="kpi-card"><div className="kpi-label">Risk Index</div><div className="kpi-value">{report.risk_assessment?.structural_risk_index?.toFixed(1) ?? 'Unavailable'}</div></div>
+            <div className="kpi-card"><div className="kpi-label">Risk Band</div><div className="kpi-value">{report.risk_assessment?.risk_band ?? 'Unavailable'}</div></div>
           </div>
+
+          {Object.entries(report.module_status ?? {}).some(([, status]) => status === 'unavailable') && (
+            <p>Unavailable modules: {Object.entries(report.module_status ?? {}).filter(([, status]) => status === 'unavailable').map(([id]) => id).join(', ')}</p>
+          )}
 
           {/* Visual Diagnostics Charts: Baseline Comparison, Hypothesis Significance & VIF */}
           <div className="grid-2" style={{ marginBottom: 14 }}>
@@ -1594,6 +1606,10 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
             </div>
           )}
 
+          {Object.entries(report.baseline_evidence ?? {}).flatMap(([target, rows]) => Object.entries(rows)
+            .filter(([, row]) => row.status === 'failed')
+            .map(([model, row]) => <p className="alert" key={JSON.stringify([target, model])}>{target}: {model} unavailable ({row.error})</p>))}
+
           {/* MODERN RANKED BASELINE MATHEMATICAL EQUATIONS + SELECTION RATIONALE */}
           {report.baseline_equations && Object.keys(report.baseline_equations).length > 0 && (
             <div className="card">
@@ -1624,10 +1640,10 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
             <SimpleTable title="Universal Statistical Diagnostics Ledger" rows={report.hypothesis_ledger || []} maxRows={80} />
           </div>
 
-          {(report.risk_assessment?.column_risks?.length ?? 0) > 0 && (
+          {(report.risk_assessment?.tail_risk_table?.length ?? 0) > 0 && (
             <div className="card">
               <div className="card-title">Distribution &amp; Tail-Risk Profile (VaR / CVaR)</div>
-              <SimpleTable title="Column Risk Metrics" rows={report.risk_assessment?.column_risks || []} />
+              <SimpleTable title="Column Risk Metrics" rows={report.risk_assessment?.tail_risk_table || []} />
             </div>
           )}
         </>

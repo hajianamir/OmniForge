@@ -215,13 +215,13 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
             <div className="card">
               <div className="card-title">
                 <span>Champion Model Leaderboard{automlRes.target ? ` · ${automlRes.target}` : ''} ({automlRes.backend_used ?? 'native'})</span>
-                <span className="badge badge-green">Lift vs Baseline: {Number(automlRes.lift_over_baseline ?? 0) >= 0 ? '+' : ''}{Number(automlRes.lift_over_baseline ?? 0).toFixed(4)}</span>
+                <span className="badge badge-green">Lift vs Baseline: {automlRes.lift_over_baseline?.toFixed(4) ?? 'Unavailable'}</span>
               </div>
               {automlRes.fallback_reason && <div className="alert alert-warn">{automlRes.fallback_reason}</div>}
               <div className="kpi-grid">
                 <div className="kpi-card"><div className="kpi-label">Best Model</div><div className="kpi-value" style={{ fontSize: 16 }}>{automlRes.best_model_name}</div></div>
                 <div className="kpi-card"><div className="kpi-label">{automlRes.metadata?.evaluation?.best_score_partition === 'test' ? 'Test ' : ''}{automlRes.primary_metric}</div><div className="kpi-value">{Number(automlRes.best_score).toFixed(4)}</div></div>
-                <div className="kpi-card"><div className="kpi-label">Strong Baseline</div><div className="kpi-value">{Number(automlRes.baseline_score).toFixed(4)}</div></div>
+                <div className="kpi-card"><div className="kpi-label">Strong Baseline</div><div className="kpi-value">{automlRes.baseline_score?.toFixed(4) ?? 'Unavailable'}</div></div>
                 <div className="kpi-card"><div className="kpi-label">Runtime</div><div className="kpi-value">{automlRes.elapsed_seconds}s</div></div>
               </div>
               {automlRes.metadata?.evaluation?.best_score_partition === 'test' && (
@@ -255,15 +255,15 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
                       rank: 1,
                       primary_metric: automlRes.primary_metric,
                       primary_score: automlRes.best_score,
-                      naive_floor_score: automlRes.baseline_score,
-                      lift_over_naive: automlRes.lift_over_baseline,
+                      naive_floor_score: automlRes.baseline_score ?? undefined,
+                      lift_over_naive: automlRes.lift_over_baseline ?? undefined,
                       selection_criterion: automlRes.metadata?.evaluation?.leaderboard_partition === 'validation'
                         ? `Selected by validation ${automlRes.primary_metric ?? 'score'}`
                         : 'Selected by the active AutoML backend',
-                      acceptance_status: Number(automlRes.lift_over_baseline ?? 0) >= 0 ? 'ACCEPTED — AUTOML CHAMPION' : 'ACCEPTED — BEST AVAILABLE',
+                      acceptance_status: automlRes.leaderboard?.find(row => row.model === automlRes.best_model_name)?.acceptance_status as string | undefined,
                       acceptance_reasons: [
                         `Selected by ${automlRes.backend_used} in ${automlRes.elapsed_seconds}s.`,
-                        `Achieved ${automlRes.primary_metric ?? ''}=${Number(automlRes.best_score).toFixed(4)} vs strong baseline ${Number(automlRes.baseline_score).toFixed(4)} (lift ${Number(automlRes.lift_over_baseline ?? 0) >= 0 ? '+' : ''}${Number(automlRes.lift_over_baseline ?? 0).toFixed(4)}).`,
+                        `Achieved ${automlRes.primary_metric ?? ''}=${Number(automlRes.best_score).toFixed(4)} vs strong baseline ${automlRes.baseline_score?.toFixed(4) ?? 'Unavailable'} (lift ${automlRes.lift_over_baseline?.toFixed(4) ?? 'unavailable'}).`,
                       ],
                     }}
                   />

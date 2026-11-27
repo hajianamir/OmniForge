@@ -197,9 +197,9 @@ export interface AdvancedMiningResponse extends AdvancedMiningResult, StateEnvel
 // ---------------------------------------------------------------------------
 
 export interface RiskAssessment {
-  overall_risk_index?: number;
-  overall_risk_band?: string;
-  column_risks?: JsonRow[];
+  structural_risk_index?: number | null;
+  risk_band?: string | null;
+  tail_risk_table?: JsonRow[];
   [key: string]: unknown;
 }
 
@@ -207,7 +207,9 @@ export interface DiagnosticsReport {
   total_tests?: number;
   significant_tests?: number;
   hypothesis_ledger?: JsonRow[];
-  risk_assessment?: RiskAssessment;
+  risk_assessment?: RiskAssessment | null;
+  module_status?: Record<string, string>;
+  baseline_evidence?: Record<string, Record<string, { status: string; role: string; error?: string }>>;
   baseline_equations?: Record<string, unknown[] | Record<string, unknown>>;
   [key: string]: unknown;
 }
@@ -311,8 +313,8 @@ export interface AutoMLResponse extends StateEnvelope {
   target?: string;
   best_model_name?: string;
   best_score?: number;
-  baseline_score?: number;
-  lift_over_baseline?: number;
+  baseline_score?: number | null;
+  lift_over_baseline?: number | null;
   primary_metric?: string;
   backend_used?: string;
   fallback_reason?: string | null;

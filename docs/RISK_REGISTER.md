@@ -93,3 +93,10 @@ Behavioral contract (enforced in `omniforge/mlops/continuous_training.py`):
 
 *Companion docs: [docs/AUDIT_REPORT.md](AUDIT_REPORT.md) · [docs/AUDIT_ANCHOR_REPLICATION.md](AUDIT_ANCHOR_REPLICATION.md) ·
 [docs/architecture.md](architecture.md) · [docs/P2_REMEDIATION_REPORT.md](P2_REMEDIATION_REPORT.md) (historical).*
+
+### Baseline evidence (RR-002)
+
+AutoML reports the per-partition outcome of every intended baseline. The observed difference is
+unavailable if any reference in the suite could not be fitted or scored. A score difference on its
+own is not evidence of statistical superiority. Studio 03's naive floor requires both fitted dummy
+references; an absent dummy is not replaced with a zero score.

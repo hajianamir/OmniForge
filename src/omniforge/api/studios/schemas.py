@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class LoadSampleReq(BaseModel):
@@ -120,7 +120,7 @@ class MiningReq(BaseModel):
 
 
 class DiagnosticsReq(BaseModel):
-    mode: str = "all"  # all | auto | custom
+    mode: Literal["all", "complete", "auto", "custom"] = "all"
     alpha: float = 0.05
     confidence_level: float = 0.95
     fdr_method: str = "fdr_bh"
@@ -132,6 +132,21 @@ class DiagnosticsReq(BaseModel):
     risk_tail_alpha: float = 0.05
     holdout_ratio: float = 0.20
     selected_modules: list[str] = Field(default_factory=list)
+
+
+    @model_validator(mode="after")
+    def validate_module_selection(self) -> Self:
+        from omniforge.eda.diagnostics import EXECUTABLE_MODULES
+
+        if self.mode == "custom" and not self.selected_modules:
+            raise ValueError("Custom mode requires at least one executable module.")
+        if self.mode != "custom" and self.selected_modules:
+            raise ValueError("Select modules only in custom mode.")
+        if set(self.selected_modules) - EXECUTABLE_MODULES.keys():
+            raise ValueError("Unknown or non-executable diagnostic module; consult the diagnostics catalog.")
+        if len(set(self.selected_modules)) != len(self.selected_modules):
+            raise ValueError("Diagnostic modules must not be repeated.")
+        return self
 
 
 class HypothesisReq(BaseModel):

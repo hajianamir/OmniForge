@@ -49,7 +49,7 @@ from omniforge.core.types import TaskType
 from omniforge.core.utils import is_package_available
 from omniforge.data.splitting import LeakageSafeSplitter, SplitConfig, SplitStrategyType
 from omniforge.models.base import BaseOmniForgeModel
-from omniforge.models.baselines import BaselineBenchmarkSuite
+from omniforge.models.baselines import BaselineBenchmarkSuite, BaselineEvidence, strongest_scored_reference
 
 logger = get_logger(__name__)
 
@@ -944,7 +944,7 @@ class MultiBackendAutoMLResult:
     primary_metric: str
     leaderboard: list[dict[str, Any]]
     baseline_benchmarks: dict[str, dict[str, float]]
-    lift_over_best_baseline: float
+    lift_over_best_baseline: float | None
     elapsed_seconds: float
     extra: dict[str, Any] = field(default_factory=dict)
     evaluation_indices: np.ndarray | None = None
@@ -1102,25 +1102,38 @@ class AutoMLBackendHub:
                 BaselineBenchmarkSuite.run_classification_detailed if is_clf
                 else BaselineBenchmarkSuite.run_regression_detailed
             )
+            validation_evidence: BaselineEvidence = {}
             validation_baselines, baseline_models = benchmark(
-                X_train_matrix, y_tr, X_validation_matrix, y_va, random_seed=random_seed,
+                X_train_matrix, y_tr, X_validation_matrix, y_va, random_seed=random_seed, evidence=validation_evidence,
             )
-            if is_clf:
-                for name, model in baseline_models.items():
-                    validation_baselines[name][metric] = score(y_va, model.predict(X_validation_matrix))
 
-            choose_best = max if is_clf else min
-            if not validation_baselines:
-                raise AutoMLError("No baseline completed specialized AutoML validation.")
-            validation_baseline = choose_best(metrics[metric] for metrics in validation_baselines.values())
+            def score_baselines(
+                y_true: pd.Series, matrix: Any, evidence: BaselineEvidence,
+            ) -> dict[str, dict[str, float]]:
+                scored = {}
+                for name, model in baseline_models.items():
+                    try:
+                        value = score(y_true, model.predict(matrix))
+                        if not np.isfinite(value):
+                            raise ArithmeticError("nonfinite baseline score")
+                        scored[name] = {metric: value}
+                    except Exception as exc:
+                        evidence[name].update(status="failed", error=f"score: {type(exc).__name__}")
+                return scored
+
+            if is_clf:
+                validation_baselines = score_baselines(y_va, X_validation_matrix, validation_evidence)
+            reference = strongest_scored_reference(validation_baselines, validation_evidence, metric, higher_is_better=is_clf)
+            baseline_score = reference[1] if reference else None
             best_score = validation_score
-            baseline_score = validation_baseline
             baselines = validation_baselines
             evaluation: dict[str, Any] = {
                 "leaderboard_partition": leaderboard_partition,
                 "best_score_partition": "validation",
                 "validation_score": validation_score,
-                "validation_baseline_score": validation_baseline,
+                "validation_baseline_score": baseline_score,
+                "validation_baseline_name": reference[0] if reference else None,
+                "baseline_evidence": {"validation": validation_evidence},
                 "n_train": len(X_tr),
                 "n_validation": len(X_va),
             }
@@ -1129,22 +1142,31 @@ class AutoMLBackendHub:
                 X_test, y_test = holdout
                 X_test_matrix = preprocessor.transform(X_test)
                 best_score = score(y_test, result["best_model"].predict(X_test))
-                baselines = {name: {metric: score(y_test, model.predict(X_test_matrix))}
-                             for name, model in baseline_models.items()}
-                baseline_score = choose_best(metrics[metric] for metrics in baselines.values())
+                test_evidence: BaselineEvidence = {
+                    name: (dict(row) if name not in baseline_models else {"role": row["role"], "status": "scored"})
+                    for name, row in validation_evidence.items()
+                }
+                baselines = score_baselines(y_test, X_test_matrix, test_evidence)
+                reference = strongest_scored_reference(baselines, test_evidence, metric, higher_is_better=is_clf)
+                baseline_score = reference[1] if reference else None
+                evaluation["baseline_evidence"]["test"] = test_evidence
                 test_positions = np.arange(len(clean_df), len(clean_df) + len(X_test))
                 evaluation.update(
                     best_score_partition="test", test_partition_source="supplied_holdout",
-                    test_baseline_score=baseline_score, n_test=len(X_test),
+                    test_baseline_score=baseline_score, test_baseline_name=reference[0] if reference else None,
+                    n_test=len(X_test),
                 )
-            lift = (best_score - baseline_score) if is_clf else (baseline_score - best_score)
+            evaluation["baseline_comparison_status"] = "available" if reference else "unavailable"
+            lift = None if baseline_score is None else (
+                (best_score - baseline_score) if is_clf else (baseline_score - best_score)
+            )
             return MultiBackendAutoMLResult(
                 requested_backend=req_backend, executed_backend=exec_backend,
                 used_fallback=used_fallback, fallback_reason=fallback_reason, task_type=resolved_task,
                 best_model_name=str(result["best_model_name"]), best_model=result["best_model"],
                 best_score=round(best_score, 6), primary_metric=metric,
                 leaderboard=list(result["leaderboard"]), baseline_benchmarks=baselines,
-                lift_over_best_baseline=round(lift, 6), elapsed_seconds=float(result["elapsed_seconds"]),
+                lift_over_best_baseline=round(lift, 6) if lift is not None else None, elapsed_seconds=float(result["elapsed_seconds"]),
                 extra={**(extra or {}), "evaluation": evaluation}, evaluation_indices=test_positions,
             )
 

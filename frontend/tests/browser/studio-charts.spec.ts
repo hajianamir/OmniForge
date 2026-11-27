@@ -584,3 +584,31 @@ test('cache restoration failures are visible and can be retried', async ({ page 
   await expect(page.getByText('Distribution: alpha')).toBeVisible();
   await expect(page.getByRole('alert').filter({ hasText: 'Could not restore studio results' })).toHaveCount(0);
 });
+
+test('Studio 03 uses catalog IDs and displays the actual tail risk payload', async ({ page }) => {
+  const mock = new MockWorkbench(initialResults());
+  await mock.install(page);
+  await page.route('**/api/workbench/s03/catalog', route => route.fulfill({
+    json: { executable_modules: { normality_distribution: 'Catalog normality scan' } },
+  }));
+  await page.route('**/api/workbench/s03/run', async route => {
+    expect(route.request().postDataJSON()).toMatchObject({
+      mode: 'custom', selected_modules: ['normality_distribution'],
+    });
+    await route.fulfill({ json: { state: mock.state, report: {
+      total_tests: 3, significant_tests: 1,
+      risk_assessment: {
+        structural_risk_index: 32.25, risk_band: 'Moderate',
+        tail_risk_table: [{ Column: 'alpha', Volatility: 8 }],
+      },
+    } } });
+  });
+  await page.goto('/');
+  await openStudio(page, '03');
+  await page.getByRole('button', { name: /custom/i, exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Catalog normality scan' })).toBeVisible();
+  await page.getByRole('button', { name: 'Execute Universal Diagnostics (CUSTOM)' }).click();
+  await expect(page.getByText('32.3', { exact: true })).toBeVisible();
+  await expect(page.getByText('Moderate', { exact: true })).toBeVisible();
+  await expect(page.getByText('Column Risk Metrics', { exact: true })).toBeVisible();
+});
