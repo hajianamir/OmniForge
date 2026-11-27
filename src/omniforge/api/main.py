@@ -12,6 +12,7 @@ from typing import Any
 
 import pandas as pd
 from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -49,7 +50,7 @@ from omniforge.causal.inference import CausalInferenceEngine
 from omniforge.config.settings import get_settings
 from omniforge.copilot.agent import OmniForgeCopilotAgent
 from omniforge.core.constants import RBAC_ROLE_PERMISSIONS
-from omniforge.core.exceptions import AuthorizationError, OmniForgeError, SecurityError
+from omniforge.core.exceptions import AuthorizationError, DataValidationError, OmniForgeError, SecurityError
 from omniforge.core.logging import get_logger
 from omniforge.core.security import RequestBodySizeLimitMiddleware, SlidingWindowRateLimitMiddleware
 from omniforge.core.types import ModelStage, Principal
@@ -207,6 +208,23 @@ def create_app() -> FastAPI:
             status_code=status_code,
             content=to_json_safe(exc.to_dict(include_internal=False)),
         )
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+        problem = DataValidationError(
+            "Request validation failed.", error_code="REQUEST_VALIDATION_ERROR",
+            suggestions=["Check the endpoint's request schema and supported field values."],
+        )
+        # FastAPI/Pydantic errors can contain raw input, arbitrary map keys and exception text.
+        errors = exc.errors()
+        payload = problem.to_dict(include_internal=False)
+        payload["detail"] = [
+            {"loc": [source] if source in {"body", "query", "path", "header", "cookie"} else [],
+             "msg": "Invalid request value.", "type": "validation_error"}
+            for row in errors
+            for source in (next(iter(row.get("loc", ())), None),)
+        ]
+        return JSONResponse(status_code=422, content=to_json_safe(payload))
 
     @app.exception_handler(Exception)
     async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:

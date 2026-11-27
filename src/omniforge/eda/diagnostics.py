@@ -39,7 +39,7 @@ DIAGNOSTIC_TEST_CATALOG: dict[str, str] = {
 
 DOWNSTREAM_MODULE_CATALOG: dict[str, str] = {
     "baseline_benchmark": "Establish Quantitative Baselines (Dummy / Linear / Tree Stump Floor)",
-    "risk_uncertainty_audit": "Quantitative Risk & Uncertainty Audit (VaR / CVaR, Structural Risk & Conformal Bounds)",
+    "risk_uncertainty_audit": "Quantitative Tail Risk & Empirical Target Uncertainty (VaR / CVaR)",
     "clustering_segmentation": "Unsupervised Clustering & Natural Segment Discovery (Auto-K + Silhouette / PCA)",
     "automated_eda": "Automated EDA Visual Report & Insights",
     "automl_benchmark": "Baseline-First AutoML Tournament (Single or Multi-Target)",
@@ -810,7 +810,7 @@ class UniversalDiagnosticsSuite:
                 }
             )
 
-        # Structural Data Risk Index (0 = lowest risk, 100 = highest risk)
+        # Uncalibrated structural screening score (0–100 heuristic points).
         missing_rate = float(df.isna().sum().sum() / max(df.shape[0] * max(df.shape[1], 1), 1))
         dup_rate = float(df.duplicated().mean()) if len(df) > 0 else 0.0
         avg_out_pct = (
@@ -877,6 +877,11 @@ class UniversalDiagnosticsSuite:
 
         return {
             "structural_risk_index": total_risk,
+            "score_kind": "uncalibrated_screening_heuristic",
+            "component_caps": {
+                "missingness_risk": 25, "duplication_risk": 15, "outlier_tail_risk": 25,
+                "multicollinearity_risk": 20, "sample_sparsity_risk": 15,
+            },
             "risk_band": risk_band,
             "confidence_level": cfg.confidence_level,
             "tail_alpha": cfg.risk_tail_alpha,

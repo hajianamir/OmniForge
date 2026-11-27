@@ -20,7 +20,7 @@ after any P0/P1 incident, plus quarterly tabletop for MANAGE-category rows.
 | ID | Trustworthy AI char. | Risk | Component | L | I | Rating | Existing controls | Residual | Owner | Status |
 |---|---|---|---|---|---|---|---|---|---|---|
 | RR-001 | Valid & Reliable / Accountable | No single accountable role for AI-system residual risk | Org process | M | H | High | This register + mandatory release review; `platform_admin` role restricted to a handful of IdP-group-mapped operators (`core/constants.py`) | Low | Eng leadership | Mitigated |
-| RR-002 | Explainable | Executives treat AutoML leaderboard as ground truth; challenged by "lift over strongest baseline" gaps | AutoML | M | M | Medium | Mandatory strong baselines; lift reporting in every AutoML result (`automl/`); `MultiBackendAutoMLResult` carries `lift_over_best_baseline` | Low | ML governance | Mitigated |
+| RR-002 | Explainable | Executives treat AutoML leaderboard as ground truth; challenged by "lift over strongest baseline" gaps | AutoML | M | M | Medium | Required baseline roster; lift is unavailable for an incomplete reference suite, and paired evidence gates acceptance (`automl/`) | Low | ML governance | Mitigated |
 | RR-003 | Privacy | PII leakage from ingestion into training artifacts, logs, or reports | Data + MLOps | M | H | High | `PIIRedactor` scan at profiling; HMAC pseudonymization with per-tenant KMS salt (`OMNIFORGE_PSEUDONYM_SALT__<TENANT>`); log redaction of secrets; artifact signing (HMAC) on save; model cards | Medium | Security eng | Mitigated |
 | RR-004 | Privacy | Audit trail unreadable/forged after host compromise — accountability collapses | Audit | L | H | Medium | v2 hash chain + HMAC; optional RFC 9162-style anchor; `docs/AUDIT_ANCHOR_REPLICATION.md` replication/witness patterns; fail-closed anchor writes | Medium (truncation with consistent log+anchor deletion needs external witness — accepted with Option A/B replication) | Security eng | Watch |
 | RR-005 | Safe / Accountable | Cross-tenant data exposure via over-privileged `admin` (historical single-role design) | AuthZ | L | H | Medium | `platform_admin` (only bypass) vs tenant-scoped `admin`; mandatory `authorize:cross_tenant` audit on every allow/deny; fail-closed allow on audit-write failure; API refuses boot on audit sink failure | Low | Security eng | Mitigated |
@@ -32,7 +32,7 @@ after any P0/P1 incident, plus quarterly tabletop for MANAGE-category rows.
 | RR-010 | Fair | No systematic fairness measurement in the AutoML/Registry promotion path for regulated domains (finance/HR) | Responsible AI + Registry | M | H | High | `ModelRegistry._enforce_fairness_gate` (`mlops/registry.py`) blocks `ModelStage.PRODUCTION` when `fairness_passed is False` (or when `OMNIFORGE_REQUIRE_FAIRNESS_FOR_PRODUCTION=true` and `fairness_passed is None`) unless an auditable `override_reason` is logged via `AuditLogger`; Studio 11 (`s11_mlops.py`) auto-binds `uap_fairness_result` | Low | Domain leads | Mitigated |
 | RR-011 | Explainable | SHAP/LIME explanations computed on training distribution; production skew makes them misleading | Responsible AI | M | M | Medium | Drift detection (PSI/KS/JS/Wasserstein) in `mlops/drift.py`; promotion gate on unseen holdout; cards document training data | Medium | ML eng | Watch |
 | RR-012 | Valid & Reliable | Synthetic (Gaussian-copula) data exported as "real" without marking | Synthetic | L | M | Medium | Synthetic engine flags `is_synthetic`; model cards include data lineage section | Low | Data eng | Mitigated |
-| RR-013 | Safe | Forecasts presented without uncertainty; consumers ignore point estimates | Forecasting | M | M | Medium | Prediction intervals/conformal variants in forecasting stack; model cards carry intended-use + limits | Medium | ML eng | Watch |
+| RR-013 | Safe | Forecasts presented without uncertainty; consumers ignore point estimates | Forecasting | M | M | Medium | Reachable forecast prediction intervals; model cards carry intended use and limits. SDK-only predictive conformal methods are not an operational control | Medium | ML eng | Watch |
 | RR-014 | Privacy | Embeddings/vector stores retain PII beyond retention policy | Feature store / vector | M | M | Medium | `LocalFeatureStore.get_online_features` enforces `spec.ttl_seconds` (Feast-compatible freshness vs. `event_timestamp`/`updated_at`); `purge_expired_features()` removes expired offline Parquet + online SQLite rows; `delete_entity_data()` implements GDPR Art. 17 right-to-erasure across all views (`data/feature_store.py`) | Low | Platform eng | Mitigated |
 
 ## MEASURE — metrics, verification, monitoring
@@ -100,3 +100,11 @@ AutoML reports the per-partition outcome of every intended baseline. The observe
 unavailable if any reference in the suite could not be fitted or scored. A score difference on its
 own is not evidence of statistical superiority. Studio 03's naive floor requires both fitted dummy
 references; an absent dummy is not replaced with a zero score.
+
+### SDK-only governance methods (not operational controls)
+
+PBO/CSCV, split/adaptive conformal intervals and sets for predictive models, nested CV,
+standalone dataset cards, Venn–Abers calibration, Kamiran–Calders reweighing, ADBench,
+Friedman–Nemenyi, and k-NN Shapley data valuation are implemented, not yet exposed through
+Workbench or production API workflows. Do not count them as mitigations for RR-011, RR-013,
+RR-038 or related risks. Reachable model cards and forecast intervals are separate controls.

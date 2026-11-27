@@ -320,6 +320,7 @@ export interface AutoMLResponse extends StateEnvelope {
   best_model_name?: string;
   best_score?: number;
   baseline_score?: number | null;
+  baseline_name?: string | null;
   lift_over_baseline?: number | null;
   lift_comparison?: { status: string; reason?: string; ci_lower?: number; ci_upper?: number };
   primary_metric?: string;

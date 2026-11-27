@@ -355,7 +355,9 @@ def _state_summary(state: dict[str, Any], session_id: str) -> dict[str, Any]:
             "n_test": lock.get("n_test"),
             "cv_folds": lock.get("cv_folds"),
             "test_size": lock.get("test_size"),
-            "passed": bool((lock.get("audit_report") or {}).get("passed", True)),
+            "exact_duplicate_leak_count": (lock.get("audit_report") or {}).get("exact_duplicate_leak_count"),
+            "passed": bool((lock.get("audit_report") or {}).get("passed", False))
+            and not (lock.get("audit_report") or {}).get("exact_duplicate_leak_count"),
         }
     deleted_log = state.get("uap_deleted_records_log") or []
     total_deleted = int(sum(int(entry.get("rows_removed", entry.get("rows_deleted", 0))) for entry in deleted_log))

@@ -221,18 +221,23 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
           {automlRes && (
             <div className="card">
               <div className="card-title">
-                <span>Champion Model Leaderboard{automlRes.target ? ` · ${automlRes.target}` : ''} ({automlRes.backend_used ?? 'native'})</span>
-                <span className="badge badge-green">Lift vs Baseline: {automlRes.lift_over_baseline?.toFixed(4) ?? 'Unavailable'}</span>
+                <span>Selected Candidate Leaderboard{automlRes.target ? ` · ${automlRes.target}` : ''} ({automlRes.backend_used ?? 'native'})</span>
+                <span className="badge">Point Lift vs Strong Reference: {automlRes.lift_over_baseline?.toFixed(4) ?? 'Unavailable'}</span>
               </div>
+              {automlRes.lift_comparison?.status === 'available' ? (
+                <p>Paired interval: [{automlRes.lift_comparison.ci_lower?.toFixed(4)}, {automlRes.lift_comparison.ci_upper?.toFixed(4)}]. The point lift alone does not establish improvement.</p>
+              ) : (
+                <p>Paired comparison unavailable{automlRes.lift_comparison?.reason ? `: ${automlRes.lift_comparison.reason}` : '.'}</p>
+              )}
               {automlRes.fallback_reason && <div className="alert alert-warn">{automlRes.fallback_reason}</div>}
               <div className="kpi-grid">
-                <div className="kpi-card"><div className="kpi-label">Best Model</div><div className="kpi-value" style={{ fontSize: 16 }}>{automlRes.best_model_name}</div></div>
+                <div className="kpi-card"><div className="kpi-label">Selected Model</div><div className="kpi-value" style={{ fontSize: 16 }}>{automlRes.best_model_name}</div></div>
                 <div className="kpi-card"><div className="kpi-label">{automlRes.metadata?.evaluation?.best_score_partition === 'test' ? 'Test ' : ''}{automlRes.primary_metric}</div><div className="kpi-value">{Number(automlRes.best_score).toFixed(4)}</div></div>
                 <div className="kpi-card"><div className="kpi-label">Strong Baseline</div><div className="kpi-value">{automlRes.baseline_score?.toFixed(4) ?? 'Unavailable'}</div></div>
                 <div className="kpi-card"><div className="kpi-label">Runtime</div><div className="kpi-value">{automlRes.elapsed_seconds}s</div></div>
               </div>
               {automlRes.metadata?.evaluation?.best_score_partition === 'test' && (
-                <p>The champion and baseline scores use {automlRes.metadata.evaluation.n_test} held-out rows. The leaderboard shows validation scores used during selection.</p>
+                <p>The selected model and reference scores use {automlRes.metadata.evaluation.n_test} held-out rows. The leaderboard shows validation scores used during selection.</p>
               )}
               {(automlRes.leaderboard?.length ?? 0) > 0 && (
                 <div style={{ marginBottom: 14 }}>
@@ -250,7 +255,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
                   />
                 </div>
               )}
-              <SimpleTable title="Ranked Model Leaderboard & Acceptance Rationale" rows={automlRes.leaderboard || []} />
+              <SimpleTable title="Ranked Candidates & Comparison Evidence" rows={automlRes.leaderboard || []} />
               {automlRes.equation && (automlRes.equation.formula_plain || automlRes.equation.equation_text) && (
                 <div style={{ marginTop: 14 }}>
                   <MathEquationCard
@@ -262,6 +267,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
                       rank: 1,
                       primary_metric: automlRes.primary_metric,
                       primary_score: automlRes.best_score,
+                      comparison_reference_label: automlRes.baseline_name ?? 'Strong Reference',
                       naive_floor_score: automlRes.baseline_score ?? undefined,
                       lift_over_naive: automlRes.lift_over_baseline ?? undefined,
                       lift_comparison: automlRes.lift_comparison,

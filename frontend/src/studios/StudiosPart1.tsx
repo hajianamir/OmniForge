@@ -1543,8 +1543,8 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
           <div className="kpi-grid">
             <div className="kpi-card"><div className="kpi-label">Total Hypothesis Tests</div><div className="kpi-value">{report.total_tests ?? report.hypothesis_ledger?.length ?? 0}</div></div>
             <div className="kpi-card"><div className="kpi-label">Significant (p &lt; α)</div><div className="kpi-value">{report.significant_tests ?? 0}</div></div>
-            <div className="kpi-card"><div className="kpi-label">Risk Index</div><div className="kpi-value">{report.risk_assessment?.structural_risk_index?.toFixed(1) ?? 'Unavailable'}</div></div>
-            <div className="kpi-card"><div className="kpi-label">Risk Band</div><div className="kpi-value">{report.risk_assessment?.risk_band ?? 'Unavailable'}</div></div>
+            <div className="kpi-card"><div className="kpi-label">Structural screening score (uncalibrated)</div><div className="kpi-value">{report.risk_assessment?.structural_risk_index?.toFixed(1) ?? 'Unavailable'}</div></div>
+            <div className="kpi-card"><div className="kpi-label">Screening band</div><div className="kpi-value">{report.risk_assessment?.risk_band ?? 'Unavailable'}</div></div>
           </div>
 
           {Object.entries(report.module_status ?? {}).some(([, status]) => status === 'unavailable') && (

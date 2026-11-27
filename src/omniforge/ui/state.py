@@ -961,7 +961,7 @@ def _realign_split_lock(
 
     # An audit calculated on the old rows/columns cannot describe the new data.
     try:
-        config = SplitConfig(group_col=lock.get("group_col"), time_col=lock.get("time_col"))
+        config = SplitConfig(group_col=lock.get("group_col"), time_col=lock.get("time_col"), strict_duplicates=True)
         audit = LeakageSafeSplitter(config).verify_no_leakage(
             updated,
             train_idx=np.asarray(train_idx, dtype=int),
@@ -1255,6 +1255,7 @@ def lock_leakage_safe_split(
         group_col=group_col if (group_col and group_col != "(None)") else None,
         gap=int(gap),
         random_seed=int(random_seed),
+        strict_duplicates=True,
     )
     res = LeakageSafeSplitter(cfg).split(df, target_col=resolved_target)
     lock_payload: dict[str, Any] = {
@@ -1282,7 +1283,7 @@ def lock_leakage_safe_split(
     record_lineage(
         state,
         "Split Lock",
-        f"Locked leakage-safe {res.strategy_used.upper()} split",
+        f"Locked {res.strategy_used.upper()} split",
         f"Train={len(res.train_indices):,} | Test={len(res.test_indices):,} | CV={cv_folds}-fold | "
         f"Audit={'PASS' if (res.audit_report is not None and res.audit_report.passed) else 'WARN'}",
     )

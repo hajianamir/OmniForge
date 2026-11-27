@@ -123,7 +123,7 @@ test('small Studio 04 results and exclusions survive Studio 01 cleaning', async 
   await expect(page.getByRole('button', { name: 'Exclusions (1)' })).toBeVisible();
 });
 
-test('native AutoML labels candidate validation and champion test scores separately', async ({ page }) => {
+test('native AutoML separates candidate validation, test scores, and unconfirmed lift', async ({ page }) => {
   await page.addInitScript((key) => localStorage.setItem('omniforge_api_key', key), apiKey!);
   await page.goto('/');
   const rows = ['reading,load,target'];
@@ -148,6 +148,9 @@ test('native AutoML labels candidate validation and champion test scores separat
   expect(result.state.active_input_feature_cols).toEqual(['reading']);
   await expect(page.getByText('Test f1_weighted', { exact: true })).toBeVisible({ timeout: 20_000 });
   await expect(page.getByText(/16 held-out rows/)).toBeVisible();
+  await expect(page.getByText(`Selected Candidate Leaderboard · target (${result.backend_used})`, { exact: true })).toBeVisible();
+  await expect(page.getByText('Point Lift vs Strong Reference:', { exact: false })).toBeVisible();
+  await expect(page.getByText('Paired comparison unavailable', { exact: false }).first()).toBeVisible();
   await expect(page.getByText('Validation f1_weighted (higher is better)').first()).toBeVisible();
 });
 

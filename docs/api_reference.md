@@ -530,3 +530,11 @@ family (`studio03_global_evaluable_ledger`), rather than per-method families; it
 size are returned. Studio 04's battery identifies `studio04_evaluable_battery`; a single selected
 exploratory test does not get a battery-wide adjustment. Mining families represent the candidate
 rules or subgroups tested, before the top-N display truncation, not the universe of all rules.
+
+### Split, validation, and deep evaluation notes
+
+Split Locks store zero-based row positions and report cross-partition exact duplicates as an
+explicit audit failure. A failed audit does not itself repartition the dataset. Request-schema
+validation returns HTTP 422 with `error_code: REQUEST_VALIDATION_ERROR`, `trace_id`, and a
+sanitized `detail` list without submitted values. Studio 06's deep benchmark reports its
+holdout sampling method and classification counts before and after any row cap.

@@ -40,6 +40,7 @@ export const STUDIOS: StudioDef[] = [
 ];
 
 export interface SplitLockSummary {
+  exact_duplicate_leak_count?: number | null;
   active: boolean;
   strategy: string;
   n_train: number;

@@ -1131,21 +1131,26 @@ def robust_mahalanobis_outliers(
 
     num = df.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan).dropna()
     p = num.shape[1]
-    if p < 2 or len(num) < max(20, p + 5):
-        return {"evaluable": False, "reason": "Requires >= 2 numeric columns and sufficient complete rows."}
+    minimum_rows = max(50, 10 * p)
+    coverage = {"n_scanned": len(num), "sampled_from": len(df), "minimum_complete_rows": minimum_rows}
+    if p < 2 or len(num) < minimum_rows:
+        return {**coverage, "evaluable": False, "reason": "Requires at least two numeric columns and max(50, 10p) complete rows."}
     X = num.to_numpy(dtype=float)
     try:
         mcd = MinCovDet(random_state=random_state).fit(X)
+        if np.linalg.matrix_rank(mcd.covariance_) < p:
+            return {**coverage, "evaluable": False, "reason": "MCD covariance is rank deficient."}
         dist_sq = mcd.mahalanobis(X)
-    except Exception:
-        cov = np.cov(X, rowvar=False) + np.eye(p) * 1e-6
-        inv_cov = np.linalg.pinv(cov)
-        diff = X - np.mean(X, axis=0)
-        dist_sq = np.einsum("ij,jk,ik->i", diff, inv_cov, diff)
+        if not np.isfinite(dist_sq).all():
+            return {**coverage, "evaluable": False, "reason": "MCD distances are not finite."}
+    except (ValueError, np.linalg.LinAlgError):
+        return {**coverage, "evaluable": False, "reason": "Could not estimate a usable MCD covariance."}
     cutoff = float(stats.chi2.ppf(1.0 - alpha, df=p))
     flags = dist_sq > cutoff
     return {
         "evaluable": True,
+        **coverage,
+        "cutoff_method": "asymptotic_chi_square_screening",
         "n_rows": int(len(num)),
         "n_features": int(p),
         "chi2_cutoff": round(cutoff, 4),

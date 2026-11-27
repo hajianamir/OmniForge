@@ -61,22 +61,13 @@ class LogisticBaseline(BaseOmniForgeModel):
             **kwargs,
         )
         self._scaler = StandardScaler()
-        try:
-            self._model = LogisticRegression(
-                C=C,
-                l1_ratio=1.0,
-                solver="saga",
-                max_iter=2000,
-                random_state=self.random_seed,
-            )
-        except TypeError:
-            self._model = LogisticRegression(
-                C=C,
-                penalty="l1",
-                solver="liblinear",
-                max_iter=2000,
-                random_state=self.random_seed,
-            )
+        self._model = LogisticRegression(
+            C=C,
+            l1_ratio=1.0,
+            solver="saga",
+            max_iter=2000,
+            random_state=self.random_seed,
+        )
 
     def _fit(self, X: np.ndarray, y: np.ndarray | None, **kwargs: Any) -> None:
         assert y is not None
@@ -272,7 +263,7 @@ class ForecastingBaseline:
         return self
 
     def predict(self, horizon: int, return_intervals: bool = False, z: float = 1.96) -> np.ndarray | dict[str, np.ndarray]:
-        """Forecast ``horizon`` steps ahead with optional conformal-like Gaussian intervals."""
+        """Forecast with optional Gaussian random-walk intervals (normal quantile × SD of differences × √h)."""
         if len(self._history) == 0:
             fc = np.zeros(horizon, dtype=float)
         elif self.method == "naive":

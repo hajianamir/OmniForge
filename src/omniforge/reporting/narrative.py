@@ -410,9 +410,9 @@ class NarrativeGenerator:
             bullets = []
             if decision_summary.get("structural_risk_index") is not None:
                 bits.append(
-                    f"Structural Risk Index scored {decision_summary['structural_risk_index']} (Band: {decision_summary.get('risk_band', 'N/A')})."
+                    f"Structural screening heuristic (uncalibrated) scored {decision_summary['structural_risk_index']} (Band: {decision_summary.get('risk_band', 'N/A')})."
                 )
-                bullets.append(f"Structural Risk Index: {decision_summary['structural_risk_index']} ({decision_summary.get('risk_band', 'N/A')})")
+                bullets.append(f"Structural screening heuristic: {decision_summary['structural_risk_index']} ({decision_summary.get('risk_band', 'N/A')})")
             if decision_summary.get("forecast_champion"):
                 bits.append(
                     f"Time-series forecasting selected champion '{decision_summary['forecast_champion']}'."
