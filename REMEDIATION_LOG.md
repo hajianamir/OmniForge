@@ -2,7 +2,30 @@
 
 ## Executive Summary for Auditor
 
-See the final roll-up appended below and `TRACEABILITY_MATRIX.md` for per-finding outcomes. Audit reference: 2026-11-27, `53fd5e3`; working branch: `arena/84cfdc36-omniforge`. The audit is not edited.
+Audit: 2026-11-27, `53fd5e3`. Branch: `arena/84cfdc36-omniforge`. The original audit is untouched.
+
+| Severity | Closed | Partial | Deferred |
+|---|---:|---:|---:|
+| S1 | 3 | 0 | 0 |
+| S2 | 6 | 3 | 0 |
+| S3 | 13 | 0 | 0 |
+| S4 | 6 | 0 | 1 |
+| **Original findings** | **28** | **3** | **1** |
+
+Phase 1 aligned dispatch and reported evidence. Phase 2 isolated feature scope and guarded
+acceptance; optional backend comparability and complete feature evidence remain **partial**
+(OF-04/06). Phase 3 unified statistical contracts, but some sibling scan caps remain **partial**
+(OF-09). Phase 4 corrected integrity and operator claims; Benford hardening is **deferred**
+(OF-31). Ad-hoc OF-13a is **partial** pending dedicated mining-family verification and is not
+included in the 32 original findings. The broader run detected a Studio 05 no-op regression;
+the follow-up restored legacy no-op behavior while keeping explicit run-only pruning.
+
+Local regression evidence covers all ten §6 strengths at the scope described below, including
+locked fitting, estimator/interval checks, state round-trip, security and VIF. The tracked
+acceptance and integrity fixtures passed, as did Ruff, CI-extras mypy, latency, Redis and the
+SPA build. Official CI parity and a completely verified phase-by-phase full suite are **not**
+claimed. See the gate record below and [TRACEABILITY_MATRIX.md](TRACEABILITY_MATRIX.md) for
+commit and test-level disposition. No PR was merged and no changelog claims were published.
 
 ## Baseline setup
 
@@ -155,3 +178,150 @@ Document the actual Gaussian random-walk volatility scaling. Do not touch the re
 ## Phase 3 — Summary
 
 The three additional red fixtures reproduced the high-cardinality ordinal encoding, the thirteenth categorical column loss, and incompatible CPCV interval support. Twelve targeted tests passed after the changes, including existing purge/embargo assertions and numeric inference serialization. SPA rebuild passed. Redis integration: 13 passed against a local Redis 7.4 build (Unix socket instead of CI TCP). Mypy still reports only the known combined-environment Redis typing mismatch. The grep for BH correction also identified three mining candidate families (OF-13a); they now name the adjusted family and its pre-display-truncation size. This sibling has no dedicated red/green result, so it remains separately tracked. The prior native ordinal representation of `BaseOmniForgeModel` remains an explicitly documented path; the distance-baseline Workbench paths use the new nominal representation.
+
+## Phase 3 / Iteration 2 / OF-09, OF-12, OF-23
+
+Sibling review found nested Shapiro and Hodges–Lehmann subsampling inside the reported scan and
+native AutoML reference models still receiving `ModelBase`'s ordinal conversion. Mitigation:
+carry the nested denominators on ledger rows; fit bounded nominal predictors independently on
+validation-training and holdout-training rows. Specialized references receive named features from
+the fitted `ColumnTransformer`, not an unnamed matrix. Check that supplied test labels do not
+select a model, strong-reference failure still withholds lift, and the Workbench fitted input
+schema is unchanged. This is code/data contract work only; no tests were relaxed to accept a
+changed holdout. `970b7f3` (+62/−9 across 7 files) also cites OF-18 in its subject; the encoding
+changes map to OF-12/23, while the Cramér's V calculation is in `0b6eeb5`.
+
+Red/green: two red failures (missing nested count and two-feature ordinal WeightedKNN), then
+seven relevant checks passed. Remaining cap inventory (OF-09 partial): `s04_stats.py` EDA plots,
+individual capped tests and hypothesis column slices; `s02_mining.py` first-six distance
+correlations and nested sampling in stability/Hopkins. These are not covered by Studio 03
+metadata. Do not describe the report scope as exhaustive for those routes.
+
+## Phase 2 / Iteration 2 / OF-05, OF-20
+
+The broader run found `test_noop_selection_does_not_discard_existing_charts` failing: the common
+constant pruner had turned a prior Studio 05 no-op commit into a real column exclusion. Restore
+legacy selector inputs for preview/commit, retaining train-fitted pruning when `apply_to_run` is
+requested. Preserve locked membership, cache invalidation, Undo and full study provenance. Before:
+1 failed, 4 passed in E2E fail-fast. After: **4 passed** for no-op, locked commit, locked cohort,
+and run-scoped opt-in. `9ccb044`: 2 files, +6/−3. This supersedes the failing result for that fixture,
+not for the entire process that had already imported the earlier source.
+
+## Phase 4 / Iteration 2 / OF-04, OF-29
+
+Sibling workflow: Studio 06's prominent green lift badge and “Champion” heading still suggested
+acceptance; the equation card also described the strong reference as naive. Use neutral point
+lift, identify the selected candidate, show the paired interval or its unavailable reason outside
+the optional equation card, and name the actual reference in the card. Do not change the holdout
+scores or their selection provenance. A real 16-row test gave a red missing-heading assertion,
+then passed against the packaged SPA. The first post-build test expected the display string
+`native`; corrected the test to use the API's actual `backend_used` (`omniforge_native`). The
+final live run passed **5/5**. This does not certify optional internal search rankings (OF-04 partial).
+
+## Phase 4 — Summary
+
+The first pristine Phase 4 selection was **8 failed, 1 passed**. The mode-invalid envelope case
+reached the wrong status (`400`) on pristine, so it is not a clean envelope-only reproduction;
+the Phase 3 branch separately reproduced missing `error_code` on a valid validation-failure `422`.
+The deep fixture reached the endpoint and failed on missing `holdout_sampling`, not a failed
+setup. The route-doc fixture was already satisfied by Phase 1. Direct transport independently
+failed on pristine (`0.8` reconstructed instead of `0.8123456789`). After: **12 passed** across
+integrity, deep provenance, and exact-score/serialization coverage. The category case confirmed
+32 outputs including the infrequent bucket. The exploratory Benford exact-integer scaling check
+changed representable values across first-digit boundaries; no tolerance policy is specified.
+The committed benign precision test uses interior values at extreme scales and passed. Nonfinite
+input and exact-threshold policy remain deferred (OF-31), not a repaired defect.
+
+The MCD guard refuses a small complete-case denominator rather than presenting an asymptotic
+percentage as calibrated; the AIPW and PSM estimators were not changed. De-listing paths from
+operational controls does not remove their SDK tests. Duplicate audit failures remain visible on
+historical and re-audited locks; no implicit repartition is performed. Disclosing deep holdout
+sampling changes what users can infer, not the locked membership or train/test fit direction.
+
+Diff: `05ce9ca` (3 files, +43/−3); `5cf9a6c` (35 files, +247/−72 including built SPA and the
+OF-04 sibling presentation). Final finding-level statuses, including the earlier phases and
+sibling OF-13a, are in `TRACEABILITY_MATRIX.md`. No audit document or changelog edited.
+
+## Executable verification and outstanding gates
+
+- Before production edits the full pristine suite was **started**; it finished later on the
+  isolated base snapshot: **664 passed, 3 skipped, 83% coverage** (Redis URL, staged installer,
+  and optional PyTorch skips). It was not a completed pre-edit gate for every phase. The phases'
+  targeted green runs were 7 + 1 (Phase 1), 13 (Phase 2), 12 (Phase 3), and 12 (Phase 4).
+  Overlapping selections are not added together as unique tests. Phase diff stats: `f6ae439`
+  28 files +479/−146; `3d16744` 30 files +558/−127; `0b6eeb5` 25 files +419/−159;
+  later iterations separately recorded above.
+- The exact new red fixtures can be replayed by extracting `git archive 53fd5e3` into a temporary
+  directory, copying the corresponding test file into that checkout, and invoking pytest with
+  its `src` on `PYTHONPATH`. Run documentation assertions with the archive as the working
+  directory. Replay only the relevant fixture on pristine: combined newer suites may replay
+  checks fixed in an earlier phase, and `test_sklearn_category_cap_includes_the_infrequent_bucket`
+  verifies an existing property rather than requiring a red result.
+- Current targeted regression selection: **55 passed**. Re-run the finding fixtures with
+  `pytest -q tests/unit/test_standards_audit_*.py` and the named E2E tests in the matrix. Run
+  `pytest -q tests --cov=omniforge --cov-report=term-missing --tb=short` for the full coverage gate.
+- Hash-locked Python dependency install and import smoke passed. `ruff check src tests`,
+  `mypy src/omniforge` (200 files) and `python scripts/latency_budget_benchmark.py` passed on
+  local CPython 3.12 with the CI quality extras (without Redis). The separate environment with
+  the Redis extra reproduces the baseline optional-module mypy error; this is not claimed fixed.
+  Live Redis + shared throttle suite passed **13 tests** against Redis 7.4 Unix socket.
+- `npm ci` and `npm run build` passed; served SPA assets regenerated and versioned. Official
+  Chromium download failed; npm-sourced Chromium verified **24 deterministic chart/contract
+  checks** and **5 live Workbench checks**. The deterministic suite preceded the final neutral
+  AutoML copy follow-up; the live suite exercised the rebuilt current SPA. This is not official
+  CI-browser-equivalent proof. Docker multi-arch registry/SBOM, Python 3.13, and optional deep
+  framework runs were not completed. No GitHub workflow result is claimed.
+
+### §6 strength checks (local scope)
+
+| Strength | Verified evidence or limitation |
+|---|---|
+| Leakage-first fitting and locked baseline partitions | Splitter and Studio 03 locked cohort tests, feature-scope no-op/commit tests, external supplied-label selection comparison, fitted inference and actual served SPA. No completed full parity before/after each phase. |
+| Hájek IPW, HT/ESS/trimming/SMD | `test_p1_12_causal_hajek_abadie_imbens_2sls_and_aipw` in focused run; numerical IPW path untouched. |
+| Abadie–Imbens and SATE floor | Same golden estimator fixture and `test_causal_aipw_and_psm_golden_se`; metadata only. |
+| Finite-sample and Mondrian conformal | `test_p1_3_split_conformal_exact_order_statistic_and_forecasters` and `test_conformal_aps_mondrian_and_strictly_causal_aci`; doc edits do not change the conformal implementation. |
+| Exact/weighted fairness CIs and insufficient evidence | Clustered-vs-IID and missing/single-cluster tests in Phase 4 strength selection; no fairness math changed. |
+| Quality effective-weight renormalization | `test_quality_reference_accuracy_and_rule_denominators`. |
+| Exclusion/undo/lineage and fail-closed realignment | `test_column_exclusion_truthful_provenance_and_uap_roundtrip`, `test_split_lock_row_id_and_fail_closed`, Studio 05 no-op and run-only integration, signed browser restore. |
+| Security/audit baseline | Concurrent hash-chain/logger checks, anchor tamper/headers, signed workspace tamper and live persistence checks, sanitized validation, shared Redis, hash lock. Docker SBOM, official browser and Python 3.13 were not reproduced. |
+| ColumnTransformer unknown behavior | Fitted single/batch unseen-category fixture and infrequent-bucket test; transformer still uses `handle_unknown="ignore"`. |
+| VIF via lstsq | `test_p1_2_diagnostics_semidev_central_range_and_inf_vif`, `test_normality_vif_nan_and_datetime_nat_handling`; numerical implementation unchanged. |
+
+### Timing clarification
+
+The pristine coverage result is from an isolated archive of the audit commit. Its run began before
+the Phase 1 baseline work, not before the earliest selector production edit. Per-phase complete
+pre- and post-edit coverage was not achieved. “Before” above means the base source snapshot,
+not a completed gate contemporaneous with every edit. Subsequent targeted suite counts do not
+stand in for that gate.
+
+### Closeout follow-up: coverage run and Phase 4 / Iteration 3 / OF-21
+
+The earlier full 3.12 coverage process finished at **695 passed, 3 failed, 3 skipped, 83%**.
+Its failures were the Studio 05 no-op regression, the first draft (exact-threshold) Benford
+fixture, and a strict-equality legacy deep-evaluation assertion that rejected the three new
+additive metadata keys. The last test must keep its original 8 evaluation fields and the
+train/test membership/encoded-schema assertions, and separately check the new sampling and
+class-count values. No production change was made in `dac5073` (1 file, +7/−1). Isolated
+reverification of those three reported failures plus the misleading-holdout regression:
+**4 passed** in the CI quality environment. The older red full run is not called green.
+
+Fresh chart-fixture browser rerun on the final SPA: **24 passed** with substitute Chromium;
+the final real-backend run was **5 passed**. A cross-tree sibling review searched the lift/risk
+zero fallbacks (T1), scope/pruning paths from Study to pipelines (T2), factorization/CPCV/FDR
+sites (T3), and SDK-only governance methods (T4). Remaining unrelated uses of factorization
+(e.g. ingestion and group/simulation codes) were not converted as if they were model distances.
+Automated governance's residual recommendation text is guidance, not an available mitigation
+button. The remaining cap/adapter/FDR work is explicit in the matrix.
+
+### Final local gate disposition
+
+The second full CPython 3.12 coverage run used the final production source and collected tests
+before the test-only commit `dac5073`. It completed with **699 passed, 1 failed, 3 skipped,
+83% coverage**; its sole failure was the stale deep evaluation equality assertion described
+above. After that run finished, `pytest -q tests --lf --lfnf=none --tb=short` loaded the
+updated test and passed (**1 passed**). This verifies the remaining case without weakening
+its training-schema or cohort assertions. The skips were the independently tested Redis job,
+unstaged Windows installer payload, and unavailable PyTorch. A single uninterrupted green run
+on the final test tree and full CI parity (including Python 3.13, official Chromium, and Docker
+amd64/arm64 persistence/SBOM) are not claimed. Partial findings remain open for auditor review.
