@@ -131,7 +131,10 @@ def s05_select_features(
         protected.update(lock[key] for key in ("time_col", "group_col", "row_id_col") if isinstance(lock.get(key), str))
     dropped_from_inputs = [c for c in protected - {target} if c in train_df.columns]
     try:
-        X_fit, y_fit, task, preprocessor = _wb()._prepare_xy_fitted(train_df.drop(columns=dropped_from_inputs), target)
+        # Keep historical preview/commit behavior; trim constants only for a model run scope.
+        X_fit, y_fit, task, preprocessor = _wb()._prepare_xy_fitted(
+            train_df.drop(columns=dropped_from_inputs), target, prune_constants=req.apply_to_run,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="The feature selection input schema could not be fitted.") from exc
     task_str = "classification" if task in (_wb().TaskType.BINARY_CLASSIFICATION, _wb().TaskType.MULTICLASS_CLASSIFICATION) else "regression"

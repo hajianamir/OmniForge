@@ -444,14 +444,14 @@ def _prepare_xy(df: pd.DataFrame, target: str, *, raw_features: bool = False) ->
 
 
 def _prepare_xy_fitted(
-    df: pd.DataFrame, target: str, *, raw_features: bool = False
+    df: pd.DataFrame, target: str, *, raw_features: bool = False, prune_constants: bool = True
 ) -> tuple[pd.DataFrame, pd.Series, TaskType, WorkbenchInputPreprocessor]:
     """Prepare training data and retain the fitted raw-input transformation for scoring."""
     work = df.dropna(subset=[target]).copy()
     if len(work) < 10:
         raise HTTPException(status_code=400, detail=f"Target '{target}' has fewer than 10 non-null observations.")
     raw = work.drop(columns=[target])
-    if not raw_features:
+    if not raw_features and prune_constants:
         raw = raw.loc[:, nonconstant_predictors(raw)]
     if raw.shape[1] == 0:
         raise HTTPException(status_code=400, detail="No usable predictor columns remain after excluding target.")
