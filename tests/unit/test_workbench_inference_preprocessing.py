@@ -59,7 +59,9 @@ def test_studio06_single_and_batch_use_fitted_training_pipeline(monkeypatch: pyt
         return SimpleNamespace(
             best_model=pipe, best_model_name="logistic", executed_backend="test", requested_backend="test",
             best_score=1.0, lift_over_best_baseline=0.2, primary_metric="accuracy", task_type=kwargs["task_type"],
-            leaderboard=[], elapsed_seconds=0.1, fallback_reason=None, extra={},
+            leaderboard=[], elapsed_seconds=0.1, fallback_reason=None,
+            extra={"evaluation": {"best_score_partition": "validation", "validation_baseline_score": 0.8123456789,
+                                  "validation_baseline_name": "designated_reference"}},
         )
 
     monkeypatch.setattr("omniforge.api.studios.s06_automl.AutoMLBackendHub.run", train)
@@ -71,6 +73,9 @@ def test_studio06_single_and_batch_use_fitted_training_pipeline(monkeypatch: pyt
     trained = client.post("/api/workbench/s06/automl", json={"target": "target", "backend": "test"})
     assert trained.status_code == 200, trained.text
     assert trained.json()["target"] == "target"
+    # The observed lift is rounded independently and cannot recover the reference score.
+    assert trained.json()["baseline_score"] == 0.8123456789
+    assert trained.json()["baseline_name"] == "designated_reference"
     assert fitted_targets == ["target"]
     summary = trained.json()["state"]
     assert summary["active_input_feature_types"]["when"] == "datetime"

@@ -762,3 +762,24 @@ def test_feature_selection_run_scope_leaves_study_and_split_intact() -> None:
     })
     assert run.status_code == 200, run.text
     assert run.json()['report']['baseline_feature_cols'] == {'target': ['alpha']}
+
+
+def test_deep_benchmark_discloses_class_mix_and_reference_provenance() -> None:
+    client, headers = _client()
+    frame = pd.DataFrame({'x': range(500), 'target': [0] * 450 + [1] * 50})
+    uploaded = client.post('/api/workbench/s01/upload', headers=headers, files={
+        'file': ('imbalanced.csv', io.BytesIO(frame.to_csv(index=False).encode()), 'text/csv'),
+    })
+    assert uploaded.status_code == 200, uploaded.text
+    response = client.post('/api/workbench/s06/deep-learning', headers=headers, json={
+        'target': 'target', 'architectures': [], 'max_rows': 100,
+    })
+    assert response.status_code == 200, response.text
+    body = response.json()
+    evaluation = body['evaluation']
+    assert evaluation['holdout_sampling'] == 'stratified_without_replacement'
+    assert evaluation['holdout_class_counts'] == {'0': 18, '1': 2}
+    assert evaluation['available_holdout_class_counts'] == {'0': 90, '1': 10}
+    assert body['baseline_evidence']['Baseline_most_frequent']['status'] == 'scored'
+    analytical = [row for row in body['results'] if 'Nadaraya' in row['model']]
+    assert analytical and analytical[0]['framework'] != 'sklearn'

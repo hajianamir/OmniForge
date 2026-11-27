@@ -463,6 +463,11 @@ def s06_run_deep_benchmark(req: DeepBenchReq, x_session_id: str | None = Header(
     training_rows, heldout_rows = len(train), len(test)
     task = _wb()._infer_task(train[target])
     is_clf = task in (_wb().TaskType.BINARY_CLASSIFICATION, _wb().TaskType.MULTICLASS_CLASSIFICATION)
+    def class_counts(frame: pd.DataFrame) -> dict[str, int] | None:
+        return {str(label): int(count) for label, count in frame[target].value_counts().items()} if is_clf else None
+
+    available_holdout_counts = class_counts(test)
+    holdout_sampling = "all_rows"
     if training_rows + heldout_rows > req.max_rows:
         train_limit = min(training_rows, max(10, min(req.max_rows - 2, req.max_rows * training_rows // (training_rows + heldout_rows))))
         test_limit = min(heldout_rows, req.max_rows - train_limit)
@@ -473,7 +478,13 @@ def s06_run_deep_benchmark(req: DeepBenchReq, x_session_id: str | None = Header(
             kept, _ = train_test_split(positions, train_size=train_limit, random_state=42, stratify=stratify)
             train = train.iloc[np.sort(kept)]
         if test_limit < heldout_rows:
-            kept = np.random.default_rng(42).choice(heldout_rows, size=test_limit, replace=False)
+            counts = test[target].value_counts()
+            can_stratify = is_clf and counts.min() >= 2 and len(counts) <= min(test_limit, heldout_rows - test_limit)
+            kept, _ = train_test_split(
+                np.arange(heldout_rows), train_size=test_limit, random_state=42,
+                stratify=test[target] if can_stratify else None,
+            )
+            holdout_sampling = "stratified_without_replacement" if can_stratify else "random_without_replacement"
             test = test.iloc[np.sort(kept)]
     if is_clf and (train[target].nunique() < 2 or not test[target].isin(train[target].unique()).all()):
         raise HTTPException(status_code=400, detail="Every holdout class must be represented in the deep benchmark training rows.")
@@ -491,7 +502,7 @@ def s06_run_deep_benchmark(req: DeepBenchReq, x_session_id: str | None = Header(
     rows: list[dict[str, Any]] = []
     for bname, bm in base_res.items():
         score = bm.get("f1_weighted" if is_clf else "r2")
-        rows.append({"model": f"Baseline: {bname}", "family": "Baseline", "framework": baseline_models[bname].framework, **baseline_feature_evidence(baseline_models[bname]), "score": round(float(score), 5) if score is not None else None, "elapsed_sec": None, "loss_curve": []})
+        rows.append({"model": f"Baseline: {bname}", "family": "Baseline", "framework": baseline_models[bname].framework, "implementation": type(baseline_models[bname]).__name__, **baseline_feature_evidence(baseline_models[bname]), "score": round(float(score), 5) if score is not None else None, "elapsed_sec": None, "loss_curve": []})
 
     arch_map = {
         "ft_transformer": lambda: FTTransformerModel(d_model=24, n_heads=4, n_layers=2, epochs=req.epochs, task_type=task, track_carbon=False),
@@ -569,6 +580,9 @@ def s06_run_deep_benchmark(req: DeepBenchReq, x_session_id: str | None = Header(
                 "source": split_source, "strategy": split_strategy,
                 "n_train": len(X_tr), "n_test": len(X_te),
                 "available_train_rows": training_rows, "available_test_rows": heldout_rows,
+                "holdout_sampling": holdout_sampling,
+                "available_holdout_class_counts": available_holdout_counts,
+                "holdout_class_counts": class_counts(test),
                 "input_columns": preprocessor.input_columns, "encoded_columns": preprocessor.output_columns,
             },
             "feature_importances": feature_importances,
