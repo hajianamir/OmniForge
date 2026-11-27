@@ -9,6 +9,7 @@ from sklearn.preprocessing import StandardScaler
 
 from omniforge.core.types import TaskType
 from omniforge.core.utils import is_package_available
+from omniforge.models._torch_state import TorchStateMixin
 from omniforge.models.base import BaseOmniForgeModel
 from omniforge.models.deep.mlp import MLPModel
 
@@ -25,7 +26,7 @@ def sparsemax_numpy(z: np.ndarray, axis: int = -1) -> np.ndarray:
     return np.asarray(np.maximum(z_shift - tau, 0.0), dtype=float)
 
 
-class TabNetModel(BaseOmniForgeModel):
+class TabNetModel(TorchStateMixin, BaseOmniForgeModel):
     """Faithful TabNet (Arik & Pfister, AAAI 2021) with PyTorch GLU/Sparsemax/GhostBN & NumPy fallback."""
 
     model_family = "deep_tabnet"
@@ -95,12 +96,10 @@ class TabNetModel(BaseOmniForgeModel):
         else:
             self._fit_numpy(X_s, y)
 
-    def _fit_torch(self, X_s: np.ndarray, y_enc: np.ndarray, *, out_dim: int, is_clf: bool) -> None:
+    def _build_torch_net(self, in_dim: int, out_dim: int) -> Any:
         import torch
         import torch.nn as nn
 
-        torch.manual_seed(self.random_seed)
-        in_dim = X_s.shape[1]
         n_d, n_a, n_steps, gamma = self.n_d, self.n_a, self.n_steps, self.gamma
 
         def _sparsemax_torch(z: torch.Tensor) -> torch.Tensor:
@@ -158,8 +157,16 @@ class TabNetModel(BaseOmniForgeModel):
                     step_imp = d_out.sum(dim=-1, keepdim=True)
                     m_explain = m_explain + step_imp * mask
                 return self.head(agg_d), m_loss / float(n_steps), m_explain
+        return _TabNetModule()
 
-        net = _TabNetModule()
+    def _fit_torch(self, X_s: np.ndarray, y_enc: np.ndarray, *, out_dim: int, is_clf: bool) -> None:
+        import torch
+        import torch.nn as nn
+
+        torch.manual_seed(self.random_seed)
+        in_dim = X_s.shape[1]
+        self._torch_build_config = {"in_dim": in_dim, "out_dim": out_dim}
+        net = self._build_torch_net(**self._torch_build_config)
         opt = torch.optim.AdamW(net.parameters(), lr=self.learning_rate, weight_decay=1e-4)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(self.epochs, 1))
         loss_fn: Any = nn.CrossEntropyLoss() if is_clf else nn.MSELoss()

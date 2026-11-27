@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import inspect
 import io
 import json
 import os
@@ -16,7 +17,9 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator
 from sklearn.metrics import accuracy_score, r2_score
+from sklearn.utils import ClassifierTags, RegressorTags, Tags
 
 from omniforge.core.carbon import CarbonTracker
 from omniforge.core.constants import DEFAULT_RANDOM_SEED
@@ -112,6 +115,7 @@ class BaseOmniForgeModel(ABC):
 
         elapsed = time.perf_counter() - start
         self.is_fitted_ = True
+        self.n_features_in_ = X_arr.shape[1]
         self.feature_names_ = feat_names
         self.metadata_.task_type = self.task_type
         self.metadata_.feature_names = feat_names
@@ -155,18 +159,71 @@ class BaseOmniForgeModel(ABC):
         self._check_is_fitted()
         return {}
 
+    def __sklearn_tags__(self) -> Tags:
+        tags = BaseEstimator.__sklearn_tags__(self)
+        if self.task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION):
+            tags.estimator_type = "classifier"
+            tags.classifier_tags = ClassifierTags()
+        elif self.task_type == TaskType.REGRESSION:
+            tags.estimator_type = "regressor"
+            tags.regressor_tags = RegressorTags()
+        tags.target_tags.required = tags.estimator_type is not None
+        tags.input_tags.allow_nan = True
+        return tags
+
+    def __sklearn_is_fitted__(self) -> bool:
+        return self.is_fitted_
+
     def get_params(self, deep: bool = True) -> dict[str, Any]:
-        """Return model hyperparameters (sklearn estimator API)."""
-        return {"name": self.name, "task_type": self.task_type, "random_seed": self.random_seed, **self.hyperparameters}
+        """Return constructor arguments with their original values."""
+        signature = inspect.signature(type(self))
+        params = {
+            "task_type": self.task_type, "random_seed": self.random_seed,
+            "track_carbon": self.track_carbon, "country_iso": self.country_iso,
+            **self.hyperparameters,
+        }
+        requested = getattr(self, "_constructor_params", {})
+        if "task_type" not in signature.parameters:
+            params.pop("task_type", None)
+        for key, arg in signature.parameters.items():
+            if arg.kind not in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
+                continue
+            if key in requested:
+                params[key] = requested[key]
+            elif key not in params and hasattr(self, key):
+                params[key] = getattr(self, key)
+        if not any(arg.kind == inspect.Parameter.VAR_KEYWORD for arg in signature.parameters.values()):
+            params = {k: v for k, v in params.items() if k in signature.parameters}
+        if deep:
+            for key, value in tuple(params.items()):
+                if hasattr(value, "get_params") and not isinstance(value, type):
+                    params.update({f"{key}__{k}": v for k, v in value.get_params().items()})
+        return params
 
     def set_params(self, **params: Any) -> BaseOmniForgeModel:
-        """Update model hyperparameters (sklearn estimator API)."""
-        for k, v in params.items():
-            if k in ("name", "task_type", "random_seed", "track_carbon", "country_iso"):
-                setattr(self, k, v)
+        """Reconstruct effective configuration and discard the previous fit on parameter changes."""
+        if not params:
+            return self
+        from sklearn.base import clone
+
+        constructor = self.get_params(deep=False)
+        nested: dict[str, dict[str, Any]] = {}
+        for key, value in params.items():
+            name, delimiter, child = key.partition("__")
+            if name not in constructor:
+                raise ModelTrainingError(f"Unsupported model parameter '{name}'.")
+            if delimiter:
+                nested.setdefault(name, {})[child] = value
             else:
-                self.hyperparameters[k] = v
-        self.metadata_.hyperparameters = dict(self.hyperparameters)
+                constructor[name] = value
+        for name, changes in nested.items():
+            estimator = constructor[name]
+            if not hasattr(estimator, "set_params"):
+                raise ModelTrainingError(f"Model parameter '{name}' does not support nested settings.")
+            constructor[name] = clone(estimator).set_params(**changes)
+        replacement = type(self)(**constructor)
+        self.__dict__.clear()
+        self.__dict__.update(replacement.__dict__)
         return self
 
     @staticmethod
@@ -329,22 +386,29 @@ class BaseOmniForgeModel(ABC):
     ) -> tuple[np.ndarray, list[str]]:
         if isinstance(X, pd.DataFrame):
             df = X.copy()
+            df.columns = df.columns.map(str)
             if fitting:
+                self._categorical_missing_v2 = True
                 self._cat_columns_ = [
                     str(c) for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])
                 ]
                 self._cat_mappings_: dict[str, dict[str, int]] = {}
                 for col in self._cat_columns_:
-                    cats = sorted(df[col].astype(str).fillna("MISSING").unique().tolist())
-                    self._cat_mappings_[col] = {cat: idx for idx, cat in enumerate(cats)}
+                    observed = df[col].dropna().astype(str)
+                    self._cat_mappings_[col] = {cat: idx for idx, cat in enumerate(sorted(observed.unique()))}
             for col in getattr(self, "_cat_columns_", []):
                 if col in df.columns:
                     mapping = getattr(self, "_cat_mappings_", {}).get(col, {})
-                    col_series = df[col].astype(str).fillna("MISSING")
-                    # Unknown categories at prediction time map to -1 (graceful degradation).
-                    # This keeps SHAP/PDP rare-category paths working — they intentionally inject
-                    # unseen instance values into background batches.
-                    df[col] = col_series.map(lambda v, _m=mapping: _m.get(v, -1)).astype(float)
+                    if getattr(self, "_categorical_missing_v2", False):
+                        # Unknown categories and missing values retain distinct codes.
+                        observed = df[col].notna()
+                        encoded = df[col].astype("string").map(mapping).fillna(-1).astype(float)
+                        df[col] = encoded.where(observed, -2.0)
+                    else:
+                        # Preserve the original representation for previously persisted fits.
+                        df[col] = df[col].astype(str).fillna("MISSING").map(mapping).fillna(-1).astype(float)
+                elif not fitting and getattr(self, "_categorical_missing_v2", False):
+                    df[col] = -2.0
             if not fitting and self.feature_names_:
                 for req in self.feature_names_:
                     if req not in df.columns:
@@ -410,6 +474,10 @@ class SklearnEstimatorAdapter(BaseOmniForgeModel):
     model_family = "sklearn_adapter"
     framework = "sklearn"
 
+    @property
+    def estimator(self) -> Any:
+        return self._estimator
+
     def __init__(
         self,
         estimator: Any,
@@ -417,19 +485,26 @@ class SklearnEstimatorAdapter(BaseOmniForgeModel):
         name: str | None = None,
         task_type: TaskType | None = None,
     ) -> None:
+        from sklearn.exceptions import NotFittedError
+        from sklearn.utils import get_tags
+        from sklearn.utils.validation import check_is_fitted
+
+        self._constructor_params = {"estimator": estimator, "name": name, "task_type": task_type}
         classes = getattr(estimator, "classes_", None)
         if task_type is None:
             if classes is not None:
                 task_type = TaskType.BINARY_CLASSIFICATION if len(classes) <= 2 else TaskType.MULTICLASS_CLASSIFICATION
             else:
-                task_type = TaskType.REGRESSION
-        super().__init__(
-            name=name or type(estimator).__name__,
-            task_type=task_type,
-            track_carbon=False,
-        )
+                task_type = TaskType.BINARY_CLASSIFICATION if get_tags(estimator).estimator_type == "classifier" else TaskType.REGRESSION
+        super().__init__(name=name or type(estimator).__name__, task_type=task_type, track_carbon=False)
         self._estimator = estimator
-        self.is_fitted_ = True
+        try:
+            check_is_fitted(estimator)
+            self.is_fitted_ = True
+        except (NotFittedError, TypeError):
+            # Some external estimator adapters publish classes or schema without
+            # implementing sklearn validation. Preserve their fitted protocol.
+            self.is_fitted_ = classes is not None or hasattr(estimator, "feature_names_in_")
         self._cat_columns_ = []
         self._cat_mappings_ = {}
         feat_in = getattr(estimator, "feature_names_in_", None)
@@ -440,8 +515,9 @@ class SklearnEstimatorAdapter(BaseOmniForgeModel):
             self.classes_ = np.asarray(classes)
 
     def _to_est_input(self, X: np.ndarray) -> pd.DataFrame | np.ndarray:
-        if self.feature_names_ and X.ndim == 2 and X.shape[1] == len(self.feature_names_):
-            return pd.DataFrame(X, columns=self.feature_names_)
+        names = getattr(self._estimator, "feature_names_in_", None)
+        if names is not None and X.ndim == 2 and X.shape[1] == len(names):
+            return pd.DataFrame(X, columns=names)
         return X
 
     def _fit(self, X: np.ndarray, y: np.ndarray | None, **kwargs: Any) -> None:

@@ -109,16 +109,19 @@ def s08_optimize(req: OptimizeReq, x_session_id: str | None = Header(default="de
     cols = [c for c in req.asset_cols if c in df.columns] or list(df.select_dtypes(include=[np.number]).columns)[:5]
     if len(cols) < 2:
         raise HTTPException(status_code=400, detail="Portfolio optimization needs at least 2 numeric columns.")
-    sub = df[cols].apply(pd.to_numeric, errors="coerce").dropna()
-    if len(sub) < 3:
-        raise HTTPException(status_code=400, detail="Portfolio optimization needs at least 3 complete numeric rows.")
-    returns = sub.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
-    if len(returns) < 5:
-        returns = (sub - sub.mean()) / sub.std().replace(0, 1.0)
+    sub = df[cols].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    returns = sub.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(returns) < 2:
+        raise HTTPException(status_code=400, detail="Portfolio optimization needs at least two jointly observed consecutive return intervals.")
     mu = returns.mean().to_numpy(dtype=float)
     cov = returns.cov().to_numpy(dtype=float) + np.eye(len(cols)) * 1e-6
     res = OptimizationEngine().optimize_portfolio(mu, cov, risk_aversion=req.risk_aversion, asset_names=cols)
     out = res.model_dump() if hasattr(res, "model_dump") else res
+    out = to_json_object(out)
+    out["return_estimation"] = {
+        "method": "arithmetic_mean_of_consecutive_simple_returns", "n_intervals": len(returns),
+        "row_order": "active_dataset", "expected_returns": dict(zip(cols, mu.tolist(), strict=True)),
+    }
     state["uap_opt_result"] = out
     return wb_cache_and_respond(state, sid, "s08_optimize", {"optimization": out})
 

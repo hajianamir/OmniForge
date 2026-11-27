@@ -29,6 +29,7 @@ class VotingEnsembleModel(BaseOmniForgeModel):
         **kwargs: Any,
     ) -> None:
         super().__init__(name="VotingEnsemble", task_type=task_type, **kwargs)
+        self._constructor_params = {"estimators": estimators}
         self.estimators = estimators or [
             ClassicalMLModel("random_forest", task_type=task_type, random_seed=self.random_seed),
             ClassicalMLModel("extra_trees", task_type=task_type, random_seed=self.random_seed + 1),
@@ -93,6 +94,7 @@ class StackingEnsembleModel(BaseOmniForgeModel):
     ) -> None:
         super().__init__(name="StackingEnsemble", task_type=task_type, cv_folds=cv_folds, **kwargs)
         self.cv_folds = max(2, cv_folds)
+        self._constructor_params = {"estimators": estimators}
         self.estimators = estimators or [
             ClassicalMLModel("random_forest", task_type=task_type, random_seed=self.random_seed),
             ClassicalMLModel("gradient_boosting", task_type=task_type, random_seed=self.random_seed + 1),

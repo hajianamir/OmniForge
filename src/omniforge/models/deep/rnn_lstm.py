@@ -9,6 +9,7 @@ from sklearn.preprocessing import StandardScaler
 
 from omniforge.core.types import TaskType
 from omniforge.core.utils import is_package_available
+from omniforge.models._torch_state import TorchStateMixin
 from omniforge.models.base import BaseOmniForgeModel
 from omniforge.models.deep.mlp import MLPModel
 
@@ -17,7 +18,7 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
     return np.asarray(1.0 / (1.0 + np.exp(-np.clip(x, -30.0, 30.0))), dtype=float)
 
 
-class RecurrentSequenceModel(BaseOmniForgeModel):
+class RecurrentSequenceModel(TorchStateMixin, BaseOmniForgeModel):
     """Sequence model supporting vanilla RNN, LSTM, and GRU gated recurrent units."""
 
     model_family = "deep_recurrent"
@@ -139,6 +140,22 @@ class RecurrentSequenceModel(BaseOmniForgeModel):
         )
         self._readout.fit(seq_repr, y)
 
+    def _build_torch_net(self, out_dim: int) -> Any:
+        import torch.nn as nn
+
+        cell_cls = {"lstm": nn.LSTM, "gru": nn.GRU, "rnn": nn.RNN}.get(self.cell_type, nn.LSTM)
+
+        class _RNNNet(nn.Module):
+            def __init__(self, hidden: int, layers: int, out_d: int) -> None:
+                super().__init__()
+                self.rnn = cell_cls(1, hidden, num_layers=layers, batch_first=True)
+                self.fc = nn.Linear(hidden, out_d)
+
+            def forward(self, inp: Any) -> Any:
+                out, _ = self.rnn(inp)
+                return self.fc(out[:, -1, :])
+        return _RNNNet(self.hidden_size, self.num_layers, out_dim)
+
     def _fit_torch(self, X: np.ndarray, y: np.ndarray, is_clf: bool) -> None:
         import torch
         import torch.nn as nn
@@ -156,19 +173,8 @@ class RecurrentSequenceModel(BaseOmniForgeModel):
             y_t = torch.tensor(y.astype(np.float32).reshape(-1, 1), dtype=torch.float32)
             out_dim = 1
 
-        cell_cls = {"lstm": nn.LSTM, "gru": nn.GRU, "rnn": nn.RNN}.get(self.cell_type, nn.LSTM)
-
-        class _RNNNet(nn.Module):
-            def __init__(self, hidden: int, layers: int, out_d: int) -> None:
-                super().__init__()
-                self.rnn = cell_cls(1, hidden, num_layers=layers, batch_first=True)
-                self.fc = nn.Linear(hidden, out_d)
-
-            def forward(self, inp: Any) -> Any:
-                out, _ = self.rnn(inp)
-                return self.fc(out[:, -1, :])
-
-        net = _RNNNet(self.hidden_size, self.num_layers, out_dim)
+        self._torch_build_config = {"out_dim": out_dim}
+        net = self._build_torch_net(**self._torch_build_config)
         opt = torch.optim.Adam(net.parameters(), lr=self.learning_rate)
         loss_fn: Any = nn.CrossEntropyLoss() if is_clf else nn.MSELoss()
         X_t = torch.tensor(X.astype(np.float32)).unsqueeze(-1)

@@ -140,64 +140,76 @@ class VisionFoundationHub:
         pretrained: bool = True,
     ) -> dict[str, Any]:
         """Extract deep image embedding via timm/torchvision pretrained backbone when installed, else spatial pyramid."""
-        rgb = self._base_cv.load_image(image_or_path)
-        if is_package_available("timm") and is_package_available("torch"):
-            try:
-                import timm
-                import torch
-
-                key = f"timm:{backbone}:{pretrained}"
-                if key not in self._cached_models:
-                    self._cached_models[key] = timm.create_model(backbone, pretrained=pretrained, num_classes=0).eval()
-                model = self._cached_models[key]
-                x = torch.from_numpy(rgb.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
-                with torch.no_grad():
-                    emb = model(x).cpu().numpy().ravel().astype(np.float32)
-                nrm = float(np.linalg.norm(emb))
-                if nrm > 1e-12:
-                    emb = emb / nrm
-                return {"backend": f"timm:{backbone}", "embedding_dim": int(len(emb)), "embedding": emb}
-            except Exception as exc:
-                # Avoid logging exception text, which can include image paths or credentials.
-                logger.warning(
-                    "vision_backend_failed",
-                    operation="foundation_embedding",
-                    backend="timm",
-                    error_type=type(exc).__name__,
-                    fallback="torchvision_or_native_spatial_pyramid",
-                )
-
-        if is_package_available("torchvision") and is_package_available("torch"):
+        rgb = self._base_cv.load_image(image_or_path, resize=False)
+        for backend in ("timm", "torchvision"):
+            if not is_package_available("torch") or not is_package_available(backend):
+                continue
             try:
                 import torch
-                import torchvision.models as tvm
+                from PIL import Image
 
-                key = f"tv:{backbone}:{pretrained}"
+                key = f"{backend}:{backbone}:{pretrained}"
                 if key not in self._cached_models:
-                    fn = getattr(tvm, backbone, tvm.resnet18)
-                    m = fn(weights="DEFAULT" if pretrained else None)
-                    if hasattr(m, "fc"):
-                        m.fc = torch.nn.Identity()
-                    self._cached_models[key] = m.eval()
-                model = self._cached_models[key]
-                x = torch.from_numpy(rgb.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
-                with torch.no_grad():
-                    emb = model(x).cpu().numpy().ravel().astype(np.float32)
-                nrm = float(np.linalg.norm(emb))
-                if nrm > 1e-12:
-                    emb = emb / nrm
-                return {"backend": f"torchvision:{backbone}", "embedding_dim": int(len(emb)), "embedding": emb}
+                    if backend == "timm":
+                        import timm
+                        from timm.data import create_transform, resolve_model_data_config
+
+                        model = timm.create_model(backbone, pretrained=pretrained, num_classes=0)
+                        transform = create_transform(**resolve_model_data_config(model), is_training=False)
+                        identity = model.pretrained_cfg.get("tag") if pretrained else None
+                    else:
+                        import torchvision.models as tvm
+
+                        fn = tvm.get_model_builder(backbone)
+                        default = tvm.get_model_weights(fn).DEFAULT
+                        model = fn(weights=default if pretrained else None)
+                        transform = default.transforms()
+                        identity = default.name if pretrained else None
+                        self._remove_torchvision_classifier(model, torch.nn)
+                    self._cached_models[key] = (model.eval(), transform, identity)
+                model, transform, identity = self._cached_models[key]
+                x = transform(Image.fromarray(rgb)).unsqueeze(0)
+                with torch.inference_mode():
+                    emb = model(x).detach().cpu().numpy()
+                if emb.ndim != 2 or emb.shape[0] != 1 or not np.isfinite(emb).all():
+                    raise ModelTrainingError("The requested backbone did not emit a finite pooled embedding.")
+                vector = emb[0].astype(np.float32)
+                norm = float(np.linalg.norm(vector))
+                if norm > 1e-12:
+                    vector = vector / norm
+                return {
+                    "backend": f"{backend}:{backbone}", "embedding_dim": int(len(vector)),
+                    "embedding": vector, "requested_backbone": backbone, "executed_backbone": backbone,
+                    "pretrained_loaded": pretrained, "weights": identity,
+                }
+            except ImportError:
+                continue
             except Exception as exc:
-                logger.warning(
-                    "vision_backend_failed",
-                    operation="foundation_embedding",
-                    backend="torchvision",
-                    error_type=type(exc).__name__,
-                    fallback="native_spatial_pyramid",
-                )
+                logger.warning("vision_backend_failed", operation="foundation_embedding",
+                               backend=backend, error_type=type(exc).__name__,
+                               fallback="torchvision_or_native_spatial_pyramid" if backend == "timm" else "native_spatial_pyramid")
 
         emb = self.extract_spatial_pyramid_descriptor(rgb)
-        return {"backend": "native_spatial_pyramid", "embedding_dim": int(len(emb)), "embedding": emb}
+        return {
+            "backend": "native_spatial_pyramid", "embedding_dim": int(len(emb)), "embedding": emb,
+            "requested_backbone": backbone, "executed_backbone": None, "pretrained_loaded": False, "weights": None,
+        }
+
+    @staticmethod
+    def _remove_torchvision_classifier(model: Any, nn: Any) -> None:
+        """Remove a recognized final classification layer and keep pooling or normalization."""
+        for name in ("fc", "head", "heads", "classifier"):
+            head = getattr(model, name, None)
+            if isinstance(head, nn.Linear):
+                setattr(model, name, nn.Identity())
+                return
+            if isinstance(head, nn.Sequential):
+                layers = list(head.named_children())
+                for layer_name, layer in reversed(layers):
+                    if isinstance(layer, nn.Linear):
+                        setattr(head, layer_name, nn.Identity())
+                        return
+        raise ModelTrainingError("No supported classification head was found for this vision backbone.")
 
     def zero_shot_classify(
         self,
@@ -432,6 +444,9 @@ class VisionFoundationHub:
         return {
             "backend": next(iter(backends)),
             "pretrained_requested": pretrained,
+            "pretrained_loaded": res.get("pretrained_loaded", False),
+            "executed_backbone": res.get("executed_backbone"),
+            "weights": res.get("weights"),
             "n_samples": len(y),
             "embedding_dim": int(X.shape[1]),
             "classes": [str(c) for c in np.unique(y)],

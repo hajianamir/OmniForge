@@ -115,6 +115,7 @@ class ClusteringEngine(BaseOmniForgeModel):
             covariance_type=covariance_type,
             **kwargs,
         )
+        self._constructor_params = {"algorithm": algorithm}
         self.algorithm = algo
         self.n_clusters = int(max(2, n_clusters))
         self.scaler_type = scaler

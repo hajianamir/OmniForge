@@ -225,11 +225,12 @@ def test_successful_binning_does_not_warn(monkeypatch: pytest.MonkeyPatch) -> No
 def _install_broken_vision_backends(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_torch = ModuleType("torch")
     fake_timm = SimpleNamespace(create_model=_fail)
-    fake_models = SimpleNamespace(resnet18=_fail)
+    fake_models = SimpleNamespace(get_model_builder=_fail)
     fake_torchvision = ModuleType("torchvision")
     fake_torchvision.models = fake_models  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
     monkeypatch.setitem(sys.modules, "timm", fake_timm)
+    monkeypatch.setitem(sys.modules, "timm.data", SimpleNamespace(create_transform=Mock(), resolve_model_data_config=Mock()))
     monkeypatch.setitem(sys.modules, "torchvision", fake_torchvision)
     monkeypatch.setitem(sys.modules, "torchvision.models", fake_models)
     monkeypatch.setitem(sys.modules, "open_clip", SimpleNamespace(create_model_and_transforms=_fail))
@@ -297,7 +298,7 @@ def test_absent_vision_backends_do_not_warn(monkeypatch: pytest.MonkeyPatch) -> 
 
 def test_successful_vision_backend_does_not_warn(monkeypatch: pytest.MonkeyPatch) -> None:
     class Tensor:
-        def permute(self, *args: Any) -> Tensor:
+        def detach(self) -> Tensor:
             return self
 
         def unsqueeze(self, *args: Any) -> Tensor:
@@ -316,8 +317,11 @@ def test_successful_vision_backend_does_not_warn(monkeypatch: pytest.MonkeyPatch
         def __call__(self, *args: Any) -> Tensor:
             return Tensor()
 
-    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(from_numpy=lambda array: Tensor(), no_grad=contextlib.nullcontext))
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(inference_mode=contextlib.nullcontext))
     monkeypatch.setitem(sys.modules, "timm", SimpleNamespace(create_model=lambda *args, **kwargs: Model()))
+    monkeypatch.setitem(sys.modules, "timm.data", SimpleNamespace(
+        create_transform=lambda **kwargs: lambda image: Tensor(), resolve_model_data_config=lambda model: {},
+    ))
     monkeypatch.setattr(foundation, "is_package_available", lambda name: name in {"timm", "torch"})
     log = Mock()
     monkeypatch.setattr(foundation, "logger", log)

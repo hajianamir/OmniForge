@@ -3,7 +3,7 @@
 Provides transparent mathematical representations for:
     - Baseline models (mean/median/prior constants, Ridge linear, Logistic sigmoid, Decision Stumps, Forecasting rules).
     - Neural Networks / Deep Learning (MLP, 1D-CNN, Tabular Transformer, GCN message passing) with exact layer
-      forward-pass equations, trainable parameter counts, weight norms, and high-fidelity linear surrogate formulas.
+      architecture descriptions, parameter counts, weight norms, and linear surrogate formulas with measured agreement.
     - Advanced Classical & Ensemble Engines (Random Forest, Extra Trees, Gradient Boosting, XGBoost, LightGBM,
       CatBoost, SVM, KNN, Voting/Stacking Ensembles) with exact additive/ensemble equations, representative
       tree rules, feature importances, and global linear surrogate formulas.
@@ -19,6 +19,7 @@ import pandas as pd
 from pydantic import BaseModel, Field, model_validator
 from sklearn.linear_model import Ridge as SklearnRidge
 from sklearn.metrics import r2_score
+from sklearn.preprocessing import StandardScaler
 from sklearn.tree import export_text
 
 from omniforge.core.logging import get_logger
@@ -121,11 +122,24 @@ def _build_external_deployment_formulas(
     coefficients: dict[str, float],
     surrogate_r2: float | None = None,
     is_surrogate: bool = False,
+    validation: dict[str, Any] | None = None,
+    response_class: str | int | float | bool | None = None,
 ) -> dict[str, str]:
     """Generate zero-dependency standalone Python, Excel, SQL, and C/MATLAB deployment formulas."""
     is_clf = "classification" in str(task_type).lower()
+    validation = validation or {}
+    encoding = validation.get("input_encoding", {})
+    response = validation.get("response_class", response_class)
+    number_format = ".8f" if validation else ".17g"
     use_sigmoid = is_clf and (equation_type == "exact_closed_form")
     b0 = float(intercept) if (intercept is not None and math.isfinite(float(intercept))) else 0.0
+
+    if intercept is None:
+        return {
+            "formula_python": "", "formula_excel": "", "formula_sql": "", "formula_c_matlab": "",
+            "formula_c": "", "formula_matlab": "",
+            "external_usage_summary": "Portable evaluation is unavailable for this structural equation.",
+        }
 
     # Keep all non-trivial physical coefficients sorted by magnitude
     terms = [
@@ -138,44 +152,50 @@ def _build_external_deployment_formulas(
     used_terms = [kv for kv in terms if abs(float(kv[1])) > 1e-12]
     safe_tgt = _safe_identifier(target_name)
 
-    if not used_terms and intercept is None:
-        return {
-            "formula_python": (
-                f"# Model: {model_name!r} ({equation_type!r})\n"
-                f"def predict_{safe_tgt}(row: dict) -> float:\n"
-                f"    \"\"\"Constant / structural model fallback.\"\"\"\n"
-                f"    return {b0:.6f}\n"
-            ),
-            "formula_excel": f"={b0:.6f}",
-            "formula_sql": f"SELECT {b0:.6f} AS predicted_{safe_tgt}\nFROM your_table;",
-            "formula_c_matlab": f"y_hat_{safe_tgt} = {b0:.6f};",
-            "external_usage_summary": (
-                f"Constant prediction rule ({b0:.6f}) for target '{target_name}'."
-            ),
-        }
-
     # 1. Standalone Zero-Dependency Python Function
     py_lines = [
         "# Standalone External Prediction Script — Exported from OmniForge",
-        f"# Model: {model_name!r} | Target: {target_name!r} | Mode: {'Reference-Fitted Analytical Surrogate (R2=' + f'{surrogate_r2:.4f})' if is_surrogate and surrogate_r2 is not None else ('Analytical Formula' if is_surrogate else 'Closed-Form Expression')}",
+        f"# Model: {model_name!r} | Target: {target_name!r} | Mode: {'Reference-held-out surrogate' if validation else ('Analytical Formula' if is_surrogate else 'Closed-Form Expression')}",
+        f"# Response class: {response!r}" if response is not None else "# Numeric response",
+        f"# Reserved reference rows: {validation.get('n_evaluation', 0)}" if validation else "# Prepared model feature input",
         "# Zero external libraries required (uses Python standard library only).",
         "import math",
         "",
         f"def predict_{safe_tgt}(row: dict) -> float:",
         "    " + repr(f"Predict {target_name} from input feature values."),
-        f"    val = {b0:.8f}",
+        f"    val = {b0:{number_format}}",
     ]
     for fname, coef in used_terms:
         sign = "+" if coef >= 0 else "-"
-        py_lines.append(f"    val {sign}= {abs(coef):.8f} * float(row.get({fname!r}, 0.0))")
+        rule = encoding.get(fname)
+        if rule and rule["kind"] == "indicator":
+            py_lines.append(f"    raw = row.get({rule['feature']!r})")
+            expression = "float(raw is None)" if rule["category"] is None else f"float(raw is not None and str(raw) == {rule['category']!r})"
+        elif rule:
+            py_lines.extend([
+                f"    raw = row.get({rule['feature']!r})",
+                "    try:",
+                "        numeric = float(raw)",
+                "    except (TypeError, ValueError):",
+                "        numeric = math.nan",
+            ])
+            expression = f"(numeric if math.isfinite(numeric) else {rule['fill']!r})"
+        else:
+            expression = f"float(row.get({fname!r}, 0.0))"
+        py_lines.append(f"    val {sign}= {abs(coef):{number_format}} * {expression}")
     if use_sigmoid:
-        py_lines.append("    z = max(-500.0, min(500.0, val))")
-        py_lines.append("    return 1.0 / (1.0 + math.exp(-z))  # Probability P(y=1 | x)")
+        py_lines.extend([
+            "    if val >= 0.0:",
+            "        return 1.0 / (1.0 + math.exp(-val))",
+            "    exp_val = math.exp(val)",
+            "    return exp_val / (1.0 + exp_val)",
+        ])
     elif is_clf and is_surrogate:
-        py_lines.append("    return max(0.0, min(1.0, val))  # Approximate probability P(y=1 | x)")
+        py_lines.append("    return max(0.0, min(1.0, val))  # Approximate probability of the response class")
     else:
         py_lines.append("    return val")
-    sample_dict = ", ".join(f"{fname!r}: 0.0" for fname, _ in used_terms[:5])
+    sample_features = dict.fromkeys(encoding[fname]["feature"] if fname in encoding else fname for fname, _ in used_terms)
+    sample_dict = ", ".join(f"{feature!r}: 0.0" for feature in list(sample_features)[:5])
     py_lines.extend([
         "",
         'if __name__ == "__main__":',
@@ -185,16 +205,16 @@ def _build_external_deployment_formulas(
     formula_python = "\n".join(py_lines)
 
     # 2. Microsoft Excel Formula (with Column Mapping Guide)
-    excel_parts = [f"{b0:.6f}"]
+    excel_parts = [f"{b0:{number_format}}"]
     col_map: list[str] = []
     for idx, (fname, coef) in enumerate(used_terms):
         col_let = _excel_col_letter(idx)
         sign = " + " if coef >= 0 else " - "
-        excel_parts.append(f"{sign}({abs(coef):.6f} * {col_let}2)")
+        excel_parts.append(f"{sign}({abs(coef):{number_format}} * {col_let}2)")
         col_map.append(f"{col_let}2={fname}")
     raw_excel_expr = "".join(excel_parts)
     if use_sigmoid:
-        excel_formula_line = f"=1/(1+EXP(-({raw_excel_expr})))"
+        excel_formula_line = f"=IF(({raw_excel_expr})>=0,1/(1+EXP(-({raw_excel_expr}))),EXP({raw_excel_expr})/(1+EXP({raw_excel_expr})))"
     elif is_clf and is_surrogate:
         excel_formula_line = f"=MIN(1, MAX(0, {raw_excel_expr}))"
     else:
@@ -205,27 +225,23 @@ def _build_external_deployment_formulas(
     )
 
     # 3. ANSI SQL SELECT Expression
-    sql_parts = [f"    {b0:.6f}"]
+    sql_parts = [f"    {b0:{number_format}}"]
     for fname, coef in used_terms:
         sign = "+" if coef >= 0 else "-"
         q_col = '"' + fname.replace('"', '""') + '"'
-        sql_parts.append(f"    {sign} {abs(coef):.6f} * COALESCE({q_col}, 0.0)")
+        sql_parts.append(f"    {sign} {abs(coef):{number_format}} * COALESCE({q_col}, 0.0)")
     sql_body = "\n".join(sql_parts)
     if use_sigmoid:
         formula_sql = (
-            "SELECT\n"
-            "  1.0 / (1.0 + EXP(-(\n"
-            f"{sql_body}\n"
-            f"  ))) AS predicted_prob_{safe_tgt}\n"
-            "FROM your_table;"
+            "SELECT CASE WHEN score_value >= 0 THEN 1.0 / (1.0 + EXP(-score_value)) "
+            f"ELSE EXP(score_value) / (1.0 + EXP(score_value)) END AS predicted_prob_{safe_tgt}\n"
+            f"FROM (SELECT ({sql_body}) AS score_value FROM your_table) AS prepared_inputs;"
         )
     elif is_clf and is_surrogate:
         formula_sql = (
             "SELECT\n"
-            "  LEAST(1.0, GREATEST(0.0,\n"
-            f"{sql_body}\n"
-            f"  )) AS predicted_prob_{safe_tgt}\n"
-            "FROM your_table;"
+            f"  CASE WHEN score_value < 0 THEN 0.0 WHEN score_value > 1 THEN 1.0 ELSE score_value END AS predicted_prob_{safe_tgt}\n"
+            f"FROM (SELECT ({sql_body}) AS score_value FROM your_table) AS surrogate_inputs;"
         )
     else:
         formula_sql = (
@@ -237,45 +253,48 @@ def _build_external_deployment_formulas(
         )
 
     # 4. C / MATLAB / JavaScript / PLC Structured-Text Formula
-    cm_parts = [f"{b0:.6f}"]
-    for fname, coef in used_terms:
+    cm_parts = [f"{b0:{number_format}}"]
+    cm_names: dict[str, str] = {}
+    for index, (fname, coef) in enumerate(used_terms, start=1):
         sign = " + " if coef >= 0 else " - "
-        cm_parts.append(f"{sign}{abs(coef):.6f} * {_safe_identifier(fname)}")
+        name = f"feature_{index}"
+        cm_names[name] = fname
+        cm_parts.append(f"{sign}{abs(coef):{number_format}} * {name}")
     cm_expr = "".join(cm_parts)
+    output = f"y_hat_{safe_tgt}"
     if use_sigmoid:
-        formula_c_matlab = f"z = {cm_expr};\ny_prob_{safe_tgt} = 1.0 / (1.0 + exp(-z));"
+        formula_c = f"double z = {cm_expr};\ndouble {output} = z >= 0 ? 1.0 / (1.0 + exp(-z)) : exp(z) / (1.0 + exp(z));"
+        formula_matlab = f"z = {cm_expr};\nif z >= 0\n    {output} = 1.0 / (1.0 + exp(-z));\nelse\n    {output} = exp(z) / (1.0 + exp(z));\nend"
+    elif is_clf and is_surrogate:
+        formula_c = f"double {output} = fmin(1.0, fmax(0.0, {cm_expr}));"
+        formula_matlab = f"{output} = min(1.0, max(0.0, {cm_expr}));"
     else:
-        formula_c_matlab = f"y_hat_{safe_tgt} = {cm_expr};"
+        formula_c = f"double {output} = {cm_expr};"
+        formula_matlab = f"{output} = {cm_expr};"
+    if cm_names:
+        mapping = repr(cm_names).replace("*/", "* /")
+        formula_c = f"/* Prepared inputs {mapping} */\n" + formula_c
+        formula_matlab = f"% Prepared inputs {mapping}\n" + formula_matlab
+    formula_c_matlab = f"C (requires math.h for probability expressions)\n{formula_c}\n\nMATLAB\n{formula_matlab}"
 
-    if not is_surrogate and equation_type == "exact_closed_form":
+    if validation:
+        score_text = f"R² {surrogate_r2:.4f}" if surrogate_r2 is not None else "R² unavailable for this response"
         summary = (
-            f"EXACT CLOSED-FORM RELATIONSHIP (100% mathematically identical to the fitted {model_name} engine). "
-            f"Copy the standalone Python, Excel, SQL, or MATLAB/C equation to compute '{target_name}' outside OmniForge with zero approximation error."
-        )
-    elif surrogate_r2 is not None:
-        fidelity_band = (
-            "Very High Fidelity (safe for direct external analytical deployment)"
-            if surrogate_r2 >= 0.90
-            else (
-                "Moderate-High Fidelity (captures primary linear trend; non-linear interactions exist — inspect Decision Rules or Python code)"
-                if surrogate_r2 >= 0.70
-                else "Approximate Global Linear Trend (strong non-linearities/interactions present — use full Decision Rules or Exact Python Tree/Model export for precision)"
-            )
-        )
-        summary = (
-            f"NON-LINEAR MODEL ({model_name}) + PORTABLE CLOSED-FORM ANALYTICAL FORMULA (Surrogate Fidelity R² = {surrogate_r2:.4f} — {fidelity_band}). "
-            f"Includes {len(used_terms)} physical-unit feature coefficients for immediate external use in Python, Excel, SQL, or MATLAB/PLC."
+            f"Analytical surrogate for {model_name}. Measured {score_text} on {validation['n_evaluation']} reserved reference rows "
+            f"after fitting on {validation['n_fit']}. Python accepts raw input and applies the stored encoding. "
+            "Spreadsheet, SQL, and C/MATLAB expressions require the prepared features in the mapping. "
+            "The measured agreement applies to the sampled reference distribution."
         )
     else:
-        summary = (
-            f"Portable analytical formula for {model_name} with {len(used_terms)} physical-unit feature coefficients ready for external deployment."
-        )
+        summary = f"Analytical expression for {model_name} over {len(used_terms)} prepared model features."
 
     return {
         "formula_python": formula_python,
         "formula_excel": formula_excel,
         "formula_sql": formula_sql,
         "formula_c_matlab": formula_c_matlab,
+        "formula_c": formula_c,
+        "formula_matlab": formula_matlab,
         "external_usage_summary": summary,
     }
 
@@ -307,6 +326,10 @@ class ModelEquationReport(BaseModel):
     surrogate_plain_equation: str | None = None
     surrogate_latex_equation: str | None = None
     surrogate_fidelity_r2: float | None = None
+    surrogate_validation: dict[str, Any] = Field(default_factory=dict)
+    response_class: str | int | float | bool | None = None
+    formula_c: str = ""
+    formula_matlab: str = ""
     intercept: float | None = None
     parameter_count: int | None = None
     coefficients_table: list[dict[str, Any]] = Field(default_factory=list)
@@ -316,6 +339,8 @@ class ModelEquationReport(BaseModel):
 
     @model_validator(mode="after")
     def _sync_formula_aliases(self) -> ModelEquationReport:
+        if self.response_class is None:
+            self.response_class = self.surrogate_validation.get("response_class")
         if not self.formula_plain:
             self.formula_plain = self.plain_equation or self.surrogate_plain_equation or ""
         if not self.formula_latex:
@@ -369,6 +394,8 @@ class ModelEquationReport(BaseModel):
                 coefficients=ext_coefs,
                 surrogate_r2=self.surrogate_fidelity_r2,
                 is_surrogate=is_surr,
+                validation=self.surrogate_validation,
+                response_class=self.response_class,
             )
             if not self.formula_python:
                 self.formula_python = self.exact_python_rules or ext["formula_python"]
@@ -378,9 +405,19 @@ class ModelEquationReport(BaseModel):
                 self.formula_sql = ext["formula_sql"]
             if not self.formula_c_matlab:
                 self.formula_c_matlab = ext["formula_c_matlab"]
+            if not self.formula_c:
+                self.formula_c = ext["formula_c"]
+            if not self.formula_matlab:
+                self.formula_matlab = ext["formula_matlab"]
             if not self.external_usage_summary:
                 self.external_usage_summary = ext["external_usage_summary"]
         return self
+
+
+def _parameter_array(value: Any) -> np.ndarray:
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value, dtype=float)
 
 
 class ModelEquationExtractor:
@@ -412,7 +449,11 @@ class ModelEquationExtractor:
         cls_name = type(model).__name__
         model_name = str(getattr(model, "name", cls_name))
         model_family = str(getattr(model, "model_family", "generic"))
-        task_val = getattr(model, "task_type", TaskType.REGRESSION)
+        task_val = getattr(model, "task_type", None)
+        if task_val is None:
+            labels = getattr(model, "classes_", None)
+            task_val = (TaskType.REGRESSION if labels is None else
+                        TaskType.MULTICLASS_CLASSIFICATION if len(labels) > 2 else TaskType.BINARY_CLASSIFICATION)
         task_str = task_val.value if isinstance(task_val, TaskType) else str(task_val)
         is_clf = task_val in (TaskType.BINARY_CLASSIFICATION, TaskType.MULTICLASS_CLASSIFICATION)
 
@@ -433,6 +474,7 @@ class ModelEquationExtractor:
         if cls_name in {"RidgeLinearBaseline", "LassoLinearBaseline", "LogisticBaseline", "_ParametricRefWrapper"}:
             return cls._extract_linear_model(
                 estimator=getattr(model, "_model", None),
+                class_labels=getattr(model, "classes_", None),
                 scaler=getattr(model, "_scaler", None),
                 model_name=model_name,
                 model_family=model_family,
@@ -503,6 +545,7 @@ class ModelEquationExtractor:
             if algo in {"ridge", "lasso", "elasticnet", "logistic_regression"} and est is not None:
                 return cls._extract_linear_model(
                     estimator=est,
+                    class_labels=getattr(model, "classes_", None),
                     scaler=getattr(model, "_scaler", None),
                     model_name=model_name,
                     model_family=model_family,
@@ -531,18 +574,26 @@ class ModelEquationExtractor:
         # 5b. Unwrap scikit-learn Pipeline / Stacking / Voting / Raw Linear / Tree / Boosting estimators (AutoML Champions)
         unwrapped_est = model
         unwrapped_scaler = None
-        if hasattr(model, "named_steps") and isinstance(getattr(model, "named_steps", None), dict):
-            steps_list = list(model.named_steps.values())
-            for st_obj in steps_list[:-1]:
-                if hasattr(st_obj, "mean_") and hasattr(st_obj, "scale_"):
-                    unwrapped_scaler = st_obj
-            if steps_list:
-                unwrapped_est = steps_list[-1]
+        preprocessing = []
+        named_steps = getattr(model, "named_steps", None)
+        if isinstance(named_steps, dict) and named_steps:
+            *preprocessing, unwrapped_est = named_steps.values()
+            if len(preprocessing) == 1 and type(preprocessing[0]) is StandardScaler:
+                scaler = preprocessing[0]
+                if scaler.with_mean and scaler.with_std:
+                    unwrapped_scaler = scaler
         est_cls = type(unwrapped_est).__name__
         est_cls_low = est_cls.lower()
-        if est_cls in {"Ridge", "RidgeCV", "LinearRegression", "Lasso", "LassoCV", "ElasticNet", "ElasticNetCV", "HuberRegressor", "BayesianRidge", "LogisticRegression", "SGDRegressor", "SGDClassifier"} and hasattr(unwrapped_est, "coef_"):
+        linear_regressors = {"Ridge", "RidgeCV", "LinearRegression", "Lasso", "LassoCV", "ElasticNet", "ElasticNetCV", "HuberRegressor", "BayesianRidge", "SGDRegressor"}
+        exact_binary_sgd = (
+            est_cls == "SGDClassifier" and getattr(unwrapped_est, "loss", None) == "log_loss"
+            and len(getattr(unwrapped_est, "classes_", ())) == 2
+        )
+        exact_linear = est_cls in linear_regressors or est_cls == "LogisticRegression" or exact_binary_sgd
+        if exact_linear and hasattr(unwrapped_est, "coef_") and (not preprocessing or unwrapped_scaler is not None):
             return cls._extract_linear_model(
                 estimator=unwrapped_est,
+                class_labels=getattr(model, "classes_", None),
                 scaler=unwrapped_scaler,
                 model_name=model_name,
                 model_family=est_cls,
@@ -553,7 +604,7 @@ class ModelEquationExtractor:
                 is_clf=is_clf,
                 max_terms=max_terms,
             )
-        if est_cls in {"DecisionTreeRegressor", "DecisionTreeClassifier"} and hasattr(unwrapped_est, "tree_"):
+        if not preprocessing and est_cls in {"DecisionTreeRegressor", "DecisionTreeClassifier"} and hasattr(unwrapped_est, "tree_"):
             return cls._extract_decision_tree_model(
                 tree_est=unwrapped_est,
                 model=model,
@@ -719,6 +770,7 @@ class ModelEquationExtractor:
         cls,
         *,
         estimator: Any,
+        class_labels: Any = None,
         scaler: Any,
         model_name: str,
         model_family: str,
@@ -786,16 +838,19 @@ class ModelEquationExtractor:
         coef_rows.sort(key=lambda r: abs(float(r["Standardized Weight (w)"])), reverse=True)
 
         t_tex = _escape_latex(target_name)
-        classes = getattr(estimator, "classes_", None)
+        classes = class_labels if class_labels is not None else getattr(estimator, "classes_", None)
         notes: list[str] = [
-            "Coefficients are inverted back to ORIGINAL feature units so you can substitute raw feature values directly.",
+            "Coefficients are expressed in the prepared feature units before estimator scaling.",
             "Standardized weights (w) measure relative impact per 1-standard-deviation change in each feature.",
         ]
         arch_plain: list[str] = []
         arch_latex: list[str] = []
 
+        pos_cls = None
         if is_clf and not is_multiclass:
-            pos_cls = classes[1] if (classes is not None and len(classes) >= 2) else 1
+            pos_cls = classes[1] if classes is not None and len(classes) == 2 else None
+            if isinstance(pos_cls, np.generic):
+                pos_cls = pos_cls.item()
             lhs_p = f"P({target_name} = {pos_cls} | x)"
             lhs_l = rf"P(\text{{{t_tex}}} = \text{{{_escape_latex(str(pos_cls))}}} \mid x)"
             plain, latex = _build_linear_strings(
@@ -873,12 +928,14 @@ class ModelEquationExtractor:
             category=category,
             target_name=target_name,
             task_type=task_str,
-            equation_type="exact_closed_form",
+            equation_type="multiclass_softmax_structure" if is_multiclass else "exact_closed_form",
+            response_class=pos_cls,
+            coefficients={} if is_multiclass else dict(zip(names, beta_orig.astype(float).tolist(), strict=True)),
             plain_equation=plain,
             latex_equation=latex,
             architecture_equations=arch_plain,
             architecture_latex=arch_latex,
-            intercept=round(beta0_orig, 6),
+            intercept=None if is_multiclass or (is_clf and pos_cls is None) else beta0_orig,
             parameter_count=param_count,
             coefficients_table=coef_rows,
             explanation_notes=notes,
@@ -929,7 +986,7 @@ class ModelEquationExtractor:
         plain = f"{target_name}_hat(x) = sum_{{m=1..{max(1, n_leaves)}}} c_m * I(x in R_m)   [Piecewise Decision Tree: depth={depth}, leaves={n_leaves}]"
         latex = rf"\widehat{{\text{{{t_tex}}}}}(x) = \sum_{{m=1}}^{{{max(1, n_leaves)}}} c_m \, \mathbb{{I}}(x \in R_m)"
 
-        surr_plain, surr_latex, surr_r2, _, surr_b0, surr_coefs = cls._fit_linear_surrogate(
+        surr_plain, surr_latex, surr_r2, _, surr_b0, surr_coefs, surr_metadata = cls._fit_linear_surrogate(
             model, X_reference, feature_names, target_name, is_clf, max_terms=max_terms
         )
         return ModelEquationReport(
@@ -944,6 +1001,7 @@ class ModelEquationExtractor:
             surrogate_plain_equation=surr_plain,
             surrogate_latex_equation=surr_latex,
             surrogate_fidelity_r2=surr_r2,
+            surrogate_validation=surr_metadata,
             surrogate_intercept=surr_b0,
             surrogate_coefficients=surr_coefs,
             intercept=surr_b0,
@@ -1143,67 +1201,67 @@ class ModelEquationExtractor:
                 head_b = np_params.get("b_head")
 
             if tok_w is not None:
-                tok_w = np.asarray(tok_w, dtype=float)
-                total_params += int(tok_w.size)
+                tok_w = _parameter_array(tok_w)
+                n_token_params = int(tok_w.size + (0 if tok_b is None else _parameter_array(tok_b).size))
+                total_params += n_token_params
                 layer_rows.append(
                     {
                         "Layer": "Feature Tokenizer",
                         "Weight Shape": f"{tok_w.shape[0]} features -> d_model={d_model}",
                         "Activation": "Linear Token Projection",
-                        "Parameters": int(tok_w.size),
+                        "Parameters": n_token_params,
                         "||W||_F": round(float(np.linalg.norm(tok_w)), 4),
-                        "||b||_2": round(float(np.linalg.norm(np.asarray(tok_b, dtype=float) if tok_b is not None else 0.0)), 4),
+                        "||b||_2": round(float(np.linalg.norm(_parameter_array(tok_b) if tok_b is not None else 0.0)), 4),
                     }
                 )
             if blocks:
                 for b_i, blk in enumerate(blocks, start=1):
-                    blk_p = 0
-                    wq = 0.0
-                    if hasattr(blk, "attn") and hasattr(blk.attn, "in_proj_weight"):
-                        wq = blk.attn.in_proj_weight
-                        blk_p += int(np.asarray(wq).size)
-                    if hasattr(blk, "ffn_in") and hasattr(blk.ffn_in, "weight"):
-                        blk_p += int(np.asarray(blk.ffn_in.weight).size)
-                    if hasattr(blk, "ffn_out") and hasattr(blk.ffn_out, "weight"):
-                        blk_p += int(np.asarray(blk.ffn_out.weight).size)
-                    total_params += blk_p
+                    wq = blk.attn.in_proj_weight
                     layer_rows.append(
                         {
                             "Layer": f"Transformer Block {b_i}",
                             "Weight Shape": f"d_model={d_model}, heads={n_heads} (d_k={d_k})",
-                            "Activation": "MHA + LayerNorm + GELU FFN",
-                            "Parameters": blk_p,
-                            "||W||_F": round(float(np.linalg.norm(np.asarray(wq, dtype=float))), 4) if wq is not None else 0.0,
-                            "||b||_2": 0.0,
+                            "Activation": "Pre-Norm MHA + GEGLU FFN",
+                            "Parameters": sum(p.numel() for p in blk.parameters()),
+                            "Attention input projection ||W||_F": round(float(np.linalg.norm(_parameter_array(wq))), 4),
                         }
                     )
             if head_w is not None:
-                head_w = np.asarray(head_w, dtype=float)
-                head_b = np.asarray(head_b, dtype=float) if head_b is not None else np.zeros((head_w.shape[1],), dtype=float)
+                head_w = _parameter_array(head_w)
+                head_b = _parameter_array(head_b) if head_b is not None else np.empty(0)
+                head_in, head_out = head_w.shape[::-1] if torch_net is not None else head_w.shape
                 n_p = int(head_w.size + head_b.size)
                 total_params += n_p
                 layer_rows.append(
                     {
                         "Layer": "Prediction Head",
-                        "Weight Shape": f"{head_w.shape[0]} -> {head_w.shape[1]}",
+                        "Weight Shape": f"{head_in} -> {head_out}",
                         "Activation": "Softmax" if is_clf else "Linear",
                         "Parameters": n_p,
                         "||W||_F": round(float(np.linalg.norm(head_w)), 4),
                         "||b||_2": round(float(np.linalg.norm(head_b)), 4),
                     }
                 )
+            if torch_net is not None:
+                total_params = sum(p.numel() for p in torch_net.parameters())
+                readout_plain = "ReLU(LayerNorm(T_CLS^(L)))"
+                readout_latex = rf"\mathrm{{ReLU}}\!\left(\mathrm{{LayerNorm}}(T_{{\mathrm{{CLS}}}}^{{({n_layers})}})\right)"
+            else:
+                total_params = sum(array.size for array in np_params.values() if isinstance(array, np.ndarray))
+                readout_plain = "concat(LayerNorm(T_CLS^(L)), z)"
+                readout_latex = rf"\mathrm{{concat}}\!\left(\mathrm{{LayerNorm}}(T_{{\mathrm{{CLS}}}}^{{({n_layers})}}), z\right)"
             arch_plain.extend(
                 [
                     f"Feature Tokenization:  T_j = z_j * w_j + b_j   (each scalar feature mapped into R^{d_model})",
                     f"Multi-Head Self-Attention ({n_layers} layers, {n_heads} heads, d_k={d_k}):  Attn(Q,K,V) = softmax(Q K^T / sqrt({d_k})) V",
-                    f"Residual LayerNorm + FFN + Mean Token Pooling -> {target_name}_hat = MLP_head(MeanPool(T^(L)))",
+                    f"Pre-Norm residual blocks + [CLS] readout -> Linear_head({readout_plain})",
                 ]
             )
             arch_latex.extend(
                 [
                     rf"T_j^{{(0)}} = z_j w_j + b_j \in \mathbb{{R}}^{{{d_model}}}",
                     rf"\mathrm{{Attn}}(Q,K,V) = \mathrm{{softmax}}\!\left(\frac{{QK^\top}}{{\sqrt{{{d_k}}}}}\right)V",
-                    rf"\widehat{{\text{{{t_tex}}}}} = \mathrm{{MLP}}_{{\text{{head}}}}\!\left(\mathrm{{MeanPool}}\!\left(\mathrm{{LayerNorm}}(T^{{({n_layers})}})\right)\right)",
+                    rf"\mathrm{{Linear}}_{{\text{{head}}}}\!\left({readout_latex}\right)",
                 ]
             )
             plain = f"{target_name}_hat = FT-Transformer[d_model={d_model}, heads={n_heads}, layers={n_layers}](z)"
@@ -1214,14 +1272,32 @@ class ModelEquationExtractor:
             h_dim = int(getattr(model, "hidden_dim", 32))
             n_hops = int(getattr(model, "n_hops", 2))
             knn_k = int(getattr(model, "knn_k", 5))
+            graph_net = getattr(model, "_torch_net", None)
+            architecture = str(getattr(model, "architecture", "gcn"))
+            algorithm = {"gcn": "GCN", "graphsage": "GraphSAGE", "gat": "GAT"}[architecture]
+            if architecture == "gat":
+                graph_rule = "Attention is normalized over adjacent nodes and self-loops for each head."
+                aggregation = "ELU(concat_heads(sum_j alpha_ij W_head h_j))"
+                aggregation_latex = r"\mathrm{ELU}\!\left(\mathop{\mathrm{concat}}_m\left[\sum_j\alpha_{ij}^{(m)} W^{(m)}h_j\right]\right)"
+            elif architecture == "graphsage":
+                graph_rule = "Neighbor means use row-normalized adjacency."
+                aggregation = "ReLU(concat(H, D^-1 A H) W + b)"
+                aggregation_latex = r"\mathrm{ReLU}\!\left(\mathrm{concat}(H,D^{-1}AH)W+b\right)"
+            else:
+                graph_rule = "Graph convolution uses symmetric normalization of adjacency with self-loops."
+                aggregation = "ReLU(D^-1/2 (A + I) D^-1/2 (H W + b))"
+                aggregation_latex = r"\mathrm{ReLU}\!\left(D^{-1/2}(A+I)D^{-1/2}(HW+b)\right)"
+            if graph_net is None:
+                aggregation = aggregation.replace(" + b", "")
+                aggregation_latex = aggregation_latex.replace("+b", "")
             for hop_i, pw in enumerate(getattr(model, "_proj_weights", []), start=1):
                 pwa = np.asarray(pw, dtype=float)
                 total_params += int(pwa.size)
                 layer_rows.append(
                     {
-                        "Layer": f"GCN Hop {hop_i}",
+                        "Layer": f"{algorithm} fixed projection {hop_i}",
                         "Weight Shape": f"{pwa.shape[0]} -> {pwa.shape[1]}",
-                        "Activation": "A_tilde @ H @ W + ReLU",
+                        "Activation": aggregation,
                         "Parameters": int(pwa.size),
                         "||W||_F": round(float(np.linalg.norm(pwa)), 4),
                         "||b||_2": 0.0,
@@ -1242,23 +1318,19 @@ class ModelEquationExtractor:
                             "||b||_2": round(float(np.linalg.norm(b)), 4),
                         }
                     )
-            arch_plain.extend(
-                [
-                    f"k-NN Similarity Graph (k={knn_k}):  A_tilde = D^(-1/2) (A + I) D^(-1/2)",
-                    f"Multi-Hop Graph Convolution ({n_hops} hops, dim={h_dim}):  H^(l) = ReLU(A_tilde H^(l-1) W^(l))",
-                    f"Node Readout Head:  {target_name}_hat = MLP_head(H^({n_hops}))",
-                ]
-            )
-            arch_latex.extend(
-                [
-                    r"\tilde{A} = D^{-1/2}(A + I)D^{-1/2}",
-                    rf"H^{{(l)}} = \mathrm{{ReLU}}\!\left(\tilde{{A}}\, H^{{(l-1)}} W^{{(l)}}\right), \quad l = 1,\dots,{n_hops}",
-                    rf"\widehat{{\text{{{t_tex}}}}} = \mathrm{{MLP}}_{{\text{{head}}}}\!\left(H^{{({n_hops})}}\right)",
-                ]
-            )
-            plain = f"{target_name}_hat = GCN[hops={n_hops}, knn_k={knn_k}, hidden={h_dim}](A_tilde, z)"
-            latex = rf"\widehat{{\text{{{t_tex}}}}} = \mathrm{{MLP}}_{{\text{{head}}}}\!\left(\mathrm{{GCN}}_{{{n_hops}\text{{-hop}}}}(\tilde{{A}}, z)\right)"
-            notes.append(f"Graph Convolutional Network propagating messages across k={knn_k} nearest neighbors for {n_hops} hops.")
+            if graph_net is None:
+                readout = "MLP head over the input and every fixed projection"
+                algorithm += " fixed projection"
+            else:
+                readout = "Linear head over the final graph layer"
+            arch_plain.extend([graph_rule, f"H^(l) = {aggregation}", readout])
+            arch_latex.append(rf"H^{{(l)}} = {aggregation_latex}, \quad l = 1,\dots,{n_hops}")
+            plain = f"{target_name}_hat = {algorithm}[hops={n_hops}, hidden={h_dim}](A, z)"
+            latex = rf"\widehat{{\text{{{t_tex}}}}} = \mathrm{{Readout}}\!\left(\mathrm{{{algorithm}}}_{{{n_hops}\text{{-hop}}}}(A, z)\right)"
+            if getattr(model, "_reference_features", None) is None:
+                notes.append("This fitted model requires adjacency aligned to the inference nodes.")
+            else:
+                notes.append(f"Each prediction uses a local graph from up to {knn_k} stored training neighbors.")
 
         # Fallback inspection for PyTorch backends (_torch_net / _torch_model on model or head) when NumPy buffers are absent
         if not layer_rows:
@@ -1289,14 +1361,16 @@ class ModelEquationExtractor:
                             "||b||_2": round(float(np.linalg.norm(b_arr)), 4),
                         }
                     )
+        if cls_name == "GraphNeuralNetworkModel" and graph_net is not None:
+            total_params = sum(p.numel() for p in graph_net.parameters())
 
-        # Fit high-fidelity Global Linear Surrogate over the network's actual predictions
-        surr_plain, surr_latex, surr_r2, surr_table, surr_b0, surr_coefs = cls._fit_linear_surrogate(
+        # Fit a global linear surrogate to the network's actual predictions.
+        surr_plain, surr_latex, surr_r2, surr_table, surr_b0, surr_coefs, surr_metadata = cls._fit_linear_surrogate(
             model, X_reference, feature_names, target_name, is_clf, max_terms=max_terms
         )
         if surr_r2 is not None:
             notes.append(
-                f"Global Linear Surrogate Equation approximates this neural network's input-output mapping with R² = {surr_r2:.4f} fidelity."
+                f"Global Linear Surrogate Equation approximates this neural network's input-output mapping with held-out reference agreement R² = {surr_r2:.4f}."
             )
 
         return ModelEquationReport(
@@ -1313,6 +1387,7 @@ class ModelEquationExtractor:
             surrogate_plain_equation=surr_plain,
             surrogate_latex_equation=surr_latex,
             surrogate_fidelity_r2=surr_r2,
+            surrogate_validation=surr_metadata,
             surrogate_intercept=surr_b0,
             surrogate_coefficients=surr_coefs,
             intercept=surr_b0,
@@ -1474,7 +1549,7 @@ class ModelEquationExtractor:
             latex = rf"\widehat{{\text{{{t_tex}}}}}(x) = f_{{\text{{{_escape_latex(model_name)}}}}}(x)"
 
         # Extract global linear surrogate equation + combine with native feature_importances_ when present
-        surr_plain, surr_latex, surr_r2, surr_table, surr_b0, surr_coefs = cls._fit_linear_surrogate(
+        surr_plain, surr_latex, surr_r2, surr_table, surr_b0, surr_coefs, surr_metadata = cls._fit_linear_surrogate(
             model, X_reference, feature_names, target_name, is_clf, max_terms=max_terms
         )
         if estimator is not None and hasattr(estimator, "feature_importances_"):
@@ -1501,7 +1576,7 @@ class ModelEquationExtractor:
 
         if surr_r2 is not None:
             notes.append(
-                f"Global Linear Surrogate Equation approximates this engine's learned mapping with R² = {surr_r2:.4f} fidelity — exported as standalone Python, Excel, SQL, and MATLAB/C formulas for external deployment."
+                f"Global Linear Surrogate Equation approximates this engine's learned mapping with held-out reference agreement R² = {surr_r2:.4f} — exported as standalone Python, Excel, SQL, and MATLAB/C formulas for external deployment."
             )
 
         return ModelEquationReport(
@@ -1518,6 +1593,7 @@ class ModelEquationExtractor:
             surrogate_plain_equation=surr_plain,
             surrogate_latex_equation=surr_latex,
             surrogate_fidelity_r2=surr_r2,
+            surrogate_validation=surr_metadata,
             surrogate_intercept=surr_b0,
             surrogate_coefficients=surr_coefs,
             intercept=surr_b0,
@@ -1537,99 +1613,142 @@ class ModelEquationExtractor:
         is_clf: bool,
         *,
         max_terms: int = 10,
-    ) -> tuple[str | None, str | None, float | None, list[dict[str, Any]], float | None, dict[str, float]]:
-        """Fit an interpretable linear surrogate Ridge model on the model's own predictions to expose explicit feature effects."""
+    ) -> tuple[str | None, str | None, float | None, list[dict[str, Any]], float | None, dict[str, float], dict[str, Any]]:
+        """Fit an encoded-input surrogate and measure the exported expression on reserved reference rows."""
+        unavailable: tuple[str | None, str | None, float | None, list[dict[str, Any]], float | None, dict[str, float], dict[str, Any]] = (None, None, None, [], None, {}, {})
         if X_reference is None:
-            return None, None, None, [], None, {}
+            return unavailable
         try:
             if isinstance(X_reference, pd.DataFrame):
-                X_df = X_reference.copy()
-                if feature_names:
-                    present = [c for c in feature_names if c in X_df.columns]
-                    if present:
-                        X_df = X_df[present]
-                if len(X_df) > 400:
-                    X_df = X_df.sample(n=400, random_state=42)
-                X_num_df = X_df.apply(pd.to_numeric, errors="coerce")
-                for col in X_num_df.columns:
-                    if X_num_df[col].isna().all():
-                        codes, _ = pd.factorize(X_df[col].astype(str))
-                        X_num_df[col] = codes.astype(float)
-                    elif X_num_df[col].isna().any():
-                        X_num_df[col] = X_num_df[col].fillna(float(X_num_df[col].median()))
-                X_mat = X_num_df.to_numpy(dtype=float)
-                names = [str(c) for c in X_num_df.columns]
-                X_for_pred: Any = X_df
+                frame = X_reference
+                if feature_names and set(feature_names).issubset(frame.columns):
+                    frame = frame.loc[:, feature_names]
+                if not frame.columns.is_unique:
+                    return unavailable
+                names = [str(name) for name in frame.columns]
+                scoring_input: Any = frame
             else:
-                X_mat = np.asarray(X_reference, dtype=float)
-                if len(X_mat) > 400:
-                    X_mat = X_mat[:400]
-                names = list(feature_names[: X_mat.shape[1]]) if len(feature_names) >= X_mat.shape[1] else [f"x_{i + 1}" for i in range(X_mat.shape[1])]
-                X_for_pred = X_mat
+                values = np.asarray(X_reference, dtype=float)
+                if values.ndim != 2:
+                    return unavailable
+                names = list(feature_names) if len(feature_names) == values.shape[1] else [f"x_{i + 1}" for i in range(values.shape[1])]
+                frame = pd.DataFrame(values, columns=names)
+                scoring_input = values
+            if len(frame) < 5 or not names or len(set(names)) != len(names):
+                return unavailable
 
-            if len(X_mat) < 5 or X_mat.shape[1] == 0:
-                return None, None, None, [], None, {}
+            rng = np.random.default_rng(42)
+            order = rng.permutation(len(frame))[:400]
+            frame = frame.iloc[order]
+            scoring_input = scoring_input.iloc[order] if isinstance(scoring_input, pd.DataFrame) else scoring_input[order]
+            n_evaluation = max(2, len(frame) // 5)
+            n_fit = len(frame) - n_evaluation
 
+            response_class = None
+            escaped = _escape_latex(target_name)
             if is_clf:
-                try:
-                    probs = np.asarray(model.predict_proba(X_for_pred), dtype=float)
-                    y_hat = probs[:, 1] if (probs.ndim == 2 and probs.shape[1] >= 2) else probs.ravel()
-                    lhs_p = f"P_approx({target_name}=1 | x)"
-                    lhs_l = rf"\tilde{{P}}(\text{{{_escape_latex(target_name)}}}=1 \mid x)"
-                except Exception:
-                    y_raw = np.asarray(model.predict(X_for_pred))
-                    codes, _ = pd.factorize(y_raw)
-                    y_hat = codes.astype(float)
-                    lhs_p = f"{target_name}_approx(x)"
-                    lhs_l = rf"\tilde{{\text{{{_escape_latex(target_name)}}}}}(x)"
+                classes = getattr(model, "classes_", None)
+                if classes is None:
+                    classes = getattr(model, "_classes", None)
+                if classes is None or len(classes) < 2:
+                    return unavailable
+                probabilities = np.asarray(model.predict_proba(scoring_input), dtype=float)
+                if (
+                    probabilities.shape != (len(frame), len(classes)) or not np.isfinite(probabilities).all()
+                    or (probabilities < 0).any() or (probabilities > 1).any()
+                    or not np.allclose(probabilities.sum(axis=1), 1, atol=1e-6, rtol=0)
+                ):
+                    return unavailable
+                response_class = classes[1]
+                if isinstance(response_class, np.generic):
+                    response_class = response_class.item()
+                if not isinstance(response_class, (str, int, float, bool)):
+                    return unavailable
+                if isinstance(response_class, float) and not math.isfinite(response_class):
+                    return unavailable
+                y_hat = probabilities[:, 1]
+                lhs_p = f"P_approx({target_name}={response_class!r} | x)"
+                lhs_l = rf"\tilde{{P}}(\text{{{escaped}}}=\text{{{_escape_latex(repr(response_class))}}} \mid x)"
             else:
-                y_hat = np.asarray(model.predict(X_for_pred), dtype=float).ravel()
+                y_hat = np.asarray(model.predict(scoring_input), dtype=float)
                 lhs_p = f"{target_name}_approx(x)"
-                lhs_l = rf"\tilde{{\text{{{_escape_latex(target_name)}}}}}(x)"
+                lhs_l = rf"\tilde{{\text{{{escaped}}}}}(x)"
+            if y_hat.shape != (len(frame),) or not np.isfinite(y_hat).all():
+                return unavailable
 
-            means = np.mean(X_mat, axis=0)
-            stds = np.std(X_mat, axis=0)
+            encoded_names: list[str] = []
+            encoding: dict[str, dict[str, Any]] = {}
+            columns = []
+            reserved = set(names)
+            for i, name in enumerate(names):
+                column = frame.iloc[:, i]
+                if pd.api.types.is_numeric_dtype(column.dtype):
+                    numeric = pd.to_numeric(column, errors="coerce").replace([np.inf, -np.inf], np.nan)
+                    observed = numeric.iloc[:n_fit].dropna()
+                    if observed.empty:
+                        continue
+                    fill = float(observed.median())
+                    columns.append(numeric.fillna(fill).to_numpy(dtype=float))
+                    encoded_names.append(name)
+                    encoding[name] = {"kind": "numeric", "feature": name, "fill": fill}
+                else:
+                    categorical = column.astype("string")
+                    counts = categorical.iloc[:n_fit].value_counts(dropna=False)
+                    for value in counts.index[:32]:
+                        category = None if pd.isna(value) else str(value)
+                        key = f"{name}={category!r}"
+                        while key in reserved:
+                            key += "_"
+                        reserved.add(key)
+                        mask = categorical.isna() if category is None else categorical.eq(category).fillna(False)
+                        columns.append(mask.to_numpy(dtype=float))
+                        encoded_names.append(key)
+                        encoding[key] = {"kind": "indicator", "feature": name, "category": category}
+            if not columns:
+                return unavailable
+
+            matrix = np.column_stack(columns)
+            training, evaluation = matrix[:n_fit], matrix[n_fit:]
+            means = training.mean(axis=0)
+            stds = training.std(axis=0)
             safe_stds = np.where(stds > 1e-12, stds, 1.0)
-            X_std = (X_mat - means) / safe_stds
-
-            surr = SklearnRidge(alpha=1.0).fit(X_std, y_hat)
-            surr_preds = surr.predict(X_std)
-            fidelity = float(r2_score(y_hat, surr_preds)) if float(np.var(y_hat)) > 1e-12 else 1.0
-            fidelity = max(-1.0, min(1.0, fidelity))
-
-            w_std = np.asarray(surr.coef_, dtype=float).ravel()
-            b_std = float(surr.intercept_)
-            beta_raw = w_std / safe_stds
-            beta0_raw = float(b_std - np.sum(w_std * means / safe_stds))
-
-            surr_plain, surr_latex = _build_linear_strings(
-                lhs_p,
-                lhs_l,
-                beta0_raw,
-                list(zip(names, beta_raw, strict=False)),
-                max_terms=max_terms,
-            )
-            total_abs = float(np.sum(np.abs(w_std))) or 1.0
+            surrogate = SklearnRidge(alpha=1.0).fit((training - means) / safe_stds, y_hat[:n_fit])
+            standardized = np.asarray(surrogate.coef_, dtype=float).ravel()
+            raw_coefficients = np.round(standardized / safe_stds, 8)
+            intercept = round(float(surrogate.intercept_ - (standardized * means / safe_stds).sum()), 8)
+            # The same rounded coefficients and clipping are used in each export.
+            predictions = intercept + evaluation @ raw_coefficients
+            if is_clf:
+                predictions = np.clip(predictions, 0.0, 1.0)
+            reference = y_hat[n_fit:]
+            fidelity = float(r2_score(reference, predictions, force_finite=False)) if np.ptp(reference) > 0 else None
+            if fidelity is not None and not math.isfinite(fidelity):
+                fidelity = None
             table: list[dict[str, Any]] = [
-                {
-                    "Feature": fn,
-                    "Surrogate Coef (beta)": round(float(br), 6),
-                    "Standardized Sensitivity": round(float(ws), 6),
-                    "Effect Direction": "Positive (+)" if br > 0 else ("Negative (-)" if br < 0 else "Neutral (0)"),
-                    "Relative Influence %": round(abs(float(ws)) / total_abs * 100.0, 2),
-                }
-                for fn, br, ws in zip(names, beta_raw, w_std, strict=False)
+                {"Feature": name, "Surrogate Coef (beta)": float(coef), "Standardized Sensitivity": round(float(w), 6)}
+                for name, coef, w in zip(encoded_names, raw_coefficients, standardized, strict=True)
             ]
-            table.sort(key=lambda r: abs(float(r["Standardized Sensitivity"])), reverse=True)
-            raw_coef_map = {
-                str(fn): round(float(br), 8)
-                for fn, br in zip(names, beta_raw, strict=False)
-                if math.isfinite(float(br))
+            magnitude = float(np.abs(standardized).sum())
+            for row, weight in zip(table, standardized, strict=True):
+                row["Relative Influence %"] = round(100 * abs(float(weight)) / magnitude, 2) if magnitude else 0.0
+                row["Effect Direction"] = "Positive (+)" if row["Surrogate Coef (beta)"] > 0 else (
+                    "Negative (-)" if row["Surrogate Coef (beta)"] < 0 else "Neutral (0)"
+                )
+            table.sort(key=lambda row: abs(float(row["Standardized Sensitivity"])), reverse=True)
+            coefficients = dict(zip(encoded_names, raw_coefficients.tolist(), strict=True))
+            plain, latex = _build_linear_strings(lhs_p, lhs_l, intercept, list(coefficients.items()), max_terms=max_terms)
+            metadata = {
+                "response_kind": "single_class_probability" if is_clf else "regression_prediction",
+                "response_class": response_class, "scope": "randomly_reserved_reference_rows",
+                "n_fit": n_fit, "n_evaluation": n_evaluation, "coefficient_decimal_places": 8,
+                "mae": float(np.mean(np.abs(reference - predictions))),
+                "rmse": float(np.sqrt(np.mean(np.square(reference - predictions)))),
+                "input_encoding": encoding,
             }
-            return surr_plain, surr_latex, round(fidelity, 4), table, round(beta0_raw, 8), raw_coef_map
+            return plain, latex, fidelity, table, intercept, coefficients, metadata
         except Exception as exc:
-            logger.debug("surrogate_equation_skipped", error=str(exc))
-            return None, None, None, [], None, {}
+            logger.debug("surrogate_equation_skipped", error_type=type(exc).__name__)
+            return unavailable
 
     @classmethod
     def _extract_nonparametric_analytical(
@@ -1647,7 +1766,7 @@ class ModelEquationExtractor:
         max_terms: int,
     ) -> ModelEquationReport:
         """Extract exact non-parametric analytical mathematical equations (B-Spline GAM, Kernel Smoother, RKHS, k-NN, Isotonic)."""
-        surr_plain, surr_latex, surr_r2, surr_table, surr_b0, surr_coefs = cls._fit_linear_surrogate(
+        surr_plain, surr_latex, surr_r2, surr_table, surr_b0, surr_coefs, surr_metadata = cls._fit_linear_surrogate(
             model=model,
             X_reference=X_reference,
             feature_names=feature_names,
@@ -1715,6 +1834,7 @@ class ModelEquationExtractor:
                 surrogate_plain_equation=surr_plain,
                 surrogate_latex_equation=surr_latex,
                 surrogate_fidelity_r2=surr_r2,
+                surrogate_validation=surr_metadata,
                 surrogate_intercept=surr_b0,
                 surrogate_coefficients=surr_coefs,
                 intercept=round(b0, 6),
@@ -1745,6 +1865,7 @@ class ModelEquationExtractor:
                 surrogate_plain_equation=surr_plain,
                 surrogate_latex_equation=surr_latex,
                 surrogate_fidelity_r2=surr_r2,
+                surrogate_validation=surr_metadata,
                 surrogate_intercept=surr_b0,
                 surrogate_coefficients=surr_coefs,
                 parameter_count=n_anc,
@@ -1778,6 +1899,7 @@ class ModelEquationExtractor:
                 surrogate_plain_equation=surr_plain,
                 surrogate_latex_equation=surr_latex,
                 surrogate_fidelity_r2=surr_r2,
+                surrogate_validation=surr_metadata,
                 surrogate_intercept=surr_b0,
                 surrogate_coefficients=surr_coefs,
                 parameter_count=n_sup,
@@ -1805,6 +1927,7 @@ class ModelEquationExtractor:
                 surrogate_plain_equation=surr_plain,
                 surrogate_latex_equation=surr_latex,
                 surrogate_fidelity_r2=surr_r2,
+                surrogate_validation=surr_metadata,
                 surrogate_intercept=surr_b0,
                 surrogate_coefficients=surr_coefs,
                 parameter_count=k_val,
@@ -1840,6 +1963,7 @@ class ModelEquationExtractor:
             surrogate_plain_equation=surr_plain,
             surrogate_latex_equation=surr_latex,
             surrogate_fidelity_r2=surr_r2,
+            surrogate_validation=surr_metadata,
             surrogate_intercept=surr_b0,
             surrogate_coefficients=surr_coefs,
             parameter_count=len(steps),

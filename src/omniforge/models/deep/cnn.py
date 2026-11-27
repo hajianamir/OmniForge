@@ -9,11 +9,12 @@ from sklearn.preprocessing import StandardScaler
 
 from omniforge.core.types import TaskType
 from omniforge.core.utils import is_package_available
+from omniforge.models._torch_state import TorchStateMixin
 from omniforge.models.base import BaseOmniForgeModel
 from omniforge.models.deep.mlp import MLPModel
 
 
-class CNN1DModel(BaseOmniForgeModel):
+class CNN1DModel(TorchStateMixin, BaseOmniForgeModel):
     """Multi-scale 1D Convolutional Neural Network for temporal/signal/tabular classification & regression."""
 
     model_family = "deep_cnn"
@@ -32,7 +33,7 @@ class CNN1DModel(BaseOmniForgeModel):
             name="DeepCNN1D",
             task_type=task_type,
             num_filters=num_filters,
-            kernel_sizes=list(kernel_sizes),
+            kernel_sizes=kernel_sizes,
             epochs=epochs,
             learning_rate=learning_rate,
             **kwargs,
@@ -94,6 +95,26 @@ class CNN1DModel(BaseOmniForgeModel):
         self._head.fit(conv_feats, y)
         self.loss_history_: list[float] = list(self._head.loss_history_)
 
+    _torch_model_attribute = "_torch_model"
+
+    def _build_torch_net(self, in_dim: int, out_dim: int) -> Any:
+        import torch
+        import torch.nn as nn
+
+        k_size = min(max(self.kernel_sizes), in_dim)
+        class _Net(nn.Module):
+            def __init__(self, n_filters: int, kernel: int, out_d: int) -> None:
+                super().__init__()
+                self.conv = nn.Conv1d(1, n_filters, kernel_size=kernel, padding=kernel // 2)
+                self.act = nn.ReLU()
+                self.fc = nn.Linear(n_filters * 2, out_d)
+
+            def forward(self, inp: Any) -> Any:
+                h = self.act(self.conv(inp))
+                pooled = torch.cat([h.mean(dim=-1), h.max(dim=-1).values], dim=-1)
+                return self.fc(pooled)
+        return _Net(self.num_filters, k_size, out_dim)
+
     def _fit_torch(self, X: np.ndarray, y: np.ndarray, is_clf: bool) -> None:
         import torch
         import torch.nn as nn
@@ -112,21 +133,8 @@ class CNN1DModel(BaseOmniForgeModel):
             y_t = torch.tensor(y.astype(np.float32).reshape(-1, 1), dtype=torch.float32)
             out_dim = 1
 
-        k_size = min(max(self.kernel_sizes), X.shape[1])
-
-        class _Net(nn.Module):
-            def __init__(self, n_filters: int, kernel: int, out_d: int) -> None:
-                super().__init__()
-                self.conv = nn.Conv1d(1, n_filters, kernel_size=kernel, padding=kernel // 2)
-                self.act = nn.ReLU()
-                self.fc = nn.Linear(n_filters * 2, out_d)
-
-            def forward(self, inp: Any) -> Any:
-                h = self.act(self.conv(inp))
-                pooled = torch.cat([h.mean(dim=-1), h.max(dim=-1).values], dim=-1)
-                return self.fc(pooled)
-
-        model = _Net(self.num_filters, k_size, out_dim)
+        self._torch_build_config = {"in_dim": X.shape[1], "out_dim": out_dim}
+        model = self._build_torch_net(**self._torch_build_config)
         opt = torch.optim.Adam(model.parameters(), lr=self.learning_rate)
         loss_fn: Any = nn.CrossEntropyLoss() if is_clf else nn.MSELoss()
         X_t = torch.tensor(X.astype(np.float32)).unsqueeze(1)
