@@ -6,8 +6,8 @@ project: OmniForge v4.0.0 (package: omniforge, import root: src/omniforge/)
 audience: Codex and other AI coding agents
 status: Active
 owner: OmniForge maintainers
-last_reviewed: 2026-11-24
-next_review: 2027-02-24
+last_reviewed: 2026-11-27
+next_review: 2027-02-27
 supersedes: agent.md (PDF draft, 2025)
 companion: AGENTS.md (repo root, auto-loaded by Codex; read that first)
 ---
@@ -44,6 +44,12 @@ The repository was **not fully green** at the previously reviewed commit (`3d6de
 | `pytest tests` | **1 failure** (`tests/e2e/test_workbench_spa.py::test_spa_static_bundle_gzip_and_all_13_studios_e2e` - `/s00/data_relationships` returned empty `topological_links`), **1 skip**. |
 
 **Before you start, re-run the gates and record the current baseline** so you do not inherit blame for pre-existing failures.
+### 0.3 Shared agent skills
+
+- [OmniForge](../.agents/skills/omniforge/SKILL.md) covers repository conventions. It and `AGENTS.md` take precedence over generic recommendations.
+- [Modern Web Guidance](../.agents/skills/modern-web-guidance/SKILL.md) is a vendored, optional reference for browser and frontend work. Use the shipped `guides/` when npm or network access is unavailable. Consult the relevant guide and validate browser support in the Workbench before adopting an API. This is not a build or runtime dependency.
+- [`skills-lock.json`](../skills-lock.json) records the upstream source, revision, and skill hash. To update the guidance, refresh the project-local installation on a working branch and review the skill and lockfile together. The [upstream Apache 2.0 license](../.agents/third-party/modern-web-guidance.LICENSE) is included separately so the installed skill tree remains unmodified.
+
 ---
 ## 1. Project identity
 - **Name / edition:** OmniForge - "Enterprise Analytics & AI Workbench". `src/omniforge/version.py` 
