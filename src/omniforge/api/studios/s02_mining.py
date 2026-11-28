@@ -56,9 +56,11 @@ def s02_advanced_mining(
     stability = ClusteringEngine.bootstrap_stability_ari(predictors, n_clusters=max(2, n_clusters), n_bootstraps=15)
     hopkins = ClusteringEngine.hopkins_statistic(predictors)
 
+    numeric = predictors.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan).dropna()
+    numeric_features = list(predictors.select_dtypes(include=[np.number]).columns)
     dcor_results: dict[str, Any] = {}
     if tgt and tgt in df.columns and pd.api.types.is_numeric_dtype(df[tgt]):
-        num_feats = list(predictors.select_dtypes(include=[np.number]).columns[:6])
+        num_feats = numeric_features[:6]
         for col in num_feats:
             dcor_results[col] = distance_correlation(df[col], df[tgt])
 
@@ -68,6 +70,20 @@ def s02_advanced_mining(
         "s02_advanced_mining",
         {
             "target": tgt,
+            "analysis_scope": {
+                "source_rows": len(df),
+                "beam_search": {
+                    "target_numeric_rows": int(pd.to_numeric(df[tgt], errors="coerce").count()) if tgt is not None else None,
+                    "beam_width": 5, "maximum_depth": 2, "minimum_support": 10, "categories_per_predictor_cap": 4,
+                },
+                "clustering": {"complete_case_rows": len(numeric), "bootstrap_trials_requested": 15,
+                               "hopkins_sample_cap": 50, "hopkins_sampled_rows": hopkins.get("sample_size")},
+                "distance_correlation": {
+                    "eligible_numeric_predictors": len(numeric_features) if dcor_results else 0,
+                    "evaluated_predictors": len(dcor_results), "predictor_cap": 6,
+                    "selection": "study column order; finite pairs per predictor (n)",
+                },
+            },
             "beam_subgroups": subgroups,
             "cluster_stability_ari": stability,
             "hopkins_clustering_tendency": hopkins,

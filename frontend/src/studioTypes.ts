@@ -197,17 +197,23 @@ export interface AdvancedMiningResponse extends AdvancedMiningResult, StateEnvel
 // ---------------------------------------------------------------------------
 
 export interface RiskAssessment {
-  overall_risk_index?: number;
-  overall_risk_band?: string;
-  column_risks?: JsonRow[];
+  structural_risk_index?: number | null;
+  risk_band?: string | null;
+  tail_risk_table?: JsonRow[];
   [key: string]: unknown;
 }
 
 export interface DiagnosticsReport {
+  n_scanned?: number;
+  sampled_from?: number;
+  columns_skipped?: Record<string, string[]>;
+  correction_family?: { id: string | null; method: string; n_evaluable: number } | null;
   total_tests?: number;
   significant_tests?: number;
   hypothesis_ledger?: JsonRow[];
-  risk_assessment?: RiskAssessment;
+  risk_assessment?: RiskAssessment | null;
+  module_status?: Record<string, string>;
+  baseline_evidence?: Record<string, Record<string, { status: string; role: string; error?: string }>>;
   baseline_equations?: Record<string, unknown[] | Record<string, unknown>>;
   [key: string]: unknown;
 }
@@ -222,6 +228,8 @@ export interface DiagnosticsResponse extends StateEnvelope {
 
 export interface EDAResponse extends StateEnvelope {
   n_rows_analyzed?: number;
+  n_rows_available?: number;
+  row_cap?: number;
   insights?: (string | JsonRow)[];
   distributions?: { column?: unknown; mean?: unknown; std?: unknown; bins?: { label?: unknown; count?: unknown }[] }[];
   categorical_distributions?: { column?: string; unique_count?: number; top_values?: { label?: string; count?: number }[] }[];
@@ -240,6 +248,7 @@ export interface HypothesisSingleResult {
   significant?: boolean;
   alpha?: number;
   interpretation?: string;
+  sample_disclosure?: string;
   extra_table?: JsonRow[] | null;
   [key: string]: unknown;
 }
@@ -273,6 +282,8 @@ export interface FeatureRanking extends JsonRow {
 export interface SelectionResponse extends StateEnvelope {
   selected_source_columns?: string[];
   fit_scope?: 'train_only' | 'full_frame';
+  run_scope?: { ignored_columns: string[] } | null;
+  run_scope_target?: string | null;
   committed?: boolean;
   mode?: string;
   rankings?: FeatureRanking[];
@@ -311,8 +322,10 @@ export interface AutoMLResponse extends StateEnvelope {
   target?: string;
   best_model_name?: string;
   best_score?: number;
-  baseline_score?: number;
-  lift_over_baseline?: number;
+  baseline_score?: number | null;
+  baseline_name?: string | null;
+  lift_over_baseline?: number | null;
+  lift_comparison?: { status: string; reason?: string; ci_lower?: number; ci_upper?: number };
   primary_metric?: string;
   backend_used?: string;
   fallback_reason?: string | null;
@@ -322,6 +335,7 @@ export interface AutoMLResponse extends StateEnvelope {
   metadata?: {
     evaluation?: {
       leaderboard_partition?: string;
+      candidate_scores_backend_specific?: boolean;
       best_score_partition?: string;
       n_test?: number;
     };
@@ -330,10 +344,12 @@ export interface AutoMLResponse extends StateEnvelope {
 
 export interface NonParametricResponse extends StateEnvelope {
   best_model_name?: string;
-  best_nonparametric_score?: number;
-  parametric_reference_score?: number;
-  lift_vs_parametric?: number;
-  nonparametric_outperforms_parametric?: boolean;
+  best_nonparametric_score?: number | null;
+  parametric_reference_score?: number | null;
+  parametric_reference_status?: 'available' | 'unavailable';
+  comparison_status?: 'available' | 'unavailable';
+  lift_vs_parametric?: number | null;
+  nonparametric_outperforms_parametric?: boolean | null;
   primary_metric?: string;
   target?: string;
   task_type?: string;

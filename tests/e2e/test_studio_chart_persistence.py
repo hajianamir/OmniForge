@@ -553,7 +553,7 @@ def test_studio03_benchmarks_use_the_same_locked_cohort_and_studio05_preview_is_
     assert diagnostics.status_code == 200, diagnostics.text
     report = diagnostics.json()["report"]
     assert report["baseline_split"]["target"] == {"source": "split_lock", "training_rows": 60, "holdout_rows": 20}
-    assert report["baseline_feature_cols"]["target"] == ["alpha", "beta", "constant"]
+    assert report["baseline_feature_cols"]["target"] == ["alpha", "beta"]
     selection = {"mode": "custom", "method": "f_test", "top_k": 1, "target": "target"}
     preview = client.post("/api/workbench/s05/select", headers=headers, json=selection)
     assert preview.status_code == 200, preview.text
@@ -712,3 +712,74 @@ def test_mining_requires_explicit_target_for_multiple_outcomes() -> None:
     assert advanced.status_code == 200, advanced.text
     assert advanced.json()["target"] == "outcome_b"
     assert set(advanced.json()["distance_correlation"]) == {"x", "z"}
+
+
+def test_diagnostics_catalog_custom_executes_real_module() -> None:
+    client, headers = _client()
+    _upload(client, headers)
+    catalog = client.get('/api/workbench/s03/catalog', headers=headers).json()
+    assert 'normality_distribution' in catalog['executable_modules']
+    assert 'automated_eda' not in catalog['executable_modules']
+    response = client.post('/api/workbench/s03/run', headers=headers, json={
+        'mode': 'custom', 'selected_modules': ['normality_distribution'],
+    })
+    assert response.status_code == 200, response.text
+    report = response.json()['report']
+    assert report['executed_modules'] == ['normality_distribution']
+    assert report['total_tests'] > 0
+
+
+def test_diagnostics_rejects_silent_dispatch_fallbacks() -> None:
+    client, headers = _client()
+    _upload(client, headers)
+    for payload in [
+        {'mode': 'Custom'},
+        {'mode': 'custom'},
+        {'mode': 'custom', 'selected_modules': ['statistical_tests']},
+        {'mode': 'custom', 'selected_modules': 'normality_distribution'},
+        {'mode': 'custom', 'selected_modules': ['automated_eda']},
+        {'mode': 'auto', 'selected_modules': ['baseline_benchmark']},
+    ]:
+        assert client.post('/api/workbench/s03/run', headers=headers, json=payload).status_code == 422, payload
+
+
+def test_feature_selection_run_scope_leaves_study_and_split_intact() -> None:
+    client, headers = _client()
+    _upload(client, headers)
+    locked = client.post('/api/workbench/split-lock', headers=headers, json={'strategy': 'random'})
+    assert locked.status_code == 200, locked.text
+    response = client.post('/api/workbench/s05/select', headers=headers, json={
+        'target': 'target', 'method': 'f_test', 'top_k': 1, 'apply_to_run': True,
+    })
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result['committed'] is False
+    assert result['run_scope']['ignored_columns'] == ['beta', 'constant']
+    assert result['state']['columns'] == ['alpha', 'beta', 'constant', 'target']
+    assert result['state']['split_lock'] == locked.json()['state']['split_lock']
+    run = client.post('/api/workbench/s03/run', headers=headers, json={
+        'mode': 'custom', 'selected_modules': ['baseline_benchmark'], **result['run_scope'],
+    })
+    assert run.status_code == 200, run.text
+    assert run.json()['report']['baseline_feature_cols'] == {'target': ['alpha']}
+
+
+def test_deep_benchmark_discloses_class_mix_and_reference_provenance() -> None:
+    client, headers = _client()
+    frame = pd.DataFrame({'x': range(500), 'target': [0] * 450 + [1] * 50})
+    uploaded = client.post('/api/workbench/s01/upload', headers=headers, files={
+        'file': ('imbalanced.csv', io.BytesIO(frame.to_csv(index=False).encode()), 'text/csv'),
+    })
+    assert uploaded.status_code == 200, uploaded.text
+    response = client.post('/api/workbench/s06/deep-learning', headers=headers, json={
+        'target': 'target', 'architectures': [], 'max_rows': 100,
+    })
+    assert response.status_code == 200, response.text
+    body = response.json()
+    evaluation = body['evaluation']
+    assert evaluation['holdout_sampling'] == 'stratified_without_replacement'
+    assert evaluation['holdout_class_counts'] == {'0': 18, '1': 2}
+    assert evaluation['available_holdout_class_counts'] == {'0': 90, '1': 10}
+    assert body['baseline_evidence']['Baseline_most_frequent']['status'] == 'scored'
+    analytical = [row for row in body['results'] if 'Nadaraya' in row['model']]
+    assert analytical and analytical[0]['framework'] != 'sklearn'

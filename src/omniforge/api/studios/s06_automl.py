@@ -25,7 +25,7 @@ from omniforge.core.utils import to_json_object
 from omniforge.data.splitting import LeakageSafeSplitter, SplitConfig
 from omniforge.evaluation.equations import ModelEquationExtractor
 from omniforge.features.inference import WorkbenchInputPreprocessor
-from omniforge.models.baselines import BaselineBenchmarkSuite
+from omniforge.models.baselines import BaselineBenchmarkSuite, BaselineEvidence, baseline_feature_evidence
 from omniforge.models.deep import (
     CNN1DModel,
     FTTransformerModel,
@@ -57,7 +57,7 @@ def _prepare_holdout(
 
 
 def _modeling_scope(
-    frame: pd.DataFrame, targets: list[str], requested: str | None,
+    frame: pd.DataFrame, targets: list[str], requested: str | None, ignored: list[str],
 ) -> tuple[str, list[str]]:
     if requested is None and len(targets) != 1:
         raise HTTPException(status_code=400, detail="Select exactly one target for this run.")
@@ -65,7 +65,9 @@ def _modeling_scope(
     if target not in frame.columns:
         raise HTTPException(status_code=400, detail="The requested target is outside the active study columns.")
     outcomes = set(targets) - {target}
-    columns = [col for col in frame.columns if col not in outcomes]
+    if (set(ignored) & (outcomes | {target})) or set(ignored) - set(frame.columns):
+        raise HTTPException(status_code=400, detail="Ignored columns must exist in the study and cannot include outcomes.")
+    columns = [col for col in frame.columns if col not in outcomes and col not in ignored]
     if len(columns) < 2:
         raise HTTPException(status_code=400, detail="No predictor columns remain after excluding selected outcomes.")
     return target, columns
@@ -83,7 +85,7 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
     active_df = _wb()._require_df(state)
     df = _wb().get_analysis_dataframe(state, active_df)
     targets = _wb().get_selected_targets(state, active_df)
-    target, columns = _modeling_scope(df, targets, req.target)
+    target, columns = _modeling_scope(df, targets, req.target, req.ignored_columns)
     scope_lock = state.get("uap_split_lock")
     scope_targets = tuple(targets)
     scope_exclusions = tuple(_wb().get_excluded_columns(state, active_df))
@@ -115,19 +117,19 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
             options["gap"] = lock.get("gap", 0)
         return options
 
-    def sources_for(target_name: str) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    def sources_for(target_name: str) -> tuple[pd.DataFrame, pd.DataFrame | None, str | None]:
         if native_backend or holdout_source is not None:
-            return automl_source, holdout_source
+            return automl_source, holdout_source, strategy
         observed = automl_source.dropna(subset=[target_name])
         if len(observed) < 13:
-            return observed, None  # Preserve the minimum 10 development rows needed by the adapter.
+            return observed, None, None  # Preserve the minimum 10 development rows needed by the adapter.
         reserved = LeakageSafeSplitter(SplitConfig(test_size=0.2)).split(observed, target_col=target_name)
-        return observed.iloc[reserved.train_indices], observed.iloc[reserved.test_indices]
+        return observed.iloc[reserved.train_indices], observed.iloc[reserved.test_indices], reserved.strategy_used
 
     def _execute(*, cancellation_token: JobCancellationToken | None = None) -> dict[str, Any]:
         if cancellation_token is not None:
             cancellation_token.checkpoint()
-        fit_source, test_source = sources_for(target)
+        fit_source, test_source, holdout_strategy = sources_for(target)
         X, y, task, input_preprocessor = _wb()._prepare_xy_fitted(fit_source, target, raw_features=True)
         holdout = _prepare_holdout(test_source, target, input_preprocessor)
         work_df = X.copy()
@@ -142,6 +144,7 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
             max_carbon_grams_co2e=req.max_carbon_grams_co2e,
             max_inference_latency_ms=req.max_inference_latency_ms,
             holdout=holdout,
+            holdout_strategy=holdout_strategy,
             **split_options(target),
         )
         if cancellation_token is not None:
@@ -159,11 +162,12 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
             _wb().logger.debug("equation_extract_skipped", error_type=type(exc).__name__)
 
         regression = task == _wb().TaskType.REGRESSION
-        baseline_score = round(float(
-            res.best_score + res.lift_over_best_baseline if regression
-            else res.best_score - res.lift_over_best_baseline
-        ), 4)
         evaluation = res.extra.get("evaluation") or {}
+        partition = evaluation.get("best_score_partition", "test")
+        baseline_score = evaluation.get(f"{partition}_baseline_score")
+        lift = res.lift_over_best_baseline
+        lift_label = f"{lift:+.4f}" if lift is not None else "unavailable"
+        comparison = evaluation.get("lift_comparison") or {"status": "unavailable"}
         ranked_lb = []
         for idx_lb, row_lb in enumerate(res.leaderboard or [], start=1):
             r_copy = dict(row_lb)
@@ -171,7 +175,8 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
             raw_score = r_copy.get(res.primary_metric, r_copy.get("cv_score", r_copy.get("score")))
             r_copy["rank"] = idx_lb
             if name == res.best_model_name:
-                r_copy["acceptance_status"] = "ACCEPTED (CHAMPION)" if res.lift_over_best_baseline >= 0 else "ACCEPTED (BEST AVAILABLE)"
+                r_copy["acceptance_status"] = "ACCEPTED (CHAMPION)" if comparison.get("supports_improvement") else "SELECTED — IMPROVEMENT NOT ESTABLISHED"
+                r_copy["lift_comparison"] = comparison
             else:
                 r_copy["acceptance_status"] = "BENCHMARKED"
             if evaluation.get("leaderboard_partition") == "validation" and raw_score is not None:
@@ -203,13 +208,15 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
             "baseline_score": baseline_score,
             "lift_over_baseline": res.lift_over_best_baseline,
         }
-        state["uap_active_feature_cols"] = list(X.columns)
+        active_columns = evaluation.get("input_columns", list(X.columns))
+        input_preprocessor.fit(fit_source.loc[:, active_columns])  # Raw normalization only; no statistics are estimated.
+        state["uap_active_feature_cols"] = active_columns
         state["uap_active_input_preprocessor"] = input_preprocessor
         evaluation_indices = getattr(res, "evaluation_indices", None)
         if holdout is not None:
-            state["uap_active_X_test"], state["uap_active_y_test"] = holdout
+            state["uap_active_X_test"], state["uap_active_y_test"] = holdout[0].loc[:, active_columns], holdout[1]
         elif evaluation_indices is not None and evaluation.get("best_score_partition") == "test":
-            state["uap_active_X_test"] = X.iloc[evaluation_indices]
+            state["uap_active_X_test"] = X.loc[:, active_columns].iloc[evaluation_indices]
             state["uap_active_y_test"] = y.iloc[evaluation_indices]
         else:
             state["uap_active_X_test"] = None
@@ -222,7 +229,7 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
             state,
             "AutoML",
             f"Trained {res.executed_backend} ({res.best_model_name})",
-            f"{res.primary_metric}={res.best_score:.4f} (Lift {res.lift_over_best_baseline:+.4f})",
+            f"{res.primary_metric}={res.best_score:.4f} (Lift {lift_label})",
         )
         return wb_cache_and_respond(
             state,
@@ -238,6 +245,9 @@ def s06_run_automl(req: AutoMLRunReq, x_session_id: str | None = Header(default=
                 "best_model_name": res.best_model_name,
                 "best_score": res.best_score,
                 "baseline_score": baseline_score,
+                "baseline_name": evaluation.get(f"{partition}_baseline_name"),
+                "baseline_comparison_status": "available" if lift is not None else "unavailable",
+                "lift_comparison": comparison,
                 "lift_over_baseline": res.lift_over_best_baseline,
                 "elapsed_seconds": res.elapsed_seconds,
                 "leaderboard": ranked_lb,
@@ -338,14 +348,17 @@ def s06_export_external_formula(
 def s06_run_nonparametric_analytical(
     req: NonParametricRunReq, x_session_id: str | None = Header(default="default")
 ) -> dict[str, Any]:
-    """Benchmark all Non-Parametric Analytical Models (Spline GAM, Nadaraya-Watson, RBF Kernel Ridge, Weighted k-NN, Isotonic) vs. Parametric Linear."""
+    """Benchmark analytical candidates; do not promote a champion without a scored reference."""
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
     active_df = _wb()._require_df(state)
     df = _wb().get_analysis_dataframe(state, active_df)
     targets = _wb().get_selected_targets(state, df)
-    target, columns = _modeling_scope(df, targets, req.target)
-    train_df, test_df, _ = _wb().get_active_split_frames(state, active_df)
+    target, columns = _modeling_scope(df, targets, req.target, req.ignored_columns)
+    train_df, test_df, lock = _wb().get_active_split_frames(state, active_df)
+    if lock:
+        controls = {lock.get(key) for key in ("row_id_col", "group_col", "time_col")}
+        columns = [column for column in columns if column == target or column not in controls]
     X, y, task, input_preprocessor = _wb()._prepare_xy_fitted(train_df.loc[:, columns], target)
     holdout = _prepare_holdout(test_df.loc[:, columns] if test_df is not None else None, target, input_preprocessor)
     if len(X) < 12 or X.shape[1] < 1:
@@ -366,6 +379,8 @@ def s06_run_nonparametric_analytical(
     )
     fitted_map = res.pop("_fitted_models", {})
     feat_cols = list(X.columns)
+    for row in res.get("leaderboard", []):
+        row["n_features"] = len(feat_cols)
 
     clear_supervisory_evaluation(state)
     np_store = state.setdefault("uap_nonparametric_models", {})
@@ -380,8 +395,8 @@ def s06_run_nonparametric_analytical(
             "feature_cols": feat_cols,
             "input_preprocessor": input_preprocessor,
             "metrics": {
-                str(row_m.get("primary_metric", "score")): row_m.get("primary_score", 0.0),
-                "lift_vs_parametric": row_m.get("lift_vs_parametric", 0.0),
+                str(row_m.get("primary_metric", "score")): row_m.get("primary_score"),
+                "lift_vs_parametric": row_m.get("lift_vs_parametric"),
             },
         }
     np_store[target] = tgt_map
@@ -389,13 +404,16 @@ def s06_run_nonparametric_analytical(
     # Promote champion non-parametric model as active if no champion model exists yet
     champ_name = str(res.get("champion_model") or "")
     champ_obj = fitted_map.get(champ_name)
-    if champ_obj is not None and state.get("uap_active_model") is None:
+    champion_score = res.get("champion_score")
+    reference_score = res.get("parametric_reference_score")
+    comparable = res.get("comparison_status") == "available" and reference_score is not None
+    if comparable and champ_obj is not None and champion_score is not None and state.get("uap_active_model") is None:
         state["uap_active_model"] = champ_obj
         state["uap_active_model_target"] = target
         state["uap_active_model_name"] = champ_name
         state["uap_active_model_metrics"] = {
-            "score": float(res.get("champion_score", 0.0)),
-            "parametric_reference": float(res.get("parametric_reference_score", 0.0)),
+            "score": champion_score,
+            "parametric_reference": reference_score,
         }
         state["uap_active_feature_cols"] = feat_cols
         state["uap_active_input_preprocessor"] = input_preprocessor
@@ -405,8 +423,12 @@ def s06_run_nonparametric_analytical(
     _wb().record_lineage(
         state,
         "Non-Parametric Modeling",
-        f"Evaluated {len(tgt_map)} Non-Parametric Analytical Models vs. Parametric Linear",
-        f"Champion={champ_name} ({res.get('champion_score', 0.0):.4f})",
+        (
+            f"Evaluated {len(tgt_map)} Non-Parametric Analytical Models vs. Parametric Linear"
+            if comparable
+            else f"Non-parametric candidates scored: {len(tgt_map)}"
+        ),
+        f"Champion={champ_name} ({champion_score:.4f})" if comparable and champion_score is not None else res["verdict"],
     )
     return wb_cache_and_respond(state, sid, "s06_nonparametric", dict(res))
 
@@ -419,7 +441,7 @@ def s06_run_deep_benchmark(req: DeepBenchReq, x_session_id: str | None = Header(
     active_df = _wb()._require_df(state)
     df = _wb().get_analysis_dataframe(state, active_df)
     targets = _wb().get_selected_targets(state, active_df)
-    target, columns = _modeling_scope(df, targets, req.target)
+    target, columns = _modeling_scope(df, targets, req.target, req.ignored_columns)
     train, test, lock = _wb().get_active_split_frames(state, active_df)
     if lock:
         keys = {lock.get(key) for key in ("time_col", "group_col", "row_id_col")}
@@ -448,6 +470,11 @@ def s06_run_deep_benchmark(req: DeepBenchReq, x_session_id: str | None = Header(
     training_rows, heldout_rows = len(train), len(test)
     task = _wb()._infer_task(train[target])
     is_clf = task in (_wb().TaskType.BINARY_CLASSIFICATION, _wb().TaskType.MULTICLASS_CLASSIFICATION)
+    def class_counts(frame: pd.DataFrame) -> dict[str, int] | None:
+        return {str(label): int(count) for label, count in frame[target].value_counts().items()} if is_clf else None
+
+    available_holdout_counts = class_counts(test)
+    holdout_sampling = "all_rows"
     if training_rows + heldout_rows > req.max_rows:
         train_limit = min(training_rows, max(10, min(req.max_rows - 2, req.max_rows * training_rows // (training_rows + heldout_rows))))
         test_limit = min(heldout_rows, req.max_rows - train_limit)
@@ -458,7 +485,13 @@ def s06_run_deep_benchmark(req: DeepBenchReq, x_session_id: str | None = Header(
             kept, _ = train_test_split(positions, train_size=train_limit, random_state=42, stratify=stratify)
             train = train.iloc[np.sort(kept)]
         if test_limit < heldout_rows:
-            kept = np.random.default_rng(42).choice(heldout_rows, size=test_limit, replace=False)
+            counts = test[target].value_counts()
+            can_stratify = is_clf and counts.min() >= 2 and len(counts) <= min(test_limit, heldout_rows - test_limit)
+            kept, _ = train_test_split(
+                np.arange(heldout_rows), train_size=test_limit, random_state=42,
+                stratify=test[target] if can_stratify else None,
+            )
+            holdout_sampling = "stratified_without_replacement" if can_stratify else "random_without_replacement"
             test = test.iloc[np.sort(kept)]
     if is_clf and (train[target].nunique() < 2 or not test[target].isin(train[target].unique()).all()):
         raise HTTPException(status_code=400, detail="Every holdout class must be represented in the deep benchmark training rows.")
@@ -470,12 +503,13 @@ def s06_run_deep_benchmark(req: DeepBenchReq, x_session_id: str | None = Header(
         raise HTTPException(status_code=400, detail="The holdout predictors do not match the training schema.") from exc
     y_te = test[target]
 
-    base_suite = BaselineBenchmarkSuite()
-    base_res = base_suite.run_classification(X_tr, y_tr, X_te, y_te) if is_clf else base_suite.run_regression(X_tr, y_tr, X_te, y_te)
+    benchmark = BaselineBenchmarkSuite.run_classification_detailed if is_clf else BaselineBenchmarkSuite.run_regression_detailed
+    baseline_evidence: BaselineEvidence = {}
+    base_res, baseline_models = benchmark(X_tr, y_tr, X_te, y_te, evidence=baseline_evidence)
     rows: list[dict[str, Any]] = []
     for bname, bm in base_res.items():
         score = bm.get("f1_weighted" if is_clf else "r2")
-        rows.append({"model": f"Baseline: {bname}", "family": "Baseline", "framework": "sklearn", "score": round(float(score), 5) if score is not None else None, "elapsed_sec": None, "loss_curve": []})
+        rows.append({"model": f"Baseline: {bname}", "family": "Baseline", "framework": baseline_models[bname].framework, "implementation": type(baseline_models[bname]).__name__, **baseline_feature_evidence(baseline_models[bname]), "score": round(float(score), 5) if score is not None else None, "elapsed_sec": None, "loss_curve": []})
 
     arch_map = {
         "ft_transformer": lambda: FTTransformerModel(d_model=24, n_heads=4, n_layers=2, epochs=req.epochs, task_type=task, track_carbon=False),
@@ -532,6 +566,8 @@ def s06_run_deep_benchmark(req: DeepBenchReq, x_session_id: str | None = Header(
                 "loss_curve": [],
             })
 
+    for row in rows:
+        row.setdefault("n_features", X_tr.shape[1] if row["score"] is not None else None)
     rows.sort(key=lambda r: r["score"] if r["score"] is not None else -float("inf"), reverse=True)
     state["uap_dl_benchmark_df"] = pd.DataFrame([{k: v for k, v in r.items() if k != "loss_curve"} for r in rows])
     clear_supervisory_evaluation(state)
@@ -551,9 +587,13 @@ def s06_run_deep_benchmark(req: DeepBenchReq, x_session_id: str | None = Header(
                 "source": split_source, "strategy": split_strategy,
                 "n_train": len(X_tr), "n_test": len(X_te),
                 "available_train_rows": training_rows, "available_test_rows": heldout_rows,
+                "holdout_sampling": holdout_sampling,
+                "available_holdout_class_counts": available_holdout_counts,
+                "holdout_class_counts": class_counts(test),
                 "input_columns": preprocessor.input_columns, "encoded_columns": preprocessor.output_columns,
             },
             "feature_importances": feature_importances,
+            "baseline_evidence": baseline_evidence,
         },
     )
 

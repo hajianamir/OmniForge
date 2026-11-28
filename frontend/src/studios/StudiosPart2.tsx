@@ -34,6 +34,10 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
   const [cvFolds, setCvFolds] = useState(3);
   const [selectedTarget, setSelectedTarget] = useState('');
   const modelingTarget = ws.targets.length === 1 ? ws.targets[0] : ws.targets.includes(selectedTarget) ? selectedTarget : '';
+  const [useRunScope, setUseRunScope] = useState(false);
+  const selection = studioCache.s05_select;
+  const runScope = ws.split_lock?.active && selection?.run_scope_target === modelingTarget ? selection?.run_scope : null;
+  const ignoredColumns = useRunScope && runScope ? runScope.ignored_columns : [];
   const automlRes = studioCache.s06_automl ?? null;
 
   // Non-Parametric Analytical Suite state
@@ -45,6 +49,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
   const [npKNeighbors, setNpKNeighbors] = useState(11);
   const [npGamma, setNpGamma] = useState<string>('');
   const npRes = studioCache.s06_nonparametric ?? null;
+  const npComparisonAvailable = npRes?.comparison_status === 'available';
 
   const [dlArchs, setDlArchs] = useState<string[]>(['ft_transformer', 'tabnet', 'resnet_tabular', 'mlp', 'gnn_gcn']);
   const [dlEpochs, setDlEpochs] = useState(20);
@@ -68,6 +73,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
     try {
       const res = await apiPost<AutoMLResponse>('/api/workbench/s06/automl', {
         target: modelingTarget,
+        ignored_columns: ignoredColumns,
         backend: selectedBackend,
         time_budget_seconds: budget,
         cv_folds: cvFolds,
@@ -88,6 +94,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
       const chosen = npMode === 'custom' ? npModels : npMode === 'auto' ? ['gam_spline', 'nadaraya_watson', 'kernel_ridge_rbf', 'weighted_knn'] : allModels;
       const res = await apiPost<NonParametricResponse>('/api/workbench/s06/nonparametric', {
         target: modelingTarget,
+        ignored_columns: ignoredColumns,
         models: chosen.length ? chosen : allModels,
         n_knots: npKnots,
         spline_degree: npDegree,
@@ -108,7 +115,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
   const runDeep = async () => {
     setBusy(true); setErr(null);
     try {
-      const res = await apiPost<DeepLearningResponse>('/api/workbench/s06/deep-learning', { target: modelingTarget, architectures: dlArchs, epochs: dlEpochs });
+      const res = await apiPost<DeepLearningResponse>('/api/workbench/s06/deep-learning', { target: modelingTarget, ignored_columns: ignoredColumns, architectures: dlArchs, epochs: dlEpochs });
       onSync(res.state);
       setStudioResult('s06_dl', res);
     } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
@@ -149,6 +156,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
         <ProvenancePill ws={ws} />
       </div>
       {err && <div className="alert alert-error">{err}</div>}
+      {tab !== 'predict' && runScope && <label className="row"><input type="checkbox" checked={useRunScope} onChange={(e) => setUseRunScope(e.target.checked)} /> Apply Studio 05 selection to this model run only</label>}
       {tab !== 'predict' && ws.targets.length > 1 && (
         <label className="field">
           Target for this run
@@ -214,20 +222,28 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
           {automlRes && (
             <div className="card">
               <div className="card-title">
-                <span>Champion Model Leaderboard{automlRes.target ? ` · ${automlRes.target}` : ''} ({automlRes.backend_used ?? 'native'})</span>
-                <span className="badge badge-green">Lift vs Baseline: {Number(automlRes.lift_over_baseline ?? 0) >= 0 ? '+' : ''}{Number(automlRes.lift_over_baseline ?? 0).toFixed(4)}</span>
+                <span>Selected Candidate Leaderboard{automlRes.target ? ` · ${automlRes.target}` : ''} ({automlRes.backend_used ?? 'native'})</span>
+                <span className="badge">Point Lift vs Strong Reference: {automlRes.lift_over_baseline?.toFixed(4) ?? 'Unavailable'}</span>
               </div>
+              {automlRes.lift_comparison?.status === 'available' ? (
+                <p>Paired interval: [{automlRes.lift_comparison.ci_lower?.toFixed(4)}, {automlRes.lift_comparison.ci_upper?.toFixed(4)}]. The point lift alone does not establish improvement.</p>
+              ) : (
+                <p>Paired comparison unavailable{automlRes.lift_comparison?.reason ? `: ${automlRes.lift_comparison.reason}` : '.'}</p>
+              )}
               {automlRes.fallback_reason && <div className="alert alert-warn">{automlRes.fallback_reason}</div>}
               <div className="kpi-grid">
-                <div className="kpi-card"><div className="kpi-label">Best Model</div><div className="kpi-value" style={{ fontSize: 16 }}>{automlRes.best_model_name}</div></div>
+                <div className="kpi-card"><div className="kpi-label">Selected Model</div><div className="kpi-value" style={{ fontSize: 16 }}>{automlRes.best_model_name}</div></div>
                 <div className="kpi-card"><div className="kpi-label">{automlRes.metadata?.evaluation?.best_score_partition === 'test' ? 'Test ' : ''}{automlRes.primary_metric}</div><div className="kpi-value">{Number(automlRes.best_score).toFixed(4)}</div></div>
-                <div className="kpi-card"><div className="kpi-label">Strong Baseline</div><div className="kpi-value">{Number(automlRes.baseline_score).toFixed(4)}</div></div>
+                <div className="kpi-card"><div className="kpi-label">Strong Baseline</div><div className="kpi-value">{automlRes.baseline_score?.toFixed(4) ?? 'Unavailable'}</div></div>
                 <div className="kpi-card"><div className="kpi-label">Runtime</div><div className="kpi-value">{automlRes.elapsed_seconds}s</div></div>
               </div>
               {automlRes.metadata?.evaluation?.best_score_partition === 'test' && (
-                <p>The champion and baseline scores use {automlRes.metadata.evaluation.n_test} held-out rows. The leaderboard shows validation scores used during selection.</p>
+                <p>The selected model and reference scores use {automlRes.metadata.evaluation.n_test} held-out rows. The leaderboard describes backend selection, not performance on that holdout.</p>
               )}
-              {(automlRes.leaderboard?.length ?? 0) > 0 && (
+              {automlRes.metadata?.evaluation?.candidate_scores_backend_specific && (
+                <p>Backend-specific leaderboard scores are not directly comparable. Compare only the selected-model metric on the same held-out rows and feature scope. “—” means a count is unavailable.</p>
+              )}
+              {!automlRes.metadata?.evaluation?.candidate_scores_backend_specific && (automlRes.leaderboard?.length ?? 0) > 0 && (
                 <div style={{ marginBottom: 14 }}>
                   <BarChartSVG
                     title={`AutoML Candidate Leaderboard (${automlRes.primary_metric || 'Score'})`}
@@ -243,7 +259,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
                   />
                 </div>
               )}
-              <SimpleTable title="Ranked Model Leaderboard & Acceptance Rationale" rows={automlRes.leaderboard || []} />
+              <SimpleTable title="Ranked Candidates & Comparison Evidence" rows={automlRes.leaderboard || []} />
               {automlRes.equation && (automlRes.equation.formula_plain || automlRes.equation.equation_text) && (
                 <div style={{ marginTop: 14 }}>
                   <MathEquationCard
@@ -255,15 +271,17 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
                       rank: 1,
                       primary_metric: automlRes.primary_metric,
                       primary_score: automlRes.best_score,
-                      naive_floor_score: automlRes.baseline_score,
-                      lift_over_naive: automlRes.lift_over_baseline,
+                      comparison_reference_label: automlRes.baseline_name ?? 'Strong Reference',
+                      naive_floor_score: automlRes.baseline_score ?? undefined,
+                      lift_over_naive: automlRes.lift_over_baseline ?? undefined,
+                      lift_comparison: automlRes.lift_comparison,
                       selection_criterion: automlRes.metadata?.evaluation?.leaderboard_partition === 'validation'
                         ? `Selected by validation ${automlRes.primary_metric ?? 'score'}`
                         : 'Selected by the active AutoML backend',
-                      acceptance_status: Number(automlRes.lift_over_baseline ?? 0) >= 0 ? 'ACCEPTED — AUTOML CHAMPION' : 'ACCEPTED — BEST AVAILABLE',
+                      acceptance_status: automlRes.leaderboard?.find(row => row.model === automlRes.best_model_name)?.acceptance_status as string | undefined,
                       acceptance_reasons: [
                         `Selected by ${automlRes.backend_used} in ${automlRes.elapsed_seconds}s.`,
-                        `Achieved ${automlRes.primary_metric ?? ''}=${Number(automlRes.best_score).toFixed(4)} vs strong baseline ${Number(automlRes.baseline_score).toFixed(4)} (lift ${Number(automlRes.lift_over_baseline ?? 0) >= 0 ? '+' : ''}${Number(automlRes.lift_over_baseline ?? 0).toFixed(4)}).`,
+                        `Achieved ${automlRes.primary_metric ?? ''}=${Number(automlRes.best_score).toFixed(4)} vs strong baseline ${automlRes.baseline_score?.toFixed(4) ?? 'Unavailable'} (lift ${automlRes.lift_over_baseline?.toFixed(4) ?? 'unavailable'}).`,
                       ],
                     }}
                   />
@@ -328,40 +346,40 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
               </div>
               <div className="kpi-grid">
                 <div className="kpi-card">
-                  <div className="kpi-label">Champion Non-Parametric</div>
-                  <div className="kpi-value" style={{ fontSize: 15 }}>{npRes.best_model_name}</div>
+                  <div className="kpi-label">Top Scoring Non-Parametric Candidate</div>
+                  <div className="kpi-value" style={{ fontSize: 15 }}>{npRes.best_model_name || 'Unavailable'}</div>
                 </div>
                 <div className="kpi-card">
                   <div className="kpi-label">Best Non-Parametric ({String(npRes.primary_metric || '').toUpperCase()})</div>
-                  <div className="kpi-value">{Number(npRes.best_nonparametric_score ?? 0).toFixed(4)}</div>
+                  <div className="kpi-value">{npRes.best_nonparametric_score?.toFixed(4) ?? 'Unavailable'}</div>
                 </div>
                 <div className="kpi-card">
                   <div className="kpi-label">Parametric Reference</div>
-                  <div className="kpi-value">{npRes.parametric_reference_score !== null && npRes.parametric_reference_score !== undefined ? Number(npRes.parametric_reference_score).toFixed(4) : 'N/A'}</div>
+                  <div className="kpi-value">{npRes.parametric_reference_score?.toFixed(4) ?? 'Unavailable'}</div>
                 </div>
                 <div className="kpi-card">
                   <div className="kpi-label">Lift vs Parametric</div>
-                  <div className="kpi-value" style={{ color: Number(npRes.lift_vs_parametric ?? 0) > 0 ? 'var(--green)' : 'var(--text)' }}>
-                    {npRes.lift_vs_parametric !== null && npRes.lift_vs_parametric !== undefined ? `${Number(npRes.lift_vs_parametric) >= 0 ? '+' : ''}${Number(npRes.lift_vs_parametric).toFixed(4)}` : 'N/A'}
+                  <div className="kpi-value" style={{ color: npRes.nonparametric_outperforms_parametric === true ? 'var(--green)' : 'var(--text)' }}>
+                    {npRes.lift_vs_parametric !== null && npRes.lift_vs_parametric !== undefined ? `${Number(npRes.lift_vs_parametric) >= 0 ? '+' : ''}${Number(npRes.lift_vs_parametric).toFixed(4)}` : 'Unavailable'}
                   </div>
                 </div>
               </div>
 
               <div className="card">
                 <div className="card-title">
-                  <span>Non-Parametric vs. Parametric Analytical Leaderboard</span>
-                  <span className="badge badge-accent">Runtime: {npRes.elapsed_seconds}s · Ready for Studio 14 Live Monitor</span>
+                  <span>{npComparisonAvailable ? 'Non-Parametric vs. Parametric Analytical Leaderboard' : 'Non-Parametric Candidate Leaderboard'}</span>
+                  <span className="badge badge-accent">Runtime: {npRes.elapsed_seconds}s{npRes.comparison_status === 'unavailable' ? ' · Comparison unavailable' : ''}</span>
                 </div>
                 {(npRes.leaderboard?.length ?? 0) > 0 && (
                   <div style={{ marginBottom: 14 }}>
                     <BarChartSVG
-                      title={`Non-Parametric vs. Parametric Benchmark (${npRes.primary_metric || 'Score'})`}
+                      title={`${npComparisonAvailable ? 'Non-Parametric vs. Parametric Benchmark' : 'Non-Parametric Candidate Scores'} (${npRes.primary_metric || 'Score'})`}
                       horizontal
                       items={(npRes.leaderboard || []).slice(0, 12).flatMap((row, idx) => {
                         const sc = Number(row.primary_score ?? row.score ?? NaN);
                         const lbl = String(row.model_name ?? row.model ?? `Estimator ${idx + 1}`);
                         return Number.isFinite(sc)
-                          ? [{ label: lbl, value: sc, color: row.is_nonparametric === false ? '#a78bfa' : idx === 0 ? '#34d399' : '#38bdf8' }]
+                          ? [{ label: lbl, value: sc, color: row.is_nonparametric === false ? '#a78bfa' : idx === 0 && npComparisonAvailable ? '#34d399' : '#38bdf8' }]
                           : [];
                       })}
                     />

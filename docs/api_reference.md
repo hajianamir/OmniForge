@@ -96,13 +96,18 @@ Each studio follows the pattern: `POST /api/workbench/sXX/<action>` with an `X-S
 
 ---
 
-### 2.4 Studio 03 — EDA (`s03`)
+### 2.4 Studio 03 — Universal Diagnostics (`s03`)
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/s03/eda` | POST | Automated exploratory data analysis |
+| `/s03/catalog` | GET | Module descriptions, including `executable_modules` for Studio 03 (not downstream suggestions) |
+| `/s03/run` | POST | Run diagnostics with `mode: all` (or `complete`), `auto`, or `custom` |
 
-**Response:** Distribution profiles, correlation matrix, missingness report, executive narrative, Plotly figures.
+Custom mode requires a nonempty `selected_modules` array of unique executable IDs.
+Other modes must omit the list or send an empty list. Invalid selections or modes return 422.
+The response includes `report.executed_modules`, `report.module_status`, the hypothesis ledger,
+and any available baseline or risk evidence. Modules without evaluable results are marked `unavailable`.
+Risk uses `structural_risk_index`, `risk_band`, and `tail_risk_table`.
 
 ---
 
@@ -508,3 +513,28 @@ See [`docs/user_guide.md`](docs/user_guide.md) Section 11 for complete Python SD
 ---
 
 *End of API Reference. For installation and quickstart, see [`README.md`](README.md). For the complete user guide, see [`docs/user_guide.md`](docs/user_guide.md).*
+### Run-level model inputs
+
+`DiagnosticsReq`, `AutoMLRunReq`, `NonParametricRunReq`, and `DeepBenchReq` accept `ignored_columns`.
+This filters predictor inputs, not the session dataset. Studio 03 still scans the entire analysis
+scope, subject to its diagnostic caps. The list must not name an outcome. Call `/s05/select` with
+`apply_to_run: true` on a locked training cohort to obtain a `run_scope` object to pass into one
+modelling request. This cannot be combined with a session-wide `commit: true`.
+
+### Diagnostic sampling and correction families
+
+Studio 03 discloses `n_scanned`, `sampled_from`, `columns_skipped`, and `scan_limits` for the
+bounded statistical scan; individual tests can use fewer observations due to missing values.
+Quality and baseline partitions are separate. The available hypothesis ledger is one predeclared
+family (`studio03_global_evaluable_ledger`), rather than per-method families; its method and
+size are returned. Studio 04's battery identifies `studio04_evaluable_battery`; a single selected
+exploratory test does not get a battery-wide adjustment. Mining families represent the candidate
+rules or subgroups tested, before the top-N display truncation, not the universe of all rules.
+
+### Split, validation, and deep evaluation notes
+
+Split Locks store zero-based row positions and report cross-partition exact duplicates as an
+explicit audit failure. A failed audit does not itself repartition the dataset. Request-schema
+validation returns HTTP 422 with `error_code: REQUEST_VALIDATION_ERROR`, `trace_id`, and a
+sanitized `detail` list without submitted values. Studio 06's deep benchmark reports its
+holdout sampling method and classification counts before and after any row cap.

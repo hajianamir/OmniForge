@@ -145,6 +145,7 @@ def _compile_report_payload(state: dict[str, Any], req: ReportCompileReq) -> dic
         target_columns=targets,
         cleaning_report=state.get("uap_clean_report"),
         diagnostics_report=state.get("uap_diag_report"),
+        decision_summary=state.get("uap_risk_report"),
         clustering_result=state.get("uap_clustering_result"),
         anomaly_meta=state.get("uap_anomaly_meta"),
         eda_report=state.get("uap_eda_report"),

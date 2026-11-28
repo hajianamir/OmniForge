@@ -11,10 +11,20 @@ from pydantic import BaseModel, Field
 from scipy import stats
 from sklearn.model_selection import train_test_split
 
+from omniforge.core.exceptions import DataValidationError
 from omniforge.core.performance import smart_sample_df
+from omniforge.core.task_inference import infer_supervised_task
+from omniforge.core.types import TaskType
 from omniforge.data.quality import DataQualityProfiler
 from omniforge.eda.statistics import HypothesisTestResult, StatisticalAnalyzer
-from omniforge.models.baselines import BaselineBenchmarkSuite
+from omniforge.evaluation.paired_comparison import paired_score_interval
+from omniforge.features.inference import WorkbenchInputPreprocessor, nonconstant_predictors
+from omniforge.models.baselines import (
+    BaselineBenchmarkSuite,
+    BaselineEvidence,
+    baseline_feature_evidence,
+    strongest_scored_reference,
+)
 
 # Complete catalog of selectable diagnostic & analytical modules (domain-agnostic)
 DIAGNOSTIC_TEST_CATALOG: dict[str, str] = {
@@ -29,11 +39,18 @@ DIAGNOSTIC_TEST_CATALOG: dict[str, str] = {
 
 DOWNSTREAM_MODULE_CATALOG: dict[str, str] = {
     "baseline_benchmark": "Establish Quantitative Baselines (Dummy / Linear / Tree Stump Floor)",
-    "risk_uncertainty_audit": "Quantitative Risk & Uncertainty Audit (VaR / CVaR, Structural Risk & Conformal Bounds)",
+    "risk_uncertainty_audit": "Quantitative Tail Risk & Empirical Target Uncertainty (VaR / CVaR)",
     "clustering_segmentation": "Unsupervised Clustering & Natural Segment Discovery (Auto-K + Silhouette / PCA)",
     "automated_eda": "Automated EDA Visual Report & Insights",
     "automl_benchmark": "Baseline-First AutoML Tournament (Single or Multi-Target)",
     "model_card": "Governance & Compliance Model Card",
+}
+
+
+EXECUTABLE_MODULES = {
+    **DIAGNOSTIC_TEST_CATALOG,
+    "baseline_benchmark": DOWNSTREAM_MODULE_CATALOG["baseline_benchmark"],
+    "risk_uncertainty_audit": "Empirical Tail Risk (VaR / CVaR) and Structural Screening",
 }
 
 
@@ -60,12 +77,19 @@ class UniversalDiagnosticsReport:
 
     criteria: StatisticalCriteriaConfig
     executed_modules: list[str]
+    n_scanned: int = 0
+    sampled_from: int = 0
+    columns_skipped: dict[str, list[str]] = field(default_factory=dict)
+    scan_limits: dict[str, Any] = field(default_factory=dict)
+    correction_family: dict[str, Any] | None = None
+    module_status: dict[str, str] = field(default_factory=dict)
     hypothesis_ledger: list[dict[str, Any]] = field(default_factory=list)
     quality_report: dict[str, Any] | None = None
     distribution_profiles: list[dict[str, Any]] = field(default_factory=list)
     outlier_profiles: list[dict[str, Any]] = field(default_factory=list)
     vif_scores: dict[str, float] = field(default_factory=dict)
     baseline_benchmarks: dict[str, dict[str, dict[str, float]]] = field(default_factory=dict)
+    baseline_evidence: dict[str, BaselineEvidence] = field(default_factory=dict)
     baseline_equations: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     baseline_feature_cols: dict[str, list[str]] = field(default_factory=dict)
     baseline_split: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -138,10 +162,7 @@ class UniversalDiagnosticsSuite:
 
     @staticmethod
     def _is_classification_series(series: pd.Series) -> bool:
-        if not pd.api.types.is_numeric_dtype(series):
-            return True
-        observed = series.dropna().drop_duplicates().to_numpy(dtype=float)
-        return bool(len(observed) <= 15 and np.all(np.isfinite(observed)) and np.all(observed == np.trunc(observed)))
+        return infer_supervised_task(series) != TaskType.REGRESSION
 
     @staticmethod
     def _bootstrap_mean_ci(
@@ -193,20 +214,38 @@ class UniversalDiagnosticsSuite:
         selected_modules: list[str] | None = None,
         criteria: StatisticalCriteriaConfig | None = None,
         baseline_partitions: tuple[pd.DataFrame, pd.DataFrame] | None = None,
+        ignored_columns: list[str] | None = None,
+        baseline_split_strategy: str | None = None,
     ) -> UniversalDiagnosticsReport:
         """Execute user-selected statistical tests, baseline benchmarks, and risk audits with exact criteria."""
         cfg = criteria or StatisticalCriteriaConfig()
         targets = [t for t in (target_cols or []) if t in df.columns]
         modules = list(selected_modules) if selected_modules is not None else list(self.recommend_modules(df, targets).keys())
 
-        report = UniversalDiagnosticsReport(criteria=cfg, executed_modules=modules)
+        unknown = set(modules) - EXECUTABLE_MODULES.keys() if selected_modules is not None else set()
+        if unknown:
+            raise DataValidationError(
+                "Unknown or non-executable diagnostic modules.",
+                suggestions=["Choose modules from the executable diagnostics catalog."],
+            )
+        modules = [module for module in dict.fromkeys(modules) if module in EXECUTABLE_MODULES]
+        report = UniversalDiagnosticsReport(criteria=cfg, executed_modules=[])
         # Bound heavy statistical scans deterministically on huge tables (>25k rows) for sub-second UX
-        work_df, _was_sampled = smart_sample_df(
+        work_df, was_sampled = smart_sample_df(
             df,
             max_rows=25_000,
             stratify_col=targets[0] if targets and targets[0] in df.columns else None,
             seed=42,
         )
+        report.n_scanned = len(work_df)
+        report.sampled_from = len(df)
+        report.scan_limits["row_sampling"] = {"sampled": was_sampled, "max_rows": 25_000, "seed": 42}
+
+        def bounded_columns(key: str, candidates: list[str], limit: int) -> list[str]:
+            report.scan_limits[key] = {"max_columns": limit, "eligible_columns": len(candidates)}
+            report.columns_skipped[key] = candidates[limit:]
+            return candidates[:limit]
+
         num_cols = list(work_df.select_dtypes(include=[np.number]).columns)
         cat_cols = [
             c
@@ -237,6 +276,7 @@ class UniversalDiagnosticsSuite:
                     "ci_high": res.ci_high,
                     "decision": "Reject H0" if res.p_value < cfg.alpha else "Fail to Reject H0",
                     "interpretation": res.interpretation,
+                    **{key: res.details[key] for key in ("n_scanned", "sampled_from", "effect_size_scan") if key in res.details},
                 }
             )
 
@@ -251,7 +291,7 @@ class UniversalDiagnosticsSuite:
 
         # 2. Normality, Shape & Bootstrap CIs
         if "normality_distribution" in modules or "group_difference_tests" in modules or "correlation_association" in modules:
-            for col in num_cols[:30]:
+            for col in bounded_columns("normality_distribution", num_cols, 30):
                 vals = pd.to_numeric(df[col], errors="coerce").dropna().to_numpy(dtype=float)
                 n_res = StatisticalAnalyzer.normality_test(df[col], alpha=cfg.alpha, method=cfg.normality_method)
                 normality_flags[col] = not n_res.reject_null
@@ -279,7 +319,7 @@ class UniversalDiagnosticsSuite:
 
         # 3. Outlier & Extreme Value Scan
         if "outlier_anomaly_scan" in modules:
-            for col in num_cols[:30]:
+            for col in bounded_columns("outlier_anomaly_scan", num_cols, 30):
                 vals = pd.to_numeric(df[col], errors="coerce").dropna().to_numpy(dtype=float)
                 cnt, pct, low, high = self._detect_outliers(vals, cfg.outlier_method)
                 report.outlier_profiles.append(
@@ -319,7 +359,14 @@ class UniversalDiagnosticsSuite:
                         seen_pairs.add(key)
                         num_pairs.append((c1, c2))
 
-            for c1, c2 in num_pairs[:35]:
+            selected_num_pairs = num_pairs[:35]
+            scanned_num = {c for pair in selected_num_pairs for c in pair}
+            report.columns_skipped["correlation_numeric"] = [c for c in num_cols if c not in scanned_num]
+            report.scan_limits["correlation_numeric"] = {
+                "non_target_candidate_columns": 12, "max_pairs": 35, "n_pairs": len(selected_num_pairs),
+                "all_possible_pairs": len(num_cols) * (len(num_cols) - 1) // 2,
+            }
+            for c1, c2 in selected_num_pairs:
                 if cfg.correlation_method == "auto":
                     both_normal = normality_flags.get(c1, False) and normality_flags.get(c2, False)
                     corr_m: Literal["pearson", "spearman", "kendall"] = (
@@ -337,18 +384,27 @@ class UniversalDiagnosticsSuite:
             for i, a in enumerate(cat_cols[:10]):
                 for b in cat_cols[i + 1 : 10]:
                     cat_pairs.append((a, b))
-            for a, b in cat_pairs[:20]:
+            selected_cat_pairs = cat_pairs[:20]
+            scanned_cat = {c for pair in selected_cat_pairs for c in pair}
+            report.columns_skipped["correlation_categorical"] = [c for c in cat_cols if c not in scanned_cat]
+            report.scan_limits["correlation_categorical"] = {
+                "candidate_columns": 10, "max_pairs": 20, "n_pairs": len(selected_cat_pairs),
+                "all_possible_pairs": len(cat_cols) * (len(cat_cols) - 1) // 2,
+            }
+            for a, b in selected_cat_pairs:
                 chi_res = StatisticalAnalyzer.chi_square_independence(df[a], df[b], alpha=cfg.alpha)
                 _append_test("Categorical Association", f"{a} vs {b}", chi_res)
 
         # 5. Group & Target Difference Hypothesis Tests (Levene + Student/Welch T-test / Mann-Whitney U / ANOVA / Kruskal)
         if "group_difference_tests" in modules:
             group_candidates = [t for t in targets if t in cat_cols] + [c for c in cat_cols if c not in targets]
-            group_cols_used = group_candidates[:4]
-            numeric_predictors = [c for c in num_cols if c not in group_cols_used][:15]
+            group_cols_used = bounded_columns("group_columns", group_candidates, 4)
+            numeric_predictors = bounded_columns("group_numeric_predictors", [c for c in num_cols if c not in group_cols_used], 15)
+            report.scan_limits["group_columns"]["max_levels"] = 12
             for g_col in group_cols_used:
                 n_grps = int(df[g_col].nunique(dropna=True))
                 if n_grps < 2 or n_grps > 12:
+                    report.columns_skipped["group_columns"].append(g_col)
                     continue
                 for v_col in numeric_predictors:
                     lev = StatisticalAnalyzer.levene_variance_test(df, v_col, g_col, alpha=cfg.alpha)
@@ -395,7 +451,7 @@ class UniversalDiagnosticsSuite:
         # 7. Sequential Stationarity (ADF) & Autocorrelation (Ljung-Box)
         if "stationarity_autocorrelation" in modules and num_cols:
             seq_cols = [t for t in targets if t in num_cols] + [c for c in num_cols if c not in targets]
-            for col in seq_cols[:8]:
+            for col in bounded_columns("stationarity_autocorrelation", seq_cols, 8):
                 adf_res = StatisticalAnalyzer.stationarity_test(df[col], alpha=cfg.alpha)
                 lb_res = StatisticalAnalyzer.ljung_box_autocorrelation_test(df[col], alpha=cfg.alpha)
                 _append_test("Stationarity", col, adf_res)
@@ -405,8 +461,14 @@ class UniversalDiagnosticsSuite:
         if raw_ledger:
             raw_ps = [float(r["p_value"]) for r in raw_ledger]
             adj_ps = StatisticalAnalyzer.adjust_p_values(raw_ps, method=cfg.multiple_testing_correction)
+            family = "studio03_global_evaluable_ledger" if cfg.multiple_testing_correction != "none" else None
+            report.correction_family = {
+                "id": family, "method": cfg.multiple_testing_correction,
+                "n_evaluable": int(np.isfinite(adj_ps).sum()),
+            }
             for row, adj_p in zip(raw_ledger, adj_ps, strict=False):
                 evaluable = bool(np.isfinite(adj_p))
+                row["correction_family"] = family
                 row["adjusted_p_value"] = adj_p if evaluable else None
                 if not evaluable:
                     row["p_value"] = None
@@ -420,11 +482,13 @@ class UniversalDiagnosticsSuite:
         if "baseline_benchmark" in modules and targets:
             from omniforge.evaluation.equations import ModelEquationExtractor
 
-            pred_cols = [c for c in df.columns if c not in targets]
-            if pred_cols:
+            excluded = set(targets) | set(ignored_columns or ())
+            eligible_predictors = [c for c in full_df.columns if c not in excluded]
+            if eligible_predictors:
                 for t_col in targets:
+                    strat: pd.Series | None = None
                     if baseline_partitions is None:
-                        work = df.dropna(subset=[t_col]).copy()
+                        work = full_df.dropna(subset=[t_col]).copy()
                         if len(work) < 12:
                             continue
                         target = work[t_col]
@@ -446,7 +510,10 @@ class UniversalDiagnosticsSuite:
                         continue
                     y_tr, y_val = train[t_col], test[t_col]
                     is_clf = self._is_classification_series(y_tr)
-                    from omniforge.features.inference import WorkbenchInputPreprocessor
+                    pred_cols = nonconstant_predictors(train[eligible_predictors])
+                    if not pred_cols:
+                        report.recommendations.append(f"Skipped baseline for '{t_col}': no nonconstant predictors in the training partition.")
+                        continue
 
                     preprocessor = WorkbenchInputPreprocessor(mode="numeric").fit(train[pred_cols])
                     X_tr = preprocessor.transform(train[pred_cols])
@@ -468,13 +535,16 @@ class UniversalDiagnosticsSuite:
                         )
                         continue
 
+                    baseline_evidence: BaselineEvidence = {}
+                    baseline_predictions: dict[str, np.ndarray] = {}
+                    report.baseline_evidence[t_col] = baseline_evidence
                     if is_clf:
                         bl_metrics, bl_models = BaselineBenchmarkSuite.run_classification_detailed(
-                            X_tr, y_tr, X_val, y_val
+                            X_tr, y_tr, X_val, y_val, evidence=baseline_evidence, predictions=baseline_predictions,
                         )
                     else:
                         bl_metrics, bl_models = BaselineBenchmarkSuite.run_regression_detailed(
-                            X_tr, y_tr, X_val, y_val
+                            X_tr, y_tr, X_val, y_val, evidence=baseline_evidence, predictions=baseline_predictions,
                         )
                     report.baseline_benchmarks[t_col] = bl_metrics
                     report.baseline_feature_cols[t_col] = list(pred_cols)
@@ -489,12 +559,10 @@ class UniversalDiagnosticsSuite:
                     )
 
                     # Determine naive floor baseline score for explicit lift & acceptance criteria
-                    naive_candidates = [
-                        (name, m.get(primary_metric, 0.0))
-                        for name, m in bl_metrics.items()
-                        if any(tok in name.lower() for tok in ("most_frequent", "stratified", "mean", "median", "dummy"))
-                    ]
-                    naive_floor = max((float(v) for _, v in naive_candidates), default=0.0)
+                    naive_reference = strongest_scored_reference(
+                        bl_metrics, baseline_evidence, primary_metric, higher_is_better=True, role="naive",
+                    )
+                    naive_floor = naive_reference[1] if naive_reference is not None else None
                     max_vif = max((float(v) for v in report.vif_scores.values() if not np.isnan(v)), default=1.0)
 
                     # Rank all baselines best -> worst
@@ -525,27 +593,41 @@ class UniversalDiagnosticsSuite:
                         m_scores = dict(bl_metrics.get(bl_name, {}))
                         p_score = float(m_scores.get(primary_metric, 0.0))
                         rank_num = int(rank_lookup.get(bl_name, len(ranked_names)))
-                        is_naive = any(
-                            tok in bl_name.lower() for tok in ("most_frequent", "stratified", "mean", "median", "dummy")
+                        is_naive = baseline_evidence[bl_name]["role"] == "naive"
+                        lift_abs = round(p_score - naive_floor, 5) if naive_floor is not None else None
+                        lift_pct = (
+                            round(lift_abs / abs(naive_floor) * 100.0, 2)
+                            if lift_abs is not None and naive_floor is not None and abs(naive_floor) > 1e-4 else None
                         )
-                        lift_abs = round(p_score - naive_floor, 5)
-                        lift_pct = round((lift_abs / max(abs(naive_floor), 1e-4)) * 100.0, 2) if abs(naive_floor) > 1e-4 else None
 
-                        if rank_num == 1 and not is_naive and lift_abs > 0:
-                            acc_status = "ACCEPTED — CHAMPION BASELINE"
-                        elif is_naive:
-                            acc_status = "REFERENCE — NAIVE FLOOR"
-                        elif lift_abs >= 0:
-                            acc_status = "ACCEPTED — VALIDATED BASELINE"
+                        comparison: dict[str, Any] = {"status": "unavailable", "reason": "No evaluable naive reference."}
+                        if naive_reference is not None and not is_naive:
+                            strategy = baseline_split_strategy if baseline_partitions is not None else (
+                                "stratified" if strat is not None else "random"
+                            )
+                            comparison = paired_score_interval(
+                                y_val, baseline_predictions[bl_name], baseline_predictions[naive_reference[0]],
+                                metric=primary_metric, split_strategy=strategy, reference_name=naive_reference[0],
+                                comparisons=len(bl_metrics) * sum(row["role"] == "naive" for row in baseline_evidence.values()),
+                                confidence=cfg.confidence_level,
+                            )
+                        if is_naive:
+                            acc_status = "REFERENCE — NAIVE FLOOR" if naive_reference else "REFERENCE — NAIVE FAMILY INCOMPLETE"
+                        elif comparison.get("supports_improvement"):
+                            acc_status = "ACCEPTED — CHAMPION BASELINE" if rank_num == 1 else "ACCEPTED — VALIDATED BASELINE"
+                        elif comparison["status"] == "available":
+                            acc_status = "BENCHMARKED — IMPROVEMENT NOT ESTABLISHED"
                         else:
-                            acc_status = "REJECTED — BELOW NAIVE FLOOR"
+                            acc_status = "BENCHMARKED — COMPARISON UNAVAILABLE"
 
                         reasons: list[str] = [
                             f"Ranked #{rank_num} of {len(ranked_names)} candidates on {len(test)} held-out rows ({partition_source}).",
                             f"Primary Criterion ({criterion_label}): {primary_metric.upper()} = {p_score:.4f}"
                             + (f" | RMSE = {float(m_scores.get('rmse', 0.0)):.4f}, MAE = {float(m_scores.get('mae', 0.0)):.4f}" if not is_clf else f" | Accuracy = {float(m_scores.get('accuracy', 0.0)):.4f}"),
                         ]
-                        if is_naive:
+                        if naive_floor is None or lift_abs is None:
+                            reasons.append("Naive floor unavailable: not all designated dummy references were scored.")
+                        elif is_naive:
                             reasons.append(
                                 "Retained as mandatory zero-skill statistical reference floor — all downstream ML/Neural models must statistically beat this floor."
                             )
@@ -596,6 +678,7 @@ class UniversalDiagnosticsSuite:
 
                         eq_d.update(
                             {
+                                **baseline_feature_evidence(bl_m),
                                 "rank": rank_num,
                                 "total_candidates": len(ranked_names),
                                 "model_paradigm": model_paradigm,
@@ -604,9 +687,12 @@ class UniversalDiagnosticsSuite:
                                 "primary_score": round(p_score, 5),
                                 "higher_is_better": higher_is_better,
                                 "selection_criterion": criterion_label,
-                                "naive_floor_score": round(naive_floor, 5),
+                                "naive_floor_score": naive_floor,
+                                "naive_floor_status": "available" if naive_reference is not None else "unavailable",
+                                "naive_floor_model": naive_reference[0] if naive_reference is not None else None,
                                 "lift_over_naive": lift_abs,
                                 "lift_over_naive_pct": lift_pct,
+                                "lift_comparison": comparison,
                                 "acceptance_status": acc_status,
                                 "acceptance_reasons": reasons,
                                 "metrics": {k: round(float(v), 5) for k, v in m_scores.items() if isinstance(v, (int, float)) and np.isfinite(v)},
@@ -626,12 +712,12 @@ class UniversalDiagnosticsSuite:
                         }
                     report.baseline_equations[t_col] = enriched_eqs
                     self.last_baseline_models_[t_col] = raw_models
-            elif len(df) >= 20:
+            elif len(full_df.columns) == len(targets) and len(full_df) >= 20:
                 # Forecasting baselines use chronological partitions for standalone series.
                 for t_col in targets:
                     if pd.api.types.is_numeric_dtype(df[t_col]):
                         if baseline_partitions is None:
-                            vals = df[t_col].dropna().to_numpy(dtype=float)
+                            vals = full_df[t_col].dropna().to_numpy(dtype=float)
                             split_i = max(10, int(len(vals) * (1.0 - cfg.holdout_ratio)))
                             train_vals, test_vals = vals[:split_i], vals[split_i:]
                             source = "diagnostics_chronological_holdout"
@@ -656,8 +742,26 @@ class UniversalDiagnosticsSuite:
 
         # 9. Quantitative Risk & Uncertainty Assessment (VaR, CVaR, Tail Risk, Structural Risk Index, Target Uncertainty)
         if "risk_uncertainty_audit" in modules:
-            report.risk_assessment = self._compute_risk_assessment(df, targets, num_cols, report, cfg)
+            tail_columns = bounded_columns("risk_tail_columns", num_cols, 25)
+            risk_outlier_columns = bounded_columns("risk_outlier_columns", num_cols, 15) if not report.outlier_profiles else []
+            report.risk_assessment = self._compute_risk_assessment(
+                df, targets, num_cols, report, cfg, tail_columns=tail_columns, risk_outlier_columns=risk_outlier_columns,
+            )
 
+        tested_families = {row["family"] for row in raw_ledger if row["decision"] != "Not evaluable"}
+        evidence = {
+            "data_quality_integrity": bool(report.quality_report),
+            "normality_distribution": bool(report.distribution_profiles),
+            "outlier_anomaly_scan": bool(report.outlier_profiles),
+            "correlation_association": bool({"Correlation", "Categorical Association"} & tested_families),
+            "group_difference_tests": "Group Comparison" in tested_families,
+            "multicollinearity_vif": bool(report.vif_scores),
+            "stationarity_autocorrelation": bool({"Stationarity", "Autocorrelation"} & tested_families),
+            "baseline_benchmark": any(report.baseline_benchmarks.values()),
+            "risk_uncertainty_audit": report.risk_assessment is not None,
+        }
+        report.module_status = {module: "executed" if evidence[module] else "unavailable" for module in modules}
+        report.executed_modules = [module for module in modules if evidence[module]]
         return report
 
     def _compute_risk_assessment(
@@ -667,11 +771,14 @@ class UniversalDiagnosticsSuite:
         num_cols: list[str],
         report: UniversalDiagnosticsReport,
         cfg: StatisticalCriteriaConfig,
+        *,
+        tail_columns: list[str],
+        risk_outlier_columns: list[str],
     ) -> dict[str, Any]:
         """Compute quantitative tail risk (VaR/CVaR), structural data risk index (0-100), and target uncertainty."""
         tail_rows: list[dict[str, Any]] = []
         fat_tail_count = 0
-        for col in num_cols[:25]:
+        for col in tail_columns:
             vals = pd.to_numeric(df[col], errors="coerce").dropna().to_numpy(dtype=float)
             if len(vals) < 5:
                 continue
@@ -703,15 +810,15 @@ class UniversalDiagnosticsSuite:
                 }
             )
 
-        # Structural Data Risk Index (0 = lowest risk, 100 = highest risk)
+        # Uncalibrated structural screening score (0–100 heuristic points).
         missing_rate = float(df.isna().sum().sum() / max(df.shape[0] * max(df.shape[1], 1), 1))
         dup_rate = float(df.duplicated().mean()) if len(df) > 0 else 0.0
         avg_out_pct = (
             float(np.mean([r["Outlier %"] for r in report.outlier_profiles]))
             if report.outlier_profiles
             else float(
-                np.mean([self._detect_outliers(pd.to_numeric(df[c], errors="coerce").dropna().to_numpy(dtype=float), cfg.outlier_method)[1] for c in num_cols[:15]])
-                if num_cols
+                np.mean([self._detect_outliers(pd.to_numeric(df[c], errors="coerce").dropna().to_numpy(dtype=float), cfg.outlier_method)[1] for c in risk_outlier_columns])
+                if risk_outlier_columns
                 else 0.0
             )
         )
@@ -770,6 +877,11 @@ class UniversalDiagnosticsSuite:
 
         return {
             "structural_risk_index": total_risk,
+            "score_kind": "uncalibrated_screening_heuristic",
+            "component_caps": {
+                "missingness_risk": 25, "duplication_risk": 15, "outlier_tail_risk": 25,
+                "multicollinearity_risk": 20, "sample_sparsity_risk": 15,
+            },
             "risk_band": risk_band,
             "confidence_level": cfg.confidence_level,
             "tail_alpha": cfg.risk_tail_alpha,

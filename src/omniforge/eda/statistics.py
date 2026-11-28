@@ -96,8 +96,10 @@ class StatisticalAnalyzer:
         if chosen == "auto":
             chosen = "shapiro_wilk" if len(vals) <= 5000 else "dagostino_pearson"
 
+        n_scanned = len(vals)
         if chosen == "shapiro_wilk":
             sample = vals if len(vals) <= 5000 else np.random.default_rng(42).choice(vals, size=5000, replace=False)
+            n_scanned = len(sample)
             stat, p_val = stats.shapiro(sample)
             name = "shapiro_wilk"
         elif chosen == "dagostino_pearson":
@@ -166,6 +168,8 @@ class StatisticalAnalyzer:
             reject = bool(p_val < alpha)
             extra_det: dict[str, Any] = {
                 "a_star": round(a_star, 6),
+                "n_scanned": len(vals),
+                "sampled_from": len(vals),
                 "skewness": round(float(stats.skew(vals)), 4),
                 "kurtosis": round(float(stats.kurtosis(vals)), 4),
             }
@@ -195,7 +199,10 @@ class StatisticalAnalyzer:
                 if reject
                 else f"No statistically significant departure from normality (p={p_val:.4g} >= alpha={alpha})."
             ),
-            details={"skewness": round(float(stats.skew(vals)), 4), "kurtosis": round(float(stats.kurtosis(vals)), 4)},
+            details={
+                "skewness": round(float(stats.skew(vals)), 4), "kurtosis": round(float(stats.kurtosis(vals)), 4),
+                "n_scanned": n_scanned, "sampled_from": len(vals),
+            },
         )
 
     @staticmethod
@@ -369,6 +376,7 @@ class StatisticalAnalyzer:
 
             # Distribution-free Hodges-Lehmann location shift & Moses CI on pairwise differences (a_i - b_j)
             max_exact_pairs = 200_000
+            n_sa, n_sb = n_a, n_b
             if n_a * n_b <= max_exact_pairs:
                 pw_diffs = np.sort((a[:, None] - b[None, :]).ravel())
                 hl_shift = float(np.median(pw_diffs))
@@ -404,6 +412,9 @@ class StatisticalAnalyzer:
                 "median_a": float(np.median(a)),
                 "median_b": float(np.median(b)),
                 "hodges_lehmann_shift": round(hl_shift, 6),
+                "effect_size_scan": {
+                    "n_scanned_a": n_sa, "n_scanned_b": n_sb, "sampled_from_a": n_a, "sampled_from_b": n_b,
+                },
                 "n_a": n_a,
                 "n_b": n_b,
             }
@@ -592,7 +603,8 @@ class StatisticalAnalyzer:
         chi2, p_val, dof, expected = stats.chi2_contingency(ct)
         n = float(ct.to_numpy().sum())
         min_dim = max(min(ct.shape) - 1, 1)
-        cramers_v = float(np.sqrt(chi2 / max(n * min_dim, 1e-12)))
+        pearson_chi2 = float(stats.chi2_contingency(ct, correction=False).statistic) if dof == 1 else float(chi2)
+        cramers_v = float(np.sqrt(pearson_chi2 / max(n * min_dim, 1e-12)))
 
         test_name = "chi_square_independence"
         stat_out = float(chi2)

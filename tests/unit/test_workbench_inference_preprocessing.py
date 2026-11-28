@@ -59,7 +59,9 @@ def test_studio06_single_and_batch_use_fitted_training_pipeline(monkeypatch: pyt
         return SimpleNamespace(
             best_model=pipe, best_model_name="logistic", executed_backend="test", requested_backend="test",
             best_score=1.0, lift_over_best_baseline=0.2, primary_metric="accuracy", task_type=kwargs["task_type"],
-            leaderboard=[], elapsed_seconds=0.1, fallback_reason=None, extra={},
+            leaderboard=[], elapsed_seconds=0.1, fallback_reason=None,
+            extra={"evaluation": {"best_score_partition": "validation", "validation_baseline_score": 0.8123456789,
+                                  "validation_baseline_name": "designated_reference"}},
         )
 
     monkeypatch.setattr("omniforge.api.studios.s06_automl.AutoMLBackendHub.run", train)
@@ -71,6 +73,9 @@ def test_studio06_single_and_batch_use_fitted_training_pipeline(monkeypatch: pyt
     trained = client.post("/api/workbench/s06/automl", json={"target": "target", "backend": "test"})
     assert trained.status_code == 200, trained.text
     assert trained.json()["target"] == "target"
+    # The observed lift is rounded independently and cannot recover the reference score.
+    assert trained.json()["baseline_score"] == 0.8123456789
+    assert trained.json()["baseline_name"] == "designated_reference"
     assert fitted_targets == ["target"]
     summary = trained.json()["state"]
     assert summary["active_input_feature_types"]["when"] == "datetime"
@@ -370,7 +375,13 @@ def test_deep_benchmark_uses_locked_rows_and_training_schema_under_row_cap(
     })
     assert response.status_code == 200, response.text
     payload = response.json()
-    assert payload["evaluation"] == {
+    evaluation = dict(payload["evaluation"])
+    assert evaluation.pop("holdout_sampling") == "stratified_without_replacement"
+    assert evaluation.pop("available_holdout_class_counts") == {"0": 14, "1": 14}
+    class_counts = evaluation.pop("holdout_class_counts")
+    assert set(class_counts) == {"0", "1"}
+    assert sorted(class_counts.values()) == [10, 11]
+    assert evaluation == {
         "source": "split_lock", "strategy": "time_series", "n_train": 79, "n_test": 21,
         "available_train_rows": 109, "available_test_rows": 28,
         "input_columns": ["sensor", "site"], "encoded_columns": ["sensor", "site_train_a", "site_train_b"],

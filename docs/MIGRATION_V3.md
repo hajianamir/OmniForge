@@ -8,7 +8,7 @@ In OmniForge v2.x, internal Workbench session state keys use the `uap_*` prefix 
 |---|---|---|
 | `uap_df` | `omniforge_active_df` | Active working DataFrame |
 | `uap_raw_df` | `omniforge_raw_df` | Immutable raw audit DataFrame |
-| `uap_split_lock` | `omniforge_split_lock` | Train/Test/Gap `row_id` contract |
+| `uap_split_lock` | `omniforge_split_lock` | Zero-based Train/Test positions; Gap rows are excluded, and realignment requires preserved, unique index labels |
 | `uap_targets` | `omniforge_targets` | Selected target columns |
 | `uap_excluded` | `omniforge_excluded` | Excluded/role columns |
 | `__uap_automl_target__` | `__omniforge_automl_target__` | Internal AutoML target column |

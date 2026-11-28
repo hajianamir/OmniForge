@@ -820,14 +820,14 @@ class ReportChartBuilder:
         ax.set_xlabel("Component Risk Score", fontsize=8.5)
         sri = risk_assessment.get("structural_risk_index", "N/A")
         band = risk_assessment.get("risk_band", "-")
-        ax.set_title(f"Structural Risk Index Breakdown (SRI: {sri} · Band: {band})", fontsize=10, fontweight="bold", color=_NAVY)
+        ax.set_title(f"Structural screening heuristic (uncalibrated) Breakdown (SRI: {sri} · Band: {band})", fontsize=10, fontweight="bold", color=_NAVY)
         _apply_clean_style(ax)
         fig.tight_layout()
         return _fig_to_artifact(
             fig,
             chart_id="risk_components",
             section_id="decision_intelligence",
-            title="Structural Risk Index Components",
+            title="Structural screening heuristic (uncalibrated) Components",
             caption=f"Decomposition of structural dataset and tail risk factors (Overall Risk Index: {sri}, Band: {band}).",
             width_inches=6.2,
             height_inches=3.0,

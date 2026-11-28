@@ -159,7 +159,8 @@ def cmd_automl(
     for idx, row in enumerate(res.leaderboard[:10], start=1):
         table.add_row(str(idx), str(row["model"]), str(row["kind"]), str(row["score"]))
     console.print(table)
-    console.print(f"Lift over best baseline: [bold green]{res.lift_over_best_baseline:+.4f}[/bold green]")
+    lift = res.lift_over_best_baseline
+    console.print(f"Lift over best baseline: {lift:+.4f}" if lift is not None else "Lift over best baseline: unavailable")
 
     if save_model:
         res.best_model.save(save_model)

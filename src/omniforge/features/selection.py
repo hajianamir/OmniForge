@@ -205,14 +205,9 @@ class FeatureSelector:
             # Standardize features so L1 penalty is strictly scale-invariant across physical units
             arr_scaled = StandardScaler().fit_transform(arr)
             if self.task == "classification":
-                try:
-                    model = LogisticRegression(
-                        l1_ratio=1.0, solver="saga", C=0.5, random_state=self.random_seed, max_iter=500
-                    )
-                except TypeError:
-                    model = LogisticRegression(
-                        penalty="l1", solver="liblinear", C=0.5, random_state=self.random_seed, max_iter=500
-                    )
+                model = LogisticRegression(
+                    l1_ratio=1.0, solver="saga", C=0.5, random_state=self.random_seed, max_iter=500,
+                )
                 model.fit(arr_scaled, y_arr)
                 weights = np.mean(np.abs(model.coef_), axis=0)
             else:

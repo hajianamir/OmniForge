@@ -206,7 +206,9 @@ def test_specialized_automl_scores_external_holdout_with_matching_baseline() -> 
     assert evaluation["best_score_partition"] == "test"
     assert evaluation["n_train"] + evaluation["n_validation"] == len(data)
     assert evaluation["n_test"] == len(X_test)
-    expected = f1_score(y_test, result.best_model.predict(X_test), average="macro")
+    assert result.primary_metric == "f1_weighted"
+    assert evaluation["lift_comparison"]["status"] == "unavailable"
+    expected = f1_score(y_test, result.best_model.predict(X_test), average="weighted")
     assert result.best_score == round(expected, 6)
-    strongest = max(metrics["f1_macro"] for metrics in result.baseline_benchmarks.values())
+    strongest = max(metrics["f1_weighted"] for metrics in result.baseline_benchmarks.values())
     assert result.lift_over_best_baseline == pytest.approx(expected - strongest, abs=1e-6)

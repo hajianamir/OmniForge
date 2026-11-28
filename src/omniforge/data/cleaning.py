@@ -1098,15 +1098,15 @@ def benford_digit_test(series: pd.Series) -> dict[str, Any]:
     """First-digit Benford's Law conformity test (Chi-square) for financial/audit data screening."""
     from scipy import stats
 
-    vals = pd.to_numeric(series, errors="coerce").dropna().abs()
-    vals = vals[vals > 0]
-    if len(vals) < 30:
-        return {"evaluable": False, "reason": "Requires >= 30 positive observations.", "n": int(len(vals))}
-    first_digits = vals.astype(str).str.lstrip("0.").str[0]
-    digits = first_digits[first_digits.isin([str(d) for d in range(1, 10)])].astype(int)
-    n = len(digits)
+    # Use the stored numeric value's shortest decimal spelling: no epsilon or
+    # rounding across a digit boundary. Trailing binary error from an upstream
+    # calculation can legitimately place an observation below that boundary.
+    vals = pd.to_numeric(series, errors="coerce")
+    vals = vals[np.isfinite(vals) & (vals != 0)]
+    n = len(vals)
     if n < 30:
-        return {"evaluable": False, "reason": "Insufficient valid leading digits.", "n": int(n)}
+        return {"evaluable": False, "reason": "Requires >= 30 finite nonzero magnitudes.", "n": int(n)}
+    digits = vals.astype(str).str.lstrip("-0.").str[0].astype(int)
     obs = np.array([int((digits == d).sum()) for d in range(1, 10)], dtype=float)
     exp = np.array([n * np.log10(1.0 + 1.0 / d) for d in range(1, 10)], dtype=float)
     chi2_stat, p_val = stats.chisquare(obs, f_exp=exp)
@@ -1131,21 +1131,26 @@ def robust_mahalanobis_outliers(
 
     num = df.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan).dropna()
     p = num.shape[1]
-    if p < 2 or len(num) < max(20, p + 5):
-        return {"evaluable": False, "reason": "Requires >= 2 numeric columns and sufficient complete rows."}
+    minimum_rows = max(50, 10 * p)
+    coverage = {"n_scanned": len(num), "sampled_from": len(df), "minimum_complete_rows": minimum_rows}
+    if p < 2 or len(num) < minimum_rows:
+        return {**coverage, "evaluable": False, "reason": "Requires at least two numeric columns and max(50, 10p) complete rows."}
     X = num.to_numpy(dtype=float)
     try:
         mcd = MinCovDet(random_state=random_state).fit(X)
+        if np.linalg.matrix_rank(mcd.covariance_) < p:
+            return {**coverage, "evaluable": False, "reason": "MCD covariance is rank deficient."}
         dist_sq = mcd.mahalanobis(X)
-    except Exception:
-        cov = np.cov(X, rowvar=False) + np.eye(p) * 1e-6
-        inv_cov = np.linalg.pinv(cov)
-        diff = X - np.mean(X, axis=0)
-        dist_sq = np.einsum("ij,jk,ik->i", diff, inv_cov, diff)
+        if not np.isfinite(dist_sq).all():
+            return {**coverage, "evaluable": False, "reason": "MCD distances are not finite."}
+    except (ValueError, np.linalg.LinAlgError):
+        return {**coverage, "evaluable": False, "reason": "Could not estimate a usable MCD covariance."}
     cutoff = float(stats.chi2.ppf(1.0 - alpha, df=p))
     flags = dist_sq > cutoff
     return {
         "evaluable": True,
+        **coverage,
+        "cutoff_method": "asymptotic_chi_square_screening",
         "n_rows": int(len(num)),
         "n_features": int(p),
         "chi2_cutoff": round(cutoff, 4),

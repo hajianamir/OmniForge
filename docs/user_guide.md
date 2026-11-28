@@ -364,7 +364,7 @@ On graceful API shutdown the worker drains accepted work and then releases its S
 
 **Fairness:** Disparate Impact, Equalized Odds, Demographic Parity. **EEOC 4/5ths rule:** DI in [0.80, 1.25] is compliant; < 0.80 is adverse impact violation.
 
-**Mitigation:** Kamiran-Calders reweighing. Compliance Model Cards generated automatically.
+**Mitigation guidance:** Kamiran–Calders reweighing is a recommendation, not a Workbench action. Compliance Model Cards are generated separately.
 
 ---
 
@@ -1254,3 +1254,45 @@ Green AI Carbon Tracker reports `emissions_g_co2eq` for every AutoML and forecas
 ---
 
 *End of User Guide. For architecture details, see [`docs/architecture.md`](docs/architecture.md). For audit anchor replication, see [`docs/AUDIT_ANCHOR_REPLICATION.md`](docs/AUDIT_ANCHOR_REPLICATION.md). For risk register, see [`docs/RISK_REGISTER.md`](docs/RISK_REGISTER.md).*
+
+### Run-level predictor scope
+
+Studio 03 and Studio 06 model the eligible predictors by default. A run can specify `ignored_columns`
+without changing workspace exclusions or the Studio 03 statistical scans. Constant and wholly missing
+predictors are omitted based on training observations, not on held-out values. IDs and correlated
+predictors remain analyst decisions. With a Split Lock, Studio 05 can prepare a scope without
+committing it to the study; opt into that scope for the corresponding target in Studio 03 or 06.
+Where reported, a parsimonious L1 reference lists its nonzero fitted support (possibly empty).
+
+Selection rank and observed lift are not acceptance decisions. Where available, Studio 03/06
+report a paired, Bonferroni-adjusted holdout bootstrap interval conditional on the fitted models;
+stratified classification resamples within classes. Acceptance requires a lower bound above zero.
+Small, dependent, or unspecified holdout designs have no row-bootstrap interval. AutoML reports
+weighted F1 for classification and RMSE for regression; optional adapters' internal search tables
+are not cross-backend tournament scores.
+
+### Governance availability and uncertainty limits
+
+PBO/CSCV, predictive split/adaptive conformal sets and intervals, nested CV, dataset cards,
+Venn–Abers calibration, Kamiran–Calders reweighing, ADBench, Friedman–Nemenyi, and k-NN
+Shapley data valuation are implemented, not yet exposed as production Workbench/API actions.
+Model cards and the available forecast intervals are separate. The naive forecast's Gaussian
+random-walk band (normal quantile × SD of first differences × √h) is not conformal.
+
+PSM uses the one-nearest-neighbor Abadie–Imbens population variance expression with a
+conditional **SATE variance floor**: the reported error is `sqrt(max(V_PATE, V_SATE, 0))`.
+It is not the unmodified population variance formula. AIPW instead reports
+`sd(psi, ddof=1) / sqrt(n)` over the fitted influence scores; cross-fitting is used when both
+arms support it, otherwise nuisance predictions are in-sample. These normal-approximation
+intervals have different inferential assumptions and are not interchangeable.
+
+The structural screening score is an **uncalibrated heuristic**, not a probability or a
+validated threshold for deployment. Its capped contributions are missing-cell rate ×120
+(cap 25), exact duplicated-row rate ×100 (cap 15), average outlier percentage ×2.5 plus
+1.5 per fat-tailed column (cap 25), positive `(max VIF − 2) ×2` (cap 20), and positive
+`(15 − rows/columns) ×1.2` (cap 15). Bands at 20, 45 and 70 only organize review.
+The score depends on the diagnostic scope, cap, configuration and available components.
+
+MCD outlier screening requires at least two numeric variables and `max(50, 10p)` complete
+rows for `p` variables. Its chi-square cutoff is asymptotic, not small-sample calibrated.
+The report shows the listwise denominator separately from the source row count.

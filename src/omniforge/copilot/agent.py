@@ -332,10 +332,12 @@ class OmniForgeCopilotAgent:
                 _require_dataset()
                 res = self.tools.invoke("train_automl", {"target_column": target_col, "time_budget_seconds": 25.0})
                 executed.append({"tool": "train_automl", "arguments": {"target_column": target_col}, "result": res})
+                lift = res.get("lift_over_best_baseline")
+                lift_label = f"{lift:+.4f}" if isinstance(lift, (int, float)) else "unavailable"
                 reply_parts.append(
                     f"AutoML complete for `{res['task_type']}`! Champion: **{res['best_algorithm']}** "
                     f"achieving **{res['primary_metric']} = {res['best_score']}** "
-                    f"(lift over strongest baseline: **{res['lift_over_best_baseline']:+.4f}**; "
+                    f"(lift over strongest baseline: **{lift_label}**; "
                     f"carbon footprint: {res['carbon_g_co2eq']:.6f} gCO2eq)."
                 )
                 next_steps = ["Explain model with SHAP/LIME", "Audit fairness & robustness", "Register model to Production"]

@@ -773,10 +773,12 @@ def test_causal_aipw_and_psm_golden_se() -> None:
     res_aipw = engine.estimate_ate(df_c, treatment_col="t", outcome_col="y", confounders=["x1", "x2"], method="aipw")
     assert abs(res_aipw.ate - 2.0) < 0.35
     assert 0.01 < res_aipw.std_error < 0.5
+    assert res_aipw.details["variance_rule"] == "sample_variance_of_influence_scores_divided_by_n"
 
     res_psm = engine.estimate_ate(df_c, treatment_col="t", outcome_col="y", confounders=["x1", "x2"], method="psm")
     assert abs(res_psm.ate - 2.0) < 0.5
     assert 0.01 < res_psm.std_error < 0.6
+    assert res_psm.details["variance_rule"] == "maximum_of_pate_and_conditional_sate_variance"
 
 
 def test_p1_nested_cv_mrmr_and_causal_refutation() -> None:

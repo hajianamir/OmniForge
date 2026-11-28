@@ -25,7 +25,9 @@ from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, PowerTransforme
 
 from omniforge.core.exceptions import DataValidationError
 from omniforge.core.logging import get_logger
+from omniforge.core.task_inference import infer_supervised_task
 from omniforge.core.types import TaskType
+from omniforge.data.cpcv import iter_cpcv_splits
 
 logger = get_logger(__name__)
 
@@ -100,7 +102,7 @@ class LeakageSafeSplitter:
         if target_col and target_col in df.columns:
             ser = df[target_col].dropna()
             if len(ser) > 0:
-                is_discrete = (not pd.api.types.is_numeric_dtype(ser)) or (ser.nunique() <= 15)
+                is_discrete = infer_supervised_task(ser) != TaskType.REGRESSION
                 if is_discrete and int(ser.value_counts().min()) >= 2:
                     return "stratified"
         return "random"
@@ -625,28 +627,14 @@ class CombinatorialPurgedKFold:
         X: Any,
         y: Any = None,
         groups: Any = None,
+        *,
+        eval_times: np.ndarray | pd.Series | None = None,
     ) -> list[tuple[np.ndarray, np.ndarray]]:
-        from itertools import combinations
-
-        n_samples = len(X)
-        if n_samples < self.n_splits:
-            raise ValueError(f"Cannot have n_splits={self.n_splits} greater than n_samples={n_samples}.")
-
-        indices = np.arange(n_samples)
-        fold_bounds = np.array_split(indices, self.n_splits)
-        embargo = int(np.ceil(n_samples * self.embargo_pct))
-        splits: list[tuple[np.ndarray, np.ndarray]] = []
-
-        for test_fold_ids in combinations(range(self.n_splits), self.n_test_splits):
-            test_idx = np.concatenate([fold_bounds[i] for i in test_fold_ids])
-            excluded = np.zeros(n_samples, dtype=bool)
-            for fid in test_fold_ids:
-                block = fold_bounds[fid]
-                start, end = int(block[0]), int(block[-1]) + 1
-                purge_start = max(0, start - self.purge_gap)
-                purge_end = min(n_samples, end + self.purge_gap + embargo)
-                excluded[purge_start:purge_end] = True
-            train_idx = indices[~excluded]
-            splits.append((train_idx, test_idx))
-        return splits
-
+        """Compatibility adapter for the historical symmetric purge and list return type."""
+        if len(X) < self.n_splits:
+            raise ValueError(f"Cannot have n_splits={self.n_splits} greater than n_samples={len(X)}.")
+        embargo = int(np.ceil(len(X) * self.embargo_pct))
+        return list(iter_cpcv_splits(
+            X, n_splits=self.n_splits, n_test_groups=self.n_test_splits, purge_gap=self.purge_gap,
+            post_buffer=self.purge_gap + embargo, eval_times=eval_times, include_empty=True,
+        ))

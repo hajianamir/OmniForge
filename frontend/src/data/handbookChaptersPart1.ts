@@ -14,14 +14,14 @@ export const HANDBOOK_CHAPTERS_PART1: StudioChapter[] = [
     realWorldApplications: [
       'Onboarding raw enterprise datasets while preserving an unclipped audit copy.',
       'Detecting linear, monotonic, and nonlinear dependencies (dCor) immediately after ingestion.',
-      'Locking Train/Test partitions with stable row_id identity before Studio 01 Data Cleaning.',
+      'Locking Train/Test membership by zero-based row positions before Studio 01 Data Cleaning.',
     ],
     stepByStep: [
       '1. Ingest Data Source: Upload CSV/XLSX/Parquet/JSON or connect to SQL/Access or load a benchmark dataset.',
       '2. Inspect Intake Audit & Data Relationships: Review structural defects and click Analyze Data Relationships (Chart & Table) to inspect Pearson, Spearman, and dCor.',
       '3. Enable Split Lock Before Studio 01: Select target/excluded columns and lock Train/Test partitions before proceeding to Studio 01 Data Cleaning.',
     ],
-    provenanceRule: 'Immutable raw view (uap_raw_df) and Split Lock row_id partitions are established in Studio 00 before any cleaning or modeling.',
+    provenanceRule: 'Studio 00 stores an immutable raw view and positional Split Lock partitions. Realignment requires preserved, unique DataFrame index labels; ambiguous identity invalidates the lock.',
     methods: [],
     thresholdTables: [],
     decisionMatrix: { title: 'Studio 00 Ingestion & Split Lock Matrix', rows: [] },

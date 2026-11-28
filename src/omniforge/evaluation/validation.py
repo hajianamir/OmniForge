@@ -14,6 +14,7 @@ from sklearn.model_selection import GroupKFold, KFold, StratifiedGroupKFold, Str
 
 from omniforge.core.exceptions import EvaluationError
 from omniforge.core.types import TaskType
+from omniforge.data.cpcv import iter_cpcv_splits
 from omniforge.evaluation.metrics import MetricsEvaluator
 from omniforge.models.base import BaseOmniForgeModel
 
@@ -96,52 +97,12 @@ class CombinatorialPurgedKFold:
         and any training sample whose label interval overlaps a test block's span ``[t0_start, max(t1_test)]``
         is purged strictly per López de Prado (2018, §7.4.1).
         """
-        n = len(X)
-        blocks = np.array_split(np.arange(n), self.n_splits)
-        embargo_from_pct = int(np.ceil(n * self.embargo_pct)) if (self.embargo_pct is not None and self.embargo_pct > 0.0) else 0
-        effective_embargo = max(self.embargo_gap, embargo_from_pct)
-
-        ev_src = eval_times if eval_times is not None else self.eval_times
-        t0_num: np.ndarray | None = None
-        t1_num: np.ndarray | None = None
-        if ev_src is not None:
-            if len(ev_src) != n:
-                raise EvaluationError(f"eval_times length ({len(ev_src)}) must match X length ({n}).")
-            ev_ser = pd.Series(ev_src)
-            if pd.api.types.is_datetime64_any_dtype(ev_ser):
-                t1_num = ev_ser.astype("int64").to_numpy(dtype=float)
-                if isinstance(X, pd.DataFrame) and isinstance(X.index, pd.DatetimeIndex):
-                    t0_num = X.index.asi8.astype(float)
-                else:
-                    t0_num = t1_num.copy()
-            else:
-                t1_num = np.asarray(ev_ser, dtype=float)
-                if isinstance(X, pd.DataFrame) and pd.api.types.is_numeric_dtype(X.index.dtype):
-                    t0_num = np.asarray(X.index, dtype=float)
-                else:
-                    t0_num = np.arange(n, dtype=float)
-
-        all_indices = np.arange(n, dtype=int)
-        for test_combo in itertools.combinations(range(self.n_splits), self.n_test_groups):
-            test_idx = np.concatenate([blocks[g] for g in test_combo])
-            keep_mask = np.ones(n, dtype=bool)
-            keep_mask[test_idx] = False
-            for g in test_combo:
-                blk = blocks[g]
-                if len(blk) == 0:
-                    continue
-                b_start, b_end = int(blk[0]), int(blk[-1])
-                keep_mask[max(0, b_start - self.purge_gap) : b_start] = False
-                keep_mask[b_end + 1 : min(n, b_end + 1 + effective_embargo)] = False
-                if t0_num is not None and t1_num is not None:
-                    test_t0 = float(np.min(t0_num[blk]))
-                    test_t1 = float(np.max(t1_num[blk]))
-                    # Overlap condition: [t0_i, t1_i] intersects [test_t0, test_t1] <=> t0_i <= test_t1 and t1_i >= test_t0
-                    overlap = (t0_num <= test_t1) & (t1_num >= test_t0)
-                    keep_mask[overlap] = False
-            train_idx = all_indices[keep_mask]
-            if len(train_idx) > 0 and len(test_idx) > 0:
-                yield train_idx, test_idx
+        embargo_from_pct = int(np.ceil(len(X) * self.embargo_pct)) if self.embargo_pct else 0
+        return iter_cpcv_splits(
+            X, n_splits=self.n_splits, n_test_groups=self.n_test_groups, purge_gap=self.purge_gap,
+            post_buffer=max(self.embargo_gap, embargo_from_pct),
+            eval_times=eval_times if eval_times is not None else self.eval_times,
+        )
 
     @staticmethod
     def compute_pbo(

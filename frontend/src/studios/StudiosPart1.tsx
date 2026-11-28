@@ -1401,21 +1401,30 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
   const [corrMethod, setCorrMethod] = useState('auto');
   const [vifThresh, setVifThresh] = useState(5.0);
   const [riskAlpha, setRiskAlpha] = useState(0.05);
-  const [selectedMods, setSelectedMods] = useState<string[]>([
-    'statistical_tests', 'baselines', 'risk_analysis', 'multicollinearity', 'outliers',
-  ]);
+  const [useRunScope, setUseRunScope] = useState(false);
+  const selection = studioCache.s05_select;
+  const runScope = ws.split_lock?.active && ws.targets.length === 1 && selection?.run_scope_target === ws.targets[0] ? selection.run_scope : null;
+  const [selectedMods, setSelectedMods] = useState<string[]>([]);
+  const [catalog, setCatalog] = useState<Record<string, string> | null>(null);
+  const [catalogError, setCatalogError] = useState<string | null>(null);
   const report = studioCache.s03_diagnostics?.report ?? null;
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  const ALL_MODS = [
-    ['statistical_tests', 'Normality & Hypothesis Tests'],
-    ['baselines', 'Strong Baselines & Equations'],
-    ['risk_analysis', 'VaR / CVaR / Tail Risk'],
-    ['multicollinearity', 'VIF Multicollinearity'],
-    ['outliers', 'Multi-Method Outliers'],
-    ['feature_screening', 'Target-Feature Screening'],
-  ];
+  useEffect(() => {
+    if (mode !== 'custom' || catalog !== null) return;
+    let current = true;
+    setCatalogError(null);
+    apiGet<{ executable_modules: Record<string, string> }>('/api/workbench/s03/catalog')
+      .then(({ executable_modules }) => {
+        if (!current) return;
+        if (!executable_modules || !Object.keys(executable_modules).length) throw new Error('No executable modules in the diagnostics catalog.');
+        setCatalog(executable_modules);
+        setSelectedMods(Object.keys(executable_modules));
+      })
+      .catch((error: unknown) => { if (current) setCatalogError(toErrorMessage(error)); });
+    return () => { current = false; };
+  }, [mode, catalog]);
 
   const toggleMod = (m: string) =>
     setSelectedMods((prev) => (prev.includes(m) ? prev.filter((x) => x !== m) : [...prev, m]));
@@ -1435,6 +1444,7 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
         vif_threshold: vifThresh,
         risk_tail_alpha: riskAlpha,
         selected_modules: mode === 'custom' ? selectedMods : [],
+        ignored_columns: useRunScope && runScope ? runScope.ignored_columns : [],
       });
       onSync(res.state);
       setStudioResult('s03_diagnostics', res);
@@ -1513,14 +1523,17 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
         </div>
         {mode === 'custom' && (
           <div className="chip-grid" style={{ marginBottom: 12 }}>
-            {ALL_MODS.map(([id, lbl]) => (
+            {catalogError && <div className="alert alert-error">{catalogError}</div>}
+            {!catalog && !catalogError && <span>Loading diagnostic modules…</span>}
+            {Object.entries(catalog ?? {}).map(([id, lbl]) => (
               <button key={id} type="button" className={`chip ${selectedMods.includes(id) ? 'selected' : ''}`} onClick={() => toggleMod(id)}>
                 {lbl}
               </button>
             ))}
           </div>
         )}
-        <button className="btn btn-primary" disabled={busy || !ws.has_dataset} onClick={run}>
+        {runScope && <label className="row"><input type="checkbox" checked={useRunScope} onChange={(e) => setUseRunScope(e.target.checked)} /> Apply Studio 05 selection to this baseline run only</label>}
+        <button className="btn btn-primary" disabled={busy || !ws.has_dataset || (mode === 'custom' && !selectedMods.length)} onClick={run}>
           {busy ? <span className="spinner" /> : null} Execute Universal Diagnostics ({mode.toUpperCase()})
         </button>
       </div>
@@ -1530,9 +1543,20 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
           <div className="kpi-grid">
             <div className="kpi-card"><div className="kpi-label">Total Hypothesis Tests</div><div className="kpi-value">{report.total_tests ?? report.hypothesis_ledger?.length ?? 0}</div></div>
             <div className="kpi-card"><div className="kpi-label">Significant (p &lt; α)</div><div className="kpi-value">{report.significant_tests ?? 0}</div></div>
-            <div className="kpi-card"><div className="kpi-label">Risk Index</div><div className="kpi-value">{Number(report.risk_assessment?.overall_risk_index ?? 0).toFixed(1)}</div></div>
-            <div className="kpi-card"><div className="kpi-label">Risk Band</div><div className="kpi-value">{report.risk_assessment?.overall_risk_band || 'N/A'}</div></div>
+            <div className="kpi-card"><div className="kpi-label">Structural screening score (uncalibrated)</div><div className="kpi-value">{report.risk_assessment?.structural_risk_index?.toFixed(1) ?? 'Unavailable'}</div></div>
+            <div className="kpi-card"><div className="kpi-label">Screening band</div><div className="kpi-value">{report.risk_assessment?.risk_band ?? 'Unavailable'}</div></div>
           </div>
+
+          {Object.entries(report.module_status ?? {}).some(([, status]) => status === 'unavailable') && (
+            <p>Unavailable modules: {Object.entries(report.module_status ?? {}).filter(([, status]) => status === 'unavailable').map(([id]) => id).join(', ')}</p>
+          )}
+
+          {typeof report.n_scanned === 'number' && typeof report.sampled_from === 'number' && (
+            <p>Statistical scan scope: {report.n_scanned.toLocaleString()} of {report.sampled_from.toLocaleString()} rows. Quality and baseline cohorts are reported separately.</p>
+          )}
+          {Object.entries(report.columns_skipped ?? {}).filter(([, cols]) => cols.length > 0).map(([scan, cols]) => (
+            <p key={scan}>Columns skipped ({scan}): {cols.join(', ')}</p>
+          ))}
 
           {/* Visual Diagnostics Charts: Baseline Comparison, Hypothesis Significance & VIF */}
           <div className="grid-2" style={{ marginBottom: 14 }}>
@@ -1594,6 +1618,10 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
             </div>
           )}
 
+          {Object.entries(report.baseline_evidence ?? {}).flatMap(([target, rows]) => Object.entries(rows)
+            .filter(([, row]) => row.status === 'failed')
+            .map(([model, row]) => <p className="alert" key={JSON.stringify([target, model])}>{target}: {model} unavailable ({row.error})</p>))}
+
           {/* MODERN RANKED BASELINE MATHEMATICAL EQUATIONS + SELECTION RATIONALE */}
           {report.baseline_equations && Object.keys(report.baseline_equations).length > 0 && (
             <div className="card">
@@ -1620,14 +1648,15 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
           )}
 
           <div className="card">
-            <div className="card-title">Hypothesis Test Ledger (FDR Adjusted)</div>
+            <div className="card-title">Hypothesis Test Ledger</div>
+            {report.correction_family && <p>Correction: {report.correction_family.method} · {report.correction_family.id ?? 'no correction family'} ({report.correction_family.n_evaluable} evaluable tests)</p>}
             <SimpleTable title="Universal Statistical Diagnostics Ledger" rows={report.hypothesis_ledger || []} maxRows={80} />
           </div>
 
-          {(report.risk_assessment?.column_risks?.length ?? 0) > 0 && (
+          {(report.risk_assessment?.tail_risk_table?.length ?? 0) > 0 && (
             <div className="card">
               <div className="card-title">Distribution &amp; Tail-Risk Profile (VaR / CVaR)</div>
-              <SimpleTable title="Column Risk Metrics" rows={report.risk_assessment?.column_risks || []} />
+              <SimpleTable title="Column Risk Metrics" rows={report.risk_assessment?.tail_risk_table || []} />
             </div>
           )}
         </>
@@ -1715,6 +1744,7 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
           {eda.n_rows_analyzed !== undefined && (
             <div className="alert alert-info" role="status">
               Analyzed {eda.n_rows_analyzed.toLocaleString()} {eda.sampled ? 'sampled rows' : 'rows'} in the current study.
+              {eda.n_rows_available !== undefined && ` ${eda.n_rows_available.toLocaleString()} available / ${(eda.n_rows_available - eda.n_rows_analyzed).toLocaleString()} omitted; row cap ${eda.row_cap?.toLocaleString()}.`}
             </div>
           )}
           {(eda.distributions?.length ?? 0) > 0 && (
@@ -1885,6 +1915,7 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
                 <><strong>{hypRes.result.test_name}:</strong> statistic={hypRes.result.statistic == null ? 'unavailable' : Number(hypRes.result.statistic).toFixed(4)} · p-value={Number(hypRes.result.p_value).toExponential(3)} · <strong>{hypRes.result.p_value_scope === 'exploratory_selected_family' ? 'EXPLORATORY FITTED-NULL CHECK' : hypRes.result.significant ? 'SIGNIFICANT' : 'NOT SIGNIFICANT'}</strong> · {hypRes.result.interpretation}</>
               )}
             </div>
+            {hypRes.result.sample_disclosure && <p>Analysis sample: {hypRes.result.sample_disclosure}</p>}
             {hypRes.result.extra_table && (
               <SimpleTable title="Distribution Fit Ranking by AIC" rows={hypRes.result.extra_table} />
             )}
@@ -1989,6 +2020,14 @@ export const Studio05Features: React.FC<StudioProps> = ({ ws, onSync, bumpGrid, 
                 setStudioResult('s05_select', r);
               } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
             }}>Rank Features ({selMode.toUpperCase()})</button>
+            <button className="btn" disabled={busy || !ws.split_lock?.active} onClick={async () => {
+              setBusy(true); setErr(null);
+              try {
+                const r = await apiPost<SelectionResponse>('/api/workbench/s05/select', { mode: selMode, method, top_k: topK, apply_to_run: true });
+                onSync(r.state);
+                setStudioResult('s05_select', r);
+              } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
+            }}>Prepare Scope for One Run</button>
             <button className="btn btn-success" disabled={busy || !ws.has_dataset} onClick={async () => {
               setBusy(true); setErr(null);
               try {
@@ -2006,7 +2045,7 @@ export const Studio05Features: React.FC<StudioProps> = ({ ws, onSync, bumpGrid, 
         <div className="card">
           <div className="card-title">Feature Importance Ranking ({selRes.selected_features?.length || 0} selected · Mode: {String(selRes.mode || selMode).toUpperCase()})</div>
           {selRes.selected_source_columns && (
-            <p>{selRes.committed ? 'Applied' : 'Preview'} · {selRes.fit_scope === 'train_only' ? 'Fitted on locked training rows' : 'Fitted on the full study'} · Source predictors {selRes.selected_source_columns.join(', ')}</p>
+            <p>{selRes.committed ? 'Applied to study' : selRes.run_scope ? 'Run scope ready in Studio 03/06' : 'Preview'} · {selRes.fit_scope === 'train_only' ? 'Fitted on locked training rows' : 'Fitted on the full study'} · Source predictors {selRes.selected_source_columns.join(', ')}</p>
           )}
           <BarChartSVG
             title="Feature Importance / Consensus Ranking"

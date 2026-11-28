@@ -786,3 +786,29 @@ through `update_active_dataset`, and analysis uses `get_analysis_dataframe`.
 - [ ] Version strings in `version.py`, `pyproject.toml` and `frontend/package.json` are aligned.
 ---
 *End of document.*
+
+### Supervised task and preprocessing contracts
+
+For tabular task inference, use `core.task_inference.infer_supervised_task` in splitting,
+diagnostics, AutoML and Workbench: booleans, categories, or at most ten finite integer levels
+imply classification; explicit task overrides remain authoritative. Noninteger numeric targets
+are regression, regardless of cardinality. Studio 03 reports exploratory grouping separately.
+
+New numeric Workbench fits use median imputation and bounded nominal indicators. A 32-output
+cap includes the infrequent bucket when present; unseen levels encode as all zero. Specialized
+AutoML uses a train-fitted sklearn `ColumnTransformer`, including model-specific scaling and
+imputation chosen by the backend. Native `BaseOmniForgeModel` retains its numeric/ordinal
+array representation and legacy persisted Workbench fits keep their original transforms.
+These representations are not interchangeable or claimed to implement the same distance geometry.
+
+The CPCV kernel is `data.cpcv.iter_cpcv_splits`. For new evaluation code, use
+`evaluation.validation.CombinatorialPurgedKFold` (pre-test purge, post-test embargo, optional
+label interval purge). `data.splitting.CombinatorialPurgedKFold` is a compatibility adapter for
+the list-returning, symmetric positional-purge API; the post-buffer is its purge plus embargo.
+
+Native AutoML's reference suite fits bounded nominal indicators independently on each
+reference training partition; specialized backend references receive a named, train-fitted
+column-transformer matrix. Standalone `ModelBase` ordinal behavior remains a separate
+SDK compatibility path, not the encoding for Workbench or native AutoML distance references.
+A diagnostic ledger row can carry a nested sample size (e.g. a Shapiro–Wilk cap) distinct
+from the enclosing report scope; sampled Hodges–Lehmann effects report both group sizes.

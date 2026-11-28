@@ -28,6 +28,7 @@ from omniforge.automl.optimizer import HyperparameterOptimizer
 from omniforge.core.carbon import CarbonTracker
 from omniforge.core.exceptions import AutoMLError
 from omniforge.core.logging import get_logger
+from omniforge.core.task_inference import infer_supervised_task
 from omniforge.core.types import CarbonReport, TaskType
 from omniforge.data.splitting import (
     LeakageAuditReport,
@@ -36,8 +37,15 @@ from omniforge.data.splitting import (
     SplitConfig,
     SplitStrategyType,
 )
+from omniforge.evaluation.paired_comparison import paired_score_interval
+from omniforge.features.inference import WorkbenchInputPreprocessor, nonconstant_predictors
 from omniforge.models.base import BaseOmniForgeModel
-from omniforge.models.baselines import BaselineBenchmarkSuite
+from omniforge.models.baselines import (
+    BaselineBenchmarkSuite,
+    BaselineEvidence,
+    baseline_feature_evidence,
+    strongest_scored_reference,
+)
 from omniforge.models.classical import ClassicalMLModel
 from omniforge.models.deep.cnn import CNN1DModel
 from omniforge.models.deep.mlp import MLPModel
@@ -58,7 +66,7 @@ class AutoMLResult:
     primary_metric: str
     leaderboard: list[dict[str, Any]]
     baseline_benchmarks: dict[str, dict[str, float]]
-    lift_over_best_baseline: float
+    lift_over_best_baseline: float | None
     carbon_report: CarbonReport | None = None
     elapsed_seconds: float = 0.0
     leakage_audit: LeakageAuditReport | None = None
@@ -151,12 +159,7 @@ class AutoMLPipelineSearch:
     @staticmethod
     def infer_task_type(y: pd.Series | np.ndarray) -> TaskType:
         """Infer binary classification, multiclass classification, or regression from target."""
-        s = pd.Series(y).dropna()
-        if not pd.api.types.is_numeric_dtype(s) or pd.api.types.is_bool_dtype(s):
-            return TaskType.BINARY_CLASSIFICATION if s.nunique() <= 2 else TaskType.MULTICLASS_CLASSIFICATION
-        if s.nunique() <= 10 and np.all(np.isclose(s, np.round(s))):
-            return TaskType.BINARY_CLASSIFICATION if s.nunique() <= 2 else TaskType.MULTICLASS_CLASSIFICATION
-        return TaskType.REGRESSION
+        return infer_supervised_task(y)
 
     @staticmethod
     def pareto_frontier(
@@ -300,6 +303,7 @@ class AutoMLPipelineSearch:
         groups: pd.Series | np.ndarray | None = None,
         time_values: pd.Series | np.ndarray | None = None,
         holdout: tuple[pd.DataFrame, pd.Series] | None = None,
+        holdout_strategy: str | None = None,
     ) -> AutoMLResult:
         """Search on development data and evaluate on the supplied or internally reserved holdout.
 
@@ -368,6 +372,11 @@ class AutoMLPipelineSearch:
             )
         split_cfg = split_cfg.model_copy(update={"strategy": cast(SplitStrategyType, split_res.strategy_used)})
 
+        input_columns = nonconstant_predictors(X_work.iloc[tr_idx])
+        if not input_columns:
+            raise AutoMLError("No nonconstant predictors remain on the training partition.")
+        X_work = X_work.loc[:, input_columns]
+
         # Predictor matrix excludes temporary audit columns
         X_tr = X_work.iloc[tr_idx].reset_index(drop=True)
         X_va = X_work.iloc[va_idx].reset_index(drop=True)
@@ -424,12 +433,22 @@ class AutoMLPipelineSearch:
                 BaselineBenchmarkSuite.run_classification_detailed
                 if is_clf else BaselineBenchmarkSuite.run_regression_detailed
             )
-            validation_baselines, baseline_models = benchmark(X_tr, y_tr, X_va, y_va, self.random_seed)
+            baseline_preprocessor = WorkbenchInputPreprocessor(mode="numeric").fit(X_tr)
+            validation_baseline_inputs = baseline_preprocessor.transform(X_tr)
+            validation_evidence: BaselineEvidence = {}
+            validation_baselines, baseline_models = benchmark(
+                validation_baseline_inputs, y_tr, baseline_preprocessor.transform(X_va), y_va,
+                self.random_seed, evidence=validation_evidence,
+            )
+            validation_reference = strongest_scored_reference(
+                validation_baselines, validation_evidence, primary_metric, higher_is_better=is_clf,
+            )
 
             leaderboard: list[dict[str, Any]] = [
                 {
                     "model": name,
                     "family": "baseline",
+                    **baseline_feature_evidence(baseline_models[name]),
                     primary_metric: scores[primary_metric],
                     "split_strategy": split_res.strategy_used,
                     "fit_time_s": 0.0,
@@ -684,20 +703,30 @@ class AutoMLPipelineSearch:
             X_dev = X_work.iloc[development_indices].reset_index(drop=True)
             y_dev = y_arr[development_indices]
             X_test, y_test = (
-                (holdout[0].reset_index(drop=True), holdout[1].to_numpy())
+                (holdout[0].loc[:, input_columns].reset_index(drop=True), holdout[1].to_numpy())
                 if holdout is not None
                 else (X_work.iloc[te_idx].reset_index(drop=True), y_arr[te_idx])
             )
 
             best_model = copy.deepcopy(best_cand_model).fit(X_dev, y_dev)
-            best_test_score = _score_model(best_model, X_test, y_test)
-            baselines, _ = benchmark(X_dev, y_dev, X_test, y_test, self.random_seed)
-            if not baselines:
-                raise AutoMLError(
-                    "No baseline could be evaluated on the independent AutoML test partition.",
-                    suggestions=["Review the data and split configuration."],
+            best_predictions = best_model.predict(X_test)
+            best_test_score = float(f1_score(y_test, best_predictions, average="weighted", zero_division=0)) if is_clf else float(root_mean_squared_error(y_test, best_predictions))
+            test_evidence: BaselineEvidence = {}
+            baseline_predictions: dict[str, np.ndarray] = {}
+            baseline_preprocessor = WorkbenchInputPreprocessor(mode="numeric").fit(X_dev)
+            baselines, _ = benchmark(
+                baseline_preprocessor.transform(X_dev), y_dev, baseline_preprocessor.transform(X_test), y_test,
+                self.random_seed, evidence=test_evidence, predictions=baseline_predictions,
+            )
+            test_reference = strongest_scored_reference(baselines, test_evidence, primary_metric, higher_is_better=is_clf)
+            best_bl_score = test_reference[1] if test_reference is not None else None
+            comparison = {"status": "unavailable", "reason": "Reference suite incomplete."}
+            if test_reference:
+                comparison = paired_score_interval(
+                    y_test, best_predictions, baseline_predictions[test_reference[0]], metric=primary_metric,
+                    split_strategy=holdout_strategy if holdout is not None else split_res.strategy_used,
+                    comparisons=len(baselines), reference_name=test_reference[0], seed=self.random_seed,
                 )
-            best_bl_score = (max if is_clf else min)(row[primary_metric] for row in baselines.values())
             all_fitted_models[best_name] = best_model
             best_model.metadata_.baseline_comparison = baselines
             best_model.metadata_.metrics[primary_metric] = round(best_test_score, 6)
@@ -710,17 +739,27 @@ class AutoMLPipelineSearch:
             equations_map: dict[str, dict[str, Any]] = {}
             for m_name, m_obj in all_fitted_models.items():
                 try:
+                    equation_inputs = validation_baseline_inputs if m_name in baseline_models else X_tr
                     equations_map[m_name] = ModelEquationExtractor.extract(
                         m_obj,
-                        X_reference=X_tr,
-                        feature_names=list(X_work.columns),
+                        X_reference=equation_inputs,
+                        feature_names=list(equation_inputs.columns),
                         target_name=target_label,
                     ).model_dump()
                 except Exception as exc:
                     logger.debug("automl_equation_extract_skipped", model=m_name, error=str(exc))
 
+            for row in leaderboard:
+                model = all_fitted_models.get(row["model"])
+                fit_features = len(model.feature_names_) if model is not None and model.feature_names_ else None
+                row.setdefault("n_features", len(input_columns))  # legacy field
+                row["input_features"] = len(input_columns)
+                row.setdefault("fit_features", fit_features)
+                row.setdefault("retained_features", None)
             leaderboard.sort(key=lambda row: row[primary_metric], reverse=is_clf)
-            lift = (best_test_score - best_bl_score) if is_clf else (best_bl_score - best_test_score)
+            lift = None if best_bl_score is None else (
+                (best_test_score - best_bl_score) if is_clf else (best_bl_score - best_test_score)
+            )
 
         # C3 Green-AI: Pareto frontier over accepted candidates (metric × latency × carbon).
         pareto_rows = self.pareto_frontier(
@@ -734,7 +773,7 @@ class AutoMLPipelineSearch:
             "automl_completed",
             best_model=best_name,
             score=round(best_test_score, 4),
-            lift=round(lift, 4),
+            lift=round(lift, 4) if lift is not None else None,
             split_strategy=split_res.strategy_used,
             leakage_audit_passed=split_res.audit_report.passed if split_res.audit_report else True,
         )
@@ -746,7 +785,7 @@ class AutoMLPipelineSearch:
             primary_metric=primary_metric,
             leaderboard=leaderboard,
             baseline_benchmarks=baselines,
-            lift_over_best_baseline=round(float(lift), 6),
+            lift_over_best_baseline=round(lift, 6) if lift is not None else None,
             carbon_report=tracker.report,
             elapsed_seconds=elapsed,
             leakage_audit=split_res.audit_report,
@@ -767,9 +806,12 @@ class AutoMLPipelineSearch:
                     "test_partition_source": "supplied_holdout" if holdout is not None else "internal_split",
                     "validation_score": round(best_val_score, 6),
                     "test_baseline_score": best_bl_score,
-                    "validation_baseline_score": (max if is_clf else min)(
-                        (row[primary_metric] for row in validation_baselines.values()), default=None,
-                    ),
+                    "validation_baseline_score": validation_reference[1] if validation_reference else None,
+                    "test_baseline_name": test_reference[0] if test_reference else None,
+                    "lift_comparison": comparison,
+                    "baseline_comparison_status": "available" if test_reference else "unavailable",
+                    "baseline_evidence": {"validation": validation_evidence, "test": test_evidence},
+                    "input_columns": input_columns,
                     "n_train": len(tr_idx),
                     "n_validation": len(va_idx),
                     "n_test": len(te_idx),

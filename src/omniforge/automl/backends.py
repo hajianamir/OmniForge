@@ -45,11 +45,19 @@ from omniforge.automl.pipeline_search import AutoMLPipelineSearch, AutoMLResult
 from omniforge.core.exceptions import AutoMLError
 from omniforge.core.logging import get_logger
 from omniforge.core.performance import parallel_n_jobs
+from omniforge.core.task_inference import infer_supervised_task
 from omniforge.core.types import TaskType
 from omniforge.core.utils import is_package_available
 from omniforge.data.splitting import LeakageSafeSplitter, SplitConfig, SplitStrategyType
+from omniforge.evaluation.paired_comparison import paired_score_interval
+from omniforge.features.inference import MAX_CATEGORY_INDICATORS, nonconstant_predictors
 from omniforge.models.base import BaseOmniForgeModel
-from omniforge.models.baselines import BaselineBenchmarkSuite
+from omniforge.models.baselines import (
+    BaselineBenchmarkSuite,
+    BaselineEvidence,
+    baseline_feature_evidence,
+    strongest_scored_reference,
+)
 
 logger = get_logger(__name__)
 
@@ -183,12 +191,7 @@ def probe_automl_backends() -> list[dict[str, Any]]:
 
 
 def _infer_task(y: pd.Series, requested: TaskType | None) -> TaskType:
-    if requested is not None:
-        return requested
-    n_uniq = int(y.nunique(dropna=True))
-    if not pd.api.types.is_numeric_dtype(y) or pd.api.types.is_bool_dtype(y) or n_uniq <= 15:
-        return TaskType.BINARY_CLASSIFICATION if n_uniq <= 2 else TaskType.MULTICLASS_CLASSIFICATION
-    return TaskType.REGRESSION
+    return requested if requested is not None else infer_supervised_task(y)
 
 
 def _build_preprocessor(X: pd.DataFrame, *, scaler_kind: str = "standard", imputer_kind: str = "median") -> ColumnTransformer:
@@ -200,10 +203,11 @@ def _build_preprocessor(X: pd.DataFrame, *, scaler_kind: str = "standard", imput
         num_pipe = Pipeline([("imp", SimpleImputer(strategy=imputer_kind)), ("scl", scaler)])
         transformers.append(("num", num_pipe, num_cols))
     if cat_cols:
+        # sklearn's cap includes the infrequent bucket when grouping is needed.
         cat_pipe = Pipeline(
             [
                 ("imp", SimpleImputer(strategy="most_frequent")),
-                ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False, max_categories=32)),
+                ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=False, max_categories=MAX_CATEGORY_INDICATORS)),
             ]
         )
         transformers.append(("cat", cat_pipe, cat_cols))
@@ -352,7 +356,7 @@ def _caruana_greedy_weights(
         if is_clf:
             idx = np.argmax(pred_arr, axis=1)
             y_hat = classes[idx] if classes is not None else idx
-            return float(f1_score(y_true, y_hat, average="macro", zero_division=0))
+            return float(f1_score(y_true, y_hat, average="weighted", zero_division=0))
         return -float(root_mean_squared_error(y_true, pred_arr.ravel()))
 
     counts: dict[str, int] = dict.fromkeys(names, 0)
@@ -570,11 +574,11 @@ class MultiLayerStackingAutoML:
             raise AutoMLError("No Layer-1 model completed all eligible outer folds.")
         l1_fitted = {name: final.estimators[name] for name in names}
         oof_preds = {name: outer_predictions[name][scored_rows] for name in names}
-        metric = "f1_macro" if is_clf else "rmse"
+        metric = "f1_weighted" if is_clf else "rmse"
 
         def validation_score(preds: np.ndarray) -> float:
             if classes is not None:
-                return float(f1_score(y_val_arr, classes[np.argmax(preds, axis=1)], average="macro", zero_division=0))
+                return float(f1_score(y_val_arr, classes[np.argmax(preds, axis=1)], average="weighted", zero_division=0))
             return float(root_mean_squared_error(y_val_arr, preds.ravel()))
 
         leaderboard: list[dict[str, Any]] = [
@@ -728,7 +732,7 @@ class GeneticPipelineAutoML:
             )
 
         pop = [_rand_genome() for _ in range(self.population_size)]
-        scoring = "f1_macro" if is_clf else "neg_root_mean_squared_error"
+        scoring = "f1_weighted" if is_clf else "neg_root_mean_squared_error"
         history: list[dict[str, Any]] = []
         evaluated: dict[str, tuple[_PipelineGenome, float]] = {}
 
@@ -775,10 +779,10 @@ class GeneticPipelineAutoML:
         winner_pipe = self._build_pipeline(winner_g, X_train, is_clf)
         winner_pipe.fit(X_train, y_train)
         val_pred = winner_pipe.predict(X_val)
-        val_score = float(f1_score(y_val, val_pred, average="macro", zero_division=0)) if is_clf else float(root_mean_squared_error(y_val, val_pred))
+        val_score = float(f1_score(y_val, val_pred, average="weighted", zero_division=0)) if is_clf else float(root_mean_squared_error(y_val, val_pred))
 
         leaderboard = [
-            {"model": g.label(), "cv_fitness": round(sc, 6), "metric": "f1_macro" if is_clf else "rmse"}
+            {"model": g.label(), "cv_fitness": round(sc, 6), "metric": "f1_weighted" if is_clf else "rmse"}
             for g, sc in ranked[:10]
         ]
         wrapped = _WrappedSklearnModel(
@@ -793,7 +797,7 @@ class GeneticPipelineAutoML:
             "best_model": wrapped,
             "best_model_name": winner_g.label(),
             "best_score": round(val_score, 6),
-            "primary_metric": "f1_macro" if is_clf else "rmse",
+            "primary_metric": "f1_weighted" if is_clf else "rmse",
             "leaderboard": leaderboard,
             "evolution_history": history,
             "elapsed_seconds": round(time.perf_counter() - t0, 3),
@@ -835,7 +839,7 @@ class MetaFeatureWarmStartAutoML:
             stump = DecisionTreeClassifier(max_depth=2, random_state=42) if is_clf else DecisionTreeRegressor(max_depth=2, random_state=42)
             pipeline = Pipeline([("pre", _build_preprocessor(landmark_rows)), ("stump", stump)])
             measured = float(np.mean(cross_val_score(
-                pipeline, landmark_rows, ym, cv=2, scoring="f1_macro" if is_clf else "r2", error_score="raise",
+                pipeline, landmark_rows, ym, cv=2, scoring="f1_weighted" if is_clf else "r2", error_score="raise",
             )))
             if np.isfinite(measured):
                 lm_score = measured
@@ -899,8 +903,9 @@ class MetaFeatureWarmStartAutoML:
                 pipe = Pipeline([("pre", _build_preprocessor(X_train, scaler_kind=scaler_choice)), ("model", est)])
                 pipe.fit(X_train, y_train)
                 preds = pipe.predict(X_val)
-                sc = float(f1_score(y_val, preds, average="macro", zero_division=0)) if is_clf else float(root_mean_squared_error(y_val, preds))
-                leaderboard.append({"model": mname, "scaler": scaler_choice, "metric": "f1_macro" if is_clf else "rmse", "score": round(sc, 6)})
+                sc = float(f1_score(y_val, preds, average="weighted", zero_division=0)) if is_clf else float(root_mean_squared_error(y_val, preds))
+                leaderboard.append({"model": mname, "scaler": scaler_choice, "metric": "f1_weighted" if is_clf else "rmse",
+                                    "score": round(sc, 6), "fit_features": len(pipe.named_steps["pre"].get_feature_names_out())})
                 better = (sc > best_score) if is_clf else (sc < best_score)
                 if better:
                     best_score = sc
@@ -922,7 +927,7 @@ class MetaFeatureWarmStartAutoML:
             "best_model": wrapped,
             "best_model_name": best_name,
             "best_score": round(float(best_score), 6),
-            "primary_metric": "f1_macro" if is_clf else "rmse",
+            "primary_metric": "f1_weighted" if is_clf else "rmse",
             "leaderboard": leaderboard,
             "meta_features": meta,
             "elapsed_seconds": round(time.perf_counter() - t0, 3),
@@ -944,7 +949,7 @@ class MultiBackendAutoMLResult:
     primary_metric: str
     leaderboard: list[dict[str, Any]]
     baseline_benchmarks: dict[str, dict[str, float]]
-    lift_over_best_baseline: float
+    lift_over_best_baseline: float | None
     elapsed_seconds: float
     extra: dict[str, Any] = field(default_factory=dict)
     evaluation_indices: np.ndarray | None = None
@@ -976,6 +981,7 @@ class AutoMLBackendHub:
         time_values: pd.Series | np.ndarray | None = None,
         gap: int = 0,
         holdout: tuple[pd.DataFrame, pd.Series] | None = None,
+        holdout_strategy: str | None = None,
     ) -> MultiBackendAutoMLResult:
         """Run any selected AutoML engine with baseline comparison and optional native fallback."""
         if target_col not in df.columns:
@@ -1006,7 +1012,7 @@ class AutoMLBackendHub:
                 random_seed=random_seed,
                 max_carbon_grams_co2e=max_carbon_grams_co2e,
                 max_inference_latency_ms=max_inference_latency_ms,
-            ).fit(X_all, y_all, groups=aligned_groups, time_values=aligned_times, holdout=holdout)
+            ).fit(X_all, y_all, groups=aligned_groups, time_values=aligned_times, holdout=holdout, holdout_strategy=holdout_strategy)
             return MultiBackendAutoMLResult(
                 requested_backend=req_backend,
                 executed_backend="omniforge_native",
@@ -1080,6 +1086,10 @@ class AutoMLBackendHub:
             raise AutoMLError("Insufficient rows to preserve the requested chronological embargo.")
         tr_df = clean_df.iloc[split_res.train_indices]
         va_df = clean_df.iloc[split_res.test_indices]
+        input_columns = nonconstant_predictors(tr_df.drop(columns=[target_col]))
+        if not input_columns:
+            raise AutoMLError("No nonconstant predictors remain on the training partition.")
+        tr_df, va_df = (frame.loc[:, [*input_columns, target_col]] for frame in (tr_df, va_df))
         X_tr, y_tr = tr_df.drop(columns=[target_col]), tr_df[target_col]
         X_va, y_va = va_df.drop(columns=[target_col]), va_df[target_col]
 
@@ -1088,63 +1098,113 @@ class AutoMLBackendHub:
         ) -> MultiBackendAutoMLResult:
             # Fit baseline preprocessing on the same development rows as the selected adapter.
             preprocessor = _build_preprocessor(X_tr)
-            X_train_matrix = preprocessor.fit_transform(X_tr)
-            X_validation_matrix = preprocessor.transform(X_va)
-            validation_score = float(result["best_score"])
-            metric = "f1_macro" if is_clf else "rmse"
+            X_train_values = preprocessor.fit_transform(X_tr)
+            baseline_columns = preprocessor.get_feature_names_out()
+            X_train_matrix = pd.DataFrame(X_train_values, columns=baseline_columns, index=X_tr.index)
+            X_validation_matrix = pd.DataFrame(preprocessor.transform(X_va), columns=baseline_columns, index=X_va.index)
+            metric = "f1_weighted" if is_clf else "rmse"
 
             def score(y_true: pd.Series, predicted: np.ndarray) -> float:
                 if is_clf:
-                    return float(f1_score(y_true, predicted, average="macro", zero_division=0))
+                    return float(f1_score(y_true, predicted, average="weighted", zero_division=0))
                 return float(root_mean_squared_error(y_true, predicted))
 
+            # Adapter search scores need not have this metric, sign, or partition.
+            validation_score = score(y_va, result["best_model"].predict(X_va))
+            opaque_ranking = exec_backend in {"h2o", "autogluon"}
+            candidate_rows = [
+                {
+                    **row,
+                    "input_features": len(input_columns),
+                    "fit_features": row.get("fit_features"),
+                    "retained_features": row.get("retained_features"),
+                    "ranking_scope": "backend_specific" if opaque_ranking else leaderboard_partition,
+                }
+                for row in result["leaderboard"]
+            ]
             benchmark = (
                 BaselineBenchmarkSuite.run_classification_detailed if is_clf
                 else BaselineBenchmarkSuite.run_regression_detailed
             )
+            validation_evidence: BaselineEvidence = {}
             validation_baselines, baseline_models = benchmark(
-                X_train_matrix, y_tr, X_validation_matrix, y_va, random_seed=random_seed,
+                X_train_matrix, y_tr, X_validation_matrix, y_va, random_seed=random_seed, evidence=validation_evidence,
             )
-            if is_clf:
-                for name, model in baseline_models.items():
-                    validation_baselines[name][metric] = score(y_va, model.predict(X_validation_matrix))
 
-            choose_best = max if is_clf else min
-            if not validation_baselines:
-                raise AutoMLError("No baseline completed specialized AutoML validation.")
-            validation_baseline = choose_best(metrics[metric] for metrics in validation_baselines.values())
+            def score_baselines(
+                y_true: pd.Series, matrix: Any, evidence: BaselineEvidence, predictions: dict[str, np.ndarray],
+            ) -> dict[str, dict[str, float]]:
+                scored = {}
+                for name, model in baseline_models.items():
+                    try:
+                        prediction = model.predict(matrix)
+                        value = score(y_true, prediction)
+                        if not np.isfinite(value):
+                            raise ArithmeticError("nonfinite baseline score")
+                        scored[name] = {metric: value}
+                        predictions[name] = prediction
+                    except Exception as exc:
+                        evidence[name].update(status="failed", error=f"score: {type(exc).__name__}")
+                return scored
+
+            if is_clf:
+                validation_baselines = score_baselines(y_va, X_validation_matrix, validation_evidence, {})
+            reference = strongest_scored_reference(validation_baselines, validation_evidence, metric, higher_is_better=is_clf)
+            baseline_score = reference[1] if reference else None
             best_score = validation_score
-            baseline_score = validation_baseline
             baselines = validation_baselines
             evaluation: dict[str, Any] = {
                 "leaderboard_partition": leaderboard_partition,
+                "candidate_scores_backend_specific": opaque_ranking,
+                "comparison_metric": metric,
+                "comparison_requires_matched_holdout": True,
                 "best_score_partition": "validation",
                 "validation_score": validation_score,
-                "validation_baseline_score": validation_baseline,
+                "validation_baseline_score": baseline_score,
+                "validation_baseline_name": reference[0] if reference else None,
+                "baseline_evidence": {"validation": validation_evidence},
+                "baseline_feature_evidence": {name: baseline_feature_evidence(model) for name, model in baseline_models.items()},
+                "input_columns": input_columns,
+                "lift_comparison": {"status": "unavailable", "reason": "Selection and scoring share the validation partition."},
                 "n_train": len(X_tr),
                 "n_validation": len(X_va),
             }
             test_positions = None
             if holdout is not None:
-                X_test, y_test = holdout
-                X_test_matrix = preprocessor.transform(X_test)
-                best_score = score(y_test, result["best_model"].predict(X_test))
-                baselines = {name: {metric: score(y_test, model.predict(X_test_matrix))}
-                             for name, model in baseline_models.items()}
-                baseline_score = choose_best(metrics[metric] for metrics in baselines.values())
+                X_test, y_test = holdout[0].loc[:, input_columns], holdout[1]
+                X_test_matrix = pd.DataFrame(preprocessor.transform(X_test), columns=baseline_columns, index=X_test.index)
+                test_predictions = result["best_model"].predict(X_test)
+                best_score = score(y_test, test_predictions)
+                test_evidence: BaselineEvidence = {
+                    name: (dict(row) if name not in baseline_models else {"role": row["role"], "status": "scored"})
+                    for name, row in validation_evidence.items()
+                }
+                baseline_predictions: dict[str, np.ndarray] = {}
+                baselines = score_baselines(y_test, X_test_matrix, test_evidence, baseline_predictions)
+                reference = strongest_scored_reference(baselines, test_evidence, metric, higher_is_better=is_clf)
+                baseline_score = reference[1] if reference else None
+                evaluation["baseline_evidence"]["test"] = test_evidence
+                evaluation["lift_comparison"] = paired_score_interval(
+                    y_test, test_predictions, baseline_predictions[reference[0]], metric=metric,
+                    split_strategy=holdout_strategy, comparisons=len(baselines), reference_name=reference[0], seed=random_seed,
+                ) if reference else {"status": "unavailable", "reason": "Reference suite incomplete."}
                 test_positions = np.arange(len(clean_df), len(clean_df) + len(X_test))
                 evaluation.update(
                     best_score_partition="test", test_partition_source="supplied_holdout",
-                    test_baseline_score=baseline_score, n_test=len(X_test),
+                    test_baseline_score=baseline_score, test_baseline_name=reference[0] if reference else None,
+                    n_test=len(X_test),
                 )
-            lift = (best_score - baseline_score) if is_clf else (baseline_score - best_score)
+            evaluation["baseline_comparison_status"] = "available" if reference else "unavailable"
+            lift = None if baseline_score is None else (
+                (best_score - baseline_score) if is_clf else (baseline_score - best_score)
+            )
             return MultiBackendAutoMLResult(
                 requested_backend=req_backend, executed_backend=exec_backend,
                 used_fallback=used_fallback, fallback_reason=fallback_reason, task_type=resolved_task,
                 best_model_name=str(result["best_model_name"]), best_model=result["best_model"],
                 best_score=round(best_score, 6), primary_metric=metric,
-                leaderboard=list(result["leaderboard"]), baseline_benchmarks=baselines,
-                lift_over_best_baseline=round(lift, 6), elapsed_seconds=float(result["elapsed_seconds"]),
+                leaderboard=candidate_rows, baseline_benchmarks=baselines,
+                lift_over_best_baseline=round(lift, 6) if lift is not None else None, elapsed_seconds=float(result["elapsed_seconds"]),
                 extra={**(extra or {}), "evaluation": evaluation}, evaluation_indices=test_positions,
             )
 
@@ -1160,7 +1220,7 @@ class AutoMLBackendHub:
             if ext_out is not None:
                 return finish(
                     ext_out, extra=ext_out.get("extra"),
-                    leaderboard_partition="adapter_internal" if req_backend == "h2o" else "validation",
+                    leaderboard_partition={"h2o": "adapter_internal", "autogluon": "backend_validation"}.get(req_backend, "validation"),
                 )
             if not fallback_to_native:
                 raise AutoMLError(f"External AutoML backend '{req_backend}' is not installed or unavailable on this system.")
@@ -1216,17 +1276,17 @@ class AutoMLBackendHub:
         if backend == "autogluon" and is_package_available("autogluon.tabular"):
             from autogluon.tabular import TabularPredictor
 
-            predictor = TabularPredictor(label=target_col, eval_metric="f1_macro" if is_clf else "root_mean_squared_error").fit(
+            predictor = TabularPredictor(label=target_col, eval_metric="f1_weighted" if is_clf else "root_mean_squared_error").fit(
                 tr_df, time_limit=max(10, int(time_budget)), verbosity=0
             )
             preds = predictor.predict(X_va)
-            sc = float(f1_score(y_va, preds, average="macro", zero_division=0)) if is_clf else float(root_mean_squared_error(y_va, preds))
+            sc = float(f1_score(y_va, preds, average="weighted", zero_division=0)) if is_clf else float(root_mean_squared_error(y_va, preds))
             lb = predictor.leaderboard(va_df, silent=True).head(10).to_dict(orient="records")
             return {
                 "best_model": _WrappedSklearnModel("AutoGluonTabular", predictor, task_type, random_seed=random_seed),
                 "best_model_name": str(predictor.model_best),
                 "best_score": round(sc, 6),
-                "primary_metric": "f1_macro" if is_clf else "rmse",
+                "primary_metric": "f1_weighted" if is_clf else "rmse",
                 "leaderboard": lb,
                 "elapsed_seconds": round(time.perf_counter() - t0, 3),
             }
@@ -1243,13 +1303,13 @@ class AutoMLBackendHub:
             pipe = Pipeline([("pre", pre), ("tpot", est)])
             pipe.fit(X_tr, y_tr)
             preds = pipe.predict(X_va)
-            sc = float(f1_score(y_va, preds, average="macro", zero_division=0)) if is_clf else float(root_mean_squared_error(y_va, preds))
+            sc = float(f1_score(y_va, preds, average="weighted", zero_division=0)) if is_clf else float(root_mean_squared_error(y_va, preds))
             return {
                 "best_model": _WrappedSklearnModel("TPOT_BestPipeline", pipe, task_type, random_seed=random_seed),
                 "best_model_name": "TPOT_BestPipeline",
                 "best_score": round(sc, 6),
-                "primary_metric": "f1_macro" if is_clf else "rmse",
-                "leaderboard": [{"model": "TPOT_BestPipeline", "metric": "f1_macro" if is_clf else "rmse", "score": round(sc, 6)}],
+                "primary_metric": "f1_weighted" if is_clf else "rmse",
+                "leaderboard": [{"model": "TPOT_BestPipeline", "metric": "f1_weighted" if is_clf else "rmse", "score": round(sc, 6)}],
                 "elapsed_seconds": round(time.perf_counter() - t0, 3),
             }
 
@@ -1262,14 +1322,14 @@ class AutoMLBackendHub:
             automl = FLAMLAutoML()
             automl.fit(X_tr_m, np.asarray(y_tr), task="classification" if is_clf else "regression", time_budget=max(5, int(time_budget)), seed=random_seed, verbose=0)
             preds = automl.predict(X_va_m)
-            sc = float(f1_score(y_va, preds, average="macro", zero_division=0)) if is_clf else float(root_mean_squared_error(y_va, preds))
+            sc = float(f1_score(y_va, preds, average="weighted", zero_division=0)) if is_clf else float(root_mean_squared_error(y_va, preds))
             pipe = Pipeline([("pre", pre), ("flaml", automl)])
             return {
                 "best_model": _WrappedSklearnModel(f"FLAML({automl.best_estimator})", pipe, task_type, random_seed=random_seed),
                 "best_model_name": f"FLAML({automl.best_estimator})",
                 "best_score": round(sc, 6),
-                "primary_metric": "f1_macro" if is_clf else "rmse",
-                "leaderboard": [{"model": f"FLAML({automl.best_estimator})", "metric": "f1_macro" if is_clf else "rmse", "score": round(sc, 6)}],
+                "primary_metric": "f1_weighted" if is_clf else "rmse",
+                "leaderboard": [{"model": f"FLAML({automl.best_estimator})", "fit_features": X_tr_m.shape[1], "metric": "f1_weighted" if is_clf else "rmse", "score": round(sc, 6)}],
                 "elapsed_seconds": round(time.perf_counter() - t0, 3),
             }
 
@@ -1287,7 +1347,7 @@ class AutoMLBackendHub:
             aml.train(y=target_col, training_frame=h_tr)
             preds_df = aml.leader.predict(h_va).as_data_frame()
             preds = preds_df["predict"].to_numpy()
-            sc = float(f1_score(y_va.astype(str), preds.astype(str), average="macro", zero_division=0)) if is_clf else float(root_mean_squared_error(y_va, preds.astype(float)))
+            sc = float(f1_score(y_va.astype(str), preds.astype(str), average="weighted", zero_division=0)) if is_clf else float(root_mean_squared_error(y_va, preds.astype(float)))
             lb = aml.leaderboard.as_data_frame().head(10).to_dict(orient="records")
 
             class _H2OWrapper:
@@ -1302,7 +1362,7 @@ class AutoMLBackendHub:
                 "best_model": _WrappedSklearnModel(f"H2O({aml.leader.model_id})", _H2OWrapper(), task_type, random_seed=random_seed),
                 "best_model_name": str(aml.leader.model_id),
                 "best_score": round(sc, 6),
-                "primary_metric": "f1_macro" if is_clf else "rmse",
+                "primary_metric": "f1_weighted" if is_clf else "rmse",
                 "leaderboard": lb,
                 "elapsed_seconds": round(time.perf_counter() - t0, 3),
             }
@@ -1316,13 +1376,13 @@ class AutoMLBackendHub:
             pipe = Pipeline([("pre", pre), ("ask", ASKEst(time_left_for_this_task=max(30, int(time_budget)), seed=random_seed))])
             pipe.fit(X_tr, y_tr)
             preds = pipe.predict(X_va)
-            sc = float(f1_score(y_va, preds, average="macro", zero_division=0)) if is_clf else float(root_mean_squared_error(y_va, preds))
+            sc = float(f1_score(y_va, preds, average="weighted", zero_division=0)) if is_clf else float(root_mean_squared_error(y_va, preds))
             return {
                 "best_model": _WrappedSklearnModel("AutoSklearn", pipe, task_type, random_seed=random_seed),
                 "best_model_name": "AutoSklearn_Ensemble",
                 "best_score": round(sc, 6),
-                "primary_metric": "f1_macro" if is_clf else "rmse",
-                "leaderboard": [{"model": "AutoSklearn_Ensemble", "metric": "f1_macro" if is_clf else "rmse", "score": round(sc, 6)}],
+                "primary_metric": "f1_weighted" if is_clf else "rmse",
+                "leaderboard": [{"model": "AutoSklearn_Ensemble", "metric": "f1_weighted" if is_clf else "rmse", "score": round(sc, 6)}],
                 "elapsed_seconds": round(time.perf_counter() - t0, 3),
             }
 

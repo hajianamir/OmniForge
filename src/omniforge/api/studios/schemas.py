@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class LoadSampleReq(BaseModel):
@@ -120,7 +120,8 @@ class MiningReq(BaseModel):
 
 
 class DiagnosticsReq(BaseModel):
-    mode: str = "all"  # all | auto | custom
+    ignored_columns: list[str] = Field(default_factory=list)
+    mode: Literal["all", "complete", "auto", "custom"] = "all"
     alpha: float = 0.05
     confidence_level: float = 0.95
     fdr_method: str = "fdr_bh"
@@ -132,6 +133,21 @@ class DiagnosticsReq(BaseModel):
     risk_tail_alpha: float = 0.05
     holdout_ratio: float = 0.20
     selected_modules: list[str] = Field(default_factory=list)
+
+
+    @model_validator(mode="after")
+    def validate_module_selection(self) -> Self:
+        from omniforge.eda.diagnostics import EXECUTABLE_MODULES
+
+        if self.mode == "custom" and not self.selected_modules:
+            raise ValueError("Custom mode requires at least one executable module.")
+        if self.mode != "custom" and self.selected_modules:
+            raise ValueError("Select modules only in custom mode.")
+        if set(self.selected_modules) - EXECUTABLE_MODULES.keys():
+            raise ValueError("Unknown or non-executable diagnostic module; consult the diagnostics catalog.")
+        if len(set(self.selected_modules)) != len(self.selected_modules):
+            raise ValueError("Diagnostic modules must not be repeated.")
+        return self
 
 
 class HypothesisReq(BaseModel):
@@ -153,6 +169,14 @@ class FeatureEngReq(BaseModel):
 
 
 class FeatureSelReq(BaseModel):
+    apply_to_run: bool = False
+
+    @model_validator(mode="after")
+    def validate_commit_scope(self) -> Self:
+        if self.commit and self.apply_to_run:
+            raise ValueError("Choose either a session commit or a non-mutating model-run scope.")
+        return self
+
     mode: str = "custom"  # custom | auto | complete
     method: str = "mutual_info"
     top_k: int = 10
@@ -161,6 +185,7 @@ class FeatureSelReq(BaseModel):
 
 
 class AutoMLRunReq(BaseModel):
+    ignored_columns: list[str] = Field(default_factory=list)
     target: str | None = None
     backend: str = "omniforge_native"
     time_budget_seconds: float = Field(default=30.0, ge=5.0, le=3600.0)
@@ -172,6 +197,7 @@ class AutoMLRunReq(BaseModel):
 
 
 class DeepBenchReq(BaseModel):
+    ignored_columns: list[str] = Field(default_factory=list)
     target: str | None = None
     architectures: list[str] = Field(
         default_factory=lambda: ["ft_transformer", "tabnet", "resnet_tabular", "mlp", "cnn1d", "gnn_gcn"]
@@ -394,6 +420,7 @@ class CopilotToolExecReq(BaseModel):
 
 
 class NonParametricRunReq(BaseModel):
+    ignored_columns: list[str] = Field(default_factory=list)
     target: str | None = None
     cv_folds: int = Field(default=5, ge=2, le=10)
     models: list[str] | None = None

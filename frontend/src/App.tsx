@@ -385,9 +385,9 @@ export const App: React.FC = () => {
               <button className="btn btn-sm" onClick={() => setModal('exclusions')}>
                 Exclusions ({ws.excluded_columns.length})
               </button>
-              <button className={`btn btn-sm ${ws.split_lock?.active ? 'btn-success' : ''}`} onClick={() => setModal('split')}>
+              <button className={`btn btn-sm ${ws.split_lock?.active && ws.split_lock.passed ? 'btn-success' : ''}`} onClick={() => setModal('split')}>
                 {ws.split_lock?.active ? <Lock size={13} /> : <Unlock size={13} />}
-                {ws.split_lock?.active ? `Split Locked (${ws.split_lock.strategy})` : 'Split Lock'}
+                {ws.split_lock?.active ? `Split Locked (${ws.split_lock.strategy}) · ${ws.split_lock.passed ? 'Audit passed' : 'Audit warning'}${ws.split_lock.exact_duplicate_leak_count ? ` · ${ws.split_lock.exact_duplicate_leak_count} duplicate leaks` : ''}` : 'Split Lock'}
               </button>
             </>
           ) : (
@@ -590,7 +590,9 @@ export const App: React.FC = () => {
                 <div className="row">
                   <button className="btn btn-primary" onClick={async () => {
                     const r = await apiPost<{ state: WorkspaceState }>('/api/workbench/split-lock', { strategy: splitStrat, test_size: splitTestSize, cv_folds: splitCvFolds });
-                    syncState(r.state); flash('Anti-Leakage Split Lock enabled.'); setModal('none');
+                    syncState(r.state);
+                    flash(r.state.split_lock?.passed ? 'Split Lock audit passed.' : 'Split locked with an audit warning. Review it before evaluating models.');
+                    setModal('none');
                   }}>Lock Train/Test Split</button>
                   {ws.split_lock?.active && (
                     <button className="btn btn-danger" onClick={async () => {
