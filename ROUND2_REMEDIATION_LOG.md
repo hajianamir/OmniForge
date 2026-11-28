@@ -9,7 +9,7 @@ parent. The corrected regression, full local Python coverage suite (704 passed, 
 Round 2 IDs. This is a remediation claim, not an independent finding verdict or full CI parity.
 The initial empty-scope record below is retained for provenance.
 
-## Executive summary for auditor
+## Initial scope intake (historical — before V-01 selection)
 
 **Disposition: scope gate blocked; no eligible findings established.** The supplied independent verification matrix is explicitly in progress. It uses evidence states, not final finding verdicts. It contains no row assigned `FALSE-CLOSURE`, `REGRESSED-STRENGTH`, or `UNVERIFIABLE`, and the reviewer did not explicitly select any confirmed partial for upgrade. This is not a finding-level closure or release determination.
 
@@ -155,3 +155,26 @@ could produce zero, positive lift, and champion/active-model claims. After: unav
 reference and null lift/comparison, no acceptance or auto-promotion, but candidate score and
 inspection remain. A real zero is explicitly not missing. No other ID entered Round 2; the
 auditor owns severity, independent finding verdicts and release disposition.
+
+## Round 2 / Iteration 2 / V-01 — wording follow-up
+
+The auditor's follow-up identifies two remaining wording mismatches, not a reopened
+statistical contract: Studio 06's lineage action and chart/leaderboard headings still
+imply a comparison when none exists. Change only the non-parametric wording in the
+shared Studio 06 API/UI files and rebuild the checked-in SPA. The available-reference
+wording and earlier findings' behavior remain unchanged. Label the initial intake as
+historical without rewriting its contents. The prior local test counts remain local
+results, not independently reproduced evidence or official CI results.
+
+- **Red/green:** the new API assertion first failed on the comparative lineage action;
+  the browser assertion first failed on the missing candidate-only heading. Both passed
+  after the wording fix (`1fb2d0d`, 12 files, +24/−12 including packaged SPA assets).
+  When comparison is unavailable, lineage now records the number of candidates scored;
+  the UI labels the leaderboard and chart as candidate results. Comparison wording is
+  unchanged when the comparison is available. Candidate scores and promotion gates are unchanged.
+- **Local rerun on `1fb2d0d`:** 7 targeted Python tests and 25 deterministic browser
+  tests passed; Ruff, mypy and the SPA build passed. The full Python 3.12 coverage run
+  passed with **704 passed, 3 skipped, 83% coverage**; the §6 selection passed **136 tests**.
+  The skipped Redis, installer and PyTorch cases match the prior full run. The earlier
+  Redis and live-backend browser checks were not repeated for this wording change. These
+  results are local engineering evidence, not independent verification or CI parity.
