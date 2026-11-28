@@ -1,0 +1,11 @@
+# OmniForge — Round 2 traceability matrix
+
+Active branch: `arena/84cfdc36-omniforge`. Parent reviewed by the auditor: `fd3647a56e0894ad09f5511d58394d2f8ebe29fc`.
+
+| ID | Prior verdict / scope | Fix commit | Test run | Round 2 claim and reason |
+|---|---|---|---|---|
+| V-01 | Open candidate against `fd3647a`; explicitly selected for `report_unavailable` | `ac7ec24` | Original auditor method probe reproduced on `fd3647a`; original false-acceptance assertion rejected on fixed source. The policy module `tests/unit/test_nonparametric_reference_failure.py` and non-parametric e2e selection passed (7). The Studio 06 browser fixture passed; full local Python suite: 704 passed, 3 skipped, 83% coverage; §6 selection: 136 passed. | **CLOSED — remediation claim only.** Failed/nonfinite reference evidence cannot become `0.0`, positive lift, acceptance, or auto-promotion. Successfully scored candidates remain inspectable, and a successfully measured zero remains valid. Official platform/CI parity and an independent verdict are not claimed. |
+
+No other rows were reopened or selected for upgrades. The earlier in-progress matrices supplied evidence states, not qualifying final verdicts. The separate 667-pass run reported on the auditor's branch is not used as evidence for this implementation.
+
+[Round 2 remediation log and remaining verification limits](ROUND2_REMEDIATION_LOG.md)
