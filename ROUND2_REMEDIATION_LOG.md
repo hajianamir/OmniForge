@@ -288,3 +288,9 @@ split membership, SDK governance, or uninstalled optional frameworks.
   hardware/backend-dependent behavior, or intentionally narrower governance contracts
   is not resolved by the core suite. Finding dispositions and release criteria remain
   the independent reviewer's responsibility.
+
+**Verification follow-up:** the full local run of `8807fd1` exposed a regression in
+existing Fisher-z correlation chart wording. The new predictor cap text had replaced
+part of the prior inference caveat. Restored the assumption/approximation and exploratory
+p-value disclosure alongside the cap, without changing the existing test or calculations.
+The original SciPy estimate, confidence interval and wording regression passes again.

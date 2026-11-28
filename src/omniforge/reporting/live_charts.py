@@ -1574,7 +1574,10 @@ def _build_feature_correlation_forest(
     sig_cnt = sum(1 for r in rows_out if r["p_value"] < 0.05)
     return {
         "title": f"Feature Correlation Forest Plot vs. {disp_fn(ref_col)}",
-        "subtitle": f"{len(rows_out)} of {len(others)} predictors tested (first 16 considered). Fisher-z CIs are approximate; p-values are unadjusted.",
+        "subtitle": (
+            f"{len(rows_out)}/{len(others)} predictors tested (cap 16). Approximate Fisher-z CIs assume independent pairs "
+            "and bivariate normality. P-values are unadjusted and exploratory."
+        ),
         "analysis_scope": {"available_predictors": len(others), "considered_predictors": min(len(others), 16),
                            "tested_predictors": len(rows_out), "predictor_cap": 16},
         "kpis": {
