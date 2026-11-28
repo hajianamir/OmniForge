@@ -224,3 +224,67 @@ auditor verification files or Round 1 traceability rows will be edited.
   auditor also identified the original pre-fix API probe in the separate audit workspace
   as `verification/test_runtime_adversarial.py::test_studio06_api_exposes_false_acceptance_after_reference_failure`;
   the branch API regression remains distinct and is not labeled a replay of that probe.
+
+## Round 2 / Iteration 4 — authorized Phase 2–4 worklist and remaining OF-09 disclosures
+
+The maintainer authorized the remaining items following the Shapiro-only fix. Baseline
+`f0b455a` passed all ten PR checks and 711 local tests. Dependencies logged before edits:
+Studio 04 hypothesis payloads and their generic report tables; Studio 02 advanced mining
+and diagnostic consumers; the shared Studio 04 chart builder; Studio 06 AutoML adapter
+results and display (not the V-01 non-parametric path); and the Studio 01 Benford function
+and its cleaning audit. Additional contract and fallback tests are additive only. Do not
+change historical audit/verification files or claim new guarantees for MCD, positional
+split membership, SDK governance, or uninstalled optional frameworks.
+
+### Selected contracts (not broader guarantees)
+
+- **Phase 2 / OF-04, OF-06:** Compare selected models only on matched held-out
+  observations and input scope: weighted F1 for classification, RMSE for regression.
+  A backend's native ranking is selection evidence, not a cross-backend ranking;
+  AutoGluon/H2O native tables are labeled backend-specific, and are not charted against
+  the shared metric. Input count means raw predictors offered to the adapter; a fit count
+  means the actual known estimator input dimension; retained count means known selected
+  support (e.g. nonzero L1 coefficients), not the raw dimension. Null means unavailable
+  or not applicable, not zero. Optional adapter boundary fixtures do not certify installed
+  library execution, internal objective equivalence, or feature transformations hidden by
+  those libraries. Dependent-split interval calibration is not claimed.
+- **Phase 3 / OF-13a:** BH families cover only *generated, eligible* hypotheses. Rules
+  must pass support, confidence and lift filters before adjustment, with each direction
+  a separate test. Transaction-rule and tabular-rule families are separate; tabular
+  item/column/pair exploration is bounded, not exhaustive enumeration. Subgroup candidates
+  are the searched bins/categories meeting size constraints against their complement;
+  adjustment uses the full eligible set before presentation ranking/truncation. The
+  exploratory/data-dependent filtering is not a guarantee of unconditional FDR control.
+  The beam-search and standalone FP-growth outputs do not claim adjusted inference.
+- **Phase 3 / CPCV:** Preserve distinct public contracts. The canonical API uses 5 folds,
+  two test groups, and by default 2 positions before/after; its post-buffer is max of
+  explicit and proportional embargo. It streams and omits empty training partitions.
+  The legacy API defaults to 6 folds and two test folds, no buffers, and returns a list
+  including empty training splits. Its post-buffer adds the symmetric purge gap and
+  ceiling-rounded proportional embargo. Both share closed interval overlap purging;
+  parity is expected only when inputs and effective buffers/empty behavior match.
+- **Phase 4:** Retain MCD as asymptotic screening only, not calibrated inference.
+  Positional-only membership and SDK-only governance remain their existing contracts,
+  not operational controls. Exercise the real capped/unstratifiable DeepBench API with
+  baseline models; PyTorch execution is optional and unverified by this core suite.
+  Benford uses positive magnitudes of finite nonzero stored values and their shortest
+  decimal spelling. At a leading-digit boundary the stored value decides the digit;
+  no epsilon snapping, and no guarantee of invariance across inexact rescaling.
+
+### Verification and disposition
+
+- Archived `f0b455a` plus the new fixtures reproduced nine failed expectations (five
+  optional adapter interface cases, the warm-start encoded-dimension contract, and
+  the missing Studio 02/04/API and chart disclosures). Five evidence-only cases
+  passed on the baseline; those tests do not imply previously broken behavior.
+- The focused regression file plus the Shapiro boundary tests passed **21 tests**;
+  the added EDA 25,001-row cap test passed separately (**22 covered**). The broader
+  focused chart/AutoML/standards run passed **45 tests** before the last additive
+  EDA/chart scope fields. The packaged Workbench passed **31 browser tests** using
+  substitute Chromium. Ruff, mypy, and the SPA build passed. The full/official gate
+  results belong to the updated PR head and will be reported on PR #31.
+- The named OF-09 surfaces now distinguish analysis sampling and display limits.
+  Remaining uncertainty about optional runtime implementations, calibrated MCD,
+  hardware/backend-dependent behavior, or intentionally narrower governance contracts
+  is not resolved by the core suite. Finding dispositions and release criteria remain
+  the independent reviewer's responsibility.

@@ -750,7 +750,12 @@ class AutoMLPipelineSearch:
                     logger.debug("automl_equation_extract_skipped", model=m_name, error=str(exc))
 
             for row in leaderboard:
-                row.setdefault("n_features", len(input_columns))
+                model = all_fitted_models.get(row["model"])
+                fit_features = len(model.feature_names_) if model is not None and model.feature_names_ else None
+                row.setdefault("n_features", len(input_columns))  # legacy field
+                row["input_features"] = len(input_columns)
+                row.setdefault("fit_features", fit_features)
+                row.setdefault("retained_features", None)
             leaderboard.sort(key=lambda row: row[primary_metric], reverse=is_clf)
             lift = None if best_bl_score is None else (
                 (best_test_score - best_bl_score) if is_clf else (best_bl_score - best_test_score)

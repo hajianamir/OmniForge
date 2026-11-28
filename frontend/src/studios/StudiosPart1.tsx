@@ -1744,6 +1744,7 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
           {eda.n_rows_analyzed !== undefined && (
             <div className="alert alert-info" role="status">
               Analyzed {eda.n_rows_analyzed.toLocaleString()} {eda.sampled ? 'sampled rows' : 'rows'} in the current study.
+              {eda.n_rows_available !== undefined && ` ${eda.n_rows_available.toLocaleString()} available / ${(eda.n_rows_available - eda.n_rows_analyzed).toLocaleString()} omitted; row cap ${eda.row_cap?.toLocaleString()}.`}
             </div>
           )}
           {(eda.distributions?.length ?? 0) > 0 && (
@@ -1914,7 +1915,7 @@ export const Studio04EDA: React.FC<StudioProps> = ({ ws, onSync, studioCache, se
                 <><strong>{hypRes.result.test_name}:</strong> statistic={hypRes.result.statistic == null ? 'unavailable' : Number(hypRes.result.statistic).toFixed(4)} · p-value={Number(hypRes.result.p_value).toExponential(3)} · <strong>{hypRes.result.p_value_scope === 'exploratory_selected_family' ? 'EXPLORATORY FITTED-NULL CHECK' : hypRes.result.significant ? 'SIGNIFICANT' : 'NOT SIGNIFICANT'}</strong> · {hypRes.result.interpretation}</>
               )}
             </div>
-            {hypRes.result.sample_disclosure && <p>Shapiro-Wilk sample: {hypRes.result.sample_disclosure}</p>}
+            {hypRes.result.sample_disclosure && <p>Analysis sample: {hypRes.result.sample_disclosure}</p>}
             {hypRes.result.extra_table && (
               <SimpleTable title="Distribution Fit Ranking by AIC" rows={hypRes.result.extra_table} />
             )}

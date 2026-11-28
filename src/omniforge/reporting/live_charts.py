@@ -1574,7 +1574,9 @@ def _build_feature_correlation_forest(
     sig_cnt = sum(1 for r in rows_out if r["p_value"] < 0.05)
     return {
         "title": f"Feature Correlation Forest Plot vs. {disp_fn(ref_col)}",
-        "subtitle": "Approximate Fisher-z 95% intervals assume independent pairs and bivariate normality. P-values are unadjusted and exploratory.",
+        "subtitle": f"{len(rows_out)} of {len(others)} predictors tested (first 16 considered). Fisher-z CIs are approximate; p-values are unadjusted.",
+        "analysis_scope": {"available_predictors": len(others), "considered_predictors": min(len(others), 16),
+                           "tested_predictors": len(rows_out), "predictor_cap": 16},
         "kpis": {
             "Reference Variable": disp_fn(ref_col),
             "Features Tested": len(rows_out),
@@ -1592,6 +1594,7 @@ def _build_standardized_effect_forest(
     ref_col: str,
     disp_fn: Any,
 ) -> dict[str, Any]:
+    available_predictors = num_df.shape[1] - 1
     predictors = [c for c in num_df.columns if c != ref_col][:14]
     if not predictors:
         raise LiveChartUnavailable("Standardized Multivariate Effect Forest Plot requires at least 2 numeric/encodable columns.")
@@ -1649,7 +1652,9 @@ def _build_standardized_effect_forest(
     rows_out.sort(key=lambda r: abs(r["estimate"]), reverse=True)
     return {
         "title": f"Standardized Multivariate Effect Forest Plot → {disp_fn(ref_col)}",
-        "subtitle": f"Standardized Ridge-OLS β coefficients ± 95% Student-t CIs (n={n:,}, R²={r2_mult:.3f})",
+        "subtitle": f"{p} of {available_predictors} predictors fitted (first 14 considered) · Standardized Ridge-OLS β ± 95% CI (n={n:,})",
+        "analysis_scope": {"available_predictors": available_predictors, "considered_predictors": len(predictors),
+                           "fitted_predictors": p, "predictor_cap": 14, "source_rows": len(num_df), "fitted_rows": n},
         "kpis": {
             "Outcome": disp_fn(ref_col),
             "Sample Size n": n,
@@ -1708,7 +1713,7 @@ def _build_missing_variance_pareto(df: pd.DataFrame, num_df: pd.DataFrame) -> di
 
     return {
         "title": chart_title,
-        "subtitle": f"Top {vital_few} of {len(items)} columns account for ≥80% of cumulative {metric_lbl.lower()}",
+        "subtitle": f"At most 14 columns shown; top {vital_few} of those {len(items)} account for ≥80% of displayed {metric_lbl.lower()}",
         "kpis": {
             "Metric": metric_lbl,
             "Vital Few (≥80%)": vital_few,
@@ -1740,15 +1745,10 @@ def _build_pca_eigenvalue_pareto(num_df: pd.DataFrame) -> dict[str, Any]:
 
     items: list[dict[str, Any]] = []
     cum = 0.0
-    vital_few = 0
-    crossed = False
+    vital_few = int(np.searchsorted(np.cumsum(eig) / total_var, 0.8) + 1)
     for idx, ev in enumerate(eig[:12], start=1):
         pct = 100.0 * float(ev) / total_var
         cum += pct
-        if not crossed:
-            vital_few += 1
-            if cum >= 80.0:
-                crossed = True
         items.append(
             {
                 "label": f"PC{idx}",
@@ -1761,7 +1761,8 @@ def _build_pca_eigenvalue_pareto(num_df: pd.DataFrame) -> dict[str, Any]:
     kaiser_k = int(np.sum(eig >= 1.0))
     return {
         "title": "PCA Eigenvalue Scree & Cumulative Explained Variance Pareto",
-        "subtitle": f"{vital_few} principal components capture ≥80% total variance · {kaiser_k} PCs satisfy Kaiser criterion (λ ≥ 1)",
+        "subtitle": f"{len(items)} of {len(eig)} PCs shown (cap 12); {vital_few} reach 80% of total variance · {kaiser_k} satisfy Kaiser",
+        "analysis_scope": {"components_available": len(eig), "components_displayed": len(items), "display_cap": 12},
         "kpis": {
             "PCs for 80% Variance": vital_few,
             "Kaiser PCs (λ≥1)": kaiser_k,
@@ -1883,8 +1884,10 @@ def _build_empirical_ecdf_ks(
 
     # Stratify if user selected group_col, or if Split Lock is active, or if binary/small categorical target exists
     raw_groups: list[tuple[str, np.ndarray]] = []
+    available_groups: int | None = None
     if group_col and group_col in df.columns and group_col != col_x:
         g_ser = _discretize_series(df[group_col], max_bins=4)
+        available_groups = int(g_ser.nunique())
         for g_val in g_ser.value_counts().head(4).index:
             arr = ser.loc[g_ser == g_val].dropna().to_numpy(dtype=float)
             if len(arr) >= 3:
@@ -1949,7 +1952,13 @@ def _build_empirical_ecdf_ks(
 
     return {
         "title": f"Empirical Cumulative Distribution (ECDF) — {disp_x}",
-        "subtitle": f"{group_desc}{sub_ks}",
+        "subtitle": (
+            (f"Top 4 groups by frequency ({available_groups} available) · " if available_groups is not None else "")
+            + ("KS uses first two displayed groups · " if ks_stat is not None else "") + f"{group_desc}{sub_ks}"
+        ),
+        "analysis_scope": {"groups_available": available_groups, "groups_displayed": len(series_out),
+                           "ks_groups": [g for g, _ in raw_groups[:2]] if ks_stat is not None else [],
+                           "rendered_points": len(table_rows), "display_cap_per_group": 220, "table_rows": min(len(table_rows), 600), "table_cap": 600},
         "kpis": kpis,
         "data": {"series": series_out, "x_label": disp_x, "ks_stat": ks_stat, "ks_pvalue": ks_p},
         "table_columns": ["Stratum", col_x, "Cumulative_Probability_Fn"],
@@ -1991,6 +2000,7 @@ def _build_stratified_violin_box(
     samples: list[tuple[str, np.ndarray]] = []
     if chosen_grp:
         g_ser = _discretize_series(df[chosen_grp], max_bins=6)
+        available = int(g_ser.nunique())
         for g_val in g_ser.value_counts().head(6).index:
             arr = num_df.loc[g_ser == g_val, col_x].dropna().to_numpy(dtype=float)
             if len(arr) >= 3:
@@ -1999,6 +2009,7 @@ def _build_stratified_violin_box(
         title_str = f"Violin & Tukey Box-Whisker — {disp_x} by {chosen_grp}"
     else:
         # Compare standardized z-distributions across top numeric columns
+        available = len(num_df.columns)
         for c in list(num_df.columns)[:6]:
             s = num_df[c].dropna().to_numpy(dtype=float)
             if len(s) >= 3:
@@ -2031,7 +2042,8 @@ def _build_stratified_violin_box(
         w_lo = float(np.min(arr[arr >= q25 - 1.5 * iqr])) if np.any(arr >= q25 - 1.5 * iqr) else lo_a
         w_hi = float(np.max(arr[arr <= q75 + 1.5 * iqr])) if np.any(arr <= q75 + 1.5 * iqr) else hi_a
         outs = arr[(arr < w_lo) | (arr > w_hi)]
-        if len(outs) > 24:
+        n_outliers = len(outs)
+        if n_outliers > 24:
             outs = np.quantile(outs, np.linspace(0, 1, 24))
         grid = np.linspace(lo_a, hi_a, 36) if hi_a > lo_a else np.linspace(lo_a - 0.5, hi_a + 0.5, 12)
         dens = _kde_curve(arr, grid)
@@ -2047,13 +2059,14 @@ def _build_stratified_violin_box(
                 "max": round(hi_a, 4),
                 "whisker_low": round(w_lo, 4),
                 "whisker_high": round(w_hi, 4),
+                "outliers_available": n_outliers,
                 "outliers": [round(float(o), 4) for o in outs],
                 "kde_y": [round(float(v), 4) for v in grid],
                 "kde_density": [round(float(d), 4) for d in dens],
                 "color": PALETTE[idx % len(PALETTE)],
             }
         )
-        table_rows.append([lbl, int(len(arr)), round(mean_v, 4), round(lo_a, 4), round(q25, 4), round(med, 4), round(q75, 4), round(hi_a, 4), int(len(outs))])
+        table_rows.append([lbl, int(len(arr)), round(mean_v, 4), round(lo_a, 4), round(q25, 4), round(med, 4), round(q75, 4), round(hi_a, 4), n_outliers, int(len(outs))])
 
     anova_p: float | None = None
     if chosen_grp and len(samples) >= 2:
@@ -2064,7 +2077,7 @@ def _build_stratified_violin_box(
         except Exception:
             anova_p = None
 
-    sub = f"{len(groups_out)} distributions · Total n = {len(all_vals):,}" + (f" · One-way ANOVA p = {anova_p:.4g}" if anova_p is not None else "")
+    sub = f"{len(groups_out)} distributions / {available} available (cap 6); outlier display cap 24 each · Total n = {len(all_vals):,}" + (f" · One-way ANOVA p = {anova_p:.4g}" if anova_p is not None else "")
     kpis: dict[str, Any] = {"Distributions": len(groups_out), "Total Observations": int(len(all_vals))}
     if anova_p is not None:
         kpis["ANOVA p-value"] = anova_p
@@ -2073,8 +2086,10 @@ def _build_stratified_violin_box(
         "title": title_str,
         "subtitle": sub,
         "kpis": kpis,
+        "analysis_scope": {"distributions_available": available, "distributions_displayed": len(samples),
+                           "distribution_cap": 6, "outlier_display_cap_per_distribution": 24},
         "data": {"groups": groups_out, "y_label": y_label, "global_min": round(g_min, 4), "global_max": round(g_max, 4)},
-        "table_columns": ["Group", "N", "Mean", "Min", "Q25", "Median", "Q75", "Max", "Outlier_Count"],
+        "table_columns": ["Group", "N", "Mean", "Min", "Q25", "Median", "Q75", "Max", "Outlier_Count", "Outliers_Displayed"],
         "table_rows": table_rows,
     }
 
@@ -2139,6 +2154,7 @@ def _build_normality_qq_plot(ser: pd.Series, disp_x: str) -> dict[str, Any]:
         # The chart image exporter truncates long subtitles; lead with the Shapiro sample.
         "subtitle": f"Shapiro-Wilk: {note} · {sw_label} · Skew = {skew_v:.3f}, Excess Kurtosis = {kurt_v:.3f}",
         "shapiro_sample": scope,
+        "plot_scope": {"available_points": n, "displayed_points": len(pts), "display_cap": 260},
         "kpis": {
             "Shapiro-Wilk W": sw_w,
             "Shapiro p-value": sw_p_value,
@@ -2234,7 +2250,8 @@ def _build_bivariate_regression_ci(
     eq_str = f"ŷ = {slope:.4g}·x {sign_str} {abs(intercept):.4g}"
     return {
         "title": f"OLS Regression & 95% Confidence/Prediction Fan — {disp_y} vs. {disp_x}",
-        "subtitle": f"{eq_str} · R² = {r2:.4f}, Pearson r = {r_val:.4f} (p = {p_val:.4g}), Spearman ρ = {rho_val:.4f}",
+        "subtitle": f"{len(scatter_pts):,} of {n:,} paired rows shown (cap 450); OLS uses all pairs · {eq_str} · R² = {r2:.4f}",
+        "analysis_scope": {"source_rows": len(num_df), "fitted_pairs": n, "displayed_points": len(scatter_pts), "display_cap": 450},
         "kpis": {
             "R²": round(r2, 4),
             "Pearson r": round(r_val, 4),
@@ -3027,7 +3044,8 @@ def _build_data_lifecycle_funnel(state: dict[str, Any], raw_active: pd.DataFrame
 
 
 def _build_correlation_heatmap_svg(num_df: pd.DataFrame) -> dict[str, Any]:
-    cols = [c for c in num_df.columns if num_df[c].nunique(dropna=True) > 1][:12]
+    eligible = [c for c in num_df.columns if num_df[c].nunique(dropna=True) > 1]
+    cols = eligible[:12]
     if len(cols) < 2:
         raise LiveChartUnavailable("Correlation Heatmap requires at least 2 non-constant columns.")
     corr = num_df[cols].corr(method="pearson")
@@ -3051,7 +3069,8 @@ def _build_correlation_heatmap_svg(num_df: pd.DataFrame) -> dict[str, Any]:
     table_rows.sort(key=lambda r: abs(r[2]), reverse=True)
     return {
         "title": "Vector Correlation & Association Matrix Heatmap",
-        "subtitle": f"{len(cols)} × {len(cols)} pairwise Pearson correlation matrix · Peak off-diagonal r = {max_off:+.3f} ({max_pair or 'N/A'})",
+        "subtitle": f"{len(cols)} of {len(eligible)} eligible columns (first 12); pairwise Pearson correlations · Peak r = {max_off:+.3f}",
+        "analysis_scope": {"columns_available": len(eligible), "columns_used": len(cols), "column_cap": 12},
         "kpis": {"Matrix Dimension": f"{len(cols)}×{len(cols)}", "Peak Pairwise r": round(max_off, 4), "Peak Pair": max_pair or "N/A"},
         "data": {"columns": [str(c) for c in cols], "values": mat_vals},
         "table_columns": ["Feature_A", "Feature_B", "Pearson_r"],
@@ -3108,7 +3127,11 @@ def _build_stacked_composition_bar(
 
     return {
         "title": f"100% Stacked Outcome Composition — {col_x} × {col_g}",
-        "subtitle": f"Cramér's V = {cramers_v:.4f} (χ² p = {chi2_p:.4g}) across {len(bars_out)} strata × {len(seg_names)} outcome segments",
+        "subtitle": f"Binned/pooled levels (axis caps 7, 5 plus Other) · {len(bars_out)} × {len(seg_names)} · Cramér's V = {cramers_v:.4f} (χ² p = {chi2_p:.4g})",
+        "analysis_scope": {"source_rows": len(df), "tested_rows": int(ctab.to_numpy().sum()),
+                           "first_axis_observed_levels": int(df[col_x].nunique(dropna=False)),
+                           "segment_axis_observed_levels": int(df[col_g].nunique(dropna=False)),
+                           "first_axis_levels_used": len(bars_out), "segment_axis_levels_used": len(seg_names)},
         "kpis": {
             "Primary Axis": col_x,
             "Segment By": col_g,

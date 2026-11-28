@@ -904,7 +904,8 @@ class MetaFeatureWarmStartAutoML:
                 pipe.fit(X_train, y_train)
                 preds = pipe.predict(X_val)
                 sc = float(f1_score(y_val, preds, average="weighted", zero_division=0)) if is_clf else float(root_mean_squared_error(y_val, preds))
-                leaderboard.append({"model": mname, "scaler": scaler_choice, "metric": "f1_weighted" if is_clf else "rmse", "score": round(sc, 6)})
+                leaderboard.append({"model": mname, "scaler": scaler_choice, "metric": "f1_weighted" if is_clf else "rmse",
+                                    "score": round(sc, 6), "fit_features": len(pipe.named_steps["pre"].get_feature_names_out())})
                 better = (sc > best_score) if is_clf else (sc < best_score)
                 if better:
                     best_score = sc
@@ -1101,7 +1102,6 @@ class AutoMLBackendHub:
             baseline_columns = preprocessor.get_feature_names_out()
             X_train_matrix = pd.DataFrame(X_train_values, columns=baseline_columns, index=X_tr.index)
             X_validation_matrix = pd.DataFrame(preprocessor.transform(X_va), columns=baseline_columns, index=X_va.index)
-            validation_score = float(result["best_score"])
             metric = "f1_weighted" if is_clf else "rmse"
 
             def score(y_true: pd.Series, predicted: np.ndarray) -> float:
@@ -1109,6 +1109,19 @@ class AutoMLBackendHub:
                     return float(f1_score(y_true, predicted, average="weighted", zero_division=0))
                 return float(root_mean_squared_error(y_true, predicted))
 
+            # Adapter search scores need not have this metric, sign, or partition.
+            validation_score = score(y_va, result["best_model"].predict(X_va))
+            opaque_ranking = exec_backend in {"h2o", "autogluon"}
+            candidate_rows = [
+                {
+                    **row,
+                    "input_features": len(input_columns),
+                    "fit_features": row.get("fit_features"),
+                    "retained_features": row.get("retained_features"),
+                    "ranking_scope": "backend_specific" if opaque_ranking else leaderboard_partition,
+                }
+                for row in result["leaderboard"]
+            ]
             benchmark = (
                 BaselineBenchmarkSuite.run_classification_detailed if is_clf
                 else BaselineBenchmarkSuite.run_regression_detailed
@@ -1142,6 +1155,9 @@ class AutoMLBackendHub:
             baselines = validation_baselines
             evaluation: dict[str, Any] = {
                 "leaderboard_partition": leaderboard_partition,
+                "candidate_scores_backend_specific": opaque_ranking,
+                "comparison_metric": metric,
+                "comparison_requires_matched_holdout": True,
                 "best_score_partition": "validation",
                 "validation_score": validation_score,
                 "validation_baseline_score": baseline_score,
@@ -1187,7 +1203,7 @@ class AutoMLBackendHub:
                 used_fallback=used_fallback, fallback_reason=fallback_reason, task_type=resolved_task,
                 best_model_name=str(result["best_model_name"]), best_model=result["best_model"],
                 best_score=round(best_score, 6), primary_metric=metric,
-                leaderboard=[{"n_features": len(input_columns), **row} for row in result["leaderboard"]], baseline_benchmarks=baselines,
+                leaderboard=candidate_rows, baseline_benchmarks=baselines,
                 lift_over_best_baseline=round(lift, 6) if lift is not None else None, elapsed_seconds=float(result["elapsed_seconds"]),
                 extra={**(extra or {}), "evaluation": evaluation}, evaluation_indices=test_positions,
             )
@@ -1204,7 +1220,7 @@ class AutoMLBackendHub:
             if ext_out is not None:
                 return finish(
                     ext_out, extra=ext_out.get("extra"),
-                    leaderboard_partition="adapter_internal" if req_backend == "h2o" else "validation",
+                    leaderboard_partition={"h2o": "adapter_internal", "autogluon": "backend_validation"}.get(req_backend, "validation"),
                 )
             if not fallback_to_native:
                 raise AutoMLError(f"External AutoML backend '{req_backend}' is not installed or unavailable on this system.")
@@ -1313,7 +1329,7 @@ class AutoMLBackendHub:
                 "best_model_name": f"FLAML({automl.best_estimator})",
                 "best_score": round(sc, 6),
                 "primary_metric": "f1_weighted" if is_clf else "rmse",
-                "leaderboard": [{"model": f"FLAML({automl.best_estimator})", "metric": "f1_weighted" if is_clf else "rmse", "score": round(sc, 6)}],
+                "leaderboard": [{"model": f"FLAML({automl.best_estimator})", "fit_features": X_tr_m.shape[1], "metric": "f1_weighted" if is_clf else "rmse", "score": round(sc, 6)}],
                 "elapsed_seconds": round(time.perf_counter() - t0, 3),
             }
 

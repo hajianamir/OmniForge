@@ -238,9 +238,12 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
                 <div className="kpi-card"><div className="kpi-label">Runtime</div><div className="kpi-value">{automlRes.elapsed_seconds}s</div></div>
               </div>
               {automlRes.metadata?.evaluation?.best_score_partition === 'test' && (
-                <p>The selected model and reference scores use {automlRes.metadata.evaluation.n_test} held-out rows. The leaderboard shows validation scores used during selection.</p>
+                <p>The selected model and reference scores use {automlRes.metadata.evaluation.n_test} held-out rows. The leaderboard describes backend selection, not performance on that holdout.</p>
               )}
-              {(automlRes.leaderboard?.length ?? 0) > 0 && (
+              {automlRes.metadata?.evaluation?.candidate_scores_backend_specific && (
+                <p>Backend-specific leaderboard scores are not directly comparable. Compare only the selected-model metric on the same held-out rows and feature scope. “—” means a count is unavailable.</p>
+              )}
+              {!automlRes.metadata?.evaluation?.candidate_scores_backend_specific && (automlRes.leaderboard?.length ?? 0) > 0 && (
                 <div style={{ marginBottom: 14 }}>
                   <BarChartSVG
                     title={`AutoML Candidate Leaderboard (${automlRes.primary_metric || 'Score'})`}

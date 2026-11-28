@@ -1098,15 +1098,15 @@ def benford_digit_test(series: pd.Series) -> dict[str, Any]:
     """First-digit Benford's Law conformity test (Chi-square) for financial/audit data screening."""
     from scipy import stats
 
-    vals = pd.to_numeric(series, errors="coerce").dropna().abs()
-    vals = vals[vals > 0]
-    if len(vals) < 30:
-        return {"evaluable": False, "reason": "Requires >= 30 positive observations.", "n": int(len(vals))}
-    first_digits = vals.astype(str).str.lstrip("0.").str[0]
-    digits = first_digits[first_digits.isin([str(d) for d in range(1, 10)])].astype(int)
-    n = len(digits)
+    # Use the stored numeric value's shortest decimal spelling: no epsilon or
+    # rounding across a digit boundary. Trailing binary error from an upstream
+    # calculation can legitimately place an observation below that boundary.
+    vals = pd.to_numeric(series, errors="coerce")
+    vals = vals[np.isfinite(vals) & (vals != 0)]
+    n = len(vals)
     if n < 30:
-        return {"evaluable": False, "reason": "Insufficient valid leading digits.", "n": int(n)}
+        return {"evaluable": False, "reason": "Requires >= 30 finite nonzero magnitudes.", "n": int(n)}
+    digits = vals.astype(str).str.lstrip("-0.").str[0].astype(int)
     obs = np.array([int((digits == d).sum()) for d in range(1, 10)], dtype=float)
     exp = np.array([n * np.log10(1.0 + 1.0 / d) for d in range(1, 10)], dtype=float)
     chi2_stat, p_val = stats.chisquare(obs, f_exp=exp)

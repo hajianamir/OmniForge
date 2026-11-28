@@ -320,11 +320,12 @@ def baseline_feature_evidence(model: BaseOmniForgeModel) -> dict[str, Any]:
     """Return the actual nonzero encoded support of fitted L1 references."""
     columns = model.feature_names_
     if not isinstance(model, (LassoLinearBaseline, LogisticBaseline)):
-        return {"n_features": len(columns)}
+        return {"n_features": len(columns), "fit_features": len(columns), "retained_features": None}
     coefficients = np.asarray(model._model.coef_)
     supported = np.any(np.atleast_2d(coefficients) != 0, axis=0)
     support = [name for name, selected in zip(columns, supported, strict=True) if selected]
-    return {"reference_kind": "parsimonious_l1", "selected_support": support, "n_features": len(support)}
+    return {"reference_kind": "parsimonious_l1", "selected_support": support, "n_features": len(support),
+            "fit_features": len(columns), "retained_features": len(support)}
 
 
 class BaselineBenchmarkSuite:

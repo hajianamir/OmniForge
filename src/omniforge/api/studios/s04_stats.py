@@ -122,6 +122,10 @@ def s04_run_eda(x_session_id: str | None = Header(default="default")) -> dict[st
         {
             "sampled": was_sampled,
             "n_rows_analyzed": len(sample_df),
+            "n_rows_available": len(df),
+            "row_cap": 25_000,
+            "display_limits": {"numeric_distributions": 6, "categorical_distributions": 6,
+                               "categories_per_chart": 12, "correlation_columns": 12, "missing_columns": 20},
             "insights": insights,
             "distributions": distributions,
             "categorical_distributions": categorical_distributions,
@@ -129,6 +133,15 @@ def s04_run_eda(x_session_id: str | None = Header(default="default")) -> dict[st
             "missing_bars": missing_bars,
         },
     )
+
+
+def _scope(available: int, used: int, cap: int, *, unit: str, selection: str) -> dict[str, Any]:
+    """Expose analysis caps independently of the display/table limit."""
+    return {
+        "analysis_scope": {"unit": unit, "available": available, "used": used,
+                           "omitted": available - used, "cap": cap, "selection": selection},
+        "sample_disclosure": f"{available:,} {unit} available / {used:,} used / {available - used:,} omitted; cap {cap:,}",
+    }
 
 
 def _studio_shapiro_disclosure(
@@ -172,10 +185,12 @@ def _run_single_stat_test(
         out = res.model_dump(exclude={"details"})
         return {**_studio_shapiro_disclosure(series, res.details, cap_applied=True), **out, "significant": bool(res.reject_null)}
     if t == "ks_normality":
-        res = StatisticalAnalyzer.normality_test(
-            df[col_a].dropna().iloc[:5000], alpha=alpha, method="kolmogorov_smirnov"
-        )
+        series = df[col_a].dropna()
+        sample = series.iloc[:5000]
+        res = StatisticalAnalyzer.normality_test(sample, alpha=alpha, method="kolmogorov_smirnov")
         return {
+            **_scope(int(pd.to_numeric(series, errors="coerce").count()), int(res.details.get("n_scanned", 0)),
+                     5000, unit="observations", selection="first non-missing rows in study order"),
             "test_name": "Lilliefors / KS Normality Test",
             "statistic": round(float(res.statistic), 5),
             "p_value": float(res.p_value),
@@ -190,6 +205,7 @@ def _run_single_stat_test(
             raise HTTPException(status_code=400, detail="Anderson-Darling test requires at least 5 numeric observations.")
         res_ad = StatisticalAnalyzer.anderson_darling_test(vals[:5000], alpha=alpha)
         return {
+            **_scope(len(vals), min(len(vals), 5000), 5000, unit="observations", selection="first finite numeric rows in study order"),
             "test_name": "Anderson-Darling Normality Test",
             "statistic": round(float(res_ad.statistic), 5),
             "p_value": float(res_ad.p_value),
@@ -204,6 +220,7 @@ def _run_single_stat_test(
             raise HTTPException(status_code=400, detail="D'Agostino-Pearson test requires at least 8 numeric observations.")
         stat, pval = sp_stats.normaltest(vals[:5000])
         return {
+            **_scope(len(vals), min(len(vals), 5000), 5000, unit="observations", selection="first finite numeric rows in study order"),
             "test_name": "D'Agostino-Pearson Omnibus K²",
             "statistic": round(float(stat), 5),
             "p_value": float(pval),
@@ -213,7 +230,9 @@ def _run_single_stat_test(
         }
     if t == "distribution_fit":
         vals = pd.to_numeric(df[col_a], errors="coerce").dropna().to_numpy(dtype=float)
-        vals = vals[np.isfinite(vals)][:4000]
+        vals = vals[np.isfinite(vals)]
+        n_available = len(vals)
+        vals = vals[:4000]
         if len(vals) < 15:
             raise HTTPException(status_code=400, detail="Distribution fitting needs at least 15 values.")
         n_obs = len(vals)
@@ -271,6 +290,7 @@ def _run_single_stat_test(
         gof_p = float(gof.pvalue)
         best.update(p_value=gof_p, bootstrap_ks_stat=float(gof.statistic))
         return {
+            **_scope(n_available, n_obs, 4000, unit="observations", selection="first finite numeric rows in study order"),
             "test_name": f"Distribution Goodness-of-Fit ({col_a})",
             "statistic": float(gof.statistic),
             "p_value": gof_p,
@@ -324,6 +344,7 @@ def _run_single_stat_test(
         fn = {"levene": sp_stats.levene, "bartlett": sp_stats.bartlett, "fligner": sp_stats.fligner}[t]
         stat, pval = fn(*groups[:12])
         return {
+            **_scope(len(groups), min(len(groups), 12), 12, unit="groups", selection="first eligible groups in group-key order"),
             "test_name": f"{t.title()} Homogeneity of Variance Test",
             "statistic": round(float(stat), 5),
             "p_value": float(pval),
@@ -441,7 +462,7 @@ def s04_run_hypothesis(req: HypothesisReq, x_session_id: str | None = Header(def
                 skipped.append({**entry, "reason": exc.detail})
                 return
             if not result["evaluable"]:
-                scope_keys = ("sample_disclosure", "shapiro_sample")
+                scope_keys = ("sample_disclosure", "analysis_scope", "shapiro_sample")
                 skipped.append({**entry, "reason": result["interpretation"], **{
                     key: result[key] for key in scope_keys if key in result
                 }})
@@ -485,6 +506,9 @@ def s04_run_hypothesis(req: HypothesisReq, x_session_id: str | None = Header(def
             {
                 "mode": mode,
                 "total_tests": len(battery),
+                "battery_scope": {"numeric_columns_available": len(numeric),
+                                  "normality_column_cap": 4, "correlation_column_cap": 4,
+                                  "group_value_column_cap": 3, "group_key_column_cap": 2},
                 "significant_tests": sum(1 for r in battery if r.get("significant")),
                 "raw_significant_tests": sum(1 for r in battery if r.get("significant_raw")),
                 "decision_policy": "Benjamini–Hochberg across the evaluable battery",

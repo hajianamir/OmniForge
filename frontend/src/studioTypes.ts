@@ -228,6 +228,8 @@ export interface DiagnosticsResponse extends StateEnvelope {
 
 export interface EDAResponse extends StateEnvelope {
   n_rows_analyzed?: number;
+  n_rows_available?: number;
+  row_cap?: number;
   insights?: (string | JsonRow)[];
   distributions?: { column?: unknown; mean?: unknown; std?: unknown; bins?: { label?: unknown; count?: unknown }[] }[];
   categorical_distributions?: { column?: string; unique_count?: number; top_values?: { label?: string; count?: number }[] }[];
@@ -333,6 +335,7 @@ export interface AutoMLResponse extends StateEnvelope {
   metadata?: {
     evaluation?: {
       leaderboard_partition?: string;
+      candidate_scores_backend_specific?: boolean;
       best_score_partition?: string;
       n_test?: number;
     };

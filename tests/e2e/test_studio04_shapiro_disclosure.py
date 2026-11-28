@@ -58,7 +58,7 @@ def test_shapiro_boundary_counts_for_custom_and_per_column_batteries(n: int) -> 
             assert (partial["source_rows"], partial["available_rows"], partial["tested_rows"]) == (n, n - 120, n - 120)
             assert partial["omitted_rows"] == partial["cap_omitted_rows"] == 0
             assert f"{n:,} source rows" in by_column["partial"]["sample_disclosure"]
-            assert all(r.get("sample_disclosure") is None for r in body["battery"] if r["test_type"] != "shapiro")
+            assert all("shapiro_sample" not in r for r in body["battery"] if r["test_type"] != "shapiro")
             skipped = next(r for r in body["skipped"] if r["scope"] == "constant" and r["test_type"] == "shapiro")
             assert skipped["shapiro_sample"]["tested_rows"] == 0
             assert skipped["shapiro_sample"]["cap_omitted_rows"] == 0
