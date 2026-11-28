@@ -25,3 +25,21 @@ All claims above are engineering evidence. This follow-up does not reopen histor
 The earlier in-progress matrices supplied evidence states, not qualifying final verdicts. The separate 667-pass run reported on the auditor's branch is not used as evidence for this implementation.
 
 [Round 2 remediation log and remaining verification limits](ROUND2_REMEDIATION_LOG.md)
+
+## Independent main audit follow-up — `4385647`
+
+Remediation branch: `arena/92c52eb8-omniforge`. These IDs are not historical
+finding IDs. The original report and probes were not changed.
+
+| Finding | Reproduced on unchanged `4385647` | Remediation evidence |
+|---|---|---|
+| MAIN-01 | All six original Studio 03 option probes returned 500. Archived SPA sent the short option values. | Holm now returns 200 and matches statsmodels on the evaluable ledger. Current browser values for the mode and all four normality methods return 200 in the API tests; obsolete short values return structured 422. A live Chromium run exercised Holm, non-parametric policy, and Anderson–Darling. |
+| MAIN-02 | Three-arm route returned 200, ATE `8.216801`, CI `[7.202181, 9.231421]`; SDK returned `8.225828`. | Same route fixture returns 400 without ATE/CI; exact SDK fixture raises `CausalInferenceError`. The 0/1 subset's full SDK result is unchanged (ATE `1.973929`, 100 per arm). Regression tests cover all six binary ATE methods, single/filtered arms, nonfinite and invalid levels, and continuous DML. |
+| MAIN-03 | Audit linear-null vector reproduced `+0.0210 R²` and the significance claim; digest `64458e3791e50fd33ac361ac02d0751b030017d06be30b6a6283acae07ceed60`. | Same lift and digest, but verdict describes a `0.015` heuristic, not an inferential test. Below-threshold replay also uses descriptive wording. Current and restored legacy views are covered; V-01 reference-failure contracts retained. |
+| MAIN-04 | API returned the map `x: 65.2236`, `x2: 65.0584`; archived SPA did not render VIF. | API map retained. Chromium renders real values, shows the recorded threshold, does not cap values at 100, and does not chart nulls as zero. |
+| MAIN-05 | API gave `0.0` for the 45-row fixture. | Same fixture gives the unrounded SciPy p-value `3.4571369789354314e-11`; the conclusion and digit-selection rule are unchanged. |
+| MAIN-06 | The synthetic exception canary appeared in both original outputs. | Original structlog and stdlib probes no longer emit the canary. JSON/console formatter tests cover chained exceptions and file/stream output. No active application disclosure was established. |
+| MAIN-07 | User guide listed `/s03/eda`; original POST returned 405. | User guide and architecture list `GET /s03/catalog` and `POST /s03/run`; an OpenAPI check covers the Studio 03 entries in both guides and the API reference. |
+
+All seven are remediated in the tested cases. This is engineering evidence for
+independent review, not an independent closure or release verdict.

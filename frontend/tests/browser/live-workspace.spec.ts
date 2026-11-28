@@ -216,3 +216,39 @@ test('supervisory quick-train selects an outcome and score-only shows unavailabl
   await expect(page.getByText('Compliance: Unavailable', { exact: true })).toBeVisible();
   await expect(page.getByText('Unevaluable: 1', { exact: true })).toBeVisible();
 });
+
+test('real Studio 03 controls run diagnostics and chart the returned VIF map', async ({ page }) => {
+  await page.addInitScript((key) => localStorage.setItem('omniforge_api_key', key), apiKey!);
+  await page.goto('/');
+  const rows = ['feature_a,feature_b'];
+  for (let i = 0; i < 120; i++) {
+    const x = (i - 60) / 20;
+    rows.push(`${x},${0.92 * x + 0.2 * Math.sin(i)}`);
+  }
+  await page.locator('input[accept=".csv,.tsv,.xlsx,.xls,.xlsm,.parquet,.json"]').setInputFiles({
+    name: 'diagnostics-main-audit.csv', mimeType: 'text/csv', buffer: Buffer.from(rows.join('\n')),
+  });
+  await expect(page.getByText(/Ingested 'diagnostics-main-audit.csv'/)).toBeVisible();
+  await page.locator('[data-studio="03"]').click();
+  await page.getByRole('button', { name: /custom/i, exact: true }).click();
+  const chips = page.locator('.chip-grid .chip.selected');
+  await expect(page.getByRole('button', { name: /Multicollinearity Diagnostics/ })).toBeVisible();
+  for (const chip of (await chips.all()).reverse()) {
+    const label = await chip.textContent();
+    if (!/Normality, Distribution Shape|Multicollinearity Diagnostics/.test(label ?? '')) await chip.click();
+  }
+  await expect(chips).toHaveCount(2);
+  await page.getByRole('combobox', { name: 'Multiple Testing Correction' }).selectOption('holm');
+  await page.getByRole('combobox', { name: 'Parametric Policy' }).selectOption('non_parametric');
+  await page.getByRole('combobox', { name: 'Normality Test' }).selectOption('anderson_darling');
+  const response = page.waitForResponse('**/api/workbench/s03/run');
+  await page.getByRole('button', { name: 'Execute Universal Diagnostics (CUSTOM)' }).click();
+  const result = await response;
+  expect(result.status()).toBe(200);
+  const { report } = await result.json();
+  expect(report.correction_family.method).toBe('holm');
+  expect(report.vif_scores.feature_a).toBeGreaterThan(5);
+  const chart = page.locator('.inspectable-box').filter({ hasText: /Variance Inflation Factor/ });
+  await expect(chart.getByText('feature_a', { exact: true })).toBeVisible();
+  await expect(chart.getByText(report.vif_scores.feature_a.toFixed(4), { exact: true }).first()).toBeVisible();
+});

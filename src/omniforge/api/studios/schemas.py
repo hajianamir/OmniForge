@@ -6,6 +6,9 @@ from typing import Any, Literal, Self
 
 from pydantic import BaseModel, Field, model_validator
 
+from omniforge.eda.diagnostics import EXECUTABLE_MODULES, CorrelationMethod, OutlierMethod, ParametricMode
+from omniforge.eda.statistics import MultipleTestingMethod, NormalityMethod
+
 
 class LoadSampleReq(BaseModel):
     source_type: str = Field(default="domain", description="'benchmark' or 'domain'")
@@ -122,23 +125,20 @@ class MiningReq(BaseModel):
 class DiagnosticsReq(BaseModel):
     ignored_columns: list[str] = Field(default_factory=list)
     mode: Literal["all", "complete", "auto", "custom"] = "all"
-    alpha: float = 0.05
-    confidence_level: float = 0.95
-    fdr_method: str = "fdr_bh"
-    parametric_mode: str = "auto"
-    normality_method: str = "auto"
-    correlation_method: str = "auto"
-    outlier_method: str = "iqr"
-    vif_threshold: float = 5.0
-    risk_tail_alpha: float = 0.05
-    holdout_ratio: float = 0.20
+    alpha: float = Field(default=0.05, gt=0.0, lt=0.5)
+    confidence_level: float = Field(default=0.95, gt=0.5, lt=0.9999)
+    fdr_method: MultipleTestingMethod = "fdr_bh"
+    parametric_mode: ParametricMode = "auto"
+    normality_method: NormalityMethod = "auto"
+    correlation_method: CorrelationMethod = "auto"
+    outlier_method: OutlierMethod = "iqr"
+    vif_threshold: float = Field(default=5.0, ge=1.5, le=50.0)
+    risk_tail_alpha: float = Field(default=0.05, gt=0.001, lt=0.5)
+    holdout_ratio: float = Field(default=0.20, ge=0.10, le=0.45)
     selected_modules: list[str] = Field(default_factory=list)
-
 
     @model_validator(mode="after")
     def validate_module_selection(self) -> Self:
-        from omniforge.eda.diagnostics import EXECUTABLE_MODULES
-
         if self.mode == "custom" and not self.selected_modules:
             raise ValueError("Custom mode requires at least one executable module.")
         if self.mode != "custom" and self.selected_modules:

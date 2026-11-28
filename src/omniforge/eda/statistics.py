@@ -9,6 +9,9 @@ import pandas as pd
 from pydantic import BaseModel, Field
 from scipy import stats
 
+type MultipleTestingMethod = Literal["none", "bonferroni", "holm", "fdr_bh"]
+type NormalityMethod = Literal["auto", "shapiro_wilk", "dagostino_pearson", "kolmogorov_smirnov", "anderson_darling"]
+
 
 class HypothesisTestResult(BaseModel):
     """Standardized output of a statistical hypothesis test with effect size, CI, and multiple-testing support."""
@@ -33,7 +36,7 @@ class StatisticalAnalyzer:
     @staticmethod
     def adjust_p_values(
         p_values: list[float],
-        method: Literal["none", "bonferroni", "fdr_bh"] = "fdr_bh",
+        method: MultipleTestingMethod = "fdr_bh",
     ) -> list[float]:
         """Adjust a family of raw p-values for multiple hypothesis testing."""
         arr = np.asarray(p_values, dtype=float)
@@ -49,15 +52,19 @@ class StatisticalAnalyzer:
         if method == "bonferroni":
             result[observed] = np.minimum(1.0, arr * m)
             return result.tolist()
-        # Benjamini-Hochberg FDR step-up procedure
         order = np.argsort(arr)
         ranked = arr[order]
-        adj = np.empty(m, dtype=float)
-        running_min = 1.0
-        for i in range(m - 1, -1, -1):
-            val = ranked[i] * m / float(i + 1)
-            running_min = min(running_min, val)
-            adj[i] = min(1.0, running_min)
+        if method == "holm":
+            # Holm step-down: enforce monotonicity in ascending p-value order.
+            adj = np.minimum(1.0, np.maximum.accumulate(ranked * np.arange(m, 0, -1)))
+        else:
+            # Benjamini-Hochberg FDR step-up procedure.
+            adj = np.empty(m, dtype=float)
+            running_min = 1.0
+            for i in range(m - 1, -1, -1):
+                val = ranked[i] * m / float(i + 1)
+                running_min = min(running_min, val)
+                adj[i] = min(1.0, running_min)
         restored = np.empty(m, dtype=float)
         restored[order] = adj
         result[observed] = restored
@@ -67,7 +74,7 @@ class StatisticalAnalyzer:
     def normality_test(
         series: pd.Series,
         alpha: float = 0.05,
-        method: Literal["auto", "shapiro_wilk", "dagostino_pearson", "kolmogorov_smirnov", "anderson_darling"] = "auto",
+        method: NormalityMethod = "auto",
     ) -> HypothesisTestResult:
         """Run Shapiro-Wilk, D'Agostino-Pearson, Kolmogorov-Smirnov, or Anderson-Darling normality test."""
         vals = pd.to_numeric(series, errors="coerce").dropna().to_numpy(dtype=float)

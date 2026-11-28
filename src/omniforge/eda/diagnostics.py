@@ -16,7 +16,7 @@ from omniforge.core.performance import smart_sample_df
 from omniforge.core.task_inference import infer_supervised_task
 from omniforge.core.types import TaskType
 from omniforge.data.quality import DataQualityProfiler
-from omniforge.eda.statistics import HypothesisTestResult, StatisticalAnalyzer
+from omniforge.eda.statistics import HypothesisTestResult, MultipleTestingMethod, NormalityMethod, StatisticalAnalyzer
 from omniforge.evaluation.paired_comparison import paired_score_interval
 from omniforge.features.inference import WorkbenchInputPreprocessor, nonconstant_predictors
 from omniforge.models.baselines import (
@@ -54,17 +54,22 @@ EXECUTABLE_MODULES = {
 }
 
 
+type ParametricMode = Literal["auto", "parametric", "non_parametric"]
+type CorrelationMethod = Literal["auto", "pearson", "spearman", "kendall"]
+type OutlierMethod = Literal["iqr", "zscore", "modified_zscore"]
+
+
 class StatisticalCriteriaConfig(BaseModel):
     """User-configurable statistical testing criteria, thresholds, and risk parameters."""
 
     alpha: float = Field(default=0.05, gt=0.0, lt=0.5, description="Significance level (Sig / p-value cutoff)")
     confidence_level: float = Field(default=0.95, gt=0.5, lt=0.9999, description="Confidence level for intervals")
-    multiple_testing_correction: Literal["none", "bonferroni", "fdr_bh"] = "fdr_bh"
+    multiple_testing_correction: MultipleTestingMethod = "fdr_bh"
     alternative: Literal["two-sided", "less", "greater"] = "two-sided"
-    parametric_mode: Literal["auto", "parametric", "non_parametric"] = "auto"
-    normality_method: Literal["auto", "shapiro_wilk", "dagostino_pearson", "kolmogorov_smirnov", "anderson_darling"] = "auto"
-    correlation_method: Literal["auto", "pearson", "spearman", "kendall"] = "auto"
-    outlier_method: Literal["iqr", "zscore", "modified_zscore"] = "iqr"
+    parametric_mode: ParametricMode = "auto"
+    normality_method: NormalityMethod = "auto"
+    correlation_method: CorrelationMethod = "auto"
+    outlier_method: OutlierMethod = "iqr"
     vif_threshold: float = Field(default=5.0, ge=1.5, le=50.0)
     risk_tail_alpha: float = Field(default=0.05, gt=0.001, lt=0.5)
     bootstrap_samples: int = Field(default=250, ge=50, le=2000)

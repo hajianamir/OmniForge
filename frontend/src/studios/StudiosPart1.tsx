@@ -1408,6 +1408,13 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
   const [catalog, setCatalog] = useState<Record<string, string> | null>(null);
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const report = studioCache.s03_diagnostics?.report ?? null;
+  const reportedVifThreshold = report?.criteria?.vif_threshold ?? 5;
+  const vifEntries = Object.entries(report?.vif_scores ?? {});
+  const vifItems = vifEntries.flatMap(([label, value]) =>
+    typeof value === 'number' && Number.isFinite(value)
+      ? [{ label, value, color: value >= reportedVifThreshold ? '#f87171' : '#34d399' }]
+      : [],
+  );
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -1480,7 +1487,7 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
           <label className="field">Confidence Level
             <input type="number" step={0.01} min={0.8} max={0.999} value={confLevel} onChange={(e) => setConfLevel(Number(e.target.value))} />
           </label>
-          <label className="field">FDR Correction
+          <label className="field">Multiple Testing Correction
             <select value={fdr} onChange={(e) => setFdr(e.target.value)}>
               <option value="fdr_bh">Benjamini-Hochberg (FDR)</option>
               <option value="bonferroni">Bonferroni</option>
@@ -1497,16 +1504,16 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
             <select value={paramMode} onChange={(e) => setParamMode(e.target.value)}>
               <option value="auto">Auto (Shapiro-Guided)</option>
               <option value="parametric">Parametric</option>
-              <option value="nonparametric">Non-Parametric</option>
+              <option value="non_parametric">Non-Parametric</option>
             </select>
           </label>
           <label className="field">Normality Test
             <select value={normMethod} onChange={(e) => setNormMethod(e.target.value)}>
               <option value="auto">Auto</option>
-              <option value="shapiro">Shapiro-Wilk</option>
-              <option value="dagostino">D'Agostino K²</option>
-              <option value="anderson">Anderson-Darling</option>
-              <option value="ks">Kolmogorov-Smirnov</option>
+              <option value="shapiro_wilk">Shapiro-Wilk</option>
+              <option value="dagostino_pearson">D'Agostino K²</option>
+              <option value="anderson_darling">Anderson-Darling</option>
+              <option value="kolmogorov_smirnov">Kolmogorov-Smirnov</option>
             </select>
           </label>
           <label className="field">Correlation Test
@@ -1602,19 +1609,19 @@ export const Studio03Diagnostics: React.FC<StudioProps> = ({ ws, onSync, studioC
             )}
           </div>
 
-          {Array.isArray(report.vif_scores) && (report.vif_scores as Array<Record<string, unknown>>).length > 0 && (
+          {vifEntries.length > 0 && (
             <div className="card">
-              <BarChartSVG
-                title={`Variance Inflation Factor (VIF) Multicollinearity Profile (Threshold = ${vifThresh})`}
-                horizontal
-                items={(report.vif_scores as Array<Record<string, unknown>>).slice(0, 14).flatMap((v) => {
-                  const col = String(v.feature ?? v.column ?? '');
-                  const vifVal = Number(v.vif ?? NaN);
-                  return col && Number.isFinite(vifVal)
-                    ? [{ label: col, value: Math.min(vifVal, 100), color: vifVal >= vifThresh ? '#f87171' : '#34d399' }]
-                    : [];
-                })}
-              />
+              {vifItems.length > 0 && (
+                <BarChartSVG
+                  title={`Variance Inflation Factor (VIF) Multicollinearity Profile (Threshold = ${reportedVifThreshold})`}
+                  horizontal
+                  items={vifItems.slice(0, 14)}
+                />
+              )}
+              {vifItems.length > 14 && <p>Showing 14 of {vifItems.length} finite VIF scores.</p>}
+              {vifEntries.length > vifItems.length && (
+                <p>{vifEntries.length - vifItems.length} non-finite VIF score(s) not charted.</p>
+              )}
             </div>
           )}
 

@@ -294,3 +294,56 @@ existing Fisher-z correlation chart wording. The new predictor cap text had repl
 part of the prior inference caveat. Restored the assumption/approximation and exploratory
 p-value disclosure alongside the cap, without changing the existing test or calculations.
 The original SciPy estimate, confidence interval and wording regression passes again.
+
+## Main audit follow-up — dependency review (before product edits)
+
+The user selected MAIN-01 through MAIN-07 from the independent audit of
+`4385647a5ec14806f3c12d6ed3b792069402de64`. Original audit and verification
+artifacts stay untouched; the supplied probes are replayed from an isolated archive.
+
+- **MAIN-03 touches the V-01 suite and Studio 06 view.** V-01 is independently
+  closed under `report_unavailable`. This change is limited to interpreting
+  *available* CV comparisons and naming the display. Preserve null comparison
+  evidence, scored candidates, and no acceptance or promotion on reference
+  failure. Rerun the reference-failure and zero-reference regressions.
+- **MAIN-01/04 touch Studio 03 diagnostics and its view.** Preserve executable
+  module dispatch, authorization, and the scope of the evaluable correction
+  family. The Holm change adds a supported adjustment, not a new test family.
+- **MAIN-05 touches the OF-31 Benford function.** Only the returned p-value
+  precision changes; preserve the finite stored-magnitude digit rule.
+- **MAIN-02 touches the causal engine.** Preserve valid 0/1 AIPW, continuous
+  DML/IV, and the clustered DiD inference contract. Binary estimators must not
+  silently reinterpret extra arms or fit when complete cases lose an arm.
+- **MAIN-06/07** are formatter and Studio 03 documentation corrections; no
+  change to API exception handling, auth, or the historical audit verdicts.
+
+### Main audit replay and remediation evidence
+
+- Extracted only the supplied report metadata and harnesses outside the repository.
+  Verified the three original Python harness files against the auditor's SHA-256s.
+  Replayed unmodified phase 2 (numerical) and phase 3 (contracts) on a clean
+  `git archive` of `4385647`; replayed unmodified phase 3 on the patched worktree.
+  The phase 2 multilevel SDK call previously expected a result, so its fixed
+  check reused the exact recorded vectors, seed, and estimator options with
+  rejection as the expectation; the binary-subset result matched in full.
+- Four new Chromium regressions failed as expected against the old packaged
+  SPA (short control values, VIF rendering, and current/legacy CV displays).
+  They passed after rebuilding. A real-browser regression also submitted fixed
+  Studio 03 controls to the API and charted the returned VIF map.
+- Focused Python regressions: 55 passed, including V-01 reference failure and
+  OF-31 stored-magnitude coverage. Ruff and mypy (201 source files) passed.
+  The CI Python extras installed successfully on CPython 3.12.12; numerical
+  library versions matched the audit (NumPy 2.5.5, pandas 3.1.1, SciPy 1.18.1,
+  scikit-learn 1.9.1 and statsmodels 0.15.0).
+- See [the traceability matrix](ROUND2_TRACEABILITY_MATRIX.md#independent-main-audit-follow-up--4385647)
+  for the per-finding before/after observations and scope limits.
+- Full local Python coverage: **763 passed, 2 skipped, 43 warnings** in 628 s;
+  **30,456 / 36,611 statements (83.19%)**. The skips were an unstaged installer
+  payload and optional PyTorch. Live Redis passed using a local Redis 7.4.9
+  socket. The separate strength and Redis selection passed **149 tests** (136
+  §6 tests and 13 shared-rate-limit tests).
+- Packaged Workbench Chromium: **36 passed**, including six live API cases.
+  A repeat production build reproduced all 12 packaged assets byte-for-byte.
+  The hash-pinned dependency install, installed SDK wheel/resource check,
+  dependency smoke imports, and strict installed SDK typing check passed.
+  No remote CI run or independent post-fix verdict is claimed.

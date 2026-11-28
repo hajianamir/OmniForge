@@ -662,3 +662,62 @@ test('Studio 04 discloses the Shapiro sample in the custom card and per-column b
   await page.getByRole('button', { name: 'Run Hypothesis Test (COMPLETE)' }).click();
   await expect(page.getByRole('row').filter({ hasText: 'alpha' }).getByText(note, { exact: true })).toBeVisible();
 });
+
+test('Studio 03 submits canonical criteria values', async ({ page }) => {
+  const backend = new MockWorkbench({});
+  await backend.install(page);
+  await page.route('**/api/workbench/s03/run', route => route.fulfill({
+    json: { state: backend.state, report: {} },
+  }));
+  await page.goto('/');
+  await openStudio(page, '03');
+  await page.getByRole('combobox', { name: /Correction/ }).selectOption({ label: 'Holm-Bonferroni' });
+  await page.getByRole('combobox', { name: 'Parametric Policy' }).selectOption({ label: 'Non-Parametric' });
+  for (const [label, value] of [
+    ['Shapiro-Wilk', 'shapiro_wilk'], ["D'Agostino K²", 'dagostino_pearson'],
+    ['Anderson-Darling', 'anderson_darling'], ['Kolmogorov-Smirnov', 'kolmogorov_smirnov'],
+  ]) {
+    await page.getByRole('combobox', { name: 'Normality Test' }).selectOption({ label });
+    const request = page.waitForRequest('**/api/workbench/s03/run');
+    await page.getByRole('button', { name: 'Execute Universal Diagnostics (COMPLETE)' }).click();
+    expect((await request).postDataJSON()).toMatchObject({
+      fdr_method: 'holm', parametric_mode: 'non_parametric', normality_method: value,
+    });
+  }
+});
+
+test('Studio 03 charts the VIF map without capping values or using the live form threshold', async ({ page }) => {
+  const backend = new MockWorkbench({ s03_diagnostics: { report: {
+    criteria: { vif_threshold: 11 }, vif_scores: { x: 65.2236, x2: 150.1234, singular: null },
+  } } });
+  await backend.install(page);
+  await page.goto('/');
+  await openStudio(page, '03');
+  const chart = page.locator('.inspectable-box').filter({ hasText: /Variance Inflation Factor/ });
+  await expect(chart).toContainText('Threshold = 11');
+  await expect(chart.getByText('x', { exact: true })).toBeVisible();
+  await expect(chart.getByText('65.2236', { exact: true })).toBeVisible();
+  await expect(chart.getByText('150.1234', { exact: true })).toBeVisible();
+  await expect(chart.getByText('singular', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('1 non-finite VIF score(s) not charted.')).toBeVisible();
+});
+
+for (const legacy of [false, true]) {
+  test(`Studio 06 presents ${legacy ? 'restored legacy' : 'current'} CV results without a significance claim`, async ({ page }) => {
+    const verdict = 'Observed CV lift of +0.02100 r2 exceeds the heuristic threshold of 0.015. This is a descriptive model comparison, not a statistical test of nonlinearity.';
+    const backend = new MockWorkbench({ s06_nonparametric: {
+      target: 'target', task_type: 'regression', primary_metric: 'r2', lift_vs_parametric: 0.021,
+      comparison_status: 'available', nonparametric_outperforms_parametric: true,
+      ...(legacy
+        ? { verdict: 'Observed lift — significant non-linear structure confirmed.' }
+        : { verdict, cv_lift_heuristic_threshold: 0.015 }),
+    } });
+    await backend.install(page);
+    await page.goto('/');
+    await openStudio(page, '06');
+    await page.getByRole('button', { name: 'Non-Parametric Analytical Models', exact: true }).click();
+    await expect(page.getByText(/Descriptive CV Comparison/)).toBeVisible();
+    await expect(page.getByText(legacy ? /compares observed CV scores/ : /exceeds the heuristic threshold/)).toBeVisible();
+    await expect(page.getByText(/significant non-linear structure confirmed/)).toHaveCount(0);
+  });
+}

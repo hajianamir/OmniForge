@@ -1114,7 +1114,7 @@ def benford_digit_test(series: pd.Series) -> dict[str, Any]:
         "evaluable": True,
         "n": int(n),
         "chi2": round(float(chi2_stat), 4),
-        "p_value": round(float(p_val), 6),
+        "p_value": float(p_val),
         "conforms_benford": bool(p_val >= 0.05),
     }
 

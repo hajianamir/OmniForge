@@ -124,8 +124,15 @@ class RedactingJsonFormatter(logging.Formatter):
             "tenant_id": get_tenant_context(),
         }
         if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
+            payload["exception"] = redact_sensitive_value(self.formatException(record.exc_info))
         return json.dumps(payload, default=str)
+
+
+class _RedactingTextFormatter(logging.Formatter):
+    """Redact the complete formatted text, including any cached traceback."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return str(redact_sensitive_value(super().format(record)))
 
 
 def configure_logging(
@@ -153,13 +160,14 @@ def configure_logging(
     use_structlog = _HAS_STRUCTLOG and structlog is not None
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setLevel(numeric_level)
+    structlog_formatter = _RedactingTextFormatter("%(message)s") if redact_secrets else logging.Formatter("%(message)s")
     if use_structlog:
-        stream_handler.setFormatter(logging.Formatter("%(message)s"))
+        stream_handler.setFormatter(structlog_formatter)
     elif log_format.lower() == "json":
         stream_handler.setFormatter(RedactingJsonFormatter())
     else:
         stream_handler.setFormatter(
-            logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
+            _RedactingTextFormatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
         )
     root_logger.addHandler(stream_handler)
 
@@ -169,7 +177,7 @@ def configure_logging(
         file_handler = logging.FileHandler(path, encoding="utf-8")
         file_handler.setLevel(numeric_level)
         file_handler.setFormatter(
-            logging.Formatter("%(message)s") if use_structlog else RedactingJsonFormatter()
+            structlog_formatter if use_structlog else RedactingJsonFormatter()
         )
         root_logger.addHandler(file_handler)
 
@@ -179,17 +187,15 @@ def configure_logging(
             structlog.stdlib.add_logger_name,
             structlog.stdlib.add_log_level,
             structlog.processors.TimeStamper(fmt="iso", utc=True),
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
         ]
         if redact_secrets:
             processors.append(_structlog_redact_processor)
-        processors.extend(
-            [
-                structlog.processors.StackInfoRenderer(),
-                structlog.processors.format_exc_info,
-                structlog.processors.JSONRenderer()
-                if log_format.lower() == "json"
-                else structlog.dev.ConsoleRenderer(),
-            ]
+        processors.append(
+            structlog.processors.JSONRenderer()
+            if log_format.lower() == "json"
+            else structlog.dev.ConsoleRenderer(),
         )
         structlog.configure(
             processors=processors,
