@@ -5,8 +5,8 @@ project: OmniForge v4.0.0 (package: omniforge, import root: src/omniforge/)
 audience: Codex and other AI coding agents
 status: Active
 owner: OmniForge maintainers
-last_reviewed: 2026-11-24
-next_review: 2027-02-24
+last_reviewed: 2026-11-27
+next_review: 2027-02-27
 companion: docs/AGENT_REFERENCE.md (full manual; read only the sections your task needs)
 ---
 
@@ -75,6 +75,8 @@ Notes:
 - CI `e2e` checks `git diff --quiet -- src/omniforge/ui/static_app` - it catches modified/deleted tracked files, **not** newly added untracked ones. Always `git add` new `static_app` files.
 
 ## 4. Task routing - read only what you need
+
+**Shared agent skills:** start with [OmniForge](.agents/skills/omniforge/SKILL.md) for repository-specific work. For HTML, CSS, browser APIs, and frontend accessibility or performance, also consult [Modern Web Guidance](.agents/skills/modern-web-guidance/SKILL.md). Agents without automatic skill discovery can open these files directly. The [vendored guides](.agents/skills/modern-web-guidance/guides/) are usable offline; no installer is needed after checkout. For how the upstream snapshot is maintained, see [Agent Reference §0.3](docs/AGENT_REFERENCE.md#03-shared-agent-skills).
 
 | If you are... | Read first | Key files |
 |---|---|---|
