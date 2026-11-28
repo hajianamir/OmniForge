@@ -11,6 +11,7 @@ from fastapi import APIRouter, Header, HTTPException
 from omniforge.api.studios.schemas import HypothesisReq, wb_cache_and_respond
 from omniforge.core.performance import smart_sample_df
 from omniforge.eda import AutomatedEDA, StatisticalAnalyzer
+from omniforge.eda.shapiro_scope import SHAPIRO_CAP, shapiro_sample_disclosure
 
 router = APIRouter(tags=["workbench-s04"])
 
@@ -130,6 +131,31 @@ def s04_run_eda(x_session_id: str | None = Header(default="default")) -> dict[st
     )
 
 
+def _studio_shapiro_disclosure(
+    series: pd.Series, details: dict[str, Any] | None = None, *, cap_applied: bool = False
+) -> dict[str, Any]:
+    available = int(pd.to_numeric(series, errors="coerce").count())
+    # The existing route caps non-missing rows before the analyzer coerces numeric strings.
+    # Count cap omissions separately from invalid inputs and tests that could not run.
+    cap_omissions = (
+        int(pd.to_numeric(series.dropna().iloc[SHAPIRO_CAP:], errors="coerce").count()) if cap_applied else 0
+    )
+    tested = int((details or {}).get("n_scanned", 0))
+    scope, note = shapiro_sample_disclosure(
+        source_rows=len(series),
+        available_rows=available,
+        tested_rows=tested,
+        cap_omitted_rows=cap_omissions,
+        selection="first_non_missing_in_study_order",
+    )
+    return {
+        # Keep the compact description ahead of wide test details in report exports.
+        "sample_disclosure": note,
+        "shapiro_sample": scope,
+        "details": {**(details or {}), "sampled_from": available, "n_scanned": tested},
+    }
+
+
 def _run_single_stat_test(
     df: pd.DataFrame,
     test_type: str,
@@ -141,10 +167,10 @@ def _run_single_stat_test(
 
     t = test_type.lower()
     if t == "shapiro":
-        res = StatisticalAnalyzer.normality_test(df[col_a].dropna().iloc[:5000], alpha=alpha)
-        out = res.model_dump() if hasattr(res, "model_dump") else dict(res)
-        out.setdefault("significant", bool(res.reject_null))
-        return out
+        series = df[col_a]
+        res = StatisticalAnalyzer.normality_test(series.dropna().iloc[:SHAPIRO_CAP], alpha=alpha, method="shapiro_wilk")
+        out = res.model_dump(exclude={"details"})
+        return {**_studio_shapiro_disclosure(series, res.details, cap_applied=True), **out, "significant": bool(res.reject_null)}
     if t == "ks_normality":
         res = StatisticalAnalyzer.normality_test(
             df[col_a].dropna().iloc[:5000], alpha=alpha, method="kolmogorov_smirnov"
@@ -359,6 +385,7 @@ def _evaluate_stat_test(
         values = pd.to_numeric(df[col_a], errors="coerce").dropna()
         if not values.empty and values.min() == values.max():
             return {
+                **(_studio_shapiro_disclosure(df[col_a]) if test.lower() == "shapiro" else {}),
                 "test_name": test,
                 "statistic": None,
                 "p_value": None,
@@ -414,7 +441,10 @@ def s04_run_hypothesis(req: HypothesisReq, x_session_id: str | None = Header(def
                 skipped.append({**entry, "reason": exc.detail})
                 return
             if not result["evaluable"]:
-                skipped.append({**entry, "reason": result["interpretation"]})
+                scope_keys = ("sample_disclosure", "shapiro_sample")
+                skipped.append({**entry, "reason": result["interpretation"], **{
+                    key: result[key] for key in scope_keys if key in result
+                }})
                 return
             battery.append({**entry, **{k: v for k, v in result.items() if k != "extra_table"}})
 
@@ -434,6 +464,12 @@ def s04_run_hypothesis(req: HypothesisReq, x_session_id: str | None = Header(def
                     evaluate(tt, nc, cc, f"{nc} by {cc}")
         if len(cat_cols) >= 2:
             evaluate("chi_square", cat_cols[0], cat_cols[1], f"{cat_cols[0]} x {cat_cols[1]}")
+        # Report/UI tables derive their columns from the first row. Keep the disclosure
+        # visible even if the first evaluable (or skipped) row was not a Shapiro test.
+        if any("sample_disclosure" in row for row in battery):
+            battery = [{"scope": row["scope"], "test_type": row["test_type"], "sample_disclosure": None, **row} for row in battery]
+        if any("sample_disclosure" in row for row in skipped):
+            skipped = [{"scope": row["scope"], "test_type": row["test_type"], "sample_disclosure": None, **row} for row in skipped]
         adjusted = StatisticalAnalyzer.adjust_p_values([float(row["p_value"]) for row in battery])
         for row, p_adj in zip(battery, adjusted, strict=True):
             row["correction_family"] = "studio04_evaluable_battery"

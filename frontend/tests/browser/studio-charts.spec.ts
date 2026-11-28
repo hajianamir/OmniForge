@@ -639,3 +639,26 @@ test('Studio 06 keeps the candidate visible when its parametric reference is una
   await expect(page.getByText(/Non-Parametric vs\. Parametric/)).toHaveCount(0);
   await expect(page.getByText(/Champion Non-Parametric|Ready for Studio 14 Live Monitor/)).toHaveCount(0);
 });
+
+test('Studio 04 discloses the Shapiro sample in the custom card and per-column battery', async ({ page }) => {
+  const note = '5,100 available / 5,000 tested / 100 omitted; cap 5,000 (p-value accuracy)';
+  const result = {
+    test_name: 'shapiro_wilk', statistic: 0.99, p_value: 0.03, significant: true,
+    interpretation: 'Departure from normality.', sample_disclosure: note,
+  };
+  const backend = new MockWorkbench({ s04_hypothesis: { mode: 'custom', result } });
+  await backend.install(page);
+  await page.route('**/api/workbench/s04/hypothesis', async (route) => {
+    await route.fulfill({ json: {
+      mode: 'complete', total_tests: 1, significant_tests: 1,
+      battery: [{ scope: 'alpha', test_type: 'shapiro', ...result }],
+      state: backend.state,
+    } });
+  });
+  await page.goto('/');
+  await openStudio(page, '04');
+  await expect(page.getByText(note, { exact: false })).toBeVisible();
+  await page.getByRole('button', { name: 'Complete (Select All)', exact: true }).click();
+  await page.getByRole('button', { name: 'Run Hypothesis Test (COMPLETE)' }).click();
+  await expect(page.getByRole('row').filter({ hasText: 'alpha' }).getByText(note, { exact: true })).toBeVisible();
+});

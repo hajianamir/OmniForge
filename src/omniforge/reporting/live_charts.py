@@ -33,6 +33,7 @@ from sklearn.metrics import (
 from omniforge.core.types import TaskType
 from omniforge.core.utils import to_json_object
 from omniforge.data.quality import DataQualityProfiler
+from omniforge.eda.shapiro_scope import SHAPIRO_CAP, shapiro_sample_disclosure
 from omniforge.mlops.supervisory_monitor import SupervisoryPredictionMonitor
 from omniforge.ui.state import (
     get_active_split_frames,
@@ -2114,20 +2115,33 @@ def _build_normality_qq_plot(ser: pd.Series, disp_x: str) -> dict[str, Any]:
         for i in keep_idx
     ]
 
-    shapiro_sample = arr_sorted if n <= 5000 else arr_sorted[np.linspace(0, n - 1, 5000).round().astype(int)]
-    if float(np.std(shapiro_sample)) > 1e-12:
+    shapiro_sample = arr_sorted if n <= SHAPIRO_CAP else arr_sorted[np.linspace(0, n - 1, SHAPIRO_CAP).round().astype(int)]
+    evaluated = float(np.std(shapiro_sample)) > 1e-12
+    if evaluated:
         sw_stat, sw_p = stats.shapiro(shapiro_sample)
+        sw_label = f"W = {float(sw_stat):.4f} (p = {float(sw_p):.4g})"
+        sw_w, sw_p_value = round(float(sw_stat), 4), round(float(sw_p), 6)
         skew_v = float(stats.skew(arr_sorted))
         kurt_v = float(stats.kurtosis(arr_sorted))
     else:
-        sw_stat, sw_p, skew_v, kurt_v = 1.0, 1.0, 0.0, 0.0
-
+        sw_label = "not run (no variation)"
+        sw_w, sw_p_value = None, None
+        skew_v, kurt_v = 0.0, 0.0
+    scope, note = shapiro_sample_disclosure(
+        source_rows=len(ser),
+        available_rows=n,
+        tested_rows=len(shapiro_sample) if evaluated else 0,
+        cap_omitted_rows=n - len(shapiro_sample),
+        selection="evenly_spaced_sorted_ranks",
+    )
     return {
         "title": f"Normal Q-Q Probability Plot — {disp_x}",
-        "subtitle": f"n = {n:,} · Shapiro-Wilk W = {float(sw_stat):.4f} (p = {float(sw_p):.4g}) · Skew = {skew_v:.3f}, Excess Kurtosis = {kurt_v:.3f}",
+        # The chart image exporter truncates long subtitles; lead with the Shapiro sample.
+        "subtitle": f"Shapiro-Wilk: {note} · {sw_label} · Skew = {skew_v:.3f}, Excess Kurtosis = {kurt_v:.3f}",
+        "shapiro_sample": scope,
         "kpis": {
-            "Shapiro-Wilk W": round(float(sw_stat), 4),
-            "Shapiro p-value": round(float(sw_p), 6),
+            "Shapiro-Wilk W": sw_w,
+            "Shapiro p-value": sw_p_value,
             "Skewness": round(skew_v, 4),
             "Excess Kurtosis": round(kurt_v, 4),
             "Sample Size n": n,

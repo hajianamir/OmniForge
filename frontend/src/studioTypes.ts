@@ -246,6 +246,7 @@ export interface HypothesisSingleResult {
   significant?: boolean;
   alpha?: number;
   interpretation?: string;
+  sample_disclosure?: string;
   extra_table?: JsonRow[] | null;
   [key: string]: unknown;
 }
