@@ -15,7 +15,7 @@ linear/logistic models and black-box ensembles:
 5. :class:`IsotonicMonotonicModel` — Non-parametric piecewise-constant monotonic regression
    fitted on the strongest Spearman-correlated predictor with explicit step thresholds.
 6. :class:`NonParametricAnalyticalSuite` — Head-to-head benchmark comparing all non-parametric
-   analytical models against a parametric linear/logistic reference with explicit non-linearity lift.
+   analytical models against a parametric linear/logistic reference with descriptive CV lift.
 """
 
 from __future__ import annotations
@@ -873,19 +873,20 @@ class NonParametricAnalyticalSuite:
         champion = leaderboard[0] if comparison_available else {}
         best_np_score = float(nonparam_best["primary_score"]) if nonparam_best is not None else None
         lift_vs_param = round(best_np_score - param_score, 5) if best_np_score is not None and param_score is not None else None
-        np_beats_param = lift_vs_param > 0.015 if lift_vs_param is not None else None
+        cv_lift_threshold = 0.015
+        np_beats_param = lift_vs_param > cv_lift_threshold if lift_vs_param is not None else None
         primary_metric_name = str(leaderboard[0]["primary_metric"]) if leaderboard else ("f1_weighted" if is_clf else "r2")
         if param_score is None:
             linearity_verdict = "Comparison unavailable: the parametric reference could not be evaluated."
-        elif nonparam_best is None:
+        elif lift_vs_param is None:
             linearity_verdict = "Comparison unavailable: no non-parametric candidate could be evaluated."
-        elif np_beats_param and lift_vs_param is not None:
-            linearity_verdict = (
-                f"Non-parametric analytical model '{nonparam_best['model_name']}' outperforms parametric linear by "
-                f"{lift_vs_param:+.4f} {primary_metric_name} — significant non-linear structure confirmed."
-            )
         else:
-            linearity_verdict = "Parametric linear relationship is competitive with non-parametric smoothers; additive/linear terms capture most signal."
+            threshold_result = "exceeds" if np_beats_param else "does not exceed"
+            linearity_verdict = (
+                f"Observed CV lift of {lift_vs_param:+.5f} {primary_metric_name} "
+                f"{threshold_result} the heuristic threshold of {cv_lift_threshold:.3f}. "
+                "This is a descriptive model comparison, not a statistical test of nonlinearity."
+            )
 
         # Return champion fitted non-parametric model + full dict for Studio 14 supervisory registration
         return {
@@ -904,6 +905,7 @@ class NonParametricAnalyticalSuite:
             "champion_score": champion.get("primary_score"),
             "best_nonparametric_score": best_np_score,
             "lift_vs_parametric": lift_vs_param,
+            "cv_lift_heuristic_threshold": cv_lift_threshold,
             "nonparametric_outperforms_parametric": np_beats_param,
             "linearity_verdict": linearity_verdict,
             "verdict": linearity_verdict,

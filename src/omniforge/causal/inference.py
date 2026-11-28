@@ -41,7 +41,8 @@ class CausalEffectResult(BaseModel):
 class CausalInferenceEngine:
     """Comprehensive causal effect estimation, CATE uplift modeling, and refutation suite."""
 
-    _SUPPORTED_METHODS = frozenset({"aipw", "ipw", "psm", "dml", "iv_2sls", "t_learner", "s_learner", "x_learner"})
+    _BINARY_METHODS = frozenset({"aipw", "ipw", "psm", "t_learner", "s_learner", "x_learner"})
+    _SUPPORTED_METHODS = _BINARY_METHODS | {"dml", "iv_2sls"}
 
     def __init__(self, random_seed: int = 42, bootstrap_rounds: int = 40) -> None:
         self.random_seed = random_seed
@@ -61,7 +62,8 @@ class CausalInferenceEngine:
         """Estimate Average Treatment Effect (ATE) and optionally run DoWhy-style refutation checks.
 
         Supported methods: ``aipw`` (Doubly Robust), ``ipw``, ``psm``, ``dml``, ``iv_2sls``,
-        ``t_learner``, ``s_learner``, ``x_learner``.
+        ``t_learner``, ``s_learner``, ``x_learner``. Except for DML and IV-2SLS,
+        observed treatment must be coded 0/1 with both arms present among complete cases.
         """
         est_method = method.lower()
         if est_method not in self._SUPPORTED_METHODS:
@@ -87,25 +89,35 @@ class CausalInferenceEngine:
         if missing:
             raise CausalInferenceError(f"Missing required columns for causal estimation: {missing}")
 
+        if est_method in self._BINARY_METHODS:
+            # Check observed coding before complete-case filtering can hide a third arm.
+            observed = pd.to_numeric(df[treatment_col].dropna(), errors="coerce")
+            if not observed.isin([0, 1]).all():
+                raise CausalInferenceError(
+                    f"Method '{est_method}' requires binary treatment coded 0 (control) and 1 (treated).",
+                    suggestions=["Select a 0/1 treatment column for the intended two-arm contrast."],
+                )
+
         work = df[required].dropna().copy()
         if len(work) < 20:
             raise CausalInferenceError("At least 20 complete observations are required for causal inference.")
+
+        T = work[treatment_col].to_numpy(dtype=float)
+        n_treated = int(np.sum(T == 1))
+        n_control = int(np.sum(T == 0))
+        if est_method in self._BINARY_METHODS and (n_treated < 2 or n_control < 2):
+            raise CausalInferenceError(
+                f"Method '{est_method}' requires at least 2 treated (T=1) and 2 control (T=0) complete observations.",
+                suggestions=["Check that both treatment arms have enough rows with all required values."],
+            )
 
         if dedup_confounders:
             X_df = pd.get_dummies(work[dedup_confounders], drop_first=True, dtype=float)
             X = X_df.to_numpy(dtype=float)
         else:
             X = np.empty((len(work), 0), dtype=float)
-        T = work[treatment_col].to_numpy(dtype=float)
         Y = work[outcome_col].to_numpy(dtype=float)
         Z = work[instrument_col].to_numpy(dtype=float) if instrument_col else None
-
-        n_treated = int(np.sum(T == 1))
-        n_control = int(np.sum(T == 0))
-        if est_method not in {"dml", "iv_2sls"} and (n_treated < 2 or n_control < 2):
-            raise CausalInferenceError(
-                f"Method '{est_method}' requires at least 2 treated (T=1) and 2 control (T=0) observations."
-            )
 
         ate, cate, extra, analytic_se = self._dispatch_estimator(est_method, X, T, Y, Z)
 

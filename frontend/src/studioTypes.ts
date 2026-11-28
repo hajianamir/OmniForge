@@ -204,6 +204,8 @@ export interface RiskAssessment {
 }
 
 export interface DiagnosticsReport {
+  criteria?: { vif_threshold?: number };
+  vif_scores?: Record<string, number | null>;
   n_scanned?: number;
   sampled_from?: number;
   columns_skipped?: Record<string, string[]>;
@@ -349,6 +351,7 @@ export interface NonParametricResponse extends StateEnvelope {
   parametric_reference_status?: 'available' | 'unavailable';
   comparison_status?: 'available' | 'unavailable';
   lift_vs_parametric?: number | null;
+  cv_lift_heuristic_threshold?: number;
   nonparametric_outperforms_parametric?: boolean | null;
   primary_metric?: string;
   target?: string;

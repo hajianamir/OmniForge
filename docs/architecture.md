@@ -410,7 +410,8 @@ CopilotToolRegistry.invoke(tool_name, arguments)
 | POST | `/s00/ingest` | S00 | Data ingestion |
 | POST | `/s01/clean` | S01 | Data cleaning |
 | POST | `/s02/mine` | S02 | Clustering & mining |
-| POST | `/s03/eda` | S03 | Automated EDA |
+| GET | `/s03/catalog` | S03 | List executable diagnostics modules |
+| POST | `/s03/run` | S03 | Run Universal Diagnostics |
 | POST | `/s04/diagnostics` | S04 | Diagnostics |
 | POST | `/s05/features` | S05 | Feature engineering |
 | POST | `/s06/run` | S06 | AutoML |

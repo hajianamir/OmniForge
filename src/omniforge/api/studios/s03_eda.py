@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, cast
+from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 
@@ -59,11 +59,11 @@ def s03_run_diagnostics(
     criteria = StatisticalCriteriaConfig(
         alpha=req.alpha,
         confidence_level=req.confidence_level,
-        multiple_testing_correction=cast(Any, req.fdr_method),
-        parametric_mode=cast(Any, req.parametric_mode),
-        normality_method=cast(Any, req.normality_method),
-        correlation_method=cast(Any, req.correlation_method),
-        outlier_method=cast(Any, req.outlier_method),
+        multiple_testing_correction=req.fdr_method,
+        parametric_mode=req.parametric_mode,
+        normality_method=req.normality_method,
+        correlation_method=req.correlation_method,
+        outlier_method=req.outlier_method,
         vif_threshold=req.vif_threshold,
         risk_tail_alpha=req.risk_tail_alpha,
         holdout_ratio=req.holdout_ratio,

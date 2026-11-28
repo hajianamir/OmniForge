@@ -1036,12 +1036,15 @@ reporter.export(payload, "report.html")   # or .pdf, .pptx, .docx, .xlsx, .ipynb
 
 ### 12.2 Studio Endpoints (Workbench)
 
+Paths in this table are relative to `/api/workbench`.
+
 | Endpoint | Method | Studio | Description |
 |---|---|---|---|
 | `/s00/ingest` | POST | S00 | Ingest dataset |
 | `/s01/clean` | POST | S01 | Clean data |
 | `/s02/mine` | POST | S02 | Clustering & mining |
-| `/s03/eda` | POST | S03 | Automated EDA |
+| `/s03/catalog` | GET | S03 | List executable diagnostics modules |
+| `/s03/run` | POST | S03 | Run Universal Diagnostics |
 | `/s04/diagnostics` | POST | S04 | Diagnostics & baselines |
 | `/s05/features` | POST | S05 | Feature engineering |
 | `/s06/run` | POST | S06 | AutoML |

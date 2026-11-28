@@ -104,7 +104,11 @@ Each studio follows the pattern: `POST /api/workbench/sXX/<action>` with an `X-S
 | `/s03/run` | POST | Run diagnostics with `mode: all` (or `complete`), `auto`, or `custom` |
 
 Custom mode requires a nonempty `selected_modules` array of unique executable IDs.
-Other modes must omit the list or send an empty list. Invalid selections or modes return 422.
+Other modes must omit the list or send an empty list. Invalid selections, modes, or criteria return 422.
+`fdr_method` accepts `fdr_bh`, `bonferroni`, `holm`, or `none`. When enabled, adjustment
+covers the evaluable hypothesis ledger as one family. `parametric_mode` accepts `auto`, `parametric`, or `non_parametric`.
+`normality_method` accepts `auto`, `shapiro_wilk`, `dagostino_pearson`, `anderson_darling`,
+or `kolmogorov_smirnov`.
 The response includes `report.executed_modules`, `report.module_status`, the hypothesis ledger,
 and any available baseline or risk evidence. Modules without evaluable results are marked `unavailable`.
 Risk uses `structural_risk_index`, `risk_band`, and `tail_risk_table`.
@@ -171,7 +175,11 @@ Risk uses `structural_risk_index`, `risk_band`, and `tail_risk_table`.
 | `/s08/causal` | POST | Causal ATE (IPW/AIPW/PSM/DML/IV/DiD) |
 | `/s08/optimize` | POST | LP/MILP/Markowitz/CVRP optimization |
 
-**Causal Methods:** `ipw`, `psm`, `aipw`, `dml`, `iv_2sls`, `did`, `cate`.
+**Causal Methods:** `aipw` (default), `ipw`, `psm`, `t_learner`, `s_learner`, and `x_learner`
+require treatment coded 0 (control) and 1 (treated) and at least two complete observations per arm.
+Unsupported coding or missing arms return HTTP 400 without an estimate. `dml` and `iv_2sls`
+can estimate a per-unit treatment effect without 0/1 coding. `clustered_did` is a separate
+2×2 design requiring `post_col` and `cluster_col`.
 
 **Response:** ATE estimate, confidence interval, p-value, refutation checks, sensitivity bounds.
 

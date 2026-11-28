@@ -300,7 +300,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
               <ModeBar mode={npMode} onChange={setNpMode} />
             </div>
             <p style={{ margin: '0 0 12px', fontSize: 12.5, color: 'var(--text-muted)' }}>
-              Benchmarks <strong>5 distribution-free analytical models</strong> — Penalized B-Spline GAM, Nadaraya-Watson Gaussian Kernel Estimator, RBF Kernel Ridge (RKHS Dual), Distance-Weighted k-NN, and Isotonic Monotonic Regression — head-to-head against a Parametric Linear/Logistic reference to detect &amp; quantify non-linear structure with exact mathematical formulas.
+              Benchmarks <strong>5 distribution-free analytical models</strong> — Penalized B-Spline GAM, Nadaraya-Watson Gaussian Kernel Estimator, RBF Kernel Ridge (RKHS Dual), Distance-Weighted k-NN, and Isotonic Monotonic Regression — head-to-head against a Parametric Linear/Logistic reference to compare cross-validated predictive performance, not to test for nonlinearity.
             </p>
             {npMode === 'custom' && (
               <div className="chip-grid" style={{ marginBottom: 12 }}>
@@ -341,8 +341,11 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
 
           {npRes && (
             <>
-              <div className={`alert ${npRes.nonparametric_outperforms_parametric ? 'alert-success' : 'alert-info'}`}>
-                <strong>Analytical Verdict ({npRes.target} · {npRes.task_type}):</strong> {npRes.verdict}
+              <div className="alert alert-info">
+                <strong>Descriptive CV Comparison ({npRes.target} · {npRes.task_type}):</strong>{' '}
+                {npRes.cv_lift_heuristic_threshold != null || npRes.comparison_status === 'unavailable'
+                  ? npRes.verdict
+                  : 'This benchmark compares observed CV scores; it is not a statistical test of nonlinearity.'}
               </div>
               <div className="kpi-grid">
                 <div className="kpi-card">
@@ -833,8 +836,8 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
                 <option value="clustered_did">Clustered difference-in-differences</option>
               </select>
             </label>
-            <label className="field">Treatment
-              <select value={treatCol} onChange={(e) => setTreatCol(e.target.value)}>
+            <label className="field" htmlFor="s08-treatment">Treatment
+              <select id="s08-treatment" aria-describedby="s08-treatment-hint" value={treatCol} onChange={(e) => setTreatCol(e.target.value)}>
                 {ws.columns.map((c) => <option key={c} value={c}>{c}</option>)}
               </select>
             </label>
@@ -871,6 +874,7 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
               } catch (e: unknown) { setErr(toErrorMessage(e)); } finally { setBusy(false); }
             }}>{causalMethod === 'clustered_did' ? 'Estimate Clustered DiD' : 'Estimate Causal ATE'}</button>
           </div>
+          <p id="s08-treatment-hint">Use a treatment column coded 0 (control) and 1 (treated), with both groups present.</p>
           {causalMethod === 'clustered_did' && <p>Use a binary treatment group that stays fixed within each cluster. Interpreting the estimate as causal requires parallel trends and no spillovers.</p>}
           {causalRes && (
             <>
