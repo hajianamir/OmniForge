@@ -97,6 +97,10 @@ def test_studio06_no_auto_promotion_after_reference_failure(forced_reference_fai
     assert_comparison_unavailable(result)
     assert result["state"]["active_model_name"] is None
     assert result["state"]["available_models_count"] == 1
+    event = result["state"]["lineage"][-1]
+    assert event["stage"] == "Non-Parametric Modeling"
+    assert event["action"] == "Non-parametric candidates scored: 1"
+    assert event["details"].startswith("Comparison unavailable:")
 
 
 def test_a_measured_zero_score_remains_a_valid_reference(

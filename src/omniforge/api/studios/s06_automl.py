@@ -423,7 +423,11 @@ def s06_run_nonparametric_analytical(
     _wb().record_lineage(
         state,
         "Non-Parametric Modeling",
-        f"Evaluated {len(tgt_map)} Non-Parametric Analytical Models vs. Parametric Linear",
+        (
+            f"Evaluated {len(tgt_map)} Non-Parametric Analytical Models vs. Parametric Linear"
+            if comparable
+            else f"Non-parametric candidates scored: {len(tgt_map)}"
+        ),
         f"Champion={champ_name} ({champion_score:.4f})" if comparable and champion_score is not None else res["verdict"],
     )
     return wb_cache_and_respond(state, sid, "s06_nonparametric", dict(res))

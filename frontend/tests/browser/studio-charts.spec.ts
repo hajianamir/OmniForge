@@ -634,5 +634,8 @@ test('Studio 06 keeps the candidate visible when its parametric reference is una
   await expect(page.locator('.kpi-card').filter({ hasText: 'Parametric Reference' })).toContainText('Unavailable');
   await expect(page.locator('.kpi-card').filter({ hasText: 'Lift vs Parametric' })).toContainText('Unavailable');
   await expect(page.getByText('NOT ASSESSED — PARAMETRIC REFERENCE UNAVAILABLE', { exact: true })).toBeVisible();
+  await expect(page.getByText('Non-Parametric Candidate Leaderboard', { exact: true })).toBeVisible();
+  await expect(page.getByText('Non-Parametric Candidate Scores (R²)', { exact: true })).toBeVisible();
+  await expect(page.getByText(/Non-Parametric vs\. Parametric/)).toHaveCount(0);
   await expect(page.getByText(/Champion Non-Parametric|Ready for Studio 14 Live Monitor/)).toHaveCount(0);
 });

@@ -49,6 +49,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
   const [npKNeighbors, setNpKNeighbors] = useState(11);
   const [npGamma, setNpGamma] = useState<string>('');
   const npRes = studioCache.s06_nonparametric ?? null;
+  const npComparisonAvailable = npRes?.comparison_status === 'available';
 
   const [dlArchs, setDlArchs] = useState<string[]>(['ft_transformer', 'tabnet', 'resnet_tabular', 'mlp', 'gnn_gcn']);
   const [dlEpochs, setDlEpochs] = useState(20);
@@ -363,19 +364,19 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
 
               <div className="card">
                 <div className="card-title">
-                  <span>Non-Parametric vs. Parametric Analytical Leaderboard</span>
+                  <span>{npComparisonAvailable ? 'Non-Parametric vs. Parametric Analytical Leaderboard' : 'Non-Parametric Candidate Leaderboard'}</span>
                   <span className="badge badge-accent">Runtime: {npRes.elapsed_seconds}s{npRes.comparison_status === 'unavailable' ? ' · Comparison unavailable' : ''}</span>
                 </div>
                 {(npRes.leaderboard?.length ?? 0) > 0 && (
                   <div style={{ marginBottom: 14 }}>
                     <BarChartSVG
-                      title={`Non-Parametric vs. Parametric Benchmark (${npRes.primary_metric || 'Score'})`}
+                      title={`${npComparisonAvailable ? 'Non-Parametric vs. Parametric Benchmark' : 'Non-Parametric Candidate Scores'} (${npRes.primary_metric || 'Score'})`}
                       horizontal
                       items={(npRes.leaderboard || []).slice(0, 12).flatMap((row, idx) => {
                         const sc = Number(row.primary_score ?? row.score ?? NaN);
                         const lbl = String(row.model_name ?? row.model ?? `Estimator ${idx + 1}`);
                         return Number.isFinite(sc)
-                          ? [{ label: lbl, value: sc, color: row.is_nonparametric === false ? '#a78bfa' : idx === 0 && npRes.comparison_status === 'available' ? '#34d399' : '#38bdf8' }]
+                          ? [{ label: lbl, value: sc, color: row.is_nonparametric === false ? '#a78bfa' : idx === 0 && npComparisonAvailable ? '#34d399' : '#38bdf8' }]
                           : [];
                       })}
                     />
