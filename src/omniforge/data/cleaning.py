@@ -1125,16 +1125,18 @@ def robust_mahalanobis_outliers(
     alpha: float = 0.01,
     random_state: int = 42,
 ) -> dict[str, Any]:
-    """Multivariate outlier detection using Minimum Covariance Determinant (MCD) Mahalanobis distance."""
+    """Screen MCD Mahalanobis distances with an uncalibrated chi-square cutoff."""
     from scipy import stats
     from sklearn.covariance import MinCovDet
 
     num = df.select_dtypes(include=[np.number]).replace([np.inf, -np.inf], np.nan).dropna()
     p = num.shape[1]
-    minimum_rows = max(50, 10 * p)
+    # Exclude the small-sample region where the in-sample distances can have
+    # markedly heavier tails. Eligibility is not a calibration guarantee.
+    minimum_rows = max(100, 20 * p)
     coverage = {"n_scanned": len(num), "sampled_from": len(df), "minimum_complete_rows": minimum_rows}
     if p < 2 or len(num) < minimum_rows:
-        return {**coverage, "evaluable": False, "reason": "Requires at least two numeric columns and max(50, 10p) complete rows."}
+        return {**coverage, "evaluable": False, "reason": "Requires at least two numeric columns and max(100, 20p) complete rows."}
     X = num.to_numpy(dtype=float)
     try:
         mcd = MinCovDet(random_state=random_state).fit(X)
@@ -1151,10 +1153,14 @@ def robust_mahalanobis_outliers(
         "evaluable": True,
         **coverage,
         "cutoff_method": "asymptotic_chi_square_screening",
+        "cutoff_tail_probability": float(alpha),
+        "false_positive_rate_calibrated": False,
+        "interpretation": "Exploratory flags. The chi-square tail probability is not a false-positive rate for fitted MCD distances.",
         "n_rows": int(len(num)),
         "n_features": int(p),
         "chi2_cutoff": round(cutoff, 4),
         "n_outliers": int(flags.sum()),
+        "flagged_fraction": float(flags.mean()),
         "outlier_indices": num.index[flags].tolist(),
     }
 

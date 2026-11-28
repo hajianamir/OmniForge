@@ -347,3 +347,62 @@ artifacts stay untouched; the supplied probes are replayed from an isolated arch
   The hash-pinned dependency install, installed SDK wheel/resource check,
   dependency smoke imports, and strict installed SDK typing check passed.
   No remote CI run or independent post-fix verdict is claimed.
+
+## Post-PR-33 audit follow-up — dependency review before edits
+
+The user selected review and remediation of all seven findings in the latest
+uploaded audit. Its exact commit is not stated; reproduction targets the clean
+archive of `8992b659ede032407c1c16a6fd792048c9524bf6`. The uploaded report and
+harnesses remain unchanged outside the working tree.
+
+- F-01 overlaps **OF-17** (`5cf9a6c`): tighten eligibility and report the observed
+  screening fraction and the absence of a calibrated false-positive rate. Keep
+  listwise denominator, rank and fit guards. Move the existing gross-outlier
+  test fixture into the newly eligible region, recording that dependency here.
+- F-02 overlaps existing forecast disclosure and horizon-stratified rolling
+  interval evidence. Relabel native recursive ML bands as heuristic; preserve
+  their numeric values, point fits, and the separate rolling method.
+- F-03 restricts the SDK omnibus decision to its predeclared Iman–Davenport
+  approximation; retain the Friedman statistic and p-value as reference evidence.
+- F-04 overlaps **OF-14** (`0b6eeb5`): name the legacy adapter explicitly and
+  recommend the canonical one without silently changing old imports, defaults,
+  empty-train behavior, return type, or buffer semantics.
+- F-05 overlaps **OF-10** (`0b6eeb5`): use shared inference for observed chart
+  targets while withholding catalog task inference for entirely missing targets.
+- F-06 overlaps **OF-18** (`0b6eeb5`): retain the independently confirmed
+  uncorrected Pearson Cramér’s V estimate and its separate p-value method.
+  Add explicit variant provenance; no bias-correction change.
+- F-07 touches presentation of previously verified AutoML partition/reference
+  contracts, not ranking, selected model, or lift. Keep disclosed SDK-only
+  methods SDK-only; no runtime surface is added.
+
+### Post-PR-33 reproduction and verification
+
+- Replayed unmodified `v01`–`v07` on the archived base and the patched source,
+  using explicit `PYTHONPATH` for each run (verified import roots) and one BLAS
+  thread. The [post-PR-33 traceability](ROUND2_TRACEABILITY_MATRIX.md#post-pr-33-independent-audit--f-01f-07)
+  separates original evidence from supplemental counterexamples and remaining limits.
+- New Python regressions are in `tests/unit/test_post_pr33_audit_contracts.py`;
+  new Chromium cases are in `frontend/tests/browser/studio-charts.spec.ts`.
+  On the archived SPA, the native-band and leaderboard-role checks reproduced as
+  failures; the existing rolling-calibrated presentation was already correct.
+  The packaged patched Workbench passed **39 Chromium tests**, including six live API
+  cases. The original audit, harnesses, and auditor-owned verification files were
+  not changed. No independent closure verdict is claimed.
+- Local CPython 3.12.12 verification: **175 passed** across the §6 selection,
+  new audit regressions, existing standards checks, and shared-rate-limit tests
+  with live Redis 7.4.9. Ruff and mypy (201 files) passed with the CI Python
+  extras. With the Redis extra present mypy reports the existing optional import
+  assignment in `core/rate_limit.py`; CI runs mypy without that extra. No rate-limit
+  source was changed.
+- The production frontend build reproduced all 12 packaged files byte-for-byte.
+  The hash-pinned runtime install, clean wheel and sdist build, installed SDK
+  resource smoke (18 domains and `py.typed`), and strict installed SDK typing
+  check passed. These are local results, not a remote CI or release verdict.
+- The CI latency/memory script passed all six budgets with its unscaled defaults
+  (25 timed iterations per path). Docker architecture jobs and the Python 3.13
+  matrix leg were not executed in this sandbox.
+- Full local Python test and coverage run, with live Redis enabled:
+  **779 passed, 2 skipped, 43 warnings** in 629.32 s; **30,472 of 36,617
+  statements (83.22%)** covered. The skips were the unstaged installer payload
+  and missing optional PyTorch. No local failures remained.

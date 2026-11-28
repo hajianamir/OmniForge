@@ -429,13 +429,12 @@ def test_benford_and_robust_mahalanobis_cleaning() -> None:
     assert b_res["conforms_benford"] is True
 
     # Multivariate MCD Mahalanobis outlier detection
-    X_in = rng.normal(0.0, 1.0, size=(80, 3))
+    X_in = rng.normal(0.0, 1.0, size=(100, 3))
     X_out = np.array([[15.0, -15.0, 12.0], [20.0, 20.0, -18.0]])
     df_mcd = pd.DataFrame(np.vstack([X_in, X_out]), columns=["a", "b", "c"])
     m_res = robust_mahalanobis_outliers(df_mcd, alpha=0.01)
     assert m_res["evaluable"] is True
-    assert 80 in m_res["outlier_indices"]
-    assert 81 in m_res["outlier_indices"]
+    assert {len(X_in), len(X_in) + 1} <= set(m_res["outlier_indices"])
 
 
 def test_distance_correlation_and_cluster_stability_ari() -> None:

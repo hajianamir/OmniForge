@@ -721,3 +721,49 @@ for (const legacy of [false, true]) {
     await expect(page.getByText(/significant non-linear structure confirmed/)).toHaveCount(0);
   });
 }
+
+test('Studio 06 distinguishes a higher-ranked reference from the selected model', async ({ page }) => {
+  const backend = new MockWorkbench({ s06_automl: {
+    target: 'target', backend_used: 'native', primary_metric: 'f1_weighted',
+    best_model_name: 'random_forest', best_score: 0.9333, lift_over_baseline: -0.0332,
+    leaderboard: [
+      { model: 'tree_baseline', family: 'baseline', f1_weighted: 1 },
+      { model: 'random_forest', family: 'classical_ml', f1_weighted: 0.97 },
+    ],
+    equation: { model_name: 'random_forest', formula_plain: 'y = x' },
+    metadata: { evaluation: { leaderboard_partition: 'validation', best_score_partition: 'test', n_test: 30 } },
+  } });
+  await backend.install(page);
+  await page.goto('/');
+  await openStudio(page, '06');
+  const baseline = page.getByRole('row', { name: /tree_baseline/ });
+  await expect(baseline.getByRole('cell', { name: 'Reference baseline' })).toBeVisible();
+  await expect(page.getByRole('row', { name: /random_forest/ }).getByRole('cell', { name: 'Selected model' })).toBeVisible();
+  await expect(page.getByText(/A baseline can rank first/)).toBeVisible();
+  await expect(page.getByText('Test f1_weighted', { exact: true })).toBeVisible();
+  await expect(page.getByText(/Rank #1/)).toHaveCount(0);
+});
+
+for (const calibrated of [false, true]) {
+  test(`Studio 08 distinguishes ${calibrated ? 'rolling-calibrated' : 'native heuristic'} ML forecast bounds`, async ({ page }) => {
+    const points = [{ step: 1, yhat: 4, yhat_lower: 3, yhat_upper: 5 }];
+    const backend = new MockWorkbench({ s08_forecast: {
+      history: [{ step: 0, actual: 3 }], deep_forecast: points,
+      classical_summary: { champion_model: 'ML_RandomForest', forecast: points, metadata: {
+        champion_native_interval: calibrated ? null : { method: 'heuristic_refit_one_step_residual_band', coverage_guaranteed: false },
+        champion_interval_calibration: { status: calibrated ? 'applied' : 'insufficient_history_or_origins' },
+      } },
+    } });
+    await backend.install(page);
+    await page.goto('/');
+    await openStudio(page, '08');
+    if (calibrated) {
+      await expect(page.getByText('ML_RandomForest with calibrated intervals', { exact: true })).toBeVisible();
+      await expect(page.getByText(/Native ML bands are heuristic/)).toHaveCount(0);
+    } else {
+      await expect(page.getByText('ML_RandomForest with heuristic intervals', { exact: true })).toBeVisible();
+      await expect(page.getByText(/Coverage is not guaranteed/)).toBeVisible();
+      await expect(page.getByText(/retains its native intervals/)).toBeVisible();
+    }
+  });
+}

@@ -443,6 +443,7 @@ export interface ForecastResponse extends StateEnvelope {
     champion_model?: string;
     forecast?: ForecastPoint[];
     metadata?: {
+      champion_native_interval?: { method: string; coverage_guaranteed: false; horizon_scaling: string } | null;
       champion_interval_calibration?: {
         status: string;
         nominal_level: number;

@@ -1296,6 +1296,21 @@ validated threshold for deployment. Its capped contributions are missing-cell ra
 `(15 − rows/columns) ×1.2` (cap 15). Bands at 20, 45 and 70 only organize review.
 The score depends on the diagnostic scope, cap, configuration and available components.
 
-MCD outlier screening requires at least two numeric variables and `max(50, 10p)` complete
-rows for `p` variables. Its chi-square cutoff is asymptotic, not small-sample calibrated.
-The report shows the listwise denominator separately from the source row count.
+MCD outlier screening requires at least two numeric variables and `max(100, 20p)` complete
+rows for `p` variables. Smaller samples are reported as ineligible, not as zero outliers.
+Even above that gate, the chi-square tail probability is not a calibrated false-positive
+rate for fitted MCD distances. The report gives the observed flagged fraction among the
+listwise-complete rows. It is not a false-positive rate and does not justify automatic removal.
+
+Cramér’s V uses the uncorrected Pearson chi-square, not Yates correction or the Bergsma
+bias correction. The association p-value is separate: Pearson chi-square, Yates-corrected
+chi-square for eligible 2×2 tables, or Fisher’s exact test for sparse 2×2 tables.
+
+The SDK Friedman–Nemenyi comparison uses the Iman–Davenport approximation as its single
+omnibus decision; the chi-square p-value is diagnostic. Nemenyi flags are post hoc, and
+ordinary overlapping CV folds should not be treated as independent benchmark datasets.
+
+Native recursive ML forecast bands are heuristic: their one-step residual width (or
+first-difference fallback) is scaled by `min(sqrt(step), 3)` around a full-data refit.
+They are not split-conformal intervals. The separate rolling interval evaluation reports
+observed coverage, not a guarantee for a new forecasting window.

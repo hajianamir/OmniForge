@@ -396,7 +396,7 @@ export const DEEP_SUPPLEMENTS_PART_1: Record<'01' | '02' | '03' | '04' | '05' | 
           'Step 1 — Expected Counts under H₀ (Independence): E(Day,Defect) = 200×50/400 = 25; E(Night,Defect) = 25; E(Day,Pass) = 175; E(Night,Pass) = 175. All E >= 5 -> Chi-Square valid!',
           'Step 2 — Apply the Studio’s 2×2 continuity correction. Each |O−E| = 7 is reduced to 6.5. χ² = 2×6.5²/25 + 2×6.5²/175 = 3.862857 (df = 1).',
           'Step 3 — The p-value for the corrected statistic is 0.04937.',
-          'Step 4 — The Studio reports Cramér’s V using the corrected statistic, √(3.862857 / 400) = 0.09827.',
+          'Step 4 — Cramér’s V uses the uncorrected Pearson statistic, 2×7²/25 + 2×7²/175 = 4.48. V = √(4.48 / 400) ≈ 0.10583. The p-value uses the separate corrected test.',
         ],
         numericalConclusion: 'The illustrative defect rates are 16% at night and 9% during the day. The corrected independence test gives p = 0.04937 for this single comparison.',
         engineeringAction: 'Check dependence between observations and possible differences in production mix, ambient conditions and calibration before attributing the association to shift.',

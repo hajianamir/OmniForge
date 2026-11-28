@@ -809,8 +809,11 @@ These representations are not interchangeable or claimed to implement the same d
 
 The CPCV kernel is `data.cpcv.iter_cpcv_splits`. For new evaluation code, use
 `evaluation.validation.CombinatorialPurgedKFold` (pre-test purge, post-test embargo, optional
-label interval purge). `data.splitting.CombinatorialPurgedKFold` is a compatibility adapter for
-the list-returning, symmetric positional-purge API; the post-buffer is its purge plus embargo.
+label interval purge). `data.splitting.LegacyCombinatorialPurgedKFold` is the compatibility
+adapter: 6 default folds, list output (including empty training sets), and an additive
+post-buffer (purge plus embargo). The old `data.splitting.CombinatorialPurgedKFold` import is
+an alias, not interchangeable with the canonical iterator (5 default folds, maximum of
+explicit and proportional post-buffers, and no empty training sets).
 
 Native AutoML's reference suite fits bounded nominal indicators independently on each
 reference training partition; specialized backend references receive a named, train-fitted
