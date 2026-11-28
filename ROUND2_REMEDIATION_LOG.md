@@ -2,12 +2,13 @@
 
 ## Current summary (supersedes the initial intake below)
 
-**V-01 only:** implemented the selected `report_unavailable` policy on
-`arena/84cfdc36-omniforge` in `ac7ec24`. The original counterexample reproduced on the archived
-parent. The corrected regression, full local Python coverage suite (704 passed, 3 skipped),
-§6 selection, and local browser/Redis checks passed. There are no other reopened or still-partial
-Round 2 IDs. This is a remediation claim, not an independent finding verdict or full CI parity.
-The initial empty-scope record below is retained for provenance.
+**V-01:** implemented `report_unavailable` in `ac7ec24` and corrected Studio 06 wording
+in `1fb2d0d`. The [independent auditor closed V-01 at `006038f`](https://github.com/hajianamir/OmniForge/pull/31#issuecomment-7235746160)
+under the selected policy after all ten PR checks passed. That verdict is not a release
+verdict. The initial empty-scope record below is retained for provenance.
+
+**OF-09, Studio 04 Shapiro only:** separately authorized after V-01. The disclosure fix
+is in `dd4901e`; other OF-09 caps and all unrelated Phase 2–4 findings remain partial.
 
 ## Initial scope intake (historical — before V-01 selection)
 
@@ -178,3 +179,48 @@ results, not independently reproduced evidence or official CI results.
   The skipped Redis, installer and PyTorch cases match the prior full run. The earlier
   Redis and live-backend browser checks were not repeated for this wording change. These
   results are local engineering evidence, not independent verification or CI parity.
+
+## Round 2 / Iteration 3 / OF-09 — Studio 04 Shapiro disclosure only
+
+The maintainer explicitly approved this item from the auditor's Phase 2–4 worklist.
+At `006038f` the auditor reproduced 5,100 rows reported as 5,000 source/scanned;
+all ten PR checks passed at that baseline. This authorization does not reopen other
+OF-09 caps, other findings, or V-01. OF-09 as a whole stays partial.
+
+**Dependencies logged before implementation:** the Studio 04 router supplies both custom
+and per-column battery results; its battery rows are also consumed by Studio 12 preview
+and exporters. The shared chart builder has a separate Shapiro cap for the Q–Q plot; the
+same payload is reused in the chart UI/gallery and SVG/PNG/XLSX export. The shared Studio
+04/05 UI source and compiled SPA are needed for the custom result; existing neighboring
+behavior and previous assertions are not to be changed. Preserve the historical test
+samples, statistics and correction family. Studio 03's disclosed Shapiro path, intake
+pretests, and non-Shapiro caps are outside this selection. No original audit artifacts,
+auditor verification files or Round 1 traceability rows will be edited.
+
+### Red/green, disposition and handoff
+
+- Against `006038f`, all seven API cases failed as expected: above the cap the legacy
+  `sampled_from` was 5,000, and the report/plot did not expose the sample counts. The
+  browser fixture also failed on the missing custom-result disclosure.
+- `dd4901e` keeps the Hypothesis Lab's first non-missing rows in study order and the Q–Q
+  plot's evenly spaced sorted-rank sample, without changing the Shapiro statistic,
+  p-value, or battery membership for evaluable inputs. Available, tested, omitted, cap,
+  and selection are structured API fields; original source rows are separate from numeric
+  availability. Q–Q point thinning is separate from Shapiro sampling, and a constant Q–Q
+  sample reports that no test ran instead of displaying a synthetic result.
+- Final focused API tests: **7 passed** using 5,000, 5,001 and 5,100 rows in custom,
+  auto and complete modes plus the Q–Q plot; covered incomplete/constant columns,
+  Studio 12 preview and JSON/HTML/Markdown/CSV/DOCX/XLSX exports, and Q–Q SVG/XLSX
+  export. The statistical values were checked against SciPy on the historical samples.
+  Neighboring chart/hypothesis regression run: **34 passed**, including the seven cases
+  before the final source-note shortening and added document-format assertions; the
+  final focused rerun included those assertions. The §6 selection passed **136 tests**.
+- Ruff, mypy (201 modules), and the production SPA build passed. Using substitute
+  Chromium, **26 deterministic** packaged Workbench tests (including the new Studio
+  04 custom-card and battery assertion) and **5 live-backend** tests passed. Full-suite
+  and official PR check outcomes are tracked against the updated PR head in PR #31.
+- **Engineering claim:** the approved Studio 04 disclosure residual is addressed;
+  this is not a finding-wide OF-09 closure. No other residual was selected. The V-01
+  auditor also identified the original pre-fix API probe in the separate audit workspace
+  as `verification/test_runtime_adversarial.py::test_studio06_api_exposes_false_acceptance_after_reference_failure`;
+  the branch API regression remains distinct and is not labeled a replay of that probe.
