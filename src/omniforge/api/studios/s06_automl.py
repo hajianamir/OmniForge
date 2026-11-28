@@ -348,7 +348,7 @@ def s06_export_external_formula(
 def s06_run_nonparametric_analytical(
     req: NonParametricRunReq, x_session_id: str | None = Header(default="default")
 ) -> dict[str, Any]:
-    """Benchmark all Non-Parametric Analytical Models (Spline GAM, Nadaraya-Watson, RBF Kernel Ridge, Weighted k-NN, Isotonic) vs. Parametric Linear."""
+    """Benchmark analytical candidates; do not promote a champion without a scored reference."""
     sid = _wb()._sid(x_session_id)
     state = _wb().get_session_state(sid)
     active_df = _wb()._require_df(state)
@@ -395,8 +395,8 @@ def s06_run_nonparametric_analytical(
             "feature_cols": feat_cols,
             "input_preprocessor": input_preprocessor,
             "metrics": {
-                str(row_m.get("primary_metric", "score")): row_m.get("primary_score", 0.0),
-                "lift_vs_parametric": row_m.get("lift_vs_parametric", 0.0),
+                str(row_m.get("primary_metric", "score")): row_m.get("primary_score"),
+                "lift_vs_parametric": row_m.get("lift_vs_parametric"),
             },
         }
     np_store[target] = tgt_map
@@ -404,13 +404,16 @@ def s06_run_nonparametric_analytical(
     # Promote champion non-parametric model as active if no champion model exists yet
     champ_name = str(res.get("champion_model") or "")
     champ_obj = fitted_map.get(champ_name)
-    if champ_obj is not None and state.get("uap_active_model") is None:
+    champion_score = res.get("champion_score")
+    reference_score = res.get("parametric_reference_score")
+    comparable = res.get("comparison_status") == "available" and reference_score is not None
+    if comparable and champ_obj is not None and champion_score is not None and state.get("uap_active_model") is None:
         state["uap_active_model"] = champ_obj
         state["uap_active_model_target"] = target
         state["uap_active_model_name"] = champ_name
         state["uap_active_model_metrics"] = {
-            "score": float(res.get("champion_score", 0.0)),
-            "parametric_reference": float(res.get("parametric_reference_score", 0.0)),
+            "score": champion_score,
+            "parametric_reference": reference_score,
         }
         state["uap_active_feature_cols"] = feat_cols
         state["uap_active_input_preprocessor"] = input_preprocessor
@@ -421,7 +424,7 @@ def s06_run_nonparametric_analytical(
         state,
         "Non-Parametric Modeling",
         f"Evaluated {len(tgt_map)} Non-Parametric Analytical Models vs. Parametric Linear",
-        f"Champion={champ_name} ({res.get('champion_score', 0.0):.4f})",
+        f"Champion={champ_name} ({champion_score:.4f})" if comparable and champion_score is not None else res["verdict"],
     )
     return wb_cache_and_respond(state, sid, "s06_nonparametric", dict(res))
 

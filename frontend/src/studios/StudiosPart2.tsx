@@ -342,21 +342,21 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
               </div>
               <div className="kpi-grid">
                 <div className="kpi-card">
-                  <div className="kpi-label">Champion Non-Parametric</div>
-                  <div className="kpi-value" style={{ fontSize: 15 }}>{npRes.best_model_name}</div>
+                  <div className="kpi-label">Top Scoring Non-Parametric Candidate</div>
+                  <div className="kpi-value" style={{ fontSize: 15 }}>{npRes.best_model_name || 'Unavailable'}</div>
                 </div>
                 <div className="kpi-card">
                   <div className="kpi-label">Best Non-Parametric ({String(npRes.primary_metric || '').toUpperCase()})</div>
-                  <div className="kpi-value">{Number(npRes.best_nonparametric_score ?? 0).toFixed(4)}</div>
+                  <div className="kpi-value">{npRes.best_nonparametric_score?.toFixed(4) ?? 'Unavailable'}</div>
                 </div>
                 <div className="kpi-card">
                   <div className="kpi-label">Parametric Reference</div>
-                  <div className="kpi-value">{npRes.parametric_reference_score !== null && npRes.parametric_reference_score !== undefined ? Number(npRes.parametric_reference_score).toFixed(4) : 'N/A'}</div>
+                  <div className="kpi-value">{npRes.parametric_reference_score?.toFixed(4) ?? 'Unavailable'}</div>
                 </div>
                 <div className="kpi-card">
                   <div className="kpi-label">Lift vs Parametric</div>
-                  <div className="kpi-value" style={{ color: Number(npRes.lift_vs_parametric ?? 0) > 0 ? 'var(--green)' : 'var(--text)' }}>
-                    {npRes.lift_vs_parametric !== null && npRes.lift_vs_parametric !== undefined ? `${Number(npRes.lift_vs_parametric) >= 0 ? '+' : ''}${Number(npRes.lift_vs_parametric).toFixed(4)}` : 'N/A'}
+                  <div className="kpi-value" style={{ color: npRes.nonparametric_outperforms_parametric === true ? 'var(--green)' : 'var(--text)' }}>
+                    {npRes.lift_vs_parametric !== null && npRes.lift_vs_parametric !== undefined ? `${Number(npRes.lift_vs_parametric) >= 0 ? '+' : ''}${Number(npRes.lift_vs_parametric).toFixed(4)}` : 'Unavailable'}
                   </div>
                 </div>
               </div>
@@ -364,7 +364,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
               <div className="card">
                 <div className="card-title">
                   <span>Non-Parametric vs. Parametric Analytical Leaderboard</span>
-                  <span className="badge badge-accent">Runtime: {npRes.elapsed_seconds}s · Ready for Studio 14 Live Monitor</span>
+                  <span className="badge badge-accent">Runtime: {npRes.elapsed_seconds}s{npRes.comparison_status === 'unavailable' ? ' · Comparison unavailable' : ''}</span>
                 </div>
                 {(npRes.leaderboard?.length ?? 0) > 0 && (
                   <div style={{ marginBottom: 14 }}>
@@ -375,7 +375,7 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
                         const sc = Number(row.primary_score ?? row.score ?? NaN);
                         const lbl = String(row.model_name ?? row.model ?? `Estimator ${idx + 1}`);
                         return Number.isFinite(sc)
-                          ? [{ label: lbl, value: sc, color: row.is_nonparametric === false ? '#a78bfa' : idx === 0 ? '#34d399' : '#38bdf8' }]
+                          ? [{ label: lbl, value: sc, color: row.is_nonparametric === false ? '#a78bfa' : idx === 0 && npRes.comparison_status === 'available' ? '#34d399' : '#38bdf8' }]
                           : [];
                       })}
                     />

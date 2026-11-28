@@ -612,3 +612,27 @@ test('Studio 03 uses catalog IDs and displays the actual tail risk payload', asy
   await expect(page.getByText('Moderate', { exact: true })).toBeVisible();
   await expect(page.getByText('Column Risk Metrics', { exact: true })).toBeVisible();
 });
+
+test('Studio 06 keeps the candidate visible when its parametric reference is unavailable', async ({ page }) => {
+  const mock = new MockWorkbench({
+    s06_nonparametric: {
+      target: 'target', task_type: 'regression', primary_metric: 'R²', elapsed_seconds: 1,
+      best_model_name: 'NonParametric_WeightedKNN', best_nonparametric_score: 1,
+      parametric_reference_status: 'unavailable', comparison_status: 'unavailable',
+      parametric_reference_score: null, lift_vs_parametric: null, nonparametric_outperforms_parametric: null,
+      verdict: 'Comparison unavailable: the parametric reference could not be evaluated.',
+      leaderboard: [{ model_name: 'NonParametric_WeightedKNN', primary_score: 1, is_nonparametric: true,
+        acceptance_status: 'NOT ASSESSED — PARAMETRIC REFERENCE UNAVAILABLE' }],
+    },
+  });
+  await mock.install(page);
+  await page.goto('/');
+  await page.locator('[data-studio="06"]').click();
+  await page.getByRole('button', { name: 'Non-Parametric Analytical Models', exact: true }).click();
+  await expect(page.getByText('Top Scoring Non-Parametric Candidate')).toBeVisible();
+  await expect(page.locator('.kpi-card').filter({ hasText: 'Best Non-Parametric' })).toContainText('1.0000');
+  await expect(page.locator('.kpi-card').filter({ hasText: 'Parametric Reference' })).toContainText('Unavailable');
+  await expect(page.locator('.kpi-card').filter({ hasText: 'Lift vs Parametric' })).toContainText('Unavailable');
+  await expect(page.getByText('NOT ASSESSED — PARAMETRIC REFERENCE UNAVAILABLE', { exact: true })).toBeVisible();
+  await expect(page.getByText(/Champion Non-Parametric|Ready for Studio 14 Live Monitor/)).toHaveCount(0);
+});

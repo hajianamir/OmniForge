@@ -340,10 +340,12 @@ export interface AutoMLResponse extends StateEnvelope {
 
 export interface NonParametricResponse extends StateEnvelope {
   best_model_name?: string;
-  best_nonparametric_score?: number;
-  parametric_reference_score?: number;
-  lift_vs_parametric?: number;
-  nonparametric_outperforms_parametric?: boolean;
+  best_nonparametric_score?: number | null;
+  parametric_reference_score?: number | null;
+  parametric_reference_status?: 'available' | 'unavailable';
+  comparison_status?: 'available' | 'unavailable';
+  lift_vs_parametric?: number | null;
+  nonparametric_outperforms_parametric?: boolean | null;
   primary_metric?: string;
   target?: string;
   task_type?: string;

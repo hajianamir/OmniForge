@@ -692,6 +692,9 @@ class NonParametricAnalyticalSuite:
 
         When an external holdout ``X_test``/``y_test`` pair is provided, cross-validation and model
         fitting run strictly on ``X``/``y`` and holdout generalization scores are reported separately.
+
+        A failed reference leaves successfully scored candidates inspectable, but produces no
+        reference score, lift, or champion. A measured zero reference is still comparable.
         """
         import time as _time
 
@@ -740,7 +743,7 @@ class NonParametricAnalyticalSuite:
         leaderboard: list[dict[str, Any]] = []
         fitted_models: dict[str, BaseOmniForgeModel] = {}
         equations: list[dict[str, Any]] = []
-        param_score = 0.0
+        param_score: float | None = None
 
         splits = list(splitter.split(X, y_arr if is_clf else None))
 
@@ -758,18 +761,19 @@ class NonParametricAnalyticalSuite:
                     else:
                         yt = np.asarray(y_arr[va_i], dtype=float)
                         yp = np.asarray(preds, dtype=float)
+                        if not np.isfinite(yt).all() or not np.isfinite(yp).all():
+                            raise ValueError("Non-finite regression outcomes or predictions.")
                         fold_primary.append(_safe_r2(yt, yp))
                         fold_sec.append(float(root_mean_squared_error(yt, yp)))
 
                 full_model = factory()
                 full_model.fit(X, y_arr)
-                fitted_models[name] = full_model
 
                 mean_p = round(float(np.mean(fold_primary)), 5)
                 std_p = round(float(np.std(fold_primary, ddof=1) if len(fold_primary) > 1 else 0.0), 5)
                 mean_s = round(float(np.mean(fold_sec)), 5)
-                if name.startswith("Parametric_"):
-                    param_score = mean_p
+                if not all(math.isfinite(score) for score in (mean_p, std_p, mean_s)):
+                    raise ValueError("Non-finite cross-validation scores.")
 
                 row: dict[str, Any] = {
                     "model_name": name,
@@ -804,18 +808,27 @@ class NonParametricAnalyticalSuite:
                 if hasattr(full_model, "fitted_k_"):
                     row["k_neighbors"] = int(full_model.fitted_k_)
                 leaderboard.append(row)
+                fitted_models[name] = full_model
+                if not row["is_nonparametric"]:
+                    param_score = mean_p
             except Exception as exc:
-                logger.warning("nonparametric_candidate_failed", model=name, error=str(exc))
+                logger.warning("nonparametric_candidate_failed", model=name, error_type=type(exc).__name__)
                 continue
 
         leaderboard.sort(key=lambda r: float(r["primary_score"]), reverse=True)
+        nonparam_best = next((r for r in leaderboard if r["is_nonparametric"]), None)
+        comparison_available = param_score is not None and nonparam_best is not None
         for rank_i, row in enumerate(leaderboard, start=1):
-            lift = round(float(row["primary_score"]) - float(param_score), 5)
+            lift = round(float(row["primary_score"]) - param_score, 5) if param_score is not None else None
             row["rank"] = rank_i
             row["lift_vs_parametric"] = lift
-            if rank_i == 1:
+            if param_score is None:
+                row["acceptance_status"] = "NOT ASSESSED — PARAMETRIC REFERENCE UNAVAILABLE"
+            elif not comparison_available:
+                row["acceptance_status"] = "REFERENCE — PARAMETRIC LINEAR"
+            elif rank_i == 1:
                 row["acceptance_status"] = "ACCEPTED — CHAMPION ANALYTICAL MODEL"
-            elif row["is_nonparametric"] and lift > 0.0:
+            elif row["is_nonparametric"] and lift is not None and lift > 0.0:
                 row["acceptance_status"] = "ACCEPTED — BEATS PARAMETRIC LINEAR"
             elif not row["is_nonparametric"]:
                 row["acceptance_status"] = "REFERENCE — PARAMETRIC LINEAR"
@@ -839,15 +852,17 @@ class NonParametricAnalyticalSuite:
                 eq_d["acceptance_status"] = row["acceptance_status"]
                 eq_d["primary_metric"] = row["primary_metric"]
                 eq_d["primary_score"] = row["primary_score"]
-                eq_d["naive_floor_score"] = param_score
                 eq_d["lift_over_naive"] = lift
-                eq_d["selection_criterion"] = (
-                    f"{k_folds}-fold CV {row['primary_metric']} vs. Parametric Linear Reference ({param_score:.4f})"
-                )
-                reasons = [
-                    f"{k_folds}-fold CV {row['primary_metric']} = {row['primary_score']:.4f} ± {row['cv_std']:.4f}",
-                    f"Lift vs. Parametric Linear Reference = {lift:+.4f}",
-                ]
+                criterion = f"{k_folds}-fold CV {row['primary_metric']}"
+                reasons = [f"{criterion} = {row['primary_score']:.4f} ± {row['cv_std']:.4f}"]
+                if param_score is not None and lift is not None:
+                    eq_d["naive_floor_score"] = param_score
+                    eq_d["comparison_reference_label"] = "Parametric Linear Reference"
+                    eq_d["selection_criterion"] = f"{criterion} vs. Parametric Linear Reference ({param_score:.4f})"
+                    reasons.append(f"Lift vs. Parametric Linear Reference = {lift:+.4f}")
+                else:
+                    eq_d["selection_criterion"] = f"{criterion}; parametric reference unavailable"
+                    reasons.append("Comparison not assessed: the parametric reference could not be evaluated.")
                 if "effective_df" in row:
                     reasons.append(f"Effective Non-Parametric Degrees of Freedom (EDF) = {row['effective_df']}")
                 if "bandwidth_h" in row:
@@ -855,19 +870,22 @@ class NonParametricAnalyticalSuite:
                 eq_d["acceptance_reasons"] = reasons
                 equations.append(eq_d)
 
-        champion = leaderboard[0] if leaderboard else {}
-        nonparam_best = next((r for r in leaderboard if r.get("is_nonparametric")), {})
-        best_np_score = float(nonparam_best.get("primary_score", 0.0)) if nonparam_best else 0.0
-        lift_vs_param = round(best_np_score - float(param_score), 5)
-        np_beats_param = bool(nonparam_best and lift_vs_param > 0.015)
-        primary_metric_name = str(nonparam_best.get("primary_metric") or champion.get("primary_metric") or ("f1_weighted" if is_clf else "r2"))
-        linearity_verdict = (
-            f"Non-parametric analytical model '{nonparam_best.get('model_name')}' outperforms parametric linear by "
-            f"{lift_vs_param:+.4f} {primary_metric_name} — "
-            "significant non-linear structure confirmed."
-            if np_beats_param
-            else "Parametric linear relationship is competitive with non-parametric smoothers; additive/linear terms capture most signal."
-        )
+        champion = leaderboard[0] if comparison_available else {}
+        best_np_score = float(nonparam_best["primary_score"]) if nonparam_best is not None else None
+        lift_vs_param = round(best_np_score - param_score, 5) if best_np_score is not None and param_score is not None else None
+        np_beats_param = lift_vs_param > 0.015 if lift_vs_param is not None else None
+        primary_metric_name = str(leaderboard[0]["primary_metric"]) if leaderboard else ("f1_weighted" if is_clf else "r2")
+        if param_score is None:
+            linearity_verdict = "Comparison unavailable: the parametric reference could not be evaluated."
+        elif nonparam_best is None:
+            linearity_verdict = "Comparison unavailable: no non-parametric candidate could be evaluated."
+        elif np_beats_param and lift_vs_param is not None:
+            linearity_verdict = (
+                f"Non-parametric analytical model '{nonparam_best['model_name']}' outperforms parametric linear by "
+                f"{lift_vs_param:+.4f} {primary_metric_name} — significant non-linear structure confirmed."
+            )
+        else:
+            linearity_verdict = "Parametric linear relationship is competitive with non-parametric smoothers; additive/linear terms capture most signal."
 
         # Return champion fitted non-parametric model + full dict for Studio 14 supervisory registration
         return {
@@ -878,10 +896,12 @@ class NonParametricAnalyticalSuite:
             "primary_metric": primary_metric_name,
             "elapsed_seconds": round(float(_time.perf_counter() - t0), 3),
             "parametric_reference_score": param_score,
-            "champion_model": champion.get("model_name", ""),
-            "best_model_name": nonparam_best.get("model_name") or champion.get("model_name", ""),
-            "champion_paradigm": champion.get("paradigm", ""),
-            "champion_score": champion.get("primary_score", 0.0),
+            "parametric_reference_status": "available" if param_score is not None else "unavailable",
+            "comparison_status": "available" if comparison_available else "unavailable",
+            "champion_model": champion.get("model_name"),
+            "best_model_name": nonparam_best["model_name"] if nonparam_best is not None else "",
+            "champion_paradigm": champion.get("paradigm"),
+            "champion_score": champion.get("primary_score"),
             "best_nonparametric_score": best_np_score,
             "lift_vs_parametric": lift_vs_param,
             "nonparametric_outperforms_parametric": np_beats_param,
