@@ -584,8 +584,10 @@ class LeakageSafePipelineBuilder:
         }
 
 
-class CombinatorialPurgedKFold:
-    """Combinatorial Purged Cross-Validation (CPCV) for time-series with overlapping labels.
+class LegacyCombinatorialPurgedKFold:
+    """Historical list-returning CPCV adapter; new callers should use evaluation.validation.
+
+    Preserves the legacy purge-plus-embargo policy and can return empty training sets.
 
     Generates all ``C(n_splits, n_test_splits)`` combinations of test folds,
     applying a symmetric ``purge_gap`` around each test block and an ``embargo_pct``
@@ -638,3 +640,7 @@ class CombinatorialPurgedKFold:
             X, n_splits=self.n_splits, n_test_groups=self.n_test_splits, purge_gap=self.purge_gap,
             post_buffer=self.purge_gap + embargo, eval_times=eval_times, include_empty=True,
         ))
+
+
+# Backward-compatible import (including existing serialized class references).
+CombinatorialPurgedKFold = LegacyCombinatorialPurgedKFold

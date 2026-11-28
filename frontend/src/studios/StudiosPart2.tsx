@@ -259,7 +259,14 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
                   />
                 </div>
               )}
-              <SimpleTable title="Ranked Candidates & Comparison Evidence" rows={automlRes.leaderboard || []} />
+              {automlRes.metadata?.evaluation?.leaderboard_partition === 'validation' && (
+                <p>Validation rank includes reference baselines. A baseline can rank first without being the selected candidate.</p>
+              )}
+              <SimpleTable title="Ranked Candidates & Comparison Evidence" rows={(automlRes.leaderboard || []).map(row => ({
+                Role: (row.model ?? row.model_name) === automlRes.best_model_name ? 'Selected model'
+                  : row.family === 'baseline' ? 'Reference baseline' : 'Candidate',
+                ...row,
+              }))} />
               {automlRes.equation && (automlRes.equation.formula_plain || automlRes.equation.equation_text) && (
                 <div style={{ marginTop: 14 }}>
                   <MathEquationCard
@@ -268,7 +275,6 @@ export const Studio06Modeling: React.FC<StudioProps> = ({ ws, onSync, studioCach
                       ...automlRes.equation,
                       model_name: automlRes.equation.model_name || automlRes.best_model_name || '',
                       formula_plain: automlRes.equation.formula_plain || automlRes.equation.equation_text,
-                      rank: 1,
                       primary_metric: automlRes.primary_metric,
                       primary_score: automlRes.best_score,
                       comparison_reference_label: automlRes.baseline_name ?? 'Strong Reference',
@@ -710,6 +716,11 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
   const foreRes = studioCache.s08_forecast ?? null;
   const classical = foreRes?.classical_summary;
   const calibration = classical?.metadata?.champion_interval_calibration;
+  const heuristicNativeBands = calibration?.status !== 'applied' && (
+    classical?.metadata?.champion_native_interval?.coverage_guaranteed === false
+    || classical?.champion_model === 'ML_GradientBoosting'
+    || classical?.champion_model === 'ML_RandomForest'
+  );
   const evaluation = calibration?.evaluation;
   const percent = (value: number | null | undefined) => value == null ? '—' : `${(100 * value).toFixed(1)}%`;
 
@@ -819,8 +830,15 @@ export const Studio08Decision: React.FC<StudioProps> = ({ ws, onSync, studioCach
                   )}
                 </div>
               )}
+              {heuristicNativeBands && (
+                <div style={{ marginTop: 16 }}>
+                  <ForecastFanSVG history={foreRes.history || []} forecast={classical?.forecast || []}
+                    title={`${classical?.champion_model || 'ML champion'} with heuristic intervals`} />
+                  <p>Native ML bands are heuristic, not split conformal. Coverage is not guaranteed.</p>
+                </div>
+              )}
               {calibration && !['disabled', 'applied'].includes(calibration.status) && (
-                <p>Calibration unavailable. The champion retains its nominal intervals.</p>
+                <p>Calibration unavailable. The champion retains its native intervals.</p>
               )}
             </>
           )}

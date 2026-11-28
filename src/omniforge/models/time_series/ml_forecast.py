@@ -1,4 +1,4 @@
-"""Machine Learning recursive & direct lag-feature forecaster with conformal intervals."""
+"""Recursive lag-feature ML forecasting with heuristic native intervals."""
 
 from __future__ import annotations
 
@@ -30,7 +30,8 @@ class MLForecaster:
         self.random_seed = random_seed
         self._model: ClassicalMLModel | None = None
         self._history: np.ndarray = np.array([], dtype=float)
-        self._conformal_q: float = 1.0
+        self._native_half_width: float = 1.0
+        self._native_interval_method: str | None = None
         self._max_lag: int = 1
 
     def _make_row(self, hist: np.ndarray, t_idx: int) -> np.ndarray:
@@ -54,7 +55,7 @@ class MLForecaster:
         return np.asarray(feats, dtype=float)
 
     def fit(self, y: pd.Series | np.ndarray, exog: pd.DataFrame | None = None) -> MLForecaster:
-        """Fit lag-engineered ML regressor and calibrate split conformal residual quantile (causal imputation)."""
+        """Fit a recursive regressor and estimate the base width of its heuristic native band."""
         s_y = pd.to_numeric(pd.Series(y), errors="coerce")
         if not s_y.notna().any():
             raise ForecastingError("MLForecaster target series contains no valid numeric values.")
@@ -79,10 +80,12 @@ class MLForecaster:
         X_mat = np.vstack(rows)
         y_vec = np.asarray(targets, dtype=float)
 
-        # Hold out last 20% for split conformal interval calibration (Angelopoulos & Bates 2021)
+        # Use one-step residuals from a chronological holdout to set the base width.
+        # The production model refits all rows; recursive horizon scaling is heuristic.
         alpha = float(np.clip(1.0 - self.confidence_level, 1e-4, 0.5))
         cal_size = max(5, int(len(X_mat) * 0.2))
         if len(X_mat) > cal_size + 10:
+            self._native_interval_method = "heuristic_refit_one_step_residual_band"
             cal_model = ClassicalMLModel(
                 algorithm=self.algorithm,
                 task_type=TaskType.REGRESSION,
@@ -93,10 +96,11 @@ class MLForecaster:
             cal_resid = np.abs(y_vec[-cal_size:] - cal_model.predict(X_mat[-cal_size:]))
             n_cal = len(cal_resid)
             k = min(max(int(np.ceil((n_cal + 1) * (1.0 - alpha))), 1), n_cal)
-            self._conformal_q = float(np.partition(cal_resid, k - 1)[k - 1])
+            self._native_half_width = float(np.partition(cal_resid, k - 1)[k - 1])
         else:
+            self._native_interval_method = "heuristic_first_difference_band"
             z_crit = float(stats.norm.ppf(1.0 - alpha / 2.0))
-            self._conformal_q = float(np.std(np.diff(arr), ddof=1)) * z_crit if len(arr) > 2 else 1.0
+            self._native_half_width = float(np.std(np.diff(arr), ddof=1)) * z_crit if len(arr) > 2 else 1.0
 
         self._model = ClassicalMLModel(
             algorithm=self.algorithm,
@@ -108,7 +112,7 @@ class MLForecaster:
         return self
 
     def predict(self, horizon: int, future_exog: pd.DataFrame | None = None) -> pd.DataFrame:
-        """Recursively roll forward ``horizon`` steps with conformal uncertainty bounds."""
+        """Roll forecasts forward with heuristic bounds, not guaranteed-coverage intervals."""
         if self._model is None:
             raise ForecastingError("MLForecaster must be fitted before predict().")
         h = max(1, int(horizon))
@@ -126,8 +130,8 @@ class MLForecaster:
             buffer.append(yhat)
 
         growth = np.sqrt(np.arange(1, h + 1, dtype=float))
-        half_w = self._conformal_q * np.minimum(growth, 3.0)
-        return pd.DataFrame(
+        half_w = self._native_half_width * np.minimum(growth, 3.0)
+        result = pd.DataFrame(
             {
                 "step": np.arange(1, h + 1),
                 "yhat": preds,
@@ -135,3 +139,9 @@ class MLForecaster:
                 "yhat_upper": preds + half_w,
             }
         )
+        result.attrs["native_interval"] = {
+            "method": self._native_interval_method,
+            "coverage_guaranteed": False,
+            "horizon_scaling": "sqrt_step_capped_at_3",
+        }
+        return result

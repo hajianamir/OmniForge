@@ -30,6 +30,7 @@ from sklearn.metrics import (
     root_mean_squared_error,
 )
 
+from omniforge.core.task_inference import infer_supervised_task as _infer_task_type
 from omniforge.core.types import TaskType
 from omniforge.core.utils import to_json_object
 from omniforge.data.quality import DataQualityProfiler
@@ -450,18 +451,6 @@ def _finite_float(val: Any, default: float = 0.0) -> float:
         return default
 
 
-def _infer_task_type(series: pd.Series) -> TaskType:
-    s = series.dropna()
-    if s.empty:
-        return TaskType.REGRESSION
-    if not pd.api.types.is_numeric_dtype(s) or pd.api.types.is_bool_dtype(s):
-        return TaskType.BINARY_CLASSIFICATION if s.nunique() <= 2 else TaskType.MULTICLASS_CLASSIFICATION
-    arr = pd.to_numeric(s, errors="coerce").dropna().to_numpy(dtype=float)
-    if len(arr) > 0 and len(np.unique(arr)) <= 10 and np.all(np.isclose(arr, np.round(arr))):
-        return TaskType.BINARY_CLASSIFICATION if len(np.unique(arr)) <= 2 else TaskType.MULTICLASS_CLASSIFICATION
-    return TaskType.REGRESSION
-
-
 def _numeric_working_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str]]:
     """Return a finite numeric DataFrame, encoding categorical columns via frequency/codes if needed."""
     label_notes: dict[str, str] = {}
@@ -730,7 +719,7 @@ def get_live_chart_catalog(state: dict[str, Any], studio_id: str = "all") -> dic
     targets = get_selected_targets(state, df) if has_df else []
     primary_target = targets[0] if targets else None
     task_str = "unsupervised"
-    if has_df and primary_target and primary_target in df.columns:
+    if has_df and primary_target and primary_target in df.columns and df[primary_target].notna().any():
         t_enum = _infer_task_type(df[primary_target])
         task_str = "regression" if t_enum == TaskType.REGRESSION else "classification"
 

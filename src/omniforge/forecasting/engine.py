@@ -445,7 +445,11 @@ class ForecastingEngine:
                         y_train_ref=y_train,
                         seasonal_period=self.seasonal_period,
                     )
-                    leaderboard.append({"model": name, "family": family, **metrics})
+                    interval = fc_val.attrs.get("native_interval")
+                    leaderboard.append({
+                        "model": name, "family": family, **metrics,
+                        **({"native_interval": interval} if interval is not None else {}),
+                    })
                     val_preds_map[name] = fc_val
                     fitted_builders[name] = builder
                 except Exception as exc:
@@ -539,6 +543,7 @@ class ForecastingEngine:
             if widths is not None:
                 future_fc["yhat_lower"] = future_fc["yhat"] - widths
                 future_fc["yhat_upper"] = future_fc["yhat"] + widths
+                future_fc.attrs.pop("native_interval", None)
 
             # Build approximate normal bounds from within-model spread and between-model disagreement.
             top_models = [r["model"] for r in non_baseline[:3]]
@@ -620,6 +625,7 @@ class ForecastingEngine:
                 "ensemble_variance_method": "law_of_total_variance_mixture",
                 "ensemble_interval_method": "approximate_normal_moment_bounds" if ensemble_fc is not None else None,
                 "champion_interval_calibration": calibration,
+                "champion_native_interval": future_fc.attrs.get("native_interval"),
                 "rolling_cv_results": rolling_cv_results,
                 "diebold_mariano_vs_runner_up": dm_summary,
             },

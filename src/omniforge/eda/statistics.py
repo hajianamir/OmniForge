@@ -594,7 +594,7 @@ class StatisticalAnalyzer:
     def chi_square_independence(
         series_a: pd.Series, series_b: pd.Series, alpha: float = 0.05
     ) -> HypothesisTestResult:
-        """Test categorical association via Pearson Chi-Square (or Fisher's Exact for sparse 2x2) and Cramér's V."""
+        """Report uncorrected Pearson Cramér's V alongside a separate association test."""
         ct = pd.crosstab(series_a, series_b)
         if ct.shape[0] < 2 or ct.shape[1] < 2:
             return HypothesisTestResult(
@@ -614,10 +614,12 @@ class StatisticalAnalyzer:
         cramers_v = float(np.sqrt(pearson_chi2 / max(n * min_dim, 1e-12)))
 
         test_name = "chi_square_independence"
+        p_value_method = "yates_corrected_chi_square" if dof == 1 else "pearson_chi_square"
         stat_out = float(chi2)
         if ct.shape == (2, 2) and float(np.min(expected)) < 5.0:
             odds_ratio, fisher_p = stats.fisher_exact(ct.to_numpy())
             test_name = "fisher_exact_test"
+            p_value_method = "fisher_exact_two_sided"
             stat_out = float(odds_ratio) if np.isfinite(odds_ratio) else float(chi2)
             p_val = float(fisher_p)
 
@@ -635,7 +637,11 @@ class StatisticalAnalyzer:
                 if reject
                 else f"No significant categorical association (p={p_val:.4g})."
             ),
-            details={"dof": int(dof), "shape": list(ct.shape)},
+            details={
+                "dof": int(dof), "shape": list(ct.shape),
+                "effect_size_variant": "uncorrected_pearson_cramers_v",
+                "p_value_method": p_value_method,
+            },
         )
 
     @staticmethod
@@ -1173,12 +1179,20 @@ def distance_correlation(
 
 
 def friedman_nemenyi_test(score_matrix: np.ndarray | pd.DataFrame, *, alpha: float = 0.05) -> dict[str, Any]:
-    """Demšar (2006, JMLR 7:1-30) Friedman + Iman-Davenport (1980) F-test + exact Studentized-Range Nemenyi CD."""
+    """Use the Iman–Davenport approximation as the single omnibus decision for independent blocks.
+
+    Keep the Friedman chi-square p-value as a diagnostic; Nemenyi is post hoc.
+    Dependent cross-validation folds are not independent benchmark datasets.
+    """
     mat = np.asarray(score_matrix, dtype=float)
-    if mat.ndim != 2 or mat.shape[0] < 3 or mat.shape[1] < 2:
-        return {"evaluable": False, "reason": "Requires >= 3 datasets/folds and >= 2 models."}
+    if mat.ndim != 2 or mat.shape[0] < 3 or mat.shape[1] < 3:
+        return {"evaluable": False, "reason": "Requires at least three independent blocks and three models."}
     if not (0.0 < alpha < 1.0):
         raise ValueError("alpha must be in (0, 1).")
+    if not np.isfinite(mat).all():
+        return {"evaluable": False, "reason": "All block scores must be finite."}
+    if np.all(mat == mat[:, :1]):
+        return {"evaluable": False, "reason": "All model scores tie within each block."}
     n_datasets, k_models = mat.shape
     stat, p_val = stats.friedmanchisquare(*[mat[:, j] for j in range(k_models)])
     chi2_f = float(stat)
@@ -1194,6 +1208,8 @@ def friedman_nemenyi_test(score_matrix: np.ndarray | pd.DataFrame, *, alpha: flo
     else:
         f_stat = float(((n_datasets - 1) * chi2_f) / id_denom)
         f_pval = float(np.clip(stats.f.sf(f_stat, df1, df2), 0.0, 1.0))
+
+    significant = bool(f_pval < alpha)
 
     # Average ranks across datasets (higher score = rank 1)
     ranks = np.array([stats.rankdata(-row) for row in mat])
@@ -1219,7 +1235,7 @@ def friedman_nemenyi_test(score_matrix: np.ndarray | pd.DataFrame, *, alpha: flo
                     "model_a": col_names[i],
                     "model_b": col_names[j],
                     "rank_diff": round(diff, 4),
-                    "significant": bool(diff > cd),
+                    "significant": bool(significant and diff > cd),
                 }
             )
 
@@ -1231,7 +1247,10 @@ def friedman_nemenyi_test(score_matrix: np.ndarray | pd.DataFrame, *, alpha: flo
         "p_value": round(float(p_val), 6),
         "iman_davenport_f": round(f_stat, 6) if np.isfinite(f_stat) else f_stat,
         "iman_davenport_p_value": round(f_pval, 6),
-        "significant": bool(p_val < alpha or f_pval < alpha),
+        "omnibus_decision_method": "iman_davenport_f",
+        "omnibus_p_value": round(f_pval, 6),
+        "significant": significant,
+        "post_hoc_status": "evaluated" if significant else "omnibus_not_rejected",
         "avg_ranks": [round(float(r), 4) for r in avg_ranks],
         "q_alpha": round(q_alpha, 6),
         "critical_difference": round(cd, 4),
